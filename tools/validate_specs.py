@@ -28,14 +28,68 @@ def require(condition, message):
         raise ValidationError(message)
 
 
+def json_equal(left, right):
+    """Implement JSON Schema equality without Python's True == 1 aliasing."""
+    if isinstance(left, bool) or isinstance(right, bool):
+        return isinstance(left, bool) and isinstance(right, bool) and left == right
+    if (isinstance(left, (int, float)) and
+            isinstance(right, (int, float))):
+        return left == right
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, list):
+        return (len(left) == len(right) and
+                all(json_equal(a, b) for a, b in zip(left, right)))
+    if isinstance(left, dict):
+        return (left.keys() == right.keys() and
+                all(json_equal(value, right[name])
+                    for name, value in left.items()))
+    return left == right
+
+
+SUPPORTED_SCHEMA_KEYS = {
+    "$schema", "$id", "title", "description", "type", "additionalProperties",
+    "required", "properties", "const", "enum", "items", "minItems", "maxItems",
+    "uniqueItems", "minimum", "maximum", "oneOf",
+}
+
+
+def validate_schema_keywords(schema, path="$"):
+    unknown = set(schema) - SUPPORTED_SCHEMA_KEYS
+    require(not unknown,
+            "{} uses unsupported schema keywords: {}".format(path, sorted(unknown)))
+    for name, child in schema.get("properties", {}).items():
+        validate_schema_keywords(child, "{}.properties.{}".format(path, name))
+    additional = schema.get("additionalProperties")
+    if isinstance(additional, dict):
+        validate_schema_keywords(additional, "{}.additionalProperties".format(path))
+    items = schema.get("items")
+    if isinstance(items, dict):
+        validate_schema_keywords(items, "{}.items".format(path))
+    for index, child in enumerate(schema.get("oneOf", [])):
+        validate_schema_keywords(child, "{}.oneOf[{}]".format(path, index))
+
+
 def validate_instance(instance, schema, path="$",
                       schema_name="schema"):
     """Validate the JSON Schema subset used by the tracked v1 fixtures."""
+    if "oneOf" in schema:
+        matches = 0
+        for option in schema["oneOf"]:
+            try:
+                validate_instance(instance, option, path, schema_name)
+                matches += 1
+            except ValidationError:
+                pass
+        require(matches == 1,
+                "{}: {} must match exactly one oneOf branch".format(schema_name, path))
+
     if "const" in schema:
-        require(instance == schema["const"],
+        require(json_equal(instance, schema["const"]),
                 "{}: {} must equal {!r}".format(schema_name, path, schema["const"]))
     if "enum" in schema:
-        require(instance in schema["enum"],
+        require(any(json_equal(instance, candidate)
+                    for candidate in schema["enum"]),
                 "{}: {} is not one of {!r}".format(schema_name, path, schema["enum"]))
 
     expected_type = schema.get("type")
@@ -78,9 +132,9 @@ def validate_instance(instance, schema, path="$",
             require(len(instance) <= schema["maxItems"],
                     "{}: {} has too many items".format(schema_name, path))
         if schema.get("uniqueItems"):
-            normalized = [json.dumps(item, sort_keys=True, separators=(",", ":"))
-                          for item in instance]
-            require(len(normalized) == len(set(normalized)),
+            require(all(not json_equal(item, previous)
+                        for index, item in enumerate(instance)
+                        for previous in instance[:index]),
                     "{}: {} items must be unique".format(schema_name, path))
         item_schema = schema.get("items")
         if isinstance(item_schema, dict):
@@ -134,7 +188,32 @@ def validate_schemas():
             "{} has an invalid $id".format(schema_name),
         )
         require(schema.get("type") == "object", "{} must validate an object".format(schema_name))
+        validate_schema_keywords(schema, schema_name)
         validate_instance(load_json(instance_name), schema, schema_name=schema_name)
+
+
+def require_rejected(instance, schema, message):
+    try:
+        validate_instance(instance, schema, schema_name="validator regression")
+    except ValidationError:
+        return
+    raise ValidationError(message)
+
+
+def validate_validator_regressions():
+    sequence_schema = load_json("schemas/sequence-trace-v1.schema.json")
+    trace_schema = sequence_schema["properties"]["traces"]["items"]
+    step_schema = trace_schema["properties"]["steps"]["items"]
+    invalid_steps = [
+        {"offset_ns": 0, "action": "button_down"},
+        {"offset_ns": 0, "action": "reset", "button": "A"},
+        {"offset_ns": 0, "action": "hat", "x": 0, "y": 0},
+    ]
+    for step in invalid_steps:
+        require_rejected(step, step_schema,
+                         "sequence action fields were not rejected: {!r}".format(step))
+    require_rejected(True, {"const": 1},
+                     "JSON boolean must not satisfy a numeric const")
 
 
 def validate_behavior():
@@ -263,6 +342,7 @@ def validate_conformance():
 
 def main():
     validate_schemas()
+    validate_validator_regressions()
     validate_behavior()
     validate_controller_fixture()
     validate_traces()
