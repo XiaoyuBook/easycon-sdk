@@ -317,11 +317,14 @@ impl Runtime {
             .expect("Runtime state lock poisoned");
         ensure_active(*state)?;
         let subscription = EventSubscription::new(options);
-        self.inner
+        let mut subscriptions = self
+            .inner
             .subscriptions
             .lock()
-            .expect("subscription registry lock poisoned")
-            .push(Arc::downgrade(&subscription.inner));
+            .expect("subscription registry lock poisoned");
+        subscriptions.retain(|existing| existing.strong_count() != 0);
+        subscriptions.push(Arc::downgrade(&subscription.inner));
+        drop(subscriptions);
         drop(state);
         Ok(subscription)
     }
@@ -1551,6 +1554,34 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn new_subscription_prunes_dropped_registry_history() {
+        let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+        for _ in 0..128 {
+            drop(
+                runtime
+                    .subscribe(SubscriptionOptions::default())
+                    .expect("temporary subscription"),
+            );
+        }
+
+        let live = runtime
+            .subscribe(SubscriptionOptions::default())
+            .expect("live subscription");
+
+        assert_eq!(
+            runtime
+                .inner
+                .subscriptions
+                .lock()
+                .expect("subscription registry")
+                .len(),
+            1
+        );
+        drop(live);
+        runtime.close();
     }
 
     #[test]
