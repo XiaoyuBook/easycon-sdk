@@ -887,6 +887,28 @@ mod tests {
     }
 
     #[test]
+    fn terminal_parent_cancels_an_already_running_child_operation() {
+        let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+        let parent = runtime.create_operation(None).expect("parent operation");
+        let child = runtime
+            .create_operation_with_parent(None, &parent.cancellation_token())
+            .expect("child operation");
+        parent.start();
+        child.start();
+
+        parent.succeed(OperationValue::Unit);
+
+        assert_eq!(parent.snapshot().state, OperationState::Succeeded);
+        assert_eq!(child.snapshot().state, OperationState::Cancelling);
+        assert_eq!(
+            child.snapshot().cancellation_reason,
+            Some(CancellationReason::ParentClose)
+        );
+        child.finish_cancelled();
+        runtime.close();
+    }
+
+    #[test]
     fn cancel_is_idempotent_before_and_after_terminal_commit() {
         let runtime = Runtime::new(Arc::new(VirtualClock::default()));
         let operation = runtime.create_operation(None).expect("operation");

@@ -292,9 +292,10 @@ impl OperationInner {
                     CancellationReason::Deadline => {
                         (ErrorCode::DeadlineExceeded, "operation deadline elapsed")
                     }
-                    CancellationReason::ParentClose => {
-                        (ErrorCode::Cancelled, "parent resource or Runtime closed")
-                    }
+                    CancellationReason::ParentClose => (
+                        ErrorCode::Cancelled,
+                        "parent operation, resource, or Runtime ended",
+                    ),
                 };
                 data.error = Some(EasyConError::new(ErrorDomain::Runtime, code, message));
                 data.state = OperationState::Cancelled;

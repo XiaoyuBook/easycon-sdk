@@ -19,7 +19,8 @@
 - Operation 只允许 `Pending -> Running -> Succeeded/Failed`，或经 `Cancelling -> Cancelled`；
   result/error 终态只提交一次。
 - Controller operation 是 Controller resource cancellation token 的子节点；父资源或 Runtime 取消会先
-  推进 operation 到 `Cancelling`，跨 Runtime 或已终结的 parent token 会在 admission 时拒绝。
+  推进 operation 到 `Cancelling`，父 operation 终结也会取消仍活动的后代；跨 Runtime 或已终结的
+  parent token 会在 admission 时拒绝。
 - wait timeout 只结束观察；operation deadline 由 Runtime worker 自动请求取消；握手/ACK protocol
   timeout 提交 Controller failure；report/command write 使用独立的 1 s 默认 I/O deadline，ACK reply
   timeout 从完整 command write 被 transport 接受后开始。

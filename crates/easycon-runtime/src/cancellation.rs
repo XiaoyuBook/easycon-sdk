@@ -69,6 +69,11 @@ impl CancellationToken {
             .children
             .lock()
             .expect("cancellation child lock poisoned");
+        if !self.inner.active.load(Ordering::Acquire) || self.is_cancelled() {
+            drop(children);
+            child.cancel();
+            return child;
+        }
         children.retain(|existing| {
             existing
                 .upgrade()
@@ -76,9 +81,7 @@ impl CancellationToken {
         });
         children.push(Arc::downgrade(&child.inner));
         drop(children);
-        if !self.inner.active.load(Ordering::Acquire) {
-            child.deactivate();
-        } else if self.is_cancelled() {
+        if !self.inner.active.load(Ordering::Acquire) || self.is_cancelled() {
             child.cancel();
         }
         child
@@ -194,15 +197,17 @@ fn deactivate_inner(inner: &Arc<CancellationInner>) {
         .lock()
         .expect("cancellation hook lock poisoned")
         .clear();
-    let children: Vec<_> = inner
-        .children
-        .lock()
-        .expect("cancellation child lock poisoned")
-        .iter()
-        .filter_map(Weak::upgrade)
-        .collect();
+    let children: Vec<_> = {
+        let mut children = inner
+            .children
+            .lock()
+            .expect("cancellation child lock poisoned");
+        let live = children.iter().filter_map(Weak::upgrade).collect();
+        children.clear();
+        live
+    };
     for child in children {
-        deactivate_inner(&child);
+        cancel_inner(&child);
     }
 }
 
@@ -286,6 +291,23 @@ mod tests {
         assert_eq!(
             token.inner.hooks.lock().expect("cancellation hooks").len(),
             1
+        );
+    }
+
+    #[test]
+    fn child_created_after_parent_deactivation_is_cancelled_without_history() {
+        let root = CancellationToken::root();
+        root.deactivate();
+
+        let child = root.child();
+
+        assert!(child.is_cancelled());
+        assert!(
+            root.inner
+                .children
+                .lock()
+                .expect("cancellation children")
+                .is_empty()
         );
     }
 }
