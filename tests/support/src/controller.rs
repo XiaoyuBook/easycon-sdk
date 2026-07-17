@@ -519,8 +519,8 @@ impl ControllerTransport for FakeControllerTransport {
         }
         if delay_ns != 0 {
             drop(state);
-            self.clock
-                .advance_to(self.clock.now_ns().saturating_add(delay_ns));
+            let delay_target = self.clock.now_ns().saturating_add(delay_ns);
+            self.clock.advance_to(delay_target.min(request.deadline_ns));
             state = self
                 .shared
                 .state

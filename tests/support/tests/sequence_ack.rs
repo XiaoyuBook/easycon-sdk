@@ -596,6 +596,32 @@ fn blocked_report_write_obeys_its_io_deadline() {
 }
 
 #[test]
+fn delayed_report_write_stops_at_its_io_deadline() {
+    let (clock, runtime, fake, controller) = connected();
+    let write_timeout_ns = ControllerOptions::default().write_timeout_ns;
+    fake.delay_next_write_by(write_timeout_ns + 50);
+
+    let operation = controller
+        .direct(ControllerAction::ButtonDown(Button::A))
+        .expect("direct");
+    wait_terminal(&operation);
+
+    assert_eq!(clock.now_ns(), write_timeout_ns);
+    assert_eq!(operation.snapshot().state, OperationState::Failed);
+    assert_eq!(
+        operation.snapshot().error.expect("write timeout").code(),
+        ErrorCode::Transport
+    );
+    assert_eq!(fake.accepted_writes().len(), 1);
+    assert_eq!(
+        fake.accepted_writes()[0].bytes,
+        SwitchReport::NEUTRAL.encode()
+    );
+    controller.close();
+    runtime.close();
+}
+
+#[test]
 fn runtime_close_does_not_execute_direct_queued_behind_ack() {
     let (_clock, runtime, fake, controller) = connected();
     fake.push_ack(AckOutcome::BlockUntilCancelled);
