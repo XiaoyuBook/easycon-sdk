@@ -516,6 +516,75 @@ fn direct_cancel_rebuilds_later_reports_from_neutral() {
 }
 
 #[test]
+fn failed_cancel_neutral_keeps_later_desired_report_authoritative() {
+    let (clock, runtime, fake, controller) = connected();
+    let first = controller
+        .direct(ControllerAction::ButtonDown(Button::X))
+        .expect("first direct");
+    wait_terminal(&first);
+    let cancelled = controller
+        .direct(ControllerAction::ButtonDown(Button::A))
+        .expect("cancelled direct");
+    let later = controller
+        .direct(ControllerAction::ButtonDown(Button::B))
+        .expect("later direct");
+    wait_until(|| {
+        controller.snapshot().desired_report.buttons()
+            == Button::X.mask() | Button::A.mask() | Button::B.mask()
+    });
+    fake.fail_write_call(
+        fake.write_call_count() + 1,
+        TransportError::new(
+            TransportErrorKind::Io,
+            "neutral write failed without disconnecting",
+        ),
+    );
+
+    cancelled.cancel();
+    wait_until(|| controller.snapshot().desired_report.buttons() == Button::B.mask());
+    clock.advance_to(30_000_000);
+    wait_terminal(&cancelled);
+    wait_terminal(&later);
+
+    assert_eq!(cancelled.snapshot().state, OperationState::Cancelled);
+    assert_eq!(later.snapshot().state, OperationState::Succeeded);
+    assert_eq!(
+        controller.snapshot().desired_report.buttons(),
+        Button::B.mask()
+    );
+    assert_eq!(fake.accepted_writes().len(), 2);
+    assert_eq!(
+        fake.accepted_writes()[1].bytes,
+        SwitchReport::new(
+            Button::B.mask(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        )
+        .encode()
+    );
+
+    let next = controller
+        .direct(ControllerAction::ButtonDown(Button::Y))
+        .expect("next direct");
+    clock.advance_to(60_000_000);
+    wait_terminal(&next);
+    assert_eq!(
+        fake.accepted_writes()[2].bytes,
+        SwitchReport::new(
+            Button::B.mask() | Button::Y.mask(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        )
+        .encode()
+    );
+
+    controller.close();
+    runtime.close();
+}
+
+#[test]
 fn ack_waits_for_an_earlier_report_in_the_fifo_lane() {
     let (clock, runtime, fake, controller) = connected();
     let first = controller

@@ -1544,6 +1544,8 @@ impl ControllerLane {
             }
             if self.state() == ControllerState::Disconnected {
                 self.fail_pending_disconnected();
+            } else {
+                self.rebuild_pending_after_neutral();
             }
             return;
         }
