@@ -31,6 +31,8 @@ pub enum ErrorCode {
     Cancelled,
     /// A protocol exchange exceeded its own timeout.
     ProtocolTimeout,
+    /// A protocol reply or byte sequence was invalid.
+    ProtocolError,
     /// The controller transport disconnected.
     DeviceDisconnected,
     /// A transport read or write failed.

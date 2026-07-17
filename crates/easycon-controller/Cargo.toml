@@ -11,5 +11,8 @@ publish = false
 easycon-model = { path = "../easycon-model" }
 easycon-runtime = { path = "../easycon-runtime" }
 
+[dev-dependencies]
+serde_json = "1.0"
+
 [lints]
 workspace = true

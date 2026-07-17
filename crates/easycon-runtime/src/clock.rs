@@ -1,6 +1,6 @@
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Identifier for one registered monotonic deadline.
@@ -36,6 +36,9 @@ pub trait Clock: Send + Sync + 'static {
     /// Subscribes to explicit clock changes. Virtual clocks notify on every advance.
     fn subscribe(&self) -> Receiver<()>;
 
+    /// Registers a non-blocking hook invoked after an explicit clock change.
+    fn on_change(&self, hook: Arc<dyn Fn() + Send + Sync>);
+
     /// Registers an absolute deadline for deterministic trace inspection.
     fn register_deadline(&self, target_ns: u64) -> DeadlineId;
 
@@ -56,6 +59,7 @@ pub struct VirtualClock {
 #[derive(Default)]
 struct VirtualClockState {
     listeners: Vec<SyncSender<()>>,
+    hooks: Vec<Arc<dyn Fn() + Send + Sync>>,
     deadlines: Vec<DeadlineTrace>,
     wake_order: Vec<DeadlineId>,
 }
@@ -101,6 +105,11 @@ impl VirtualClock {
                 Ok(()) | Err(TrySendError::Full(())) => true,
                 Err(TrySendError::Disconnected(())) => false,
             });
+        let hooks = state.hooks.clone();
+        drop(state);
+        for hook in hooks {
+            hook();
+        }
     }
 
     /// Advances by a checked duration.
@@ -159,6 +168,14 @@ impl Clock for VirtualClock {
         receiver
     }
 
+    fn on_change(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        self.state
+            .lock()
+            .expect("virtual clock lock poisoned")
+            .hooks
+            .push(hook);
+    }
+
     fn register_deadline(&self, target_ns: u64) -> DeadlineId {
         let id = DeadlineId(self.next_deadline.fetch_add(1, Ordering::Relaxed));
         self.state
@@ -197,6 +214,7 @@ pub struct SystemClock {
     epoch: Instant,
     next_deadline: AtomicU64,
     listeners: Mutex<Vec<SyncSender<()>>>,
+    hooks: Mutex<Vec<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl SystemClock {
@@ -207,6 +225,7 @@ impl SystemClock {
             epoch: Instant::now(),
             next_deadline: AtomicU64::new(1),
             listeners: Mutex::new(Vec::new()),
+            hooks: Mutex::new(Vec::new()),
         }
     }
 }
@@ -229,6 +248,13 @@ impl Clock for SystemClock {
             .expect("system clock listener lock poisoned")
             .push(sender);
         receiver
+    }
+
+    fn on_change(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        self.hooks
+            .lock()
+            .expect("system clock hook lock poisoned")
+            .push(hook);
     }
 
     fn register_deadline(&self, _target_ns: u64) -> DeadlineId {

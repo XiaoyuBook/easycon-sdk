@@ -296,6 +296,46 @@ impl Runtime {
         })
     }
 
+    /// Atomically registers an active resource and the worker task it owns.
+    ///
+    /// This prevents shutdown from observing a half-admitted active resource during construction.
+    pub fn register_resource_with_task(
+        &self,
+        resource: Arc<dyn ManagedResource>,
+    ) -> Result<(ResourceRegistration, TaskRegistration), EasyConError> {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .expect("Runtime state lock poisoned");
+        ensure_active(*state)?;
+        let resource_id = ResourceId::new(self.inner.allocate_id());
+        let task_id = TaskId::new(self.inner.allocate_id());
+        self.inner
+            .resources
+            .lock()
+            .expect("resource registry lock poisoned")
+            .insert(resource_id, Arc::downgrade(&resource));
+        self.inner
+            .tasks
+            .lock()
+            .expect("task registry lock poisoned")
+            .insert(task_id);
+        drop(state);
+        Ok((
+            ResourceRegistration {
+                runtime: Arc::downgrade(&self.inner),
+                id: resource_id,
+                released: AtomicBool::new(false),
+            },
+            TaskRegistration {
+                runtime: Arc::downgrade(&self.inner),
+                id: task_id,
+                released: AtomicBool::new(false),
+            },
+        ))
+    }
+
     /// Registers one supervised task. Its guard must outlive the worker.
     pub fn register_task(&self) -> Result<TaskRegistration, EasyConError> {
         let state = self

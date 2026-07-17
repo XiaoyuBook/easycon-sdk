@@ -3,6 +3,7 @@ members = [
     "crates/easycon-model",
     "crates/easycon-runtime",
     "crates/easycon-controller",
+    "tests/support",
 ]
 resolver = "3"
 

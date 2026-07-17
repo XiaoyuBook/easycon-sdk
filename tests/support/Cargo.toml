@@ -1,0 +1,16 @@
+[package]
+name = "easycon-test-support"
+description = "Deterministic non-release fakes for EasyCon core tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+easycon-controller = { path = "../../crates/easycon-controller" }
+easycon-model = { path = "../../crates/easycon-model" }
+easycon-runtime = { path = "../../crates/easycon-runtime" }
+
+[lints]
+workspace = true

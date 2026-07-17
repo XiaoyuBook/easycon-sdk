@@ -1,0 +1,358 @@
+use std::collections::VecDeque;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::ThreadId;
+use std::time::Duration;
+
+use easycon_controller::{
+    ControllerTransport, HANDSHAKE_REPLY, HANDSHAKE_REQUEST, HandshakeRequest, TransportError,
+    TransportErrorKind, WriteContext,
+};
+use easycon_runtime::{Clock, VirtualClock};
+
+/// Scripted result for one expected baud attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HandshakeOutcome {
+    /// Hello succeeds after deterministic virtual elapsed time.
+    Success { elapsed_ns: u64 },
+    /// The protocol attempt times out.
+    Timeout { elapsed_ns: u64 },
+    /// A specific non-timeout failure occurs.
+    Error {
+        kind: TransportErrorKind,
+        message: Arc<str>,
+    },
+}
+
+/// Recorded source-exact handshake attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HandshakeAttemptRecord {
+    /// Baud supplied by the controller state machine.
+    pub baud_rate: u32,
+    /// Request bytes seen by transport.
+    pub request_bytes: [u8; 3],
+    /// Expected reply matcher.
+    pub expected_reply: u8,
+    /// Absolute protocol deadline.
+    pub deadline_ns: u64,
+}
+
+/// One complete logical write accepted after any number of partial writes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AcceptedWrite {
+    /// Context shared by every partial call.
+    pub context: WriteContext,
+    /// Reassembled accepted bytes.
+    pub bytes: Vec<u8>,
+    /// OS thread that called every transport write.
+    pub writer_thread: ThreadId,
+    /// Number of partial calls used for this payload.
+    pub partial_calls: usize,
+}
+
+/// Cloneable handle and transport implementation with shared deterministic state.
+#[derive(Clone)]
+pub struct FakeControllerTransport {
+    clock: Arc<VirtualClock>,
+    shared: Arc<FakeShared>,
+}
+
+struct FakeShared {
+    state: Mutex<FakeState>,
+    changed: Condvar,
+}
+
+struct FakeState {
+    handshakes: VecDeque<HandshakeScript>,
+    attempts: Vec<HandshakeAttemptRecord>,
+    accepted_writes: Vec<AcceptedWrite>,
+    partial: Option<PartialWrite>,
+    maximum_write_chunk: usize,
+    write_calls: usize,
+    fail_write_call: Option<(usize, TransportError)>,
+    open: bool,
+    closed: bool,
+}
+
+struct HandshakeScript {
+    baud_rate: u32,
+    outcome: HandshakeOutcome,
+}
+
+struct PartialWrite {
+    context: WriteContext,
+    bytes: Vec<u8>,
+    writer_thread: ThreadId,
+    calls: usize,
+}
+
+impl FakeControllerTransport {
+    /// Creates an empty deterministic fake using the Runtime virtual clock.
+    #[must_use]
+    pub fn new(clock: Arc<VirtualClock>) -> Self {
+        Self {
+            clock,
+            shared: Arc::new(FakeShared {
+                state: Mutex::new(FakeState {
+                    handshakes: VecDeque::new(),
+                    attempts: Vec::new(),
+                    accepted_writes: Vec::new(),
+                    partial: None,
+                    maximum_write_chunk: usize::MAX,
+                    write_calls: 0,
+                    fail_write_call: None,
+                    open: false,
+                    closed: false,
+                }),
+                changed: Condvar::new(),
+            }),
+        }
+    }
+
+    /// Appends one expected baud and outcome.
+    pub fn push_handshake(&self, baud_rate: u32, outcome: HandshakeOutcome) {
+        self.shared
+            .state
+            .lock()
+            .expect("fake transport lock poisoned")
+            .handshakes
+            .push_back(HandshakeScript { baud_rate, outcome });
+    }
+
+    /// Limits each `write` call to a non-zero prefix.
+    pub fn set_maximum_write_chunk(&self, maximum: usize) {
+        assert!(maximum != 0, "partial write chunk must be non-zero");
+        self.shared
+            .state
+            .lock()
+            .expect("fake transport lock poisoned")
+            .maximum_write_chunk = maximum;
+    }
+
+    /// Fails one one-based partial write call.
+    pub fn fail_write_call(&self, call: usize, error: TransportError) {
+        assert!(call != 0, "write call index is one-based");
+        self.shared
+            .state
+            .lock()
+            .expect("fake transport lock poisoned")
+            .fail_write_call = Some((call, error));
+    }
+
+    /// Simulates an external disconnect before the next write.
+    pub fn disconnect(&self) {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .expect("fake transport lock poisoned");
+        state.open = false;
+        state.closed = true;
+    }
+
+    /// Returns recorded attempts in order.
+    #[must_use]
+    pub fn handshake_attempts(&self) -> Vec<HandshakeAttemptRecord> {
+        self.shared
+            .state
+            .lock()
+            .expect("fake transport lock poisoned")
+            .attempts
+            .clone()
+    }
+
+    /// Returns complete accepted logical writes in order.
+    #[must_use]
+    pub fn accepted_writes(&self) -> Vec<AcceptedWrite> {
+        self.shared
+            .state
+            .lock()
+            .expect("fake transport lock poisoned")
+            .accepted_writes
+            .clone()
+    }
+
+    /// Returns total transport partial-write calls.
+    #[must_use]
+    pub fn write_call_count(&self) -> usize {
+        self.shared
+            .state
+            .lock()
+            .expect("fake transport lock poisoned")
+            .write_calls
+    }
+
+    /// Returns whether close was requested.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.shared
+            .state
+            .lock()
+            .expect("fake transport lock poisoned")
+            .closed
+    }
+
+    /// Waits until at least `count` complete writes are accepted.
+    #[must_use]
+    pub fn wait_for_accepted_count(&self, count: usize, timeout: Duration) -> bool {
+        let state = self
+            .shared
+            .state
+            .lock()
+            .expect("fake transport lock poisoned");
+        let (state, _result) = self
+            .shared
+            .changed
+            .wait_timeout_while(state, timeout, |state| state.accepted_writes.len() < count)
+            .expect("fake transport lock poisoned while waiting");
+        state.accepted_writes.len() >= count
+    }
+}
+
+impl ControllerTransport for FakeControllerTransport {
+    fn handshake(&mut self, request: HandshakeRequest) -> Result<(), TransportError> {
+        if request.request_bytes != HANDSHAKE_REQUEST || request.expected_reply != HANDSHAKE_REPLY {
+            return Err(TransportError::new(
+                TransportErrorKind::Protocol,
+                "handshake bytes do not match the source-exact protocol",
+            ));
+        }
+        let script = {
+            let mut state = self
+                .shared
+                .state
+                .lock()
+                .expect("fake transport lock poisoned");
+            state.closed = false;
+            state.attempts.push(HandshakeAttemptRecord {
+                baud_rate: request.baud_rate,
+                request_bytes: request.request_bytes,
+                expected_reply: request.expected_reply,
+                deadline_ns: request.deadline_ns,
+            });
+            state.handshakes.pop_front().ok_or_else(|| {
+                TransportError::new(
+                    TransportErrorKind::Protocol,
+                    "no scripted handshake outcome",
+                )
+            })?
+        };
+        if script.baud_rate != request.baud_rate {
+            return Err(TransportError::new(
+                TransportErrorKind::Protocol,
+                "handshake baud order differed from the script",
+            ));
+        }
+        if request.cancellation.is_cancelled() {
+            return Err(TransportError::new(
+                TransportErrorKind::Cancelled,
+                "handshake cancelled",
+            ));
+        }
+
+        let elapsed_ns = match &script.outcome {
+            HandshakeOutcome::Success { elapsed_ns } | HandshakeOutcome::Timeout { elapsed_ns } => {
+                *elapsed_ns
+            }
+            HandshakeOutcome::Error { .. } => 0,
+        };
+        let target = self.clock.now_ns().saturating_add(elapsed_ns);
+        self.clock.advance_to(target.min(request.deadline_ns));
+        if request.cancellation.is_cancelled() {
+            return Err(TransportError::new(
+                TransportErrorKind::Cancelled,
+                "handshake cancelled",
+            ));
+        }
+        if target >= request.deadline_ns {
+            return Err(TransportError::new(
+                TransportErrorKind::Timeout,
+                "handshake protocol timeout",
+            ));
+        }
+
+        match script.outcome {
+            HandshakeOutcome::Success { .. } => {
+                self.shared
+                    .state
+                    .lock()
+                    .expect("fake transport lock poisoned")
+                    .open = true;
+                Ok(())
+            }
+            HandshakeOutcome::Timeout { .. } => Err(TransportError::new(
+                TransportErrorKind::Timeout,
+                "scripted handshake timeout",
+            )),
+            HandshakeOutcome::Error { kind, message } => Err(TransportError::new(kind, message)),
+        }
+    }
+
+    fn write(&mut self, context: WriteContext, bytes: &[u8]) -> Result<usize, TransportError> {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .expect("fake transport lock poisoned");
+        if state.closed || !state.open {
+            return Err(TransportError::new(
+                TransportErrorKind::Disconnected,
+                "fake transport is disconnected",
+            ));
+        }
+        state.write_calls = state
+            .write_calls
+            .checked_add(1)
+            .expect("write call overflow");
+        if let Some((call, error)) = &state.fail_write_call
+            && *call == state.write_calls
+        {
+            return Err(error.clone());
+        }
+        let accepted = state.maximum_write_chunk.min(bytes.len());
+        let thread = std::thread::current().id();
+        if state.partial.is_none() {
+            state.partial = Some(PartialWrite {
+                context,
+                bytes: Vec::with_capacity(context.total_len),
+                writer_thread: thread,
+                calls: 0,
+            });
+        }
+        let partial = state.partial.as_mut().expect("partial initialized above");
+        if partial.context != context || partial.writer_thread != thread {
+            return Err(TransportError::new(
+                TransportErrorKind::Protocol,
+                "partial writes changed context or writer thread",
+            ));
+        }
+        partial.bytes.extend_from_slice(&bytes[..accepted]);
+        partial.calls = partial.calls.checked_add(1).expect("partial call overflow");
+        if partial.bytes.len() == context.total_len {
+            let complete = state.partial.take().expect("complete partial exists");
+            state.accepted_writes.push(AcceptedWrite {
+                context: complete.context,
+                bytes: complete.bytes,
+                writer_thread: complete.writer_thread,
+                partial_calls: complete.calls,
+            });
+            self.shared.changed.notify_all();
+        } else if partial.bytes.len() > context.total_len {
+            return Err(TransportError::new(
+                TransportErrorKind::Protocol,
+                "partial writes exceeded the logical payload length",
+            ));
+        }
+        Ok(accepted)
+    }
+
+    fn close(&mut self) {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .expect("fake transport lock poisoned");
+        state.open = false;
+        state.closed = true;
+        state.partial = None;
+    }
+}
