@@ -29,6 +29,7 @@ dependencies = [
  "easycon-controller",
  "easycon-model",
  "easycon-runtime",
+ "serde_json",
 ]
 
 [[package]]

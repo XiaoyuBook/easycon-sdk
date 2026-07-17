@@ -12,10 +12,13 @@ architecture.
   traces in virtual monotonic nanoseconds.
 - `conformance/runtime-controller-v1.json` defines the hardware-free vertical slice and fault
   scenarios.
-- `schemas/` contains JSON Schema Draft 2020-12 documents for these assets.
+- `schemas/` contains JSON Schema Draft 2020-12 documents for every asset shape. The local validator
+  applies the schema subset used here to each concrete instance rather than only parsing the schema
+  documents.
 
-The fixtures were transcribed from the source evidence named in each file. Tests and validation do
-not open, build, download, or otherwise depend on `EasyCon/`.
+The fixtures were transcribed from the source evidence named in each file. Controller golden-vector
+and precise-sequence tests read these tracked files directly. Tests and validation do not open,
+build, download, or otherwise depend on `EasyCon/`.
 
 Run the local validator with:
 

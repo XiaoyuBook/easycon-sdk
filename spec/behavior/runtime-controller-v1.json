@@ -17,7 +17,8 @@
     "timeouts": {
       "wait_timeout": "ends only the caller wait and never cancels the operation",
       "operation_deadline": "requests cancellation and normally ends Cancelled with reason deadline",
-      "protocol_timeout": "fails the operation in the controller or I/O error domain after bounded attempts"
+      "protocol_timeout": "fails the operation in the controller error domain after a bounded handshake or ACK exchange",
+      "transport_write_timeout": "bounds partial report and command writes independently from protocol replies"
     },
     "terminal_commit": "exactly once; immutable result and error are mutually exclusive"
   },
@@ -45,6 +46,7 @@
   "controller": {
     "single_writer": true,
     "default_minimum_report_interval_ns": 30000000,
+    "write_timeout_ns": 1000000000,
     "direct_success_boundary": "the complete report bytes were accepted by transport",
     "hardware_execution_claimed": false,
     "sequence": {

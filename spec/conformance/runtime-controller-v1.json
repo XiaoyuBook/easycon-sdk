@@ -27,13 +27,15 @@
       "id": "timeout-separation",
       "steps": [
         "poll a running operation with zero wait timeout",
-        "advance past an operation deadline",
-        "inject a handshake protocol timeout in a separate operation"
+        "advance past an operation deadline without manually polling Runtime",
+        "inject a handshake protocol timeout in a separate operation",
+        "block a report write until its independent I/O deadline"
       ],
       "assertions": [
         "wait timeout leaves the operation Running",
         "deadline requests cancellation and finishes Cancelled after cleanup",
-        "protocol timeout finishes Failed with controller or I/O error"
+        "protocol timeout finishes Failed with controller error",
+        "write timeout finishes Failed with transport error"
       ]
     },
     {
@@ -42,12 +44,18 @@
         "accept a report using partial writes",
         "ignore a late ACK from an older generation",
         "reject an error ACK",
+        "queue an ACK behind a report that is waiting for its minimum interval",
+        "cancel after direct and final sequence bytes are accepted but before write returns",
+        "close while a report write is blocked before acceptance",
         "disconnect during a sequence",
         "close while an ACK read is blocked"
       ],
       "assertions": [
         "bytes are neither duplicated nor truncated",
         "late ACK cannot complete the current operation",
+        "ACK waits for the earlier report instead of returning resource busy",
+        "accepted-byte cancellation neutralizes and reaches Cancelled exactly once",
+        "close interrupts blocked write and joins the lane",
         "disconnect fails pending work and exposes neutralization warning",
         "transport close wakes the blocked read and the lane joins"
       ]
@@ -57,11 +65,14 @@
       "steps": [
         "create a capacity-one subscription",
         "publish more ordinary events than capacity",
+        "retain an earlier critical event while a later ordinary event is dropped",
+        "publish concurrently from multiple producers",
         "complete an operation",
         "read the subscription and query the operation"
       ],
       "assertions": [
         "EventGap reports the dropped sequence interval",
+        "concrete events and gaps are read in strictly increasing sequence order",
         "producer never blocks",
         "authoritative terminal state remains queryable"
       ]

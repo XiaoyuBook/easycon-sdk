@@ -1,3 +1,4 @@
+use std::fs;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -12,6 +13,23 @@ use easycon_runtime::{
     SubscriptionRead, VirtualClock, WaitResult, WaitTimeout,
 };
 use easycon_test_support::{AckOutcome, FakeControllerTransport, HandshakeOutcome};
+use serde_json::Value;
+
+struct SequenceTrace {
+    lane_start_ns: u64,
+    minimum_report_interval_ns: u64,
+    cancel_at_ns: Option<u64>,
+    steps: Vec<SequenceStep>,
+    expected_reports: Vec<ExpectedReport>,
+    operation_states: Vec<String>,
+    terminal_preconditions: Vec<String>,
+}
+
+struct ExpectedReport {
+    timestamp_ns: u64,
+    bytes: [u8; 8],
+    purpose: Option<String>,
+}
 
 fn connected() -> (
     Arc<VirtualClock>,
@@ -55,6 +73,128 @@ fn wait_until(mut predicate: impl FnMut() -> bool) {
     }
 }
 
+fn load_sequence_trace(id: &str) -> SequenceTrace {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../spec/fixtures/controller/sequence-traces-v1.json"
+    );
+    let document: Value =
+        serde_json::from_str(&fs::read_to_string(path).expect("trace read")).expect("trace JSON");
+    let trace = document["traces"]
+        .as_array()
+        .expect("trace array")
+        .iter()
+        .find(|trace| trace["id"].as_str() == Some(id))
+        .unwrap_or_else(|| panic!("missing sequence trace {id}"));
+    SequenceTrace {
+        lane_start_ns: json_u64(&trace["lane_start_ns"]),
+        minimum_report_interval_ns: json_u64(&trace["minimum_report_interval_ns"]),
+        cancel_at_ns: trace.get("cancel_at_ns").map(json_u64),
+        steps: trace["steps"]
+            .as_array()
+            .expect("steps")
+            .iter()
+            .map(|step| SequenceStep::new(json_u64(&step["offset_ns"]), fixture_action(step)))
+            .collect(),
+        expected_reports: trace["expected_reports"]
+            .as_array()
+            .expect("expected reports")
+            .iter()
+            .map(|report| ExpectedReport {
+                timestamp_ns: json_u64(&report["timestamp_ns"]),
+                bytes: report["bytes"]
+                    .as_array()
+                    .expect("report bytes")
+                    .iter()
+                    .map(json_u8)
+                    .collect::<Vec<_>>()
+                    .try_into()
+                    .expect("eight report bytes"),
+                purpose: report
+                    .get("purpose")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            })
+            .collect(),
+        operation_states: trace["operation_states"]
+            .as_array()
+            .expect("operation states")
+            .iter()
+            .map(|state| state.as_str().expect("operation state").to_owned())
+            .collect(),
+        terminal_preconditions: trace
+            .get("terminal_preconditions")
+            .and_then(Value::as_array)
+            .map_or_else(Vec::new, |items| {
+                items
+                    .iter()
+                    .map(|item| item.as_str().expect("terminal precondition").to_owned())
+                    .collect()
+            }),
+    }
+}
+
+fn fixture_action(step: &Value) -> ControllerAction {
+    match step["action"].as_str().expect("action") {
+        "button_down" => ControllerAction::ButtonDown(fixture_button(&step["button"])),
+        "button_up" => ControllerAction::ButtonUp(fixture_button(&step["button"])),
+        "hat" => ControllerAction::Hat(fixture_hat(&step["hat"])),
+        "left_stick" => ControllerAction::LeftStick(StickPosition::new(
+            json_u8(&step["x"]),
+            json_u8(&step["y"]),
+        )),
+        "right_stick" => ControllerAction::RightStick(StickPosition::new(
+            json_u8(&step["x"]),
+            json_u8(&step["y"]),
+        )),
+        "reset" => ControllerAction::Reset,
+        action => panic!("unknown fixture action {action}"),
+    }
+}
+
+fn fixture_button(value: &Value) -> Button {
+    match value.as_str().expect("button") {
+        "Y" => Button::Y,
+        "B" => Button::B,
+        "A" => Button::A,
+        "X" => Button::X,
+        "L" => Button::L,
+        "R" => Button::R,
+        "ZL" => Button::ZL,
+        "ZR" => Button::ZR,
+        "MINUS" => Button::Minus,
+        "PLUS" => Button::Plus,
+        "LCLICK" => Button::LClick,
+        "RCLICK" => Button::RClick,
+        "HOME" => Button::Home,
+        "CAPTURE" => Button::Capture,
+        button => panic!("unknown fixture button {button}"),
+    }
+}
+
+fn fixture_hat(value: &Value) -> Hat {
+    match value.as_str().expect("HAT") {
+        "TOP" => Hat::Top,
+        "TOP_RIGHT" => Hat::TopRight,
+        "RIGHT" => Hat::Right,
+        "BOTTOM_RIGHT" => Hat::BottomRight,
+        "BOTTOM" => Hat::Bottom,
+        "BOTTOM_LEFT" => Hat::BottomLeft,
+        "LEFT" => Hat::Left,
+        "TOP_LEFT" => Hat::TopLeft,
+        "CENTER" => Hat::Center,
+        hat => panic!("unknown fixture HAT {hat}"),
+    }
+}
+
+fn json_u64(value: &Value) -> u64 {
+    value.as_u64().expect("fixture u64")
+}
+
+fn json_u8(value: &Value) -> u8 {
+    u8::try_from(json_u64(value)).expect("fixture byte")
+}
+
 fn drain_events(subscription: &easycon_runtime::EventSubscription) -> Vec<Event> {
     std::iter::from_fn(|| match subscription.read(WaitTimeout::Poll) {
         SubscriptionRead::Event(event) => Some(event),
@@ -66,27 +206,23 @@ fn drain_events(subscription: &easycon_runtime::EventSubscription) -> Vec<Event>
 #[test]
 fn precise_sequence_matches_absolute_offset_fixture_without_drift() {
     let (clock, runtime, fake, controller) = connected();
-    clock.advance_to(100_000_000);
-    let sequence = PreciseSequence::new(vec![
-        SequenceStep::new(0, ControllerAction::ButtonDown(Button::A)),
-        SequenceStep::new(0, ControllerAction::Hat(Hat::Right)),
-        SequenceStep::new(
-            30_000_000,
-            ControllerAction::LeftStick(StickPosition::new(0, 255)),
-        ),
-        SequenceStep::new(70_000_000, ControllerAction::ButtonUp(Button::A)),
-    ])
-    .expect("sequence");
+    let trace = load_sequence_trace("absolute-offsets-and-same-offset-merge");
+    assert_eq!(
+        trace.minimum_report_interval_ns,
+        ControllerOptions::default().minimum_report_interval_ns
+    );
+    clock.advance_to(trace.lane_start_ns);
+    let sequence = PreciseSequence::new(trace.steps).expect("sequence");
     let operation = controller
         .precise_sequence(sequence)
         .expect("sequence submit");
 
     assert!(fake.wait_for_accepted_count(1, Duration::from_secs(2)));
     assert_eq!(operation.wait(WaitTimeout::Poll), WaitResult::Timeout);
-    clock.advance_to(130_000_000);
-    assert!(fake.wait_for_accepted_count(2, Duration::from_secs(2)));
-    clock.advance_to(170_000_000);
-    assert!(fake.wait_for_accepted_count(3, Duration::from_secs(2)));
+    for (index, report) in trace.expected_reports.iter().enumerate().skip(1) {
+        clock.advance_to(report.timestamp_ns);
+        assert!(fake.wait_for_accepted_count(index + 1, Duration::from_secs(2)));
+    }
     wait_terminal(&operation);
 
     let writes = fake.accepted_writes();
@@ -95,11 +231,27 @@ fn precise_sequence_matches_absolute_offset_fixture_without_drift() {
             .iter()
             .map(|write| write.context.timestamp_ns)
             .collect::<Vec<_>>(),
-        [100_000_000, 130_000_000, 170_000_000]
+        trace
+            .expected_reports
+            .iter()
+            .map(|report| report.timestamp_ns)
+            .collect::<Vec<_>>()
     );
-    assert_eq!(writes[0].bytes, [0, 1, 0, 40, 4, 2, 1, 128]);
-    assert_eq!(writes[1].bytes, [0, 1, 0, 32, 7, 126, 1, 128]);
-    assert_eq!(writes[2].bytes, [0, 0, 0, 32, 7, 126, 1, 128]);
+    assert_eq!(
+        writes
+            .iter()
+            .map(|write| write.bytes.as_slice())
+            .collect::<Vec<_>>(),
+        trace
+            .expected_reports
+            .iter()
+            .map(|report| report.bytes.as_slice())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        trace.operation_states.last().map(String::as_str),
+        Some("Succeeded")
+    );
     assert_eq!(operation.snapshot().state, OperationState::Succeeded);
     assert_eq!(controller.snapshot().lease, ControllerLeaseState::Available);
 
@@ -113,12 +265,9 @@ fn sequence_cancel_neutralizes_and_releases_before_terminal() {
     let events = runtime
         .subscribe(SubscriptionOptions::default())
         .expect("events");
-    clock.advance_to(200_000_000);
-    let sequence = PreciseSequence::new(vec![
-        SequenceStep::new(0, ControllerAction::ButtonDown(Button::B)),
-        SequenceStep::new(30_000_000, ControllerAction::ButtonDown(Button::A)),
-    ])
-    .expect("sequence");
+    let trace = load_sequence_trace("cancel-before-future-step-neutralizes");
+    clock.advance_to(trace.lane_start_ns);
+    let sequence = PreciseSequence::new(trace.steps).expect("sequence");
     let operation = controller
         .precise_sequence(sequence)
         .expect("sequence submit");
@@ -134,7 +283,7 @@ fn sequence_cancel_neutralizes_and_releases_before_terminal() {
         ErrorCode::ResourceBusy
     );
 
-    clock.advance_to(215_000_000);
+    clock.advance_to(trace.cancel_at_ns.expect("cancel timestamp"));
     operation.cancel();
     assert_eq!(operation.snapshot().state, OperationState::Cancelling);
     assert!(matches!(
@@ -143,14 +292,33 @@ fn sequence_cancel_neutralizes_and_releases_before_terminal() {
     ));
     assert_eq!(operation.wait(WaitTimeout::Poll), WaitResult::Timeout);
 
-    clock.advance_to(230_000_000);
+    clock.advance_to(
+        trace
+            .expected_reports
+            .last()
+            .expect("neutral report")
+            .timestamp_ns,
+    );
     assert!(fake.wait_for_accepted_count(2, Duration::from_secs(2)));
     wait_terminal(&operation);
     assert_eq!(operation.snapshot().state, OperationState::Cancelled);
-    assert_eq!(fake.accepted_writes()[0].bytes, [0, 0, 65, 8, 4, 2, 1, 128]);
+    assert_eq!(
+        fake.accepted_writes()[0].bytes,
+        trace.expected_reports[0].bytes
+    );
     assert_eq!(
         fake.accepted_writes()[1].bytes,
-        SwitchReport::NEUTRAL.encode()
+        trace.expected_reports[1].bytes
+    );
+    assert_eq!(
+        trace.expected_reports[1].purpose.as_deref(),
+        Some("neutralize")
+    );
+    assert!(
+        trace
+            .terminal_preconditions
+            .iter()
+            .any(|condition| condition == "sequence lease released")
     );
     assert_eq!(
         fake.accepted_writes()[1].context.kind,

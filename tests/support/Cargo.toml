@@ -12,5 +12,8 @@ easycon-controller = { path = "../../crates/easycon-controller" }
 easycon-model = { path = "../../crates/easycon-model" }
 easycon-runtime = { path = "../../crates/easycon-runtime" }
 
+[dev-dependencies]
+serde_json = "1.0"
+
 [lints]
 workspace = true

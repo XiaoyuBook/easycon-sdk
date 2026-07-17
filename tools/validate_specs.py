@@ -28,6 +28,75 @@ def require(condition, message):
         raise ValidationError(message)
 
 
+def validate_instance(instance, schema, path="$",
+                      schema_name="schema"):
+    """Validate the JSON Schema subset used by the tracked v1 fixtures."""
+    if "const" in schema:
+        require(instance == schema["const"],
+                "{}: {} must equal {!r}".format(schema_name, path, schema["const"]))
+    if "enum" in schema:
+        require(instance in schema["enum"],
+                "{}: {} is not one of {!r}".format(schema_name, path, schema["enum"]))
+
+    expected_type = schema.get("type")
+    type_checks = {
+        "object": lambda value: isinstance(value, dict),
+        "array": lambda value: isinstance(value, list),
+        "string": lambda value: isinstance(value, str),
+        "integer": lambda value: isinstance(value, int) and not isinstance(value, bool),
+        "boolean": lambda value: isinstance(value, bool),
+        "null": lambda value: value is None,
+    }
+    if expected_type:
+        require(expected_type in type_checks,
+                "{}: unsupported schema type {}".format(schema_name, expected_type))
+        require(type_checks[expected_type](instance),
+                "{}: {} must be {}".format(schema_name, path, expected_type))
+
+    if isinstance(instance, dict):
+        properties = schema.get("properties", {})
+        for name in schema.get("required", []):
+            require(name in instance,
+                    "{}: {} is missing required property {}".format(schema_name, path, name))
+        additional = schema.get("additionalProperties", True)
+        for name, value in instance.items():
+            child_path = "{}.{}".format(path, name)
+            if name in properties:
+                validate_instance(value, properties[name], child_path, schema_name)
+            elif additional is False:
+                raise ValidationError(
+                    "{}: {} is not an allowed property".format(schema_name, child_path)
+                )
+            elif isinstance(additional, dict):
+                validate_instance(value, additional, child_path, schema_name)
+
+    if isinstance(instance, list):
+        if "minItems" in schema:
+            require(len(instance) >= schema["minItems"],
+                    "{}: {} has too few items".format(schema_name, path))
+        if "maxItems" in schema:
+            require(len(instance) <= schema["maxItems"],
+                    "{}: {} has too many items".format(schema_name, path))
+        if schema.get("uniqueItems"):
+            normalized = [json.dumps(item, sort_keys=True, separators=(",", ":"))
+                          for item in instance]
+            require(len(normalized) == len(set(normalized)),
+                    "{}: {} items must be unique".format(schema_name, path))
+        item_schema = schema.get("items")
+        if isinstance(item_schema, dict):
+            for index, value in enumerate(instance):
+                validate_instance(value, item_schema,
+                                  "{}[{}]".format(path, index), schema_name)
+
+    if isinstance(instance, int) and not isinstance(instance, bool):
+        if "minimum" in schema:
+            require(instance >= schema["minimum"],
+                    "{}: {} is below minimum".format(schema_name, path))
+        if "maximum" in schema:
+            require(instance <= schema["maximum"],
+                    "{}: {} exceeds maximum".format(schema_name, path))
+
+
 def encode_report(state):
     button = state["button_mask"]
     serialized = button.to_bytes(2, byteorder="big") + bytes(
@@ -48,19 +117,24 @@ def encode_report(state):
 
 
 def validate_schemas():
-    names = [
-        "schemas/behavior-v1.schema.json",
-        "schemas/controller-fixture-v1.schema.json",
-        "schemas/conformance-v1.schema.json",
+    mappings = [
+        ("schemas/behavior-v1.schema.json", "behavior/runtime-controller-v1.json"),
+        ("schemas/controller-fixture-v1.schema.json", "fixtures/controller/reports-v1.json"),
+        ("schemas/conformance-v1.schema.json", "conformance/runtime-controller-v1.json"),
+        ("schemas/sequence-trace-v1.schema.json", "fixtures/controller/sequence-traces-v1.json"),
     ]
-    for name in names:
-        schema = load_json(name)
+    for schema_name, instance_name in mappings:
+        schema = load_json(schema_name)
         require(
             schema.get("$schema") == "https://json-schema.org/draft/2020-12/schema",
-            "{} does not declare JSON Schema Draft 2020-12".format(name),
+            "{} does not declare JSON Schema Draft 2020-12".format(schema_name),
         )
-        require(schema.get("$id", "").endswith(Path(name).name), "{} has an invalid $id".format(name))
-        require(schema.get("type") == "object", "{} must validate an object".format(name))
+        require(
+            schema.get("$id", "").endswith(Path(schema_name).name),
+            "{} has an invalid $id".format(schema_name),
+        )
+        require(schema.get("type") == "object", "{} must validate an object".format(schema_name))
+        validate_instance(load_json(instance_name), schema, schema_name=schema_name)
 
 
 def validate_behavior():
@@ -92,6 +166,10 @@ def validate_behavior():
     require(
         behavior["controller"]["default_minimum_report_interval_ns"] == 30_000_000,
         "controller interval must remain 30 ms",
+    )
+    require(
+        behavior["controller"]["write_timeout_ns"] == 1_000_000_000,
+        "controller write timeout must remain 1 s",
     )
     classes = {item["classification"] for item in behavior["classifications"]}
     require(classes == {"source-exact", "corrected"}, "behavior classifications are incomplete")
@@ -189,7 +267,7 @@ def main():
     validate_controller_fixture()
     validate_traces()
     validate_conformance()
-    print("validated 3 schemas, 1 behavior spec, 2 controller fixtures, and 4 conformance scenarios")
+    print("validated 4 schemas, 1 behavior spec, 2 controller fixtures, and 4 conformance scenarios")
     return 0
 
 

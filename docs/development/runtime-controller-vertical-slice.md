@@ -5,8 +5,8 @@
 首个开发里程碑在冻结架构下实现且只实现以下 Rust 组件：
 
 - `easycon-model`：Runtime/operation/resource/task ID、稳定错误域、按钮、HAT 和摇杆值。
-- `easycon-runtime`：operation 状态机、取消树、VirtualClock、事件 subscription、registry 和
-  幂等确定性关闭。
+- `easycon-runtime`：operation 状态机、取消树、deadline coordinator、VirtualClock、严格有序事件
+  subscription、registry 和幂等确定性关闭。
 - `easycon-controller`：源码精确 Switch report、ControllerTransport、连接状态机、单写者
   command lane、direct/reset、精确序列、Automation lease 原语和 ACK generation matcher。
 - `easycon-test-support`：只供测试使用的 FakeControllerTransport 与 vertical slice harness。
@@ -18,17 +18,20 @@
 
 - Operation 只允许 `Pending -> Running -> Succeeded/Failed`，或经 `Cancelling -> Cancelled`；
   result/error 终态只提交一次。
-- wait timeout 只结束观察；operation deadline 请求取消；握手/ACK protocol timeout 提交
-  Controller/I/O failure。
+- wait timeout 只结束观察；operation deadline 由 Runtime worker 自动请求取消；握手/ACK protocol
+  timeout 提交 Controller failure；report/command write 使用独立的 1 s 默认 I/O deadline。
 - 每个 subscription 有独立有界队列。普通事件溢出合并为 `EventGap`，operation/resource
-  query 始终是权威状态。
-- 每个 Controller 只有一个 writer thread。普通 report 的默认最小间隔是 30 ms。
+  query 始终是权威状态；并发发布和 gap 均保持严格递增 sequence。
+- 每个 Controller 只有一个 writer thread。普通 report 的默认最小间隔是 30 ms；write 必须响应
+  operation/resource cancellation 或绝对 I/O deadline。
 - precise sequence 的 offset 相对 lane 获权时刻且始终为绝对目标；同 offset 按输入顺序合并
   成一个 report，不从上次 dispatch 累加目标。
 - sequence 取消或可恢复失败时，先让 transport 接受 neutral report，再释放 lease 并提交终态。
   断线导致 neutral 无法送达时发布 warning，绝不声称硬件已经中立。
 - 普通 report operation 的 `Succeeded` 只表示完整字节被 transport 接受。事件 detail 明确记录
   `hardware_execution=false`。
+- ACK command 在同一 FIFO lane 中等待前序 direct report，只有独占 sequence/Automation lease 才
+  返回 `RESOURCE_BUSY`。
 - Runtime close 先取消根树，再关闭/中立化并 join Controller，最后发布 `runtime.closed`；关闭后
   operation/resource/task 计数全部为零。
 

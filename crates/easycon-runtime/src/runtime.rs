@@ -474,19 +474,6 @@ impl Runtime {
         }
         drop(operations);
 
-        self.inner.stop_deadline_worker();
-
-        let stopped_counts = self.counts();
-        assert_eq!(
-            stopped_counts,
-            RuntimeCounts {
-                active_operations: 0,
-                active_resources: 0,
-                active_tasks: 0,
-            },
-            "supervised work remained after deterministic close"
-        );
-
         self.inner.publish_event(EventDraft::critical(
             EventKind::State,
             "runtime.closed",
@@ -503,6 +490,17 @@ impl Runtime {
         for subscription in subscriptions {
             subscription.close();
         }
+
+        self.inner.stop_deadline_worker();
+        assert_eq!(
+            self.counts(),
+            RuntimeCounts {
+                active_operations: 0,
+                active_resources: 0,
+                active_tasks: 0,
+            },
+            "supervised work remained after deterministic close"
+        );
 
         let mut state = self
             .inner

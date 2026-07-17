@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://easycon.invalid/schemas/sequence-trace-v1.schema.json",
+  "title": "EasyCon controller precise-sequence trace fixture v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "milestone", "license", "clock", "traces"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "milestone": { "const": "runtime-controller-fake-v1" },
+    "license": { "const": "GPL-3.0-only" },
+    "clock": { "const": "virtual-monotonic-nanoseconds" },
+    "traces": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "classification",
+          "lane_start_ns",
+          "minimum_report_interval_ns",
+          "steps",
+          "expected_reports",
+          "operation_states"
+        ],
+        "properties": {
+          "id": { "type": "string" },
+          "classification": { "const": "corrected" },
+          "lane_start_ns": { "type": "integer", "minimum": 0 },
+          "minimum_report_interval_ns": { "type": "integer", "minimum": 1 },
+          "cancel_at_ns": { "type": "integer", "minimum": 0 },
+          "steps": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["offset_ns", "action"],
+              "properties": {
+                "offset_ns": { "type": "integer", "minimum": 0 },
+                "action": {
+                  "enum": ["button_down", "button_up", "hat", "left_stick", "right_stick", "reset"]
+                },
+                "button": { "type": "string" },
+                "hat": { "type": "string" },
+                "x": { "type": "integer", "minimum": 0, "maximum": 255 },
+                "y": { "type": "integer", "minimum": 0, "maximum": 255 }
+              }
+            }
+          },
+          "expected_reports": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["timestamp_ns", "bytes"],
+              "properties": {
+                "timestamp_ns": { "type": "integer", "minimum": 0 },
+                "bytes": {
+                  "type": "array",
+                  "minItems": 8,
+                  "maxItems": 8,
+                  "items": { "type": "integer", "minimum": 0, "maximum": 255 }
+                },
+                "purpose": { "enum": ["report", "neutralize"] }
+              }
+            }
+          },
+          "operation_states": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "enum": ["Pending", "Running", "Cancelling", "Succeeded", "Failed", "Cancelled"]
+            }
+          },
+          "terminal_preconditions": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string" }
+          }
+        }
+      }
+    }
+  }
+}
