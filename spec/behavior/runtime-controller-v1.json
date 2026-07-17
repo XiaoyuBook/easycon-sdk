@@ -41,7 +41,7 @@
     "delivery": "per-subscriber bounded pull queue",
     "sequence": "strictly increasing across one Runtime",
     "overflow": "oldest ordinary events are summarized by EventGap; authoritative state remains queryable",
-    "close": "RuntimeClosed is published before subscriptions become closed and queued events remain drainable"
+    "close": "RuntimeClosed is the final delivered event; subscriptions remain drainable and later publish attempts are rejected"
   },
   "controller": {
     "single_writer": true,

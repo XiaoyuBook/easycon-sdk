@@ -7,7 +7,7 @@ use easycon_controller::{
     AckFrame, AckRequest, ControllerTransport, HANDSHAKE_REPLY, HANDSHAKE_REQUEST,
     HandshakeRequest, TransportError, TransportErrorKind, WriteContext, WriteRequest,
 };
-use easycon_runtime::{Clock, VirtualClock};
+use easycon_runtime::{Clock, ClockChangeRegistration, VirtualClock};
 
 /// Scripted result for one expected baud attempt.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -74,6 +74,7 @@ pub struct AcceptedWrite {
 pub struct FakeControllerTransport {
     clock: Arc<VirtualClock>,
     shared: Arc<FakeShared>,
+    _clock_hook: Arc<ClockChangeRegistration>,
 }
 
 struct FakeShared {
@@ -142,9 +143,17 @@ impl FakeControllerTransport {
             }),
             changed: Condvar::new(),
         });
-        let clock_wake = shared.clone();
-        clock.on_change(Arc::new(move || clock_wake.changed.notify_all()));
-        Self { clock, shared }
+        let clock_wake = Arc::downgrade(&shared);
+        let clock_hook = clock.on_change(Arc::new(move || {
+            if let Some(shared) = clock_wake.upgrade() {
+                shared.changed.notify_all();
+            }
+        }));
+        Self {
+            clock,
+            shared,
+            _clock_hook: Arc::new(clock_hook),
+        }
     }
 
     /// Appends one expected baud and outcome.
@@ -428,13 +437,13 @@ impl ControllerTransport for FakeControllerTransport {
         let operation_cancel = request.cancellation.clone();
         let resource_cancel = request.resource_cancellation.clone();
         let shared = self.shared.clone();
-        request
+        let _operation_wake = request
             .cancellation
-            .on_cancel(move || shared.changed.notify_all());
+            .on_cancel_scoped(move || shared.changed.notify_all());
         let shared = self.shared.clone();
-        request
+        let _resource_wake = request
             .resource_cancellation
-            .on_cancel(move || shared.changed.notify_all());
+            .on_cancel_scoped(move || shared.changed.notify_all());
         let mut state = self
             .shared
             .state
@@ -662,13 +671,13 @@ impl ControllerTransport for FakeControllerTransport {
                 let operation_cancel = request.cancellation.clone();
                 let resource_cancel = request.resource_cancellation.clone();
                 let shared = self.shared.clone();
-                request
+                let _operation_wake = request
                     .cancellation
-                    .on_cancel(move || shared.changed.notify_all());
+                    .on_cancel_scoped(move || shared.changed.notify_all());
                 let shared = self.shared.clone();
-                request
+                let _resource_wake = request
                     .resource_cancellation
-                    .on_cancel(move || shared.changed.notify_all());
+                    .on_cancel_scoped(move || shared.changed.notify_all());
                 let mut state = self
                     .shared
                     .state

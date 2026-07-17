@@ -1,6 +1,5 @@
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 /// Identifier for one registered monotonic deadline.
@@ -28,16 +27,31 @@ pub struct DeadlineTrace {
     pub woken: bool,
 }
 
+type ClockChangeHook = dyn Fn() + Send + Sync;
+
+/// RAII ownership for one explicit clock-change callback.
+#[derive(Clone)]
+pub struct ClockChangeRegistration {
+    _hook: Arc<ClockChangeHook>,
+}
+
+impl ClockChangeRegistration {
+    /// Keeps a callback alive for a `Clock` implementation until this guard is dropped.
+    #[must_use]
+    pub fn new(hook: Arc<dyn Fn() + Send + Sync>) -> Self {
+        Self { _hook: hook }
+    }
+}
+
 /// Monotonic time source used by runtime and controller scheduling.
 pub trait Clock: Send + Sync + 'static {
     /// Returns nanoseconds since this clock's private monotonic epoch.
     fn now_ns(&self) -> u64;
 
-    /// Subscribes to explicit clock changes. Virtual clocks notify on every advance.
-    fn subscribe(&self) -> Receiver<()>;
-
     /// Registers a non-blocking hook invoked after an explicit clock change.
-    fn on_change(&self, hook: Arc<dyn Fn() + Send + Sync>);
+    /// Dropping the returned registration disables the hook.
+    #[must_use]
+    fn on_change(&self, hook: Arc<ClockChangeHook>) -> ClockChangeRegistration;
 
     /// Registers an absolute deadline for deterministic trace inspection.
     fn register_deadline(&self, target_ns: u64) -> DeadlineId;
@@ -58,8 +72,7 @@ pub struct VirtualClock {
 
 #[derive(Default)]
 struct VirtualClockState {
-    listeners: Vec<SyncSender<()>>,
-    hooks: Vec<Arc<dyn Fn() + Send + Sync>>,
+    hooks: Vec<Weak<ClockChangeHook>>,
     deadlines: Vec<DeadlineTrace>,
     wake_order: Vec<DeadlineId>,
 }
@@ -75,40 +88,22 @@ impl VirtualClock {
         }
     }
 
-    /// Advances to an absolute instant and wakes registered listeners.
+    /// Advances to an absolute instant and invokes registered change callbacks.
     ///
     /// # Panics
     ///
     /// Panics if `target_ns` is earlier than the current monotonic time.
     pub fn advance_to(&self, target_ns: u64) {
-        let previous = self.now_ns.fetch_max(target_ns, Ordering::AcqRel);
-        assert!(
-            target_ns >= previous,
-            "virtual monotonic time cannot move backwards"
-        );
-
         let mut state = self.state.lock().expect("virtual clock lock poisoned");
-        let newly_woken: Vec<_> = state
-            .deadlines
-            .iter_mut()
-            .filter(|deadline| !deadline.woken && deadline.target_ns <= target_ns)
-            .map(|deadline| {
-                deadline.woken = true;
-                deadline.id
-            })
-            .collect();
-        state.wake_order.extend(newly_woken);
-        state
-            .listeners
-            .retain(|listener| match listener.try_send(()) {
-                Ok(()) | Err(TrySendError::Full(())) => true,
-                Err(TrySendError::Disconnected(())) => false,
-            });
-        let hooks = state.hooks.clone();
-        drop(state);
-        for hook in hooks {
-            hook();
+        let previous = self.now_ns.load(Ordering::Acquire);
+        if target_ns < previous {
+            drop(state);
+            panic!("virtual monotonic time cannot move backwards");
         }
+        self.now_ns.store(target_ns, Ordering::Release);
+        let hooks = advance_state(&mut state, target_ns);
+        drop(state);
+        invoke_hooks(hooks);
     }
 
     /// Advances by a checked duration.
@@ -118,11 +113,16 @@ impl VirtualClock {
     /// Panics if the new timestamp would overflow `u64`.
     pub fn advance_by(&self, duration: Duration) {
         let delta = u64::try_from(duration.as_nanos()).expect("duration exceeds u64 nanoseconds");
-        let target = self
-            .now_ns()
-            .checked_add(delta)
-            .expect("virtual monotonic timestamp overflow");
-        self.advance_to(target);
+        let mut state = self.state.lock().expect("virtual clock lock poisoned");
+        let previous = self.now_ns.load(Ordering::Acquire);
+        let Some(target_ns) = previous.checked_add(delta) else {
+            drop(state);
+            panic!("virtual monotonic timestamp overflow");
+        };
+        self.now_ns.store(target_ns, Ordering::Release);
+        let hooks = advance_state(&mut state, target_ns);
+        drop(state);
+        invoke_hooks(hooks);
     }
 
     /// Returns deadline records in registration order.
@@ -146,6 +146,30 @@ impl VirtualClock {
     }
 }
 
+fn advance_state(state: &mut VirtualClockState, target_ns: u64) -> Vec<Arc<ClockChangeHook>> {
+    let mut newly_woken: Vec<_> = state
+        .deadlines
+        .iter_mut()
+        .filter(|deadline| !deadline.woken && deadline.target_ns <= target_ns)
+        .map(|deadline| {
+            deadline.woken = true;
+            (deadline.target_ns, deadline.id)
+        })
+        .collect();
+    newly_woken.sort_unstable();
+    state
+        .wake_order
+        .extend(newly_woken.into_iter().map(|(_, id)| id));
+    state.hooks.retain(|hook| hook.strong_count() != 0);
+    state.hooks.iter().filter_map(Weak::upgrade).collect()
+}
+
+fn invoke_hooks(hooks: Vec<Arc<ClockChangeHook>>) {
+    for hook in hooks {
+        hook();
+    }
+}
+
 impl Default for VirtualClock {
     fn default() -> Self {
         Self::new(0)
@@ -157,36 +181,27 @@ impl Clock for VirtualClock {
         self.now_ns.load(Ordering::Acquire)
     }
 
-    fn subscribe(&self) -> Receiver<()> {
-        let (sender, receiver) = mpsc::sync_channel(1);
-        self.state
-            .lock()
-            .expect("virtual clock lock poisoned")
-            .listeners
-            .push(sender);
-        receiver
-    }
-
-    fn on_change(&self, hook: Arc<dyn Fn() + Send + Sync>) {
-        self.state
-            .lock()
-            .expect("virtual clock lock poisoned")
-            .hooks
-            .push(hook);
+    fn on_change(&self, hook: Arc<ClockChangeHook>) -> ClockChangeRegistration {
+        let mut state = self.state.lock().expect("virtual clock lock poisoned");
+        state.hooks.retain(|existing| existing.strong_count() != 0);
+        state.hooks.push(Arc::downgrade(&hook));
+        ClockChangeRegistration::new(hook)
     }
 
     fn register_deadline(&self, target_ns: u64) -> DeadlineId {
         let id = DeadlineId(self.next_deadline.fetch_add(1, Ordering::Relaxed));
-        self.state
-            .lock()
-            .expect("virtual clock lock poisoned")
-            .deadlines
-            .push(DeadlineTrace {
-                id,
-                target_ns,
-                dispatched_at_ns: None,
-                woken: target_ns <= self.now_ns(),
-            });
+        assert!(id.0 != 0, "virtual deadline ID space exhausted");
+        let mut state = self.state.lock().expect("virtual clock lock poisoned");
+        let woken = target_ns <= self.now_ns();
+        state.deadlines.push(DeadlineTrace {
+            id,
+            target_ns,
+            dispatched_at_ns: None,
+            woken,
+        });
+        if woken {
+            state.wake_order.push(id);
+        }
         id
     }
 
@@ -212,8 +227,6 @@ impl Clock for VirtualClock {
 pub struct SystemClock {
     epoch: Instant,
     next_deadline: AtomicU64,
-    listeners: Mutex<Vec<SyncSender<()>>>,
-    hooks: Mutex<Vec<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl SystemClock {
@@ -223,8 +236,6 @@ impl SystemClock {
         Self {
             epoch: Instant::now(),
             next_deadline: AtomicU64::new(1),
-            listeners: Mutex::new(Vec::new()),
-            hooks: Mutex::new(Vec::new()),
         }
     }
 }
@@ -240,24 +251,14 @@ impl Clock for SystemClock {
         u64::try_from(self.epoch.elapsed().as_nanos()).unwrap_or(u64::MAX)
     }
 
-    fn subscribe(&self) -> Receiver<()> {
-        let (sender, receiver) = mpsc::sync_channel(1);
-        self.listeners
-            .lock()
-            .expect("system clock listener lock poisoned")
-            .push(sender);
-        receiver
-    }
-
-    fn on_change(&self, hook: Arc<dyn Fn() + Send + Sync>) {
-        self.hooks
-            .lock()
-            .expect("system clock hook lock poisoned")
-            .push(hook);
+    fn on_change(&self, hook: Arc<ClockChangeHook>) -> ClockChangeRegistration {
+        ClockChangeRegistration::new(hook)
     }
 
     fn register_deadline(&self, _target_ns: u64) -> DeadlineId {
-        DeadlineId(self.next_deadline.fetch_add(1, Ordering::Relaxed))
+        let id = DeadlineId(self.next_deadline.fetch_add(1, Ordering::Relaxed));
+        assert!(id.0 != 0, "system deadline ID space exhausted");
+        id
     }
 
     fn record_dispatch(&self, _id: DeadlineId, _actual_ns: u64) {}
@@ -271,6 +272,10 @@ impl Clock for SystemClock {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Barrier;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::mpsc;
+
     use super::*;
 
     #[test]
@@ -278,7 +283,10 @@ mod tests {
         let clock = VirtualClock::new(10);
         let later = clock.register_deadline(30);
         let earlier = clock.register_deadline(20);
-        let receiver = clock.subscribe();
+        let (wake, receiver) = mpsc::channel();
+        let _registration = clock.on_change(Arc::new(move || {
+            let _ = wake.send(());
+        }));
 
         clock.advance_to(20);
         assert!(receiver.try_recv().is_ok());
@@ -294,5 +302,82 @@ mod tests {
     #[should_panic(expected = "cannot move backwards")]
     fn virtual_clock_rejects_backwards_time() {
         VirtualClock::new(10).advance_to(9);
+    }
+
+    #[test]
+    fn dropped_change_registration_stops_callbacks() {
+        let clock = VirtualClock::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let registration = clock.on_change(Arc::new(move || {
+            observed.fetch_add(1, Ordering::AcqRel);
+        }));
+        clock.advance_to(1);
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+
+        drop(registration);
+        clock.advance_to(2);
+
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert!(
+            clock
+                .state
+                .lock()
+                .expect("virtual clock lock")
+                .hooks
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn already_due_deadline_is_recorded_in_wake_order() {
+        let clock = VirtualClock::new(10);
+
+        let deadline = clock.register_deadline(10);
+
+        assert!(clock.deadline_trace()[0].woken);
+        assert_eq!(clock.wake_order(), [deadline]);
+    }
+
+    #[test]
+    fn one_jump_wakes_deadlines_by_target_then_registration() {
+        let clock = VirtualClock::default();
+        let later = clock.register_deadline(30);
+        let earlier = clock.register_deadline(20);
+        let same_time = clock.register_deadline(20);
+
+        clock.advance_to(30);
+
+        assert_eq!(clock.wake_order(), [earlier, same_time, later]);
+    }
+
+    #[test]
+    fn concurrent_relative_advances_are_not_lost() {
+        const THREADS: usize = 8;
+        const ADVANCES_PER_THREAD: usize = 1_000;
+
+        let clock = Arc::new(VirtualClock::default());
+        let barrier = Arc::new(Barrier::new(THREADS + 1));
+        let workers: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let clock = clock.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..ADVANCES_PER_THREAD {
+                        clock.advance_by(Duration::from_nanos(1));
+                    }
+                })
+            })
+            .collect();
+        barrier.wait();
+        for worker in workers {
+            worker.join().expect("clock worker");
+        }
+
+        assert_eq!(
+            clock.now_ns(),
+            u64::try_from(THREADS * ADVANCES_PER_THREAD).expect("test timestamp")
+        );
     }
 }

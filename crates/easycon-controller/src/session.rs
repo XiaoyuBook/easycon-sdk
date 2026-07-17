@@ -8,8 +8,9 @@ use easycon_model::{
     Button, EasyConError, ErrorCode, ErrorDomain, Hat, OperationId, ResourceId, StickPosition,
 };
 use easycon_runtime::{
-    Clock, DeadlineId, EventDraft, EventKind, ManagedResource, Operation, OperationState,
-    OperationValue, ResourceRegistration, Runtime, Severity, TaskRegistration, TransitionOutcome,
+    Clock, ClockChangeRegistration, DeadlineId, EventDraft, EventKind, ManagedResource, Operation,
+    OperationState, OperationValue, ResourceRegistration, Runtime, Severity, TaskRegistration,
+    TransitionOutcome,
 };
 
 use crate::protocol::SwitchReport;
@@ -324,6 +325,7 @@ struct ControllerLane {
     last_report_acceptance_ns: Option<u64>,
     next_write_sequence: u64,
     resource_cancellation: easycon_runtime::CancellationToken,
+    _clock_hook: ClockChangeRegistration,
     lease_owner: Option<LeaseOwner>,
     waiting_sequence: Option<WaitingSequence>,
     next_ack_generation: u64,
@@ -382,7 +384,7 @@ impl ControllerSession {
             .expect("controller registration lock poisoned") = Some(registration);
         let clock = runtime.clock();
         let wake_sender = sender;
-        clock.on_change(Arc::new(move || {
+        let clock_hook = clock.on_change(Arc::new(move || {
             let _ = wake_sender.send(LaneCommand::Wake);
         }));
         let lane = ControllerLane {
@@ -400,6 +402,7 @@ impl ControllerSession {
             last_report_acceptance_ns: None,
             next_write_sequence: 1,
             resource_cancellation,
+            _clock_hook: clock_hook,
             lease_owner: None,
             waiting_sequence: None,
             next_ack_generation: 1,
@@ -580,7 +583,10 @@ impl ControllerSession {
         if self.inner.closing.load(Ordering::Acquire) {
             return Err(closed_lane_error());
         }
-        let operation = self.inner.runtime.create_operation(deadline_ns)?;
+        let operation = self
+            .inner
+            .runtime
+            .create_operation_with_parent(deadline_ns, &self.inner.resource_cancellation)?;
         self.attach_wake(&operation);
         if self.inner.sender.send(command(operation.clone())).is_err() {
             fail_closed_lane(&operation);
@@ -1128,7 +1134,7 @@ impl ControllerLane {
             };
             match self.transport.wait_for_ack(request) {
                 Ok(frame) if frame.generation < generation => {
-                    self.runtime.publish(
+                    let _ = self.runtime.publish(
                         EventDraft::ordinary(
                             EventKind::Warning,
                             "controller.ack.late_ignored",
@@ -1610,7 +1616,7 @@ impl ControllerLane {
         if let Some(operation_id) = operation_id {
             event = event.with_operation(operation_id);
         }
-        self.runtime.publish(event);
+        let _ = self.runtime.publish(event);
     }
 
     fn fail_pending_disconnected(&mut self) {
@@ -1702,7 +1708,7 @@ impl ControllerLane {
                     self.record_report_acceptance(accepted_at_ns, None, bytes);
                 }
                 Err(error) => {
-                    self.runtime.publish(
+                    let _ = self.runtime.publish(
                         EventDraft::critical(
                             EventKind::Warning,
                             "controller.neutralization.not_delivered",
@@ -1752,7 +1758,7 @@ impl ControllerLane {
         if let Some(operation_id) = operation_id {
             event = event.with_operation(operation_id);
         }
-        self.runtime.publish(event);
+        let _ = self.runtime.publish(event);
     }
 
     fn update_desired_snapshot(&self) {
@@ -1776,7 +1782,7 @@ impl ControllerLane {
             .lock()
             .expect("controller snapshot lock poisoned")
             .lease = state;
-        self.runtime.publish(
+        let _ = self.runtime.publish(
             EventDraft::critical(
                 EventKind::State,
                 if owner.is_some() {
@@ -1802,7 +1808,7 @@ impl ControllerLane {
         target_ns: u64,
         dispatch_not_before_ns: u64,
     ) {
-        self.runtime.publish(
+        let _ = self.runtime.publish(
             EventDraft::ordinary(
                 EventKind::TimingDeviation,
                 "controller.report.delayed",
@@ -1831,7 +1837,7 @@ impl ControllerLane {
         if let Some(operation_id) = operation_id {
             event = event.with_operation(operation_id);
         }
-        self.runtime.publish(event);
+        let _ = self.runtime.publish(event);
     }
 }
 

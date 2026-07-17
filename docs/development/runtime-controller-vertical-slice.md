@@ -18,6 +18,8 @@
 
 - Operation 只允许 `Pending -> Running -> Succeeded/Failed`，或经 `Cancelling -> Cancelled`；
   result/error 终态只提交一次。
+- Controller operation 是 Controller resource cancellation token 的子节点；父资源或 Runtime 取消会先
+  推进 operation 到 `Cancelling`，跨 Runtime 或已终结的 parent token 会在 admission 时拒绝。
 - wait timeout 只结束观察；operation deadline 由 Runtime worker 自动请求取消；握手/ACK protocol
   timeout 提交 Controller failure；report/command write 使用独立的 1 s 默认 I/O deadline。
 - 每个 subscription 有独立有界队列。普通事件溢出合并为 `EventGap`，operation/resource
@@ -34,7 +36,7 @@
 - ACK command 在同一 FIFO lane 中等待前序 direct report，只有独占 sequence/Automation lease 才
   返回 `RESOURCE_BUSY`；ACK 路径发现断线时重置 desired report、记录中立化 warning 并关闭 transport。
 - Runtime close 先取消根树，再关闭/中立化并 join Controller，最后发布 `runtime.closed`；关闭后
-  operation/resource/task 计数全部为零。
+  operation/resource/task 计数全部为零，`runtime.closed` 之后的事件发布会被拒绝。
 
 ## 本地验证
 

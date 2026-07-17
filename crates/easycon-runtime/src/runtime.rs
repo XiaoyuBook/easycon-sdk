@@ -9,7 +9,7 @@ use easycon_model::{
 };
 
 use crate::cancellation::CancellationToken;
-use crate::clock::Clock;
+use crate::clock::{Clock, ClockChangeRegistration};
 use crate::event::{
     Event, EventDraft, EventKind, EventSubscription, Severity, SubscriptionInner,
     SubscriptionOptions,
@@ -65,8 +65,10 @@ pub(crate) struct RuntimeInner {
     tasks: Mutex<HashSet<TaskId>>,
     tasks_changed: Condvar,
     subscriptions: Mutex<Vec<Weak<SubscriptionInner>>>,
+    events_closed: AtomicBool,
     deadline_sender: Sender<DeadlineSignal>,
     deadline_worker: Mutex<Option<JoinHandle<()>>>,
+    clock_hook: Mutex<Option<ClockChangeRegistration>>,
 }
 
 #[derive(Clone, Copy)]
@@ -155,11 +157,12 @@ impl Runtime {
         let runtime_number = NEXT_RUNTIME_ID.fetch_add(1, Ordering::Relaxed);
         assert!(runtime_number != 0, "Runtime ID space exhausted");
         let (deadline_sender, deadline_receiver) = mpsc::channel();
+        let runtime_id = RuntimeId::new(runtime_number);
         let inner = Arc::new(RuntimeInner {
-            id: RuntimeId::new(runtime_number),
+            id: runtime_id,
             state: Mutex::new(RuntimeState::Active),
             state_changed: Condvar::new(),
-            root_cancellation: CancellationToken::root(),
+            root_cancellation: CancellationToken::root_for_runtime(runtime_id),
             clock,
             next_id: AtomicU64::new(1),
             next_sequence: AtomicU64::new(1),
@@ -168,8 +171,10 @@ impl Runtime {
             tasks: Mutex::new(HashSet::new()),
             tasks_changed: Condvar::new(),
             subscriptions: Mutex::new(Vec::new()),
+            events_closed: AtomicBool::new(false),
             deadline_sender: deadline_sender.clone(),
             deadline_worker: Mutex::new(None),
+            clock_hook: Mutex::new(None),
         });
 
         let task_id = TaskId::new(inner.allocate_id());
@@ -184,9 +189,13 @@ impl Runtime {
             released: AtomicBool::new(false),
         };
         let clock_sender = deadline_sender;
-        inner.clock.on_change(Arc::new(move || {
+        let clock_hook = inner.clock.on_change(Arc::new(move || {
             let _ = clock_sender.send(DeadlineSignal::Wake);
         }));
+        *inner
+            .clock_hook
+            .lock()
+            .expect("deadline clock hook lock poisoned") = Some(clock_hook);
         let runtime = Arc::downgrade(&inner);
         let worker = std::thread::Builder::new()
             .name(format!("easycon-deadline-{runtime_number}"))
@@ -230,19 +239,42 @@ impl Runtime {
 
     /// Creates and supervises a pending operation.
     pub fn create_operation(&self, deadline_ns: Option<u64>) -> Result<Operation, EasyConError> {
+        self.create_operation_with_parent(deadline_ns, &self.inner.root_cancellation)
+    }
+
+    /// Creates a pending operation below an active cancellation token owned by this Runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error when `parent` belongs to another Runtime or has already ended.
+    pub fn create_operation_with_parent(
+        &self,
+        deadline_ns: Option<u64>,
+        parent: &CancellationToken,
+    ) -> Result<Operation, EasyConError> {
         let state = self
             .inner
             .state
             .lock()
             .expect("Runtime state lock poisoned");
         ensure_active(*state)?;
+        if parent.owner() != Some(self.inner.id) {
+            return Err(EasyConError::new(
+                ErrorDomain::Validation,
+                ErrorCode::InvalidArgument,
+                "operation cancellation parent belongs to a different Runtime",
+            ));
+        }
+        if !parent.is_active() {
+            return Err(EasyConError::new(
+                ErrorDomain::Validation,
+                ErrorCode::InvalidArgument,
+                "operation cancellation parent is no longer active",
+            ));
+        }
         let id = OperationId::new(self.inner.allocate_id());
-        let operation = Operation::new(
-            id,
-            Arc::downgrade(&self.inner),
-            self.inner.root_cancellation.child(),
-            deadline_ns,
-        );
+        let operation =
+            Operation::new(id, Arc::downgrade(&self.inner), parent.child(), deadline_ns);
         if let Some(deadline) = deadline_ns {
             self.inner.clock.register_deadline(deadline);
         }
@@ -292,8 +324,12 @@ impl Runtime {
     }
 
     /// Publishes typed domain data to all matching subscriptions without blocking producers.
-    pub fn publish(&self, draft: EventDraft) -> Event {
-        self.inner.publish_event(draft)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::RuntimeClosing`] after the final Runtime event closes production.
+    pub fn publish(&self, draft: EventDraft) -> Result<Event, EasyConError> {
+        self.inner.try_publish_event(draft)
     }
 
     /// Registers an active resource for Runtime-owned shutdown.
@@ -437,14 +473,14 @@ impl Runtime {
             return;
         }
 
-        self.inner.publish_event(EventDraft::critical(
+        let _ = self.inner.try_publish_event(EventDraft::critical(
             EventKind::State,
             "runtime.closing",
             Severity::Info,
         ));
         self.inner.root_cancellation.cancel();
 
-        let operations: Vec<_> = self
+        let mut operations: Vec<_> = self
             .inner
             .operations
             .lock()
@@ -453,21 +489,35 @@ impl Runtime {
             .cloned()
             .map(|inner| Operation { inner })
             .collect();
+        operations.sort_by_key(Operation::id);
         for operation in &operations {
             if !operation.snapshot().state.is_terminal() {
                 let _ = operation.request_cancel(CancellationReason::ParentClose);
             }
         }
 
-        let resources: Vec<_> = self
-            .inner
-            .resources
-            .lock()
-            .expect("resource registry lock poisoned")
-            .values()
-            .filter_map(Weak::upgrade)
-            .collect();
-        for resource in &resources {
+        let mut resources = {
+            let mut registry = self
+                .inner
+                .resources
+                .lock()
+                .expect("resource registry lock poisoned");
+            let mut stale = Vec::new();
+            let mut live = Vec::new();
+            for (&id, resource) in registry.iter() {
+                if let Some(resource) = resource.upgrade() {
+                    live.push((id, resource));
+                } else {
+                    stale.push(id);
+                }
+            }
+            for id in stale {
+                registry.remove(&id);
+            }
+            live
+        };
+        resources.sort_by_key(|(id, _)| *id);
+        for (_, resource) in &resources {
             resource.close();
         }
         drop(resources);
@@ -479,22 +529,11 @@ impl Runtime {
         }
         drop(operations);
 
-        self.inner.publish_event(EventDraft::critical(
+        self.inner.close_events(EventDraft::critical(
             EventKind::State,
             "runtime.closed",
             Severity::Info,
         ));
-        let subscriptions: Vec<_> = self
-            .inner
-            .subscriptions
-            .lock()
-            .expect("subscription registry lock poisoned")
-            .iter()
-            .filter_map(Weak::upgrade)
-            .collect();
-        for subscription in subscriptions {
-            subscription.close();
-        }
 
         self.inner.stop_deadline_worker();
         self.inner.wait_for_tasks();
@@ -541,14 +580,38 @@ impl RuntimeInner {
             .remove(&id);
     }
 
-    pub(crate) fn publish_event(&self, draft: EventDraft) -> Event {
+    pub(crate) fn try_publish_event(&self, draft: EventDraft) -> Result<Event, EasyConError> {
         let mut subscriptions = self
             .subscriptions
             .lock()
             .expect("subscription registry lock poisoned");
+        if self.events_closed.load(Ordering::Acquire) {
+            return Err(events_closed_error());
+        }
+        let event = self.next_event(draft);
+        enqueue_event(&mut subscriptions, &event);
+        Ok(event)
+    }
+
+    fn close_events(&self, draft: EventDraft) {
+        let mut subscriptions = self
+            .subscriptions
+            .lock()
+            .expect("subscription registry lock poisoned");
+        if self.events_closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let event = self.next_event(draft);
+        enqueue_event(&mut subscriptions, &event);
+        for subscription in subscriptions.iter().filter_map(Weak::upgrade) {
+            subscription.close();
+        }
+    }
+
+    fn next_event(&self, draft: EventDraft) -> Event {
         let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
         assert!(sequence != 0, "event sequence space exhausted");
-        let event = Event {
+        Event {
             sequence,
             timestamp_ns: self.clock.now_ns(),
             class: draft.class,
@@ -558,26 +621,22 @@ impl RuntimeInner {
             operation_id: draft.operation_id,
             resource_id: draft.resource_id,
             detail: draft.detail,
-        };
-        subscriptions.retain(|subscription| {
-            let Some(subscription) = subscription.upgrade() else {
-                return false;
-            };
-            subscription.enqueue(event.clone());
-            true
-        });
-        event
+        }
     }
 
     fn poll_deadlines(&self) -> usize {
         let now = self.clock.now_ns();
-        self.live_operations()
+        let mut due: Vec<_> = self
+            .live_operations()
             .into_iter()
             .filter(|operation| {
                 operation
                     .deadline_ns()
                     .is_some_and(|deadline| deadline <= now)
             })
+            .collect();
+        due.sort_by_key(|operation| (operation.deadline_ns().unwrap_or(u64::MAX), operation.id()));
+        due.into_iter()
             .filter(|operation| {
                 operation.request_cancel(CancellationReason::Deadline)
                     == crate::operation::TransitionOutcome::Applied
@@ -601,16 +660,23 @@ impl RuntimeInner {
     }
 
     fn live_operations(&self) -> Vec<Operation> {
-        self.operations
+        let mut operations: Vec<_> = self
+            .operations
             .lock()
             .expect("operation registry lock poisoned")
             .values()
             .cloned()
             .map(|inner| Operation { inner })
-            .collect()
+            .collect();
+        operations.sort_by_key(Operation::id);
+        operations
     }
 
     fn stop_deadline_worker(&self) {
+        self.clock_hook
+            .lock()
+            .expect("deadline clock hook lock poisoned")
+            .take();
         let _ = self.deadline_sender.send(DeadlineSignal::Shutdown);
         let worker = self
             .deadline_worker
@@ -671,6 +737,24 @@ fn deadline_worker(
             Some(DeadlineSignal::Shutdown) | None => break,
         }
     }
+}
+
+fn enqueue_event(subscriptions: &mut Vec<Weak<SubscriptionInner>>, event: &Event) {
+    subscriptions.retain(|subscription| {
+        let Some(subscription) = subscription.upgrade() else {
+            return false;
+        };
+        subscription.enqueue(event.clone());
+        true
+    });
+}
+
+fn events_closed_error() -> EasyConError {
+    EasyConError::new(
+        ErrorDomain::Runtime,
+        ErrorCode::RuntimeClosing,
+        "Runtime event production is closed",
+    )
 }
 
 fn ensure_active(state: RuntimeState) -> Result<(), EasyConError> {
@@ -747,6 +831,59 @@ mod tests {
         assert_eq!(operation.wait(WaitTimeout::Poll), WaitResult::Timeout);
         assert_eq!(operation.snapshot().state, OperationState::Running);
         assert!(!operation.cancellation_token().is_cancelled());
+    }
+
+    #[test]
+    fn runtime_owned_parent_cancels_child_operation_state() {
+        let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+        let parent = runtime.child_cancellation_token();
+        let operation = runtime
+            .create_operation_with_parent(None, &parent)
+            .expect("child operation");
+        operation.start();
+
+        parent.cancel();
+
+        assert_eq!(operation.snapshot().state, OperationState::Cancelling);
+        assert_eq!(
+            operation.snapshot().cancellation_reason,
+            Some(CancellationReason::ParentClose)
+        );
+        operation.finish_cancelled();
+        runtime.close();
+    }
+
+    #[test]
+    fn operation_parent_must_belong_to_the_same_runtime() {
+        let first = Runtime::new(Arc::new(VirtualClock::default()));
+        let second = Runtime::new(Arc::new(VirtualClock::default()));
+        let parent = first.child_cancellation_token();
+
+        let Err(error) = second.create_operation_with_parent(None, &parent) else {
+            panic!("cross-Runtime cancellation parent must be rejected");
+        };
+
+        assert_eq!(error.domain(), ErrorDomain::Validation);
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        first.close();
+        second.close();
+    }
+
+    #[test]
+    fn terminal_operation_token_cannot_parent_new_work() {
+        let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+        let parent = runtime.create_operation(None).expect("parent operation");
+        let parent_token = parent.cancellation_token();
+        parent.start();
+        parent.succeed(OperationValue::Unit);
+
+        let Err(error) = runtime.create_operation_with_parent(None, &parent_token) else {
+            panic!("terminal operation token must not parent new work");
+        };
+
+        assert_eq!(error.domain(), ErrorDomain::Validation);
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        runtime.close();
     }
 
     #[test]
@@ -907,23 +1044,29 @@ mod tests {
             .expect("subscribe");
         let operation = runtime.create_operation(None).expect("operation");
 
-        runtime.publish(EventDraft::ordinary(
-            EventKind::Log,
-            "test.one",
-            Severity::Debug,
-        ));
+        runtime
+            .publish(EventDraft::ordinary(
+                EventKind::Log,
+                "test.one",
+                Severity::Debug,
+            ))
+            .expect("publish");
         clock.advance_to(1);
-        runtime.publish(EventDraft::ordinary(
-            EventKind::Log,
-            "test.two",
-            Severity::Debug,
-        ));
+        runtime
+            .publish(EventDraft::ordinary(
+                EventKind::Log,
+                "test.two",
+                Severity::Debug,
+            ))
+            .expect("publish");
         clock.advance_to(2);
-        runtime.publish(EventDraft::ordinary(
-            EventKind::Log,
-            "test.three",
-            Severity::Debug,
-        ));
+        runtime
+            .publish(EventDraft::ordinary(
+                EventKind::Log,
+                "test.three",
+                Severity::Debug,
+            ))
+            .expect("publish");
 
         let SubscriptionRead::Event(gap) = subscription.read(WaitTimeout::Poll) else {
             panic!("expected gap event");
@@ -950,11 +1093,13 @@ mod tests {
             })
             .expect("subscribe");
         let operation = runtime.create_operation(None).expect("operation");
-        runtime.publish(EventDraft::ordinary(
-            EventKind::Log,
-            "test.log",
-            Severity::Debug,
-        ));
+        runtime
+            .publish(EventDraft::ordinary(
+                EventKind::Log,
+                "test.log",
+                Severity::Debug,
+            ))
+            .expect("publish");
         operation.start();
         operation.succeed(OperationValue::Unit);
 
@@ -985,21 +1130,27 @@ mod tests {
                 ..SubscriptionOptions::default()
             })
             .expect("subscribe");
-        runtime.publish(EventDraft::critical(
-            EventKind::State,
-            "test.critical",
-            Severity::Info,
-        ));
-        runtime.publish(EventDraft::ordinary(
-            EventKind::Log,
-            "test.dropped",
-            Severity::Debug,
-        ));
-        runtime.publish(EventDraft::ordinary(
-            EventKind::Log,
-            "test.latest",
-            Severity::Debug,
-        ));
+        runtime
+            .publish(EventDraft::critical(
+                EventKind::State,
+                "test.critical",
+                Severity::Info,
+            ))
+            .expect("publish");
+        runtime
+            .publish(EventDraft::ordinary(
+                EventKind::Log,
+                "test.dropped",
+                Severity::Debug,
+            ))
+            .expect("publish");
+        runtime
+            .publish(EventDraft::ordinary(
+                EventKind::Log,
+                "test.latest",
+                Severity::Debug,
+            ))
+            .expect("publish");
 
         let events: Vec<_> = std::iter::from_fn(|| match subscription.read(WaitTimeout::Poll) {
             SubscriptionRead::Event(event) => Some(event),
@@ -1034,11 +1185,13 @@ mod tests {
                 std::thread::spawn(move || {
                     barrier.wait();
                     for _ in 0..32 {
-                        runtime.publish(EventDraft::ordinary(
-                            EventKind::Data,
-                            "test.concurrent",
-                            Severity::Info,
-                        ));
+                        runtime
+                            .publish(EventDraft::ordinary(
+                                EventKind::Data,
+                                "test.concurrent",
+                                Severity::Info,
+                            ))
+                            .expect("publish");
                     }
                 })
             })
@@ -1076,6 +1229,30 @@ mod tests {
         }
     }
 
+    struct OrderedResource {
+        marker: u8,
+        order: Arc<Mutex<Vec<u8>>>,
+        registration: Mutex<Option<ResourceRegistration>>,
+    }
+
+    impl ManagedResource for OrderedResource {
+        fn close(&self) {
+            self.order
+                .lock()
+                .expect("close order lock")
+                .push(self.marker);
+            self.registration.lock().expect("registration lock").take();
+        }
+    }
+
+    struct AlreadyDroppedResource;
+
+    impl ManagedResource for AlreadyDroppedResource {
+        fn close(&self) {
+            panic!("a dropped resource cannot be closed");
+        }
+    }
+
     struct CancellationObservingResource {
         operation: Operation,
         saw_cancelling: AtomicBool,
@@ -1110,6 +1287,63 @@ mod tests {
 
         assert!(resource.saw_cancelling.load(Ordering::Acquire));
         assert_eq!(operation.snapshot().state, OperationState::Cancelled);
+    }
+
+    #[test]
+    fn close_uses_runtime_id_order_for_resources_and_terminal_operations() {
+        let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+        let events = runtime
+            .subscribe(SubscriptionOptions::default())
+            .expect("subscribe");
+        let close_order = Arc::new(Mutex::new(Vec::new()));
+        let mut resources = Vec::new();
+        for marker in 1..=3 {
+            let resource = Arc::new(OrderedResource {
+                marker,
+                order: close_order.clone(),
+                registration: Mutex::new(None),
+            });
+            let managed: Arc<dyn ManagedResource> = resource.clone();
+            *resource.registration.lock().expect("registration lock") =
+                Some(runtime.register_resource(managed).expect("resource"));
+            resources.push(resource);
+        }
+        let operations: Vec<_> = (0..3)
+            .map(|_| {
+                let operation = runtime.create_operation(None).expect("operation");
+                operation.start();
+                operation
+            })
+            .collect();
+        let operation_ids: Vec<_> = operations.iter().map(Operation::id).collect();
+
+        runtime.close();
+
+        assert_eq!(*close_order.lock().expect("close order lock"), [1, 2, 3]);
+        let terminal_ids: Vec<_> = std::iter::from_fn(|| match events.read(WaitTimeout::Poll) {
+            SubscriptionRead::Event(event) => Some(event),
+            SubscriptionRead::Closed | SubscriptionRead::Timeout => None,
+        })
+        .filter(|event| event.code == "runtime.operation.cancelled")
+        .filter_map(|event| event.operation_id)
+        .collect();
+        assert_eq!(terminal_ids, operation_ids);
+        drop(resources);
+    }
+
+    #[test]
+    fn close_prunes_a_registration_whose_weak_resource_already_expired() {
+        let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+        let resource: Arc<dyn ManagedResource> = Arc::new(AlreadyDroppedResource);
+        let registration = runtime
+            .register_resource(resource.clone())
+            .expect("resource registration");
+        drop(resource);
+
+        runtime.close();
+
+        assert_eq!(runtime.counts().active_resources, 0);
+        drop(registration);
     }
 
     #[test]
@@ -1151,6 +1385,14 @@ mod tests {
         }
         assert!(codes.contains(&"runtime.closed"));
         assert_eq!(codes.last(), Some(&"runtime.closed"));
+        let error = runtime
+            .publish(EventDraft::ordinary(
+                EventKind::Data,
+                "test.after_close",
+                Severity::Info,
+            ))
+            .expect_err("event production is closed");
+        assert_eq!(error.code(), ErrorCode::RuntimeClosing);
     }
 
     #[test]
@@ -1237,16 +1479,20 @@ mod tests {
             })
             .expect("subscribe");
 
-        runtime.publish(EventDraft::ordinary(
-            EventKind::Log,
-            "test.log",
-            Severity::Info,
-        ));
-        runtime.publish(EventDraft::critical(
-            EventKind::Warning,
-            "test.warning",
-            Severity::Warning,
-        ));
+        runtime
+            .publish(EventDraft::ordinary(
+                EventKind::Log,
+                "test.log",
+                Severity::Info,
+            ))
+            .expect("publish");
+        runtime
+            .publish(EventDraft::critical(
+                EventKind::Warning,
+                "test.warning",
+                Severity::Warning,
+            ))
+            .expect("publish");
 
         assert_eq!(with_logs.queued_len(), 2);
         assert_eq!(without_logs.queued_len(), 1);

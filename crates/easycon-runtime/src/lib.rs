@@ -8,8 +8,10 @@ mod operation;
 mod runtime;
 mod wait;
 
-pub use cancellation::CancellationToken;
-pub use clock::{Clock, DeadlineId, DeadlineTrace, SystemClock, VirtualClock};
+pub use cancellation::{CancellationHookRegistration, CancellationToken};
+pub use clock::{
+    Clock, ClockChangeRegistration, DeadlineId, DeadlineTrace, SystemClock, VirtualClock,
+};
 pub use event::{
     Event, EventClass, EventDraft, EventGap, EventKind, EventSubscription, Severity,
     SubscriptionOptions, SubscriptionRead,

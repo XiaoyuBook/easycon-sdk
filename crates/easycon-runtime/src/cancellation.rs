@@ -1,7 +1,27 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
+use easycon_model::RuntimeId;
+
 type CancelHook = Arc<dyn Fn() + Send + Sync + 'static>;
+
+struct CancelHookEntry {
+    lifetime: Option<Weak<()>>,
+    hook: CancelHook,
+}
+
+impl CancelHookEntry {
+    fn is_active(&self) -> bool {
+        self.lifetime
+            .as_ref()
+            .is_none_or(|lifetime| lifetime.strong_count() != 0)
+    }
+}
+
+/// RAII lifetime for a cancellation hook used only by one blocking call.
+pub struct CancellationHookRegistration {
+    _lifetime: Arc<()>,
+}
 
 /// A node in the Runtime-owned cancellation tree.
 #[derive(Clone)]
@@ -10,18 +30,28 @@ pub struct CancellationToken {
 }
 
 struct CancellationInner {
+    owner: Option<RuntimeId>,
     active: AtomicBool,
     cancelled: AtomicBool,
     children: Mutex<Vec<Weak<CancellationInner>>>,
-    hooks: Mutex<Vec<CancelHook>>,
+    hooks: Mutex<Vec<CancelHookEntry>>,
 }
 
 impl CancellationToken {
     /// Creates an uncancelled root token.
     #[must_use]
     pub fn root() -> Self {
+        Self::root_with_owner(None)
+    }
+
+    pub(crate) fn root_for_runtime(owner: RuntimeId) -> Self {
+        Self::root_with_owner(Some(owner))
+    }
+
+    fn root_with_owner(owner: Option<RuntimeId>) -> Self {
         Self {
             inner: Arc::new(CancellationInner {
+                owner,
                 active: AtomicBool::new(true),
                 cancelled: AtomicBool::new(false),
                 children: Mutex::new(Vec::new()),
@@ -33,7 +63,7 @@ impl CancellationToken {
     /// Creates a child cancelled recursively by this token.
     #[must_use]
     pub fn child(&self) -> Self {
-        let child = Self::root();
+        let child = Self::root_with_owner(self.inner.owner);
         let mut children = self
             .inner
             .children
@@ -60,6 +90,14 @@ impl CancellationToken {
         self.inner.cancelled.load(Ordering::Acquire)
     }
 
+    pub(crate) fn owner(&self) -> Option<RuntimeId> {
+        self.inner.owner
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        self.inner.active.load(Ordering::Acquire)
+    }
+
     /// Cancels this token and every live descendant exactly once.
     pub fn cancel(&self) {
         cancel_inner(&self.inner);
@@ -67,7 +105,23 @@ impl CancellationToken {
 
     /// Registers a non-blocking hook used to wake supervised work on cancellation.
     pub fn on_cancel(&self, hook: impl Fn() + Send + Sync + 'static) {
-        let hook: CancelHook = Arc::new(hook);
+        self.register_hook(Arc::new(hook), None);
+    }
+
+    /// Registers a wake hook that becomes inactive when the returned guard is dropped.
+    #[must_use]
+    pub fn on_cancel_scoped(
+        &self,
+        hook: impl Fn() + Send + Sync + 'static,
+    ) -> CancellationHookRegistration {
+        let lifetime = Arc::new(());
+        self.register_hook(Arc::new(hook), Some(Arc::downgrade(&lifetime)));
+        CancellationHookRegistration {
+            _lifetime: lifetime,
+        }
+    }
+
+    fn register_hook(&self, hook: CancelHook, lifetime: Option<Weak<()>>) {
         if !self.inner.active.load(Ordering::Acquire) {
             return;
         }
@@ -81,6 +135,7 @@ impl CancellationToken {
             .hooks
             .lock()
             .expect("cancellation hook lock poisoned");
+        hooks.retain(CancelHookEntry::is_active);
         if !self.inner.active.load(Ordering::Acquire) {
             return;
         }
@@ -88,7 +143,7 @@ impl CancellationToken {
             drop(hooks);
             hook();
         } else {
-            hooks.push(hook);
+            hooks.push(CancelHookEntry { lifetime, hook });
         }
     }
 
@@ -106,8 +161,8 @@ fn cancel_inner(inner: &Arc<CancellationInner>) {
     }
 
     let hooks = std::mem::take(&mut *inner.hooks.lock().expect("cancellation hook lock poisoned"));
-    for hook in hooks {
-        hook();
+    for entry in hooks.into_iter().filter(CancelHookEntry::is_active) {
+        (entry.hook)();
     }
 
     let children = {
@@ -203,5 +258,33 @@ mod tests {
             1
         );
         assert!(!live.is_cancelled());
+    }
+
+    #[test]
+    fn dropped_scoped_hook_is_not_called() {
+        let token = CancellationToken::root();
+        let (called, observed) = mpsc::channel();
+        let registration = token.on_cancel_scoped(move || {
+            let _ = called.send(());
+        });
+        drop(registration);
+
+        token.cancel();
+
+        assert_eq!(observed.try_iter().count(), 0);
+    }
+
+    #[test]
+    fn repeated_scoped_hooks_prune_inactive_history() {
+        let token = CancellationToken::root();
+        for _ in 0..128 {
+            drop(token.on_cancel_scoped(|| {}));
+        }
+        token.on_cancel(|| {});
+
+        assert_eq!(
+            token.inner.hooks.lock().expect("cancellation hooks").len(),
+            1
+        );
     }
 }

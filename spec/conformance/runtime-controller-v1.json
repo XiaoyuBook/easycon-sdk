@@ -14,13 +14,15 @@
         "submit precise sequence with absolute offsets",
         "cancel before a future step and accept neutral report",
         "close Runtime twice",
-        "drain RuntimeClosed and close subscription"
+        "drain RuntimeClosed and close subscription",
+        "attempt an event publish after RuntimeClosed"
       ],
       "assertions": [
         "operation states and events follow the canonical transitions",
         "report bytes and virtual timestamps match tracked fixtures",
         "direct success claims transport acceptance only",
-        "active operation, task, and resource counts are zero after close"
+        "active operation, task, and resource counts are zero after close",
+        "post-close event production is rejected"
       ]
     },
     {

@@ -119,7 +119,7 @@ impl Operation {
         cancellation: CancellationToken,
         deadline_ns: Option<u64>,
     ) -> Self {
-        Self {
+        let operation = Self {
             inner: Arc::new(OperationInner {
                 id,
                 runtime,
@@ -133,7 +133,14 @@ impl Operation {
                 }),
                 changed: Condvar::new(),
             }),
-        }
+        };
+        let weak = Arc::downgrade(&operation.inner);
+        operation.inner.cancellation.on_cancel(move || {
+            if let Some(inner) = weak.upgrade() {
+                let _ = inner.request_cancel(CancellationReason::ParentClose);
+            }
+        });
+        operation
     }
 
     /// Returns the Runtime-local operation identifier.
@@ -236,7 +243,7 @@ impl OperationInner {
         match data.state {
             OperationState::Pending => {
                 data.state = OperationState::Running;
-                self.publish(&data, false);
+                self.publish(&data);
                 TransitionOutcome::Applied
             }
             state if state.is_terminal() => TransitionOutcome::AlreadyTerminal,
@@ -251,7 +258,7 @@ impl OperationInner {
                 OperationState::Pending | OperationState::Running => {
                     data.state = OperationState::Cancelling;
                     data.cancellation_reason = Some(reason);
-                    self.publish(&data, false);
+                    self.publish(&data);
                     TransitionOutcome::Applied
                 }
                 OperationState::Cancelling => TransitionOutcome::Unchanged,
@@ -286,12 +293,12 @@ impl OperationInner {
                         (ErrorCode::DeadlineExceeded, "operation deadline elapsed")
                     }
                     CancellationReason::ParentClose => {
-                        (ErrorCode::Cancelled, "parent Runtime closed")
+                        (ErrorCode::Cancelled, "parent resource or Runtime closed")
                     }
                 };
                 data.error = Some(EasyConError::new(ErrorDomain::Runtime, code, message));
                 data.state = OperationState::Cancelled;
-                self.publish(&data, true);
+                self.publish(&data);
                 drop(data);
                 self.terminal_committed();
                 TransitionOutcome::Applied
@@ -328,7 +335,7 @@ impl OperationInner {
         data.state = terminal;
         data.result = result;
         data.error = error;
-        self.publish(&data, true);
+        self.publish(&data);
         drop(data);
         self.terminal_committed();
         TransitionOutcome::Applied
@@ -378,11 +385,11 @@ impl OperationInner {
         }
     }
 
-    fn publish(&self, data: &OperationData, terminal: bool) {
+    fn publish(&self, data: &OperationData) {
         let Some(runtime) = self.runtime.upgrade() else {
             return;
         };
-        let (kind, code, severity) = if terminal {
+        let (kind, code, severity) = if data.state.is_terminal() {
             let severity = if data.state == OperationState::Failed {
                 Severity::Error
             } else {
@@ -393,7 +400,7 @@ impl OperationInner {
             (EventKind::State, state_code(data.state), Severity::Info)
         };
         let draft = EventDraft::critical(kind, code, severity);
-        runtime.publish_event(draft.with_operation(self.id));
+        let _ = runtime.try_publish_event(draft.with_operation(self.id));
     }
 }
 
