@@ -81,12 +81,11 @@ impl VirtualClock {
     ///
     /// Panics if `target_ns` is earlier than the current monotonic time.
     pub fn advance_to(&self, target_ns: u64) {
-        let previous = self.now_ns.load(Ordering::Acquire);
+        let previous = self.now_ns.fetch_max(target_ns, Ordering::AcqRel);
         assert!(
             target_ns >= previous,
             "virtual monotonic time cannot move backwards"
         );
-        self.now_ns.store(target_ns, Ordering::Release);
 
         let mut state = self.state.lock().expect("virtual clock lock poisoned");
         let newly_woken: Vec<_> = state

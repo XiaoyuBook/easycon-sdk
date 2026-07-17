@@ -10,6 +10,7 @@ pub struct CancellationToken {
 }
 
 struct CancellationInner {
+    active: AtomicBool,
     cancelled: AtomicBool,
     children: Mutex<Vec<Weak<CancellationInner>>>,
     hooks: Mutex<Vec<CancelHook>>,
@@ -21,6 +22,7 @@ impl CancellationToken {
     pub fn root() -> Self {
         Self {
             inner: Arc::new(CancellationInner {
+                active: AtomicBool::new(true),
                 cancelled: AtomicBool::new(false),
                 children: Mutex::new(Vec::new()),
                 hooks: Mutex::new(Vec::new()),
@@ -32,12 +34,21 @@ impl CancellationToken {
     #[must_use]
     pub fn child(&self) -> Self {
         let child = Self::root();
-        self.inner
+        let mut children = self
+            .inner
             .children
             .lock()
-            .expect("cancellation child lock poisoned")
-            .push(Arc::downgrade(&child.inner));
-        if self.is_cancelled() {
+            .expect("cancellation child lock poisoned");
+        children.retain(|existing| {
+            existing
+                .upgrade()
+                .is_some_and(|child| child.active.load(Ordering::Acquire))
+        });
+        children.push(Arc::downgrade(&child.inner));
+        drop(children);
+        if !self.inner.active.load(Ordering::Acquire) {
+            child.deactivate();
+        } else if self.is_cancelled() {
             child.cancel();
         }
         child
@@ -57,6 +68,9 @@ impl CancellationToken {
     /// Registers a non-blocking hook used to wake supervised work on cancellation.
     pub fn on_cancel(&self, hook: impl Fn() + Send + Sync + 'static) {
         let hook: CancelHook = Arc::new(hook);
+        if !self.inner.active.load(Ordering::Acquire) {
+            return;
+        }
         if self.is_cancelled() {
             hook();
             return;
@@ -67,6 +81,9 @@ impl CancellationToken {
             .hooks
             .lock()
             .expect("cancellation hook lock poisoned");
+        if !self.inner.active.load(Ordering::Acquire) {
+            return;
+        }
         if self.is_cancelled() {
             drop(hooks);
             hook();
@@ -74,29 +91,62 @@ impl CancellationToken {
             hooks.push(hook);
         }
     }
+
+    pub(crate) fn deactivate(&self) {
+        deactivate_inner(&self.inner);
+    }
 }
 
 fn cancel_inner(inner: &Arc<CancellationInner>) {
+    if !inner.active.load(Ordering::Acquire) {
+        return;
+    }
     if inner.cancelled.swap(true, Ordering::AcqRel) {
         return;
     }
 
-    let hooks = inner
-        .hooks
-        .lock()
-        .expect("cancellation hook lock poisoned")
-        .clone();
+    let hooks = std::mem::take(&mut *inner.hooks.lock().expect("cancellation hook lock poisoned"));
     for hook in hooks {
         hook();
     }
 
-    let children = inner
+    let children = {
+        let mut children = inner
+            .children
+            .lock()
+            .expect("cancellation child lock poisoned");
+        let live: Vec<_> = children
+            .iter()
+            .filter_map(Weak::upgrade)
+            .filter(|child| child.active.load(Ordering::Acquire))
+            .collect();
+        children.clear();
+        children.extend(live.iter().map(Arc::downgrade));
+        live
+    };
+    for child in children {
+        cancel_inner(&child);
+    }
+}
+
+fn deactivate_inner(inner: &Arc<CancellationInner>) {
+    if !inner.active.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    inner
+        .hooks
+        .lock()
+        .expect("cancellation hook lock poisoned")
+        .clear();
+    let children: Vec<_> = inner
         .children
         .lock()
         .expect("cancellation child lock poisoned")
-        .clone();
-    for child in children.into_iter().filter_map(|child| child.upgrade()) {
-        cancel_inner(&child);
+        .iter()
+        .filter_map(Weak::upgrade)
+        .collect();
+    for child in children {
+        deactivate_inner(&child);
     }
 }
 
@@ -134,5 +184,24 @@ mod tests {
         assert!(left.is_cancelled());
         assert!(!right.is_cancelled());
         assert!(!root.is_cancelled());
+    }
+
+    #[test]
+    fn creating_children_prunes_dropped_history() {
+        let root = CancellationToken::root();
+        for _ in 0..128 {
+            drop(root.child());
+        }
+        let live = root.child();
+
+        assert_eq!(
+            root.inner
+                .children
+                .lock()
+                .expect("cancellation child lock")
+                .len(),
+            1
+        );
+        assert!(!live.is_cancelled());
     }
 }

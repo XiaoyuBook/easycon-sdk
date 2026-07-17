@@ -63,6 +63,7 @@ pub(crate) struct RuntimeInner {
     operations: Mutex<HashMap<OperationId, Arc<OperationInner>>>,
     resources: Mutex<HashMap<ResourceId, Weak<dyn ManagedResource>>>,
     tasks: Mutex<HashSet<TaskId>>,
+    tasks_changed: Condvar,
     subscriptions: Mutex<Vec<Weak<SubscriptionInner>>>,
     deadline_sender: Sender<DeadlineSignal>,
     deadline_worker: Mutex<Option<JoinHandle<()>>>,
@@ -129,11 +130,14 @@ impl TaskRegistration {
             return;
         }
         if let Some(runtime) = self.runtime.upgrade() {
-            runtime
+            let removed = runtime
                 .tasks
                 .lock()
                 .expect("task registry lock poisoned")
                 .remove(&self.id);
+            if removed {
+                runtime.tasks_changed.notify_all();
+            }
         }
     }
 }
@@ -162,6 +166,7 @@ impl Runtime {
             operations: Mutex::new(HashMap::new()),
             resources: Mutex::new(HashMap::new()),
             tasks: Mutex::new(HashSet::new()),
+            tasks_changed: Condvar::new(),
             subscriptions: Mutex::new(Vec::new()),
             deadline_sender: deadline_sender.clone(),
             deadline_worker: Mutex::new(None),
@@ -492,6 +497,7 @@ impl Runtime {
         }
 
         self.inner.stop_deadline_worker();
+        self.inner.wait_for_tasks();
         assert_eq!(
             self.counts(),
             RuntimeCounts {
@@ -617,6 +623,16 @@ impl RuntimeInner {
             worker
                 .join()
                 .expect("Runtime deadline worker must not panic");
+        }
+    }
+
+    fn wait_for_tasks(&self) {
+        let mut tasks = self.tasks.lock().expect("task registry lock poisoned");
+        while !tasks.is_empty() {
+            tasks = self
+                .tasks_changed
+                .wait(tasks)
+                .expect("task registry lock poisoned while closing");
         }
     }
 }
@@ -745,6 +761,52 @@ mod tests {
         let terminal = operation.snapshot();
         assert_eq!(operation.cancel(), TransitionOutcome::AlreadyTerminal);
         assert_eq!(operation.snapshot(), terminal);
+    }
+
+    #[test]
+    fn cancelling_is_a_state_event_until_cleanup_commits_terminal() {
+        let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+        let events = runtime
+            .subscribe(SubscriptionOptions::default())
+            .expect("subscribe");
+        let operation = runtime.create_operation(None).expect("operation");
+
+        operation.start();
+        operation.cancel();
+        operation.finish_cancelled();
+
+        let observed: Vec<_> = std::iter::from_fn(|| match events.read(WaitTimeout::Poll) {
+            SubscriptionRead::Event(event) => Some(event),
+            SubscriptionRead::Timeout | SubscriptionRead::Closed => None,
+        })
+        .collect();
+        assert!(observed.iter().any(|event| {
+            event.code == "runtime.operation.cancelling" && event.kind == EventKind::State
+        }));
+        assert!(observed.iter().all(|event| {
+            event.kind != EventKind::Terminal || event.code == "runtime.operation.cancelled"
+        }));
+    }
+
+    #[test]
+    fn terminal_operation_drops_obsolete_cancellation_hooks() {
+        let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+        let operation = runtime.create_operation(None).expect("operation");
+        let (cancelled, observed) = mpsc::channel();
+        let before_terminal = cancelled.clone();
+        operation.on_cancel(move || {
+            let _ = before_terminal.send(());
+        });
+        operation.start();
+        operation.succeed(OperationValue::Unit);
+        operation.on_cancel(move || {
+            let _ = cancelled.send(());
+        });
+
+        runtime.close();
+
+        assert_eq!(observed.try_iter().count(), 0);
+        assert_eq!(operation.snapshot().state, OperationState::Succeeded);
     }
 
     #[test]
@@ -1117,6 +1179,48 @@ mod tests {
         assert_eq!(left.join().expect("left close"), RuntimeState::Closed);
         assert_eq!(right.join().expect("right close"), RuntimeState::Closed);
         assert_eq!(operation.snapshot().state, OperationState::Cancelled);
+        assert_eq!(runtime.counts().active_tasks, 0);
+    }
+
+    #[test]
+    fn close_waits_for_a_supervised_task_to_finish_cleanup() {
+        let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+        let cancellation = runtime.child_cancellation_token();
+        let task = runtime.register_task().expect("task");
+        let (wake, woken) = mpsc::channel();
+        cancellation.on_cancel(move || {
+            let _ = wake.send(());
+        });
+        let (cleanup_started, observed_cleanup) = mpsc::channel();
+        let (release_cleanup, released) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            woken.recv().expect("root cancellation");
+            cleanup_started.send(()).expect("cleanup observer");
+            released.recv().expect("cleanup release");
+            drop(task);
+        });
+        let (closed, observed_close) = mpsc::channel();
+        let closing_runtime = runtime.clone();
+        let closer = std::thread::spawn(move || {
+            closing_runtime.close();
+            closed.send(()).expect("close observer");
+        });
+
+        observed_cleanup
+            .recv_timeout(Duration::from_secs(2))
+            .expect("task began cancellation cleanup");
+        assert!(matches!(
+            observed_close.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        release_cleanup.send(()).expect("release task cleanup");
+        observed_close
+            .recv_timeout(Duration::from_secs(2))
+            .expect("Runtime waited for task cleanup");
+        worker.join().expect("supervised worker");
+        closer.join().expect("Runtime closer");
+
+        assert_eq!(runtime.state(), RuntimeState::Closed);
         assert_eq!(runtime.counts().active_tasks, 0);
     }
 

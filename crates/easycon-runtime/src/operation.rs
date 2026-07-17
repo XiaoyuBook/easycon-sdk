@@ -251,7 +251,7 @@ impl OperationInner {
                 OperationState::Pending | OperationState::Running => {
                     data.state = OperationState::Cancelling;
                     data.cancellation_reason = Some(reason);
-                    self.publish(&data, true);
+                    self.publish(&data, false);
                     TransitionOutcome::Applied
                 }
                 OperationState::Cancelling => TransitionOutcome::Unchanged,
@@ -335,6 +335,7 @@ impl OperationInner {
     }
 
     fn terminal_committed(&self) {
+        self.cancellation.deactivate();
         self.changed.notify_all();
         if let Some(runtime) = self.runtime.upgrade() {
             runtime.unregister_operation(self.id);
