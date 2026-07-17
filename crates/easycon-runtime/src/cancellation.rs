@@ -69,16 +69,16 @@ impl CancellationToken {
             .children
             .lock()
             .expect("cancellation child lock poisoned");
-        if !self.inner.active.load(Ordering::Acquire) || self.is_cancelled() {
-            drop(children);
-            child.cancel();
-            return child;
-        }
         children.retain(|existing| {
             existing
                 .upgrade()
                 .is_some_and(|child| child.active.load(Ordering::Acquire))
         });
+        if !self.inner.active.load(Ordering::Acquire) || self.is_cancelled() {
+            drop(children);
+            child.cancel();
+            return child;
+        }
         children.push(Arc::downgrade(&child.inner));
         drop(children);
         if !self.inner.active.load(Ordering::Acquire) || self.is_cancelled() {
@@ -180,7 +180,6 @@ fn cancel_inner(inner: &Arc<CancellationInner>) {
             .filter(|child| child.active.load(Ordering::Acquire))
             .collect();
         children.clear();
-        children.extend(live.iter().map(Arc::downgrade));
         live
     };
     for child in children {
@@ -245,6 +244,23 @@ mod tests {
         assert!(left.is_cancelled());
         assert!(!right.is_cancelled());
         assert!(!root.is_cancelled());
+    }
+
+    #[test]
+    fn parent_cancel_releases_live_child_history_after_propagation() {
+        let root = CancellationToken::root();
+        let child = root.child();
+
+        root.cancel();
+
+        assert!(child.is_cancelled());
+        assert!(
+            root.inner
+                .children
+                .lock()
+                .expect("cancellation children")
+                .is_empty()
+        );
     }
 
     #[test]
