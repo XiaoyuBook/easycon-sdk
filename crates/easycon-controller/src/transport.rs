@@ -25,6 +25,33 @@ pub struct HandshakeRequest {
     pub deadline_ns: u64,
     /// Cancellation propagated from the operation and Runtime root.
     pub cancellation: CancellationToken,
+    /// Resource cancellation used to interrupt close while the lane is blocked.
+    pub resource_cancellation: CancellationToken,
+}
+
+/// One generation-tagged protocol reply byte.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AckFrame {
+    /// Request generation assigned by the single matcher.
+    pub generation: u64,
+    /// Reply byte.
+    pub byte: u8,
+}
+
+/// One bounded generation-aware ACK wait.
+pub struct AckRequest {
+    /// Related operation.
+    pub operation_id: OperationId,
+    /// Current request generation.
+    pub generation: u64,
+    /// Required reply byte.
+    pub expected_reply: u8,
+    /// Absolute protocol deadline.
+    pub deadline_ns: u64,
+    /// Operation cancellation.
+    pub cancellation: CancellationToken,
+    /// Resource close cancellation.
+    pub resource_cancellation: CancellationToken,
 }
 
 /// Semantic purpose of a transport write.
@@ -115,6 +142,9 @@ pub trait ControllerTransport: Send + 'static {
 
     /// Accepts some non-zero prefix of `bytes`, allowing deterministic partial-I/O tests.
     fn write(&mut self, context: WriteContext, bytes: &[u8]) -> Result<usize, TransportError>;
+
+    /// Waits for one generation-tagged ACK frame or a bounded/cancelled outcome.
+    fn wait_for_ack(&mut self, request: AckRequest) -> Result<AckFrame, TransportError>;
 
     /// Interrupts blocking I/O and releases the transport. Calling repeatedly is harmless.
     fn close(&mut self);

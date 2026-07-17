@@ -4,8 +4,8 @@ use std::thread::ThreadId;
 use std::time::Duration;
 
 use easycon_controller::{
-    ControllerTransport, HANDSHAKE_REPLY, HANDSHAKE_REQUEST, HandshakeRequest, TransportError,
-    TransportErrorKind, WriteContext,
+    AckFrame, AckRequest, ControllerTransport, HANDSHAKE_REPLY, HANDSHAKE_REQUEST,
+    HandshakeRequest, TransportError, TransportErrorKind, WriteContext,
 };
 use easycon_runtime::{Clock, VirtualClock};
 
@@ -21,6 +21,26 @@ pub enum HandshakeOutcome {
         kind: TransportErrorKind,
         message: Arc<str>,
     },
+}
+
+/// Scripted ACK matcher input.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AckOutcome {
+    /// Delivers one generation-tagged byte.
+    Frame {
+        generation: u64,
+        byte: u8,
+        elapsed_ns: u64,
+    },
+    /// Exceeds the protocol deadline.
+    Timeout { elapsed_ns: u64 },
+    /// Returns a transport failure.
+    Error {
+        kind: TransportErrorKind,
+        message: Arc<str>,
+    },
+    /// Blocks until operation/resource cancellation or transport close wakes it.
+    BlockUntilCancelled,
 }
 
 /// Recorded source-exact handshake attempt.
@@ -69,6 +89,8 @@ struct FakeState {
     maximum_write_chunk: usize,
     write_calls: usize,
     fail_write_call: Option<(usize, TransportError)>,
+    ack_outcomes: VecDeque<AckOutcome>,
+    ack_waiting: bool,
     open: bool,
     closed: bool,
 }
@@ -100,6 +122,8 @@ impl FakeControllerTransport {
                     maximum_write_chunk: usize::MAX,
                     write_calls: 0,
                     fail_write_call: None,
+                    ack_outcomes: VecDeque::new(),
+                    ack_waiting: false,
                     open: false,
                     closed: false,
                 }),
@@ -138,6 +162,16 @@ impl FakeControllerTransport {
             .fail_write_call = Some((call, error));
     }
 
+    /// Appends one ACK result.
+    pub fn push_ack(&self, outcome: AckOutcome) {
+        self.shared
+            .state
+            .lock()
+            .expect("fake transport lock poisoned")
+            .ack_outcomes
+            .push_back(outcome);
+    }
+
     /// Simulates an external disconnect before the next write.
     pub fn disconnect(&self) {
         let mut state = self
@@ -147,6 +181,7 @@ impl FakeControllerTransport {
             .expect("fake transport lock poisoned");
         state.open = false;
         state.closed = true;
+        self.shared.changed.notify_all();
     }
 
     /// Returns recorded attempts in order.
@@ -206,6 +241,22 @@ impl FakeControllerTransport {
             .expect("fake transport lock poisoned while waiting");
         state.accepted_writes.len() >= count
     }
+
+    /// Waits until the fake is blocked inside an ACK read.
+    #[must_use]
+    pub fn wait_until_ack_blocked(&self, timeout: Duration) -> bool {
+        let state = self
+            .shared
+            .state
+            .lock()
+            .expect("fake transport lock poisoned");
+        let (state, _result) = self
+            .shared
+            .changed
+            .wait_timeout_while(state, timeout, |state| !state.ack_waiting)
+            .expect("fake transport lock poisoned while waiting");
+        state.ack_waiting
+    }
 }
 
 impl ControllerTransport for FakeControllerTransport {
@@ -242,7 +293,7 @@ impl ControllerTransport for FakeControllerTransport {
                 "handshake baud order differed from the script",
             ));
         }
-        if request.cancellation.is_cancelled() {
+        if request.cancellation.is_cancelled() || request.resource_cancellation.is_cancelled() {
             return Err(TransportError::new(
                 TransportErrorKind::Cancelled,
                 "handshake cancelled",
@@ -257,7 +308,7 @@ impl ControllerTransport for FakeControllerTransport {
         };
         let target = self.clock.now_ns().saturating_add(elapsed_ns);
         self.clock.advance_to(target.min(request.deadline_ns));
-        if request.cancellation.is_cancelled() {
+        if request.cancellation.is_cancelled() || request.resource_cancellation.is_cancelled() {
             return Err(TransportError::new(
                 TransportErrorKind::Cancelled,
                 "handshake cancelled",
@@ -303,10 +354,17 @@ impl ControllerTransport for FakeControllerTransport {
             .write_calls
             .checked_add(1)
             .expect("write call overflow");
-        if let Some((call, error)) = &state.fail_write_call
-            && *call == state.write_calls
+        if state
+            .fail_write_call
+            .as_ref()
+            .is_some_and(|(call, _)| *call == state.write_calls)
         {
-            return Err(error.clone());
+            let (_, error) = state
+                .fail_write_call
+                .take()
+                .expect("write failure checked above");
+            state.partial = None;
+            return Err(error);
         }
         let accepted = state.maximum_write_chunk.min(bytes.len());
         let thread = std::thread::current().id();
@@ -345,6 +403,94 @@ impl ControllerTransport for FakeControllerTransport {
         Ok(accepted)
     }
 
+    fn wait_for_ack(&mut self, request: AckRequest) -> Result<AckFrame, TransportError> {
+        let outcome = self
+            .shared
+            .state
+            .lock()
+            .expect("fake transport lock poisoned")
+            .ack_outcomes
+            .pop_front()
+            .ok_or_else(|| {
+                TransportError::new(TransportErrorKind::Protocol, "no scripted ACK outcome")
+            })?;
+        if request.cancellation.is_cancelled() || request.resource_cancellation.is_cancelled() {
+            return Err(TransportError::new(
+                TransportErrorKind::Cancelled,
+                "ACK wait cancelled",
+            ));
+        }
+        match outcome {
+            AckOutcome::Frame {
+                generation,
+                byte,
+                elapsed_ns,
+            } => {
+                let target = self.clock.now_ns().saturating_add(elapsed_ns);
+                self.clock.advance_to(target.min(request.deadline_ns));
+                if target >= request.deadline_ns {
+                    Err(TransportError::new(
+                        TransportErrorKind::Timeout,
+                        "ACK protocol timeout",
+                    ))
+                } else {
+                    Ok(AckFrame { generation, byte })
+                }
+            }
+            AckOutcome::Timeout { elapsed_ns } => {
+                let target = self.clock.now_ns().saturating_add(elapsed_ns);
+                self.clock.advance_to(target.min(request.deadline_ns));
+                Err(TransportError::new(
+                    TransportErrorKind::Timeout,
+                    "scripted ACK timeout",
+                ))
+            }
+            AckOutcome::Error { kind, message } => Err(TransportError::new(kind, message)),
+            AckOutcome::BlockUntilCancelled => {
+                let operation_cancel = request.cancellation.clone();
+                let resource_cancel = request.resource_cancellation.clone();
+                let shared = self.shared.clone();
+                request
+                    .cancellation
+                    .on_cancel(move || shared.changed.notify_all());
+                let shared = self.shared.clone();
+                request
+                    .resource_cancellation
+                    .on_cancel(move || shared.changed.notify_all());
+                let mut state = self
+                    .shared
+                    .state
+                    .lock()
+                    .expect("fake transport lock poisoned");
+                state.ack_waiting = true;
+                self.shared.changed.notify_all();
+                while !operation_cancel.is_cancelled()
+                    && !resource_cancel.is_cancelled()
+                    && !state.closed
+                {
+                    state = self
+                        .shared
+                        .changed
+                        .wait(state)
+                        .expect("fake transport lock poisoned while ACK waits");
+                }
+                state.ack_waiting = false;
+                self.shared.changed.notify_all();
+                if operation_cancel.is_cancelled() || resource_cancel.is_cancelled() {
+                    Err(TransportError::new(
+                        TransportErrorKind::Cancelled,
+                        "ACK wait cancelled",
+                    ))
+                } else {
+                    Err(TransportError::new(
+                        TransportErrorKind::Disconnected,
+                        "transport closed during ACK wait",
+                    ))
+                }
+            }
+        }
+    }
+
     fn close(&mut self) {
         let mut state = self
             .shared
@@ -354,5 +500,6 @@ impl ControllerTransport for FakeControllerTransport {
         state.open = false;
         state.closed = true;
         state.partial = None;
+        self.shared.changed.notify_all();
     }
 }

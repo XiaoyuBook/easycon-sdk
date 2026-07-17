@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
@@ -12,9 +13,10 @@ use easycon_runtime::{
 };
 
 use crate::protocol::SwitchReport;
+use crate::sequence::PreciseSequence;
 use crate::transport::{
-    AUTO_BAUD_RATES, ControllerTransport, HANDSHAKE_REPLY, HANDSHAKE_REQUEST, HandshakeRequest,
-    TransportError, TransportErrorKind, WriteContext, WriteKind,
+    AUTO_BAUD_RATES, AckRequest, ControllerTransport, HANDSHAKE_REPLY, HANDSHAKE_REQUEST,
+    HandshakeRequest, TransportError, TransportErrorKind, WriteContext, WriteKind,
 };
 
 /// Controller connection/resource state.
@@ -32,6 +34,17 @@ pub enum ControllerState {
     Closed,
 }
 
+/// Authoritative controller write-lease owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ControllerLeaseState {
+    /// Direct writes and sequence admission are available.
+    Available,
+    /// A precise sequence owns writes until terminal cleanup.
+    Sequence(OperationId),
+    /// A future Automation adapter owns the primitive lease.
+    Automation(u64),
+}
+
 /// Immutable state query snapshot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ControllerSnapshot {
@@ -43,6 +56,8 @@ pub struct ControllerSnapshot {
     pub accepted_report_count: u64,
     /// Runtime-clock time of the latest complete report acceptance.
     pub last_report_timestamp_ns: Option<u64>,
+    /// Current exclusive write owner.
+    pub lease: ControllerLeaseState,
 }
 
 impl Default for ControllerSnapshot {
@@ -52,6 +67,7 @@ impl Default for ControllerSnapshot {
             desired_report: SwitchReport::NEUTRAL,
             accepted_report_count: 0,
             last_report_timestamp_ns: None,
+            lease: ControllerLeaseState::Available,
         }
     }
 }
@@ -125,6 +141,47 @@ pub struct ControllerSession {
     inner: Arc<ControllerInner>,
 }
 
+/// Exclusive primitive reserved for the future Automation adapter.
+pub struct AutomationLease {
+    controller_id: ResourceId,
+    lease_id: u64,
+    sender: Sender<LaneCommand>,
+    active: AtomicBool,
+}
+
+impl AutomationLease {
+    /// Controller resource that issued this lease.
+    #[must_use]
+    pub const fn controller_id(&self) -> ResourceId {
+        self.controller_id
+    }
+
+    /// Runtime-local lease generation.
+    #[must_use]
+    pub const fn lease_id(&self) -> u64 {
+        self.lease_id
+    }
+
+    /// Explicitly releases the lease. Dropping it performs the same action.
+    pub fn release(self) {
+        self.release_inner();
+    }
+
+    fn release_inner(&self) {
+        if self.active.swap(false, Ordering::AcqRel) {
+            let _ = self.sender.send(LaneCommand::ReleaseAutomationLease {
+                lease_id: self.lease_id,
+            });
+        }
+    }
+}
+
+impl Drop for AutomationLease {
+    fn drop(&mut self) {
+        self.release_inner();
+    }
+}
+
 struct ControllerInner {
     runtime: Runtime,
     resource_id: OnceLock<ResourceId>,
@@ -134,6 +191,7 @@ struct ControllerInner {
     worker_ready: Condvar,
     close_gate: Mutex<()>,
     registration: Mutex<Option<ResourceRegistration>>,
+    resource_cancellation: easycon_runtime::CancellationToken,
 }
 
 enum WorkerState {
@@ -151,10 +209,59 @@ enum LaneCommand {
     Direct {
         operation: Operation,
         action: ControllerAction,
+        lease_access: LeaseAccess,
+    },
+    Sequence {
+        operation: Operation,
+        sequence: PreciseSequence,
+    },
+    Ack {
+        operation: Operation,
+        command: Arc<[u8]>,
+        expected_reply: u8,
+        protocol_timeout_ns: u64,
+    },
+    AcquireAutomationLease {
+        lease_id: u64,
+        completed: SyncSender<Result<(), EasyConError>>,
+    },
+    ReleaseAutomationLease {
+        lease_id: u64,
     },
     Wake,
     Close {
         completed: SyncSender<()>,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum LeaseAccess {
+    Direct,
+    Automation(u64),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LeaseOwner {
+    Sequence(OperationId),
+    Automation(u64),
+}
+
+struct WaitingSequence {
+    operation: Operation,
+    sequence: PreciseSequence,
+}
+
+enum ReportCompletion {
+    Direct,
+    Sequence {
+        final_report: bool,
+    },
+    Cancelled {
+        release_sequence: bool,
+    },
+    Failed {
+        error: EasyConError,
+        release_sequence: bool,
     },
 }
 
@@ -165,6 +272,7 @@ struct ScheduledReport {
     operation: Operation,
     report: SwitchReport,
     kind: WriteKind,
+    completion: ReportCompletion,
 }
 
 struct ControllerLane {
@@ -180,6 +288,10 @@ struct ControllerLane {
     pending_reports: VecDeque<ScheduledReport>,
     last_dispatch_ns: Option<u64>,
     next_write_sequence: u64,
+    resource_cancellation: easycon_runtime::CancellationToken,
+    lease_owner: Option<LeaseOwner>,
+    waiting_sequence: Option<WaitingSequence>,
+    next_ack_generation: u64,
 }
 
 impl ControllerSession {
@@ -198,6 +310,7 @@ impl ControllerSession {
         }
         let (sender, receiver) = mpsc::channel();
         let snapshot = Arc::new(Mutex::new(ControllerSnapshot::default()));
+        let resource_cancellation = runtime.child_cancellation_token();
         let inner = Arc::new(ControllerInner {
             runtime: runtime.clone(),
             resource_id: OnceLock::new(),
@@ -207,6 +320,7 @@ impl ControllerSession {
             worker_ready: Condvar::new(),
             close_gate: Mutex::new(()),
             registration: Mutex::new(None),
+            resource_cancellation: resource_cancellation.clone(),
         });
         let managed: Arc<dyn ManagedResource> = inner.clone();
         let (registration, task) = match runtime.register_resource_with_task(managed) {
@@ -247,6 +361,10 @@ impl ControllerSession {
             pending_reports: VecDeque::new(),
             last_dispatch_ns: None,
             next_write_sequence: 1,
+            resource_cancellation,
+            lease_owner: None,
+            waiting_sequence: None,
+            next_ack_generation: 1,
         };
         let worker = std::thread::Builder::new()
             .name(format!("easycon-controller-{}", resource_id.get()))
@@ -325,6 +443,109 @@ impl ControllerSession {
 
     /// Submits one direct desired-state mutation.
     pub fn direct(&self, action: ControllerAction) -> Result<Operation, EasyConError> {
+        self.submit_direct(action, LeaseAccess::Direct)
+    }
+
+    /// Submits an action authorized by a matching Automation primitive lease.
+    pub fn direct_with_lease(
+        &self,
+        lease: &AutomationLease,
+        action: ControllerAction,
+    ) -> Result<Operation, EasyConError> {
+        if lease.controller_id != self.id() || !lease.active.load(Ordering::Acquire) {
+            return Err(EasyConError::new(
+                ErrorDomain::Controller,
+                ErrorCode::InvalidArgument,
+                "Automation lease does not belong to this active controller",
+            ));
+        }
+        self.submit_direct(action, LeaseAccess::Automation(lease.lease_id))
+    }
+
+    /// Submits a validated precise sequence with an exclusive write lease.
+    pub fn precise_sequence(&self, sequence: PreciseSequence) -> Result<Operation, EasyConError> {
+        let operation = self.inner.runtime.create_operation(None)?;
+        self.attach_wake(&operation);
+        if self
+            .inner
+            .sender
+            .send(LaneCommand::Sequence {
+                operation: operation.clone(),
+                sequence,
+            })
+            .is_err()
+        {
+            fail_closed_lane(&operation);
+        }
+        Ok(operation)
+    }
+
+    /// Submits a serialized command whose success requires a generation-matched ACK.
+    pub fn command_with_ack(
+        &self,
+        command: impl Into<Arc<[u8]>>,
+        expected_reply: u8,
+        protocol_timeout_ns: u64,
+    ) -> Result<Operation, EasyConError> {
+        let command = command.into();
+        if command.is_empty() || protocol_timeout_ns == 0 {
+            return Err(EasyConError::new(
+                ErrorDomain::Validation,
+                ErrorCode::InvalidArgument,
+                "ACK command and protocol timeout must be non-empty",
+            ));
+        }
+        let operation = self.inner.runtime.create_operation(None)?;
+        self.attach_wake(&operation);
+        if self
+            .inner
+            .sender
+            .send(LaneCommand::Ack {
+                operation: operation.clone(),
+                command,
+                expected_reply,
+                protocol_timeout_ns,
+            })
+            .is_err()
+        {
+            fail_closed_lane(&operation);
+        }
+        Ok(operation)
+    }
+
+    /// Acquires the low-level Automation arbitration primitive without implementing ECS.
+    pub fn acquire_automation_lease(&self) -> Result<AutomationLease, EasyConError> {
+        static NEXT_LEASE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let lease_id = NEXT_LEASE_ID.fetch_add(1, Ordering::Relaxed);
+        if lease_id == 0 {
+            return Err(EasyConError::new(
+                ErrorDomain::Internal,
+                ErrorCode::Internal,
+                "Automation lease ID space exhausted",
+            ));
+        }
+        let (completed, receiver) = mpsc::sync_channel(0);
+        self.inner
+            .sender
+            .send(LaneCommand::AcquireAutomationLease {
+                lease_id,
+                completed,
+            })
+            .map_err(|_| closed_lane_error())?;
+        receiver.recv().map_err(|_| closed_lane_error())??;
+        Ok(AutomationLease {
+            controller_id: self.id(),
+            lease_id,
+            sender: self.inner.sender.clone(),
+            active: AtomicBool::new(true),
+        })
+    }
+
+    fn submit_direct(
+        &self,
+        action: ControllerAction,
+        lease_access: LeaseAccess,
+    ) -> Result<Operation, EasyConError> {
         let operation = self.inner.runtime.create_operation(None)?;
         self.attach_wake(&operation);
         if self
@@ -333,6 +554,7 @@ impl ControllerSession {
             .send(LaneCommand::Direct {
                 operation: operation.clone(),
                 action,
+                lease_access,
             })
             .is_err()
         {
@@ -361,6 +583,7 @@ impl ControllerSession {
 
 impl ControllerInner {
     fn close_internal(&self) {
+        self.resource_cancellation.cancel();
         let _close = self
             .close_gate
             .lock()
@@ -415,6 +638,7 @@ impl ControllerLane {
         loop {
             self.observe_cancellation();
             self.dispatch_due_reports();
+            self.activate_waiting_sequence();
 
             let command = match self.next_wait_duration() {
                 Some(duration) => match self.receiver.recv_timeout(duration) {
@@ -432,8 +656,35 @@ impl ControllerLane {
                 LaneCommand::Connect { operation, options } => {
                     self.handle_connect(operation, options);
                 }
-                LaneCommand::Direct { operation, action } => {
-                    self.handle_direct(operation, action);
+                LaneCommand::Direct {
+                    operation,
+                    action,
+                    lease_access,
+                } => {
+                    self.handle_direct(operation, action, lease_access);
+                }
+                LaneCommand::Sequence {
+                    operation,
+                    sequence,
+                } => {
+                    self.handle_sequence(operation, sequence);
+                }
+                LaneCommand::Ack {
+                    operation,
+                    command,
+                    expected_reply,
+                    protocol_timeout_ns,
+                } => {
+                    self.handle_ack(operation, command, expected_reply, protocol_timeout_ns);
+                }
+                LaneCommand::AcquireAutomationLease {
+                    lease_id,
+                    completed,
+                } => {
+                    let _ = completed.send(self.acquire_automation_lease(lease_id));
+                }
+                LaneCommand::ReleaseAutomationLease { lease_id } => {
+                    self.release_automation_lease(lease_id);
                 }
                 LaneCommand::Wake => {}
                 LaneCommand::Close { completed } => {
@@ -502,6 +753,7 @@ impl ControllerLane {
                 expected_reply: HANDSHAKE_REPLY,
                 deadline_ns: attempt_deadline,
                 cancellation: operation.cancellation_token(),
+                resource_cancellation: self.resource_cancellation.clone(),
             };
             match self.transport.handshake(request) {
                 Ok(()) if !self.cancel_or_deadline(&operation, options.operation_deadline_ns) => {
@@ -566,7 +818,12 @@ impl ControllerLane {
         false
     }
 
-    fn handle_direct(&mut self, operation: Operation, action: ControllerAction) {
+    fn handle_direct(
+        &mut self,
+        operation: Operation,
+        action: ControllerAction,
+        lease_access: LeaseAccess,
+    ) {
         if operation.snapshot().state == OperationState::Cancelling {
             operation.finish_cancelled();
             return;
@@ -580,6 +837,17 @@ impl ControllerLane {
                 ErrorCode::DeviceDisconnected,
                 "controller is not connected",
             ));
+            return;
+        }
+        let lease_allowed = match (self.lease_owner, lease_access) {
+            (None, LeaseAccess::Direct) => true,
+            (Some(LeaseOwner::Automation(owner)), LeaseAccess::Automation(access)) => {
+                owner == access
+            }
+            _ => false,
+        };
+        if !lease_allowed {
+            operation.fail(resource_busy_error("controller write lease is owned"));
             return;
         }
 
@@ -598,10 +866,242 @@ impl ControllerLane {
             operation,
             report: self.desired_report,
             kind: WriteKind::Report,
+            completion: ReportCompletion::Direct,
         });
     }
 
+    fn handle_sequence(&mut self, operation: Operation, sequence: PreciseSequence) {
+        if operation.snapshot().state == OperationState::Cancelling {
+            operation.finish_cancelled();
+            return;
+        }
+        if operation.start() != TransitionOutcome::Applied {
+            return;
+        }
+        if self.state() != ControllerState::Connected {
+            operation.fail(EasyConError::new(
+                ErrorDomain::Controller,
+                ErrorCode::DeviceDisconnected,
+                "controller is not connected",
+            ));
+            return;
+        }
+        if self.lease_owner.is_some() {
+            operation.fail(resource_busy_error("controller write lease is owned"));
+            return;
+        }
+        self.set_lease_owner(Some(LeaseOwner::Sequence(operation.id())));
+        let waiting = WaitingSequence {
+            operation,
+            sequence,
+        };
+        if self.pending_reports.is_empty() {
+            self.schedule_sequence(waiting);
+        } else {
+            self.waiting_sequence = Some(waiting);
+        }
+    }
+
+    fn activate_waiting_sequence(&mut self) {
+        if !self.pending_reports.is_empty() {
+            return;
+        }
+        let Some(waiting) = self.waiting_sequence.take() else {
+            return;
+        };
+        if waiting.operation.snapshot().state == OperationState::Cancelling {
+            self.schedule_cancel_cleanup(waiting.operation, true);
+        } else {
+            self.schedule_sequence(waiting);
+        }
+    }
+
+    fn schedule_sequence(&mut self, waiting: WaitingSequence) {
+        let origin_ns = self.clock.now_ns();
+        let mut groups = waiting
+            .sequence
+            .steps()
+            .chunk_by(|left, right| left.offset_ns == right.offset_ns);
+        let group_count = groups.clone().count();
+        let mut previous_due = self
+            .last_dispatch_ns
+            .map(|last| last.saturating_add(self.options.minimum_report_interval_ns));
+        for (index, group) in groups.by_ref().enumerate() {
+            for step in group {
+                step.action.apply(&mut self.desired_report);
+            }
+            let Some(target_ns) = origin_ns.checked_add(group[0].offset_ns) else {
+                self.pending_reports
+                    .retain(|pending| pending.operation.id() != waiting.operation.id());
+                self.schedule_failure_cleanup(
+                    waiting.operation,
+                    EasyConError::new(
+                        ErrorDomain::Validation,
+                        ErrorCode::InvalidArgument,
+                        "sequence target overflowed monotonic time",
+                    ),
+                    true,
+                );
+                return;
+            };
+            let due_ns = previous_due.map_or(target_ns, |previous| previous.max(target_ns));
+            if due_ns > target_ns {
+                self.publish_timing_deviation(waiting.operation.id(), target_ns, due_ns);
+            }
+            previous_due = Some(due_ns.saturating_add(self.options.minimum_report_interval_ns));
+            let deadline_id = self.clock.register_deadline(due_ns);
+            self.pending_reports.push_back(ScheduledReport {
+                target_ns,
+                due_ns,
+                deadline_id,
+                operation: waiting.operation.clone(),
+                report: self.desired_report,
+                kind: WriteKind::Report,
+                completion: ReportCompletion::Sequence {
+                    final_report: index + 1 == group_count,
+                },
+            });
+        }
+        self.update_desired_snapshot();
+    }
+
+    fn handle_ack(
+        &mut self,
+        operation: Operation,
+        command: Arc<[u8]>,
+        expected_reply: u8,
+        protocol_timeout_ns: u64,
+    ) {
+        if operation.snapshot().state == OperationState::Cancelling {
+            operation.finish_cancelled();
+            return;
+        }
+        if operation.start() != TransitionOutcome::Applied {
+            return;
+        }
+        if self.state() != ControllerState::Connected {
+            operation.fail(EasyConError::new(
+                ErrorDomain::Controller,
+                ErrorCode::DeviceDisconnected,
+                "controller is not connected",
+            ));
+            return;
+        }
+        if self.lease_owner.is_some()
+            || self.waiting_sequence.is_some()
+            || !self.pending_reports.is_empty()
+        {
+            operation.fail(resource_busy_error(
+                "controller lane has pending report work",
+            ));
+            return;
+        }
+
+        let generation = self.next_ack_generation;
+        self.next_ack_generation = self
+            .next_ack_generation
+            .checked_add(1)
+            .expect("ACK generation exhausted");
+        let now = self.clock.now_ns();
+        if let Err(error) =
+            self.write_payload(Some(operation.id()), WriteKind::Command, now, &command)
+        {
+            operation.fail(map_transport_error(error));
+            return;
+        }
+        let deadline_ns = now.saturating_add(protocol_timeout_ns);
+        loop {
+            let request = AckRequest {
+                operation_id: operation.id(),
+                generation,
+                expected_reply,
+                deadline_ns,
+                cancellation: operation.cancellation_token(),
+                resource_cancellation: self.resource_cancellation.clone(),
+            };
+            match self.transport.wait_for_ack(request) {
+                Ok(frame) if frame.generation < generation => {
+                    self.runtime.publish(
+                        EventDraft::ordinary(
+                            EventKind::Warning,
+                            "controller.ack.late_ignored",
+                            Severity::Warning,
+                        )
+                        .with_resource(self.resource_id)
+                        .with_operation(operation.id()),
+                    );
+                }
+                Ok(frame) if frame.generation == generation && frame.byte == expected_reply => {
+                    operation.succeed(OperationValue::Unit);
+                    return;
+                }
+                Ok(_) => {
+                    operation.fail(EasyConError::new(
+                        ErrorDomain::Controller,
+                        ErrorCode::ProtocolError,
+                        "ACK generation or reply byte did not match",
+                    ));
+                    return;
+                }
+                Err(error) if error.kind() == TransportErrorKind::Cancelled => {
+                    if operation.snapshot().state != OperationState::Cancelling {
+                        operation.request_cancel(easycon_runtime::CancellationReason::ParentClose);
+                    }
+                    operation.finish_cancelled();
+                    return;
+                }
+                Err(error) => {
+                    if error.kind() == TransportErrorKind::Disconnected {
+                        self.set_state(
+                            ControllerState::Disconnected,
+                            "controller.disconnected",
+                            None,
+                        );
+                    }
+                    operation.fail(map_transport_error(error));
+                    return;
+                }
+            }
+        }
+    }
+
+    fn acquire_automation_lease(&mut self, lease_id: u64) -> Result<(), EasyConError> {
+        if self.state() != ControllerState::Connected {
+            return Err(EasyConError::new(
+                ErrorDomain::Controller,
+                ErrorCode::DeviceDisconnected,
+                "controller is not connected",
+            ));
+        }
+        if self.lease_owner.is_some()
+            || self.waiting_sequence.is_some()
+            || !self.pending_reports.is_empty()
+        {
+            return Err(resource_busy_error("controller write lease is owned"));
+        }
+        self.set_lease_owner(Some(LeaseOwner::Automation(lease_id)));
+        Ok(())
+    }
+
+    fn release_automation_lease(&mut self, lease_id: u64) {
+        if self.lease_owner == Some(LeaseOwner::Automation(lease_id)) {
+            self.set_lease_owner(None);
+        }
+    }
+
     fn observe_cancellation(&mut self) {
+        if self.pending_reports.is_empty()
+            && self.waiting_sequence.as_ref().is_some_and(|waiting| {
+                waiting.operation.snapshot().state == OperationState::Cancelling
+            })
+        {
+            let waiting = self
+                .waiting_sequence
+                .take()
+                .expect("waiting sequence checked above");
+            self.schedule_cancel_cleanup(waiting.operation, true);
+            return;
+        }
         let Some(index) = self.pending_reports.iter().position(|report| {
             report.kind == WriteKind::Report
                 && report.operation.snapshot().state == OperationState::Cancelling
@@ -612,6 +1112,14 @@ impl ControllerLane {
             .pending_reports
             .remove(index)
             .expect("index came from pending report queue");
+        let operation_id = cancelled.operation.id();
+        let release_sequence = self.lease_owner == Some(LeaseOwner::Sequence(operation_id));
+        self.pending_reports
+            .retain(|pending| pending.operation.id() != operation_id);
+        self.schedule_cancel_cleanup(cancelled.operation, release_sequence);
+    }
+
+    fn schedule_cancel_cleanup(&mut self, operation: Operation, release_sequence: bool) {
         self.desired_report.reset();
         self.update_desired_snapshot();
         let now = self.clock.now_ns();
@@ -624,9 +1132,38 @@ impl ControllerLane {
             target_ns: now,
             due_ns,
             deadline_id,
-            operation: cancelled.operation,
+            operation,
             report: SwitchReport::NEUTRAL,
             kind: WriteKind::Neutralize,
+            completion: ReportCompletion::Cancelled { release_sequence },
+        });
+    }
+
+    fn schedule_failure_cleanup(
+        &mut self,
+        operation: Operation,
+        error: EasyConError,
+        release_sequence: bool,
+    ) {
+        self.desired_report.reset();
+        self.update_desired_snapshot();
+        let now = self.clock.now_ns();
+        let due_ns = self.last_dispatch_ns.map_or(now, |last| {
+            last.saturating_add(self.options.minimum_report_interval_ns)
+                .max(now)
+        });
+        let deadline_id = self.clock.register_deadline(due_ns);
+        self.pending_reports.push_front(ScheduledReport {
+            target_ns: now,
+            due_ns,
+            deadline_id,
+            operation,
+            report: SwitchReport::NEUTRAL,
+            kind: WriteKind::Neutralize,
+            completion: ReportCompletion::Failed {
+                error,
+                release_sequence,
+            },
         });
     }
 
@@ -653,19 +1190,7 @@ impl ControllerLane {
             if earliest > now {
                 pending.due_ns = earliest;
                 pending.deadline_id = self.clock.register_deadline(earliest);
-                self.runtime.publish(
-                    EventDraft::ordinary(
-                        EventKind::TimingDeviation,
-                        "controller.report.delayed",
-                        Severity::Warning,
-                    )
-                    .with_resource(self.resource_id)
-                    .with_operation(pending.operation.id())
-                    .with_detail(format!(
-                        "target_ns={}, dispatch_not_before_ns={earliest}",
-                        pending.target_ns
-                    )),
-                );
+                self.publish_timing_deviation(pending.operation.id(), pending.target_ns, earliest);
                 self.pending_reports.push_front(pending);
                 return;
             }
@@ -681,39 +1206,84 @@ impl ControllerLane {
                         pending.operation.id(),
                         bytes,
                     );
-                    if pending.kind == WriteKind::Neutralize {
-                        pending.operation.finish_cancelled();
-                    } else {
-                        pending.operation.succeed(OperationValue::Unit);
+                    match pending.completion {
+                        ReportCompletion::Direct => {
+                            pending.operation.succeed(OperationValue::Unit);
+                        }
+                        ReportCompletion::Sequence {
+                            final_report: false,
+                        } => {}
+                        ReportCompletion::Sequence { final_report: true } => {
+                            self.release_sequence(pending.operation.id());
+                            pending.operation.succeed(OperationValue::Unit);
+                        }
+                        ReportCompletion::Cancelled { release_sequence } => {
+                            if release_sequence {
+                                self.release_sequence(pending.operation.id());
+                            }
+                            pending.operation.finish_cancelled();
+                        }
+                        ReportCompletion::Failed {
+                            error,
+                            release_sequence,
+                        } => {
+                            if release_sequence {
+                                self.release_sequence(pending.operation.id());
+                            }
+                            pending.operation.fail(error);
+                        }
                     }
                 }
                 Err(error) => {
-                    self.desired_report.reset();
-                    self.update_desired_snapshot();
-                    self.set_state(
-                        ControllerState::Disconnected,
-                        "controller.disconnected",
-                        None,
-                    );
-                    self.runtime.publish(
-                        EventDraft::critical(
-                            EventKind::Warning,
-                            "controller.neutralization.not_delivered",
-                            Severity::Warning,
-                        )
-                        .with_resource(self.resource_id)
-                        .with_operation(pending.operation.id())
-                        .with_detail(error.to_string()),
-                    );
-                    if pending.operation.snapshot().state == OperationState::Cancelling {
-                        pending.operation.finish_cancelled();
-                    } else {
-                        pending.operation.fail(map_transport_error(error));
-                    }
-                    self.fail_pending_disconnected();
+                    self.handle_report_write_failure(pending, error);
                 }
             }
         }
+    }
+
+    fn handle_report_write_failure(&mut self, pending: ScheduledReport, error: TransportError) {
+        let operation_id = pending.operation.id();
+        let release_sequence = self.lease_owner == Some(LeaseOwner::Sequence(operation_id));
+        self.pending_reports
+            .retain(|queued| queued.operation.id() != operation_id);
+        self.desired_report.reset();
+        self.update_desired_snapshot();
+
+        if pending.kind == WriteKind::Neutralize || error.kind() == TransportErrorKind::Disconnected
+        {
+            if error.kind() == TransportErrorKind::Disconnected {
+                self.set_state(
+                    ControllerState::Disconnected,
+                    "controller.disconnected",
+                    None,
+                );
+            }
+            self.publish_neutralization_warning(Some(operation_id), &error);
+            if release_sequence {
+                self.release_sequence(operation_id);
+            }
+            match pending.completion {
+                ReportCompletion::Cancelled { .. } => {
+                    pending.operation.finish_cancelled();
+                }
+                ReportCompletion::Failed { error, .. } => {
+                    pending.operation.fail(error);
+                }
+                ReportCompletion::Direct | ReportCompletion::Sequence { .. } => {
+                    pending.operation.fail(map_transport_error(error));
+                }
+            }
+            if self.state() == ControllerState::Disconnected {
+                self.fail_pending_disconnected();
+            }
+            return;
+        }
+
+        self.schedule_failure_cleanup(
+            pending.operation,
+            map_transport_error(error),
+            release_sequence,
+        );
     }
 
     fn write_payload(
@@ -781,7 +1351,12 @@ impl ControllerLane {
     }
 
     fn fail_pending_disconnected(&mut self) {
-        for pending in self.pending_reports.drain(..) {
+        let pending_reports: Vec<_> = self.pending_reports.drain(..).collect();
+        for pending in pending_reports {
+            let operation_id = pending.operation.id();
+            if self.lease_owner == Some(LeaseOwner::Sequence(operation_id)) {
+                self.set_lease_owner(None);
+            }
             if pending.operation.snapshot().state == OperationState::Cancelling {
                 pending.operation.finish_cancelled();
             } else {
@@ -791,6 +1366,14 @@ impl ControllerLane {
                     "controller disconnected before report acceptance",
                 ));
             }
+        }
+        if let Some(waiting) = self.waiting_sequence.take() {
+            self.release_sequence(waiting.operation.id());
+            waiting.operation.fail(EasyConError::new(
+                ErrorDomain::Io,
+                ErrorCode::DeviceDisconnected,
+                "controller disconnected before sequence dispatch",
+            ));
         }
         self.transport.close();
     }
@@ -804,11 +1387,16 @@ impl ControllerLane {
                 None,
             );
         }
-        let operations: Vec<_> = self
+        let mut operations: Vec<_> = self
             .pending_reports
             .drain(..)
             .map(|pending| pending.operation)
             .collect();
+        if let Some(waiting) = self.waiting_sequence.take() {
+            operations.push(waiting.operation);
+        }
+        operations.sort_by_key(|operation| operation.id());
+        operations.dedup_by_key(|operation| operation.id());
         for operation in &operations {
             if !operation.snapshot().state.is_terminal() {
                 operation.request_cancel(easycon_runtime::CancellationReason::ParentClose);
@@ -831,6 +1419,7 @@ impl ControllerLane {
                 );
             }
         }
+        self.set_lease_owner(None);
         for operation in operations {
             if operation.snapshot().state == OperationState::Cancelling {
                 operation.finish_cancelled();
@@ -874,6 +1463,78 @@ impl ControllerLane {
             .expect("controller snapshot lock poisoned")
             .desired_report = self.desired_report;
     }
+
+    fn set_lease_owner(&mut self, owner: Option<LeaseOwner>) {
+        if self.lease_owner == owner {
+            return;
+        }
+        self.lease_owner = owner;
+        let state = match owner {
+            None => ControllerLeaseState::Available,
+            Some(LeaseOwner::Sequence(operation)) => ControllerLeaseState::Sequence(operation),
+            Some(LeaseOwner::Automation(lease)) => ControllerLeaseState::Automation(lease),
+        };
+        self.snapshot
+            .lock()
+            .expect("controller snapshot lock poisoned")
+            .lease = state;
+        self.runtime.publish(
+            EventDraft::critical(
+                EventKind::State,
+                if owner.is_some() {
+                    "controller.lease.acquired"
+                } else {
+                    "controller.lease.released"
+                },
+                Severity::Info,
+            )
+            .with_resource(self.resource_id),
+        );
+    }
+
+    fn release_sequence(&mut self, operation_id: OperationId) {
+        if self.lease_owner == Some(LeaseOwner::Sequence(operation_id)) {
+            self.set_lease_owner(None);
+        }
+    }
+
+    fn publish_timing_deviation(
+        &self,
+        operation_id: OperationId,
+        target_ns: u64,
+        dispatch_not_before_ns: u64,
+    ) {
+        self.runtime.publish(
+            EventDraft::ordinary(
+                EventKind::TimingDeviation,
+                "controller.report.delayed",
+                Severity::Warning,
+            )
+            .with_resource(self.resource_id)
+            .with_operation(operation_id)
+            .with_detail(format!(
+                "target_ns={target_ns}, dispatch_not_before_ns={dispatch_not_before_ns}"
+            )),
+        );
+    }
+
+    fn publish_neutralization_warning(
+        &self,
+        operation_id: Option<OperationId>,
+        error: &TransportError,
+    ) {
+        let mut event = EventDraft::critical(
+            EventKind::Warning,
+            "controller.neutralization.not_delivered",
+            Severity::Warning,
+        )
+        .with_resource(self.resource_id)
+        .with_detail(error.to_string());
+        if let Some(operation_id) = operation_id {
+            event = event.with_operation(operation_id);
+        }
+        self.runtime.publish(event);
+    }
 }
 
 fn map_transport_error(error: TransportError) -> EasyConError {
@@ -888,9 +1549,17 @@ fn map_transport_error(error: TransportError) -> EasyConError {
 }
 
 fn fail_closed_lane(operation: &Operation) {
-    operation.fail(EasyConError::new(
+    operation.fail(closed_lane_error());
+}
+
+fn closed_lane_error() -> EasyConError {
+    EasyConError::new(
         ErrorDomain::Controller,
         ErrorCode::DeviceDisconnected,
         "controller lane is closed",
-    ));
+    )
+}
+
+fn resource_busy_error(message: &'static str) -> EasyConError {
+    EasyConError::new(ErrorDomain::Controller, ErrorCode::ResourceBusy, message)
 }

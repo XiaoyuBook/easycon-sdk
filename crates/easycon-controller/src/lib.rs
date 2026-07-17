@@ -2,17 +2,19 @@
 //! Source-exact Controller protocol and a Runtime-supervised single-writer command lane.
 
 mod protocol;
+mod sequence;
 mod session;
 mod transport;
 
 pub use protocol::SwitchReport;
+pub use sequence::{MAX_SEQUENCE_DURATION_NS, MAX_SEQUENCE_STEPS, PreciseSequence, SequenceStep};
 pub use session::{
-    ConnectOptions, ControllerAction, ControllerOptions, ControllerSession, ControllerSnapshot,
-    ControllerState,
+    AutomationLease, ConnectOptions, ControllerAction, ControllerLeaseState, ControllerOptions,
+    ControllerSession, ControllerSnapshot, ControllerState,
 };
 pub use transport::{
-    AUTO_BAUD_RATES, ControllerTransport, HANDSHAKE_REPLY, HANDSHAKE_REQUEST, HandshakeRequest,
-    TransportError, TransportErrorKind, WriteContext, WriteKind,
+    AUTO_BAUD_RATES, AckFrame, AckRequest, ControllerTransport, HANDSHAKE_REPLY, HANDSHAKE_REQUEST,
+    HandshakeRequest, TransportError, TransportErrorKind, WriteContext, WriteKind,
 };
 
 /// Behavior schema version implemented by this crate.

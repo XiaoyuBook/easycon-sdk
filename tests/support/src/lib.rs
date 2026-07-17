@@ -4,5 +4,5 @@
 mod controller;
 
 pub use controller::{
-    AcceptedWrite, FakeControllerTransport, HandshakeAttemptRecord, HandshakeOutcome,
+    AcceptedWrite, AckOutcome, FakeControllerTransport, HandshakeAttemptRecord, HandshakeOutcome,
 };
