@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use easycon_controller::{
     AckFrame, AckRequest, ControllerTransport, HANDSHAKE_REPLY, HANDSHAKE_REQUEST,
-    HandshakeRequest, TransportError, TransportErrorKind, WriteContext,
+    HandshakeRequest, TransportError, TransportErrorKind, WriteContext, WriteRequest,
 };
 use easycon_runtime::{Clock, VirtualClock};
 
@@ -89,6 +89,9 @@ struct FakeState {
     maximum_write_chunk: usize,
     write_calls: usize,
     fail_write_call: Option<(usize, TransportError)>,
+    write_block: Option<WriteBlockMode>,
+    write_waiting: bool,
+    write_release: bool,
     ack_outcomes: VecDeque<AckOutcome>,
     ack_waiting: bool,
     open: bool,
@@ -105,31 +108,41 @@ struct PartialWrite {
     bytes: Vec<u8>,
     writer_thread: ThreadId,
     calls: usize,
+    block_after_acceptance: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WriteBlockMode {
+    BeforeAcceptance,
+    AfterAcceptance,
 }
 
 impl FakeControllerTransport {
     /// Creates an empty deterministic fake using the Runtime virtual clock.
     #[must_use]
     pub fn new(clock: Arc<VirtualClock>) -> Self {
-        Self {
-            clock,
-            shared: Arc::new(FakeShared {
-                state: Mutex::new(FakeState {
-                    handshakes: VecDeque::new(),
-                    attempts: Vec::new(),
-                    accepted_writes: Vec::new(),
-                    partial: None,
-                    maximum_write_chunk: usize::MAX,
-                    write_calls: 0,
-                    fail_write_call: None,
-                    ack_outcomes: VecDeque::new(),
-                    ack_waiting: false,
-                    open: false,
-                    closed: false,
-                }),
-                changed: Condvar::new(),
+        let shared = Arc::new(FakeShared {
+            state: Mutex::new(FakeState {
+                handshakes: VecDeque::new(),
+                attempts: Vec::new(),
+                accepted_writes: Vec::new(),
+                partial: None,
+                maximum_write_chunk: usize::MAX,
+                write_calls: 0,
+                fail_write_call: None,
+                write_block: None,
+                write_waiting: false,
+                write_release: false,
+                ack_outcomes: VecDeque::new(),
+                ack_waiting: false,
+                open: false,
+                closed: false,
             }),
-        }
+            changed: Condvar::new(),
+        });
+        let clock_wake = shared.clone();
+        clock.on_change(Arc::new(move || clock_wake.changed.notify_all()));
+        Self { clock, shared }
     }
 
     /// Appends one expected baud and outcome.
@@ -160,6 +173,61 @@ impl FakeControllerTransport {
             .lock()
             .expect("fake transport lock poisoned")
             .fail_write_call = Some((call, error));
+    }
+
+    /// Blocks the next logical write before any byte is accepted until cancellation/close.
+    pub fn block_next_write_before_acceptance(&self) {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .expect("fake transport lock poisoned");
+        assert!(
+            state.write_block.is_none(),
+            "a write block is already scripted"
+        );
+        state.write_block = Some(WriteBlockMode::BeforeAcceptance);
+    }
+
+    /// Blocks after the next logical payload is accepted but before `write` returns.
+    pub fn block_next_write_after_acceptance(&self) {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .expect("fake transport lock poisoned");
+        assert!(
+            state.write_block.is_none(),
+            "a write block is already scripted"
+        );
+        state.write_block = Some(WriteBlockMode::AfterAcceptance);
+    }
+
+    /// Waits until the fake is blocked in a transport write.
+    #[must_use]
+    pub fn wait_until_write_blocked(&self, timeout: Duration) -> bool {
+        let state = self
+            .shared
+            .state
+            .lock()
+            .expect("fake transport lock poisoned");
+        let (state, _result) = self
+            .shared
+            .changed
+            .wait_timeout_while(state, timeout, |state| !state.write_waiting)
+            .expect("fake transport lock poisoned while write waits");
+        state.write_waiting
+    }
+
+    /// Releases a write blocked after byte acceptance.
+    pub fn release_blocked_write(&self) {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .expect("fake transport lock poisoned");
+        state.write_release = true;
+        self.shared.changed.notify_all();
     }
 
     /// Appends one ACK result.
@@ -338,17 +406,88 @@ impl ControllerTransport for FakeControllerTransport {
         }
     }
 
-    fn write(&mut self, context: WriteContext, bytes: &[u8]) -> Result<usize, TransportError> {
+    fn write(&mut self, request: WriteRequest<'_>) -> Result<usize, TransportError> {
+        let context = request.context;
+        let bytes = request.bytes;
+        let operation_cancel = request.cancellation.clone();
+        let resource_cancel = request.resource_cancellation.clone();
+        let shared = self.shared.clone();
+        request
+            .cancellation
+            .on_cancel(move || shared.changed.notify_all());
+        let shared = self.shared.clone();
+        request
+            .resource_cancellation
+            .on_cancel(move || shared.changed.notify_all());
         let mut state = self
             .shared
             .state
             .lock()
             .expect("fake transport lock poisoned");
         if state.closed || !state.open {
+            state.partial = None;
             return Err(TransportError::new(
                 TransportErrorKind::Disconnected,
                 "fake transport is disconnected",
             ));
+        }
+        if operation_cancel.is_cancelled() || resource_cancel.is_cancelled() {
+            state.partial = None;
+            return Err(TransportError::new(
+                TransportErrorKind::Cancelled,
+                "write cancelled before transport acceptance",
+            ));
+        }
+        if self.clock.now_ns() >= request.deadline_ns {
+            state.partial = None;
+            return Err(TransportError::new(
+                TransportErrorKind::WriteTimeout,
+                "write I/O deadline elapsed",
+            ));
+        }
+        let block = if state.partial.is_none() {
+            state.write_block.take()
+        } else {
+            None
+        };
+        if block == Some(WriteBlockMode::BeforeAcceptance) {
+            state.write_waiting = true;
+            state.write_release = false;
+            self.shared.changed.notify_all();
+            while !operation_cancel.is_cancelled()
+                && !resource_cancel.is_cancelled()
+                && !state.closed
+                && self.clock.now_ns() < request.deadline_ns
+            {
+                state = self
+                    .shared
+                    .changed
+                    .wait(state)
+                    .expect("fake transport lock poisoned while write waits");
+            }
+            state.write_waiting = false;
+            self.shared.changed.notify_all();
+            if operation_cancel.is_cancelled() || resource_cancel.is_cancelled() {
+                state.partial = None;
+                return Err(TransportError::new(
+                    TransportErrorKind::Cancelled,
+                    "write cancelled before transport acceptance",
+                ));
+            }
+            if state.closed {
+                state.partial = None;
+                return Err(TransportError::new(
+                    TransportErrorKind::Disconnected,
+                    "transport closed during write",
+                ));
+            }
+            if self.clock.now_ns() >= request.deadline_ns {
+                state.partial = None;
+                return Err(TransportError::new(
+                    TransportErrorKind::WriteTimeout,
+                    "write I/O deadline elapsed",
+                ));
+            }
         }
         state.write_calls = state
             .write_calls
@@ -374,6 +513,7 @@ impl ControllerTransport for FakeControllerTransport {
                 bytes: Vec::with_capacity(context.total_len),
                 writer_thread: thread,
                 calls: 0,
+                block_after_acceptance: block == Some(WriteBlockMode::AfterAcceptance),
             });
         }
         let partial = state.partial.as_mut().expect("partial initialized above");
@@ -385,8 +525,10 @@ impl ControllerTransport for FakeControllerTransport {
         }
         partial.bytes.extend_from_slice(&bytes[..accepted]);
         partial.calls = partial.calls.checked_add(1).expect("partial call overflow");
+        let mut block_after_acceptance = false;
         if partial.bytes.len() == context.total_len {
             let complete = state.partial.take().expect("complete partial exists");
+            block_after_acceptance = complete.block_after_acceptance;
             state.accepted_writes.push(AcceptedWrite {
                 context: complete.context,
                 bytes: complete.bytes,
@@ -399,6 +541,26 @@ impl ControllerTransport for FakeControllerTransport {
                 TransportErrorKind::Protocol,
                 "partial writes exceeded the logical payload length",
             ));
+        }
+        if block_after_acceptance {
+            state.write_waiting = true;
+            state.write_release = false;
+            self.shared.changed.notify_all();
+            while !state.write_release
+                && !operation_cancel.is_cancelled()
+                && !resource_cancel.is_cancelled()
+                && !state.closed
+                && self.clock.now_ns() < request.deadline_ns
+            {
+                state = self
+                    .shared
+                    .changed
+                    .wait(state)
+                    .expect("fake transport lock poisoned after write acceptance");
+            }
+            state.write_waiting = false;
+            state.write_release = false;
+            self.shared.changed.notify_all();
         }
         Ok(accepted)
     }

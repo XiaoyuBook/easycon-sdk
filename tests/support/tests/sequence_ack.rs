@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use easycon_controller::{
     ConnectOptions, ControllerAction, ControllerLeaseState, ControllerOptions, ControllerSession,
@@ -42,6 +42,17 @@ fn wait_terminal(operation: &Operation) {
         operation.wait(WaitTimeout::For(Duration::from_secs(2))),
         WaitResult::Completed(_)
     ));
+}
+
+fn wait_until(mut predicate: impl FnMut() -> bool) {
+    let started = Instant::now();
+    while !predicate() {
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "condition timed out"
+        );
+        std::thread::yield_now();
+    }
 }
 
 fn drain_events(subscription: &easycon_runtime::EventSubscription) -> Vec<Event> {
@@ -195,6 +206,257 @@ fn minimum_interval_delays_steps_without_dropping_transitions() {
     assert_eq!(fake.accepted_writes()[2].bytes, [0, 0, 65, 8, 4, 2, 1, 128]);
     controller.close();
     runtime.close();
+}
+
+#[test]
+fn sequence_future_state_is_not_applied_before_its_offset() {
+    let (clock, runtime, fake, controller) = connected();
+    let sequence = PreciseSequence::new(vec![SequenceStep::new(
+        30_000_000,
+        ControllerAction::ButtonDown(Button::A),
+    )])
+    .expect("sequence");
+    let operation = controller
+        .precise_sequence(sequence)
+        .expect("sequence submit");
+    wait_until(|| {
+        matches!(
+            controller.snapshot().lease,
+            ControllerLeaseState::Sequence(_)
+        )
+    });
+
+    assert_eq!(controller.snapshot().desired_report, SwitchReport::NEUTRAL);
+    assert!(fake.accepted_writes().is_empty());
+
+    clock.advance_to(30_000_000);
+    wait_terminal(&operation);
+    assert_eq!(
+        controller.snapshot().desired_report,
+        SwitchReport::new(
+            Button::A.mask(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        )
+    );
+    controller.close();
+    runtime.close();
+}
+
+#[test]
+fn cancel_after_final_sequence_acceptance_still_neutralizes() {
+    let (clock, runtime, fake, controller) = connected();
+    fake.block_next_write_after_acceptance();
+    let sequence = PreciseSequence::new(vec![SequenceStep::new(
+        0,
+        ControllerAction::ButtonDown(Button::A),
+    )])
+    .expect("sequence");
+    let operation = controller
+        .precise_sequence(sequence)
+        .expect("sequence submit");
+    assert!(fake.wait_until_write_blocked(Duration::from_secs(2)));
+    assert_eq!(fake.accepted_writes().len(), 1);
+
+    operation.cancel();
+    clock.advance_to(30_000_000);
+    wait_terminal(&operation);
+
+    assert_eq!(operation.snapshot().state, OperationState::Cancelled);
+    assert_eq!(controller.snapshot().lease, ControllerLeaseState::Available);
+    assert_eq!(fake.accepted_writes().len(), 2);
+    assert_eq!(
+        fake.accepted_writes()[1].bytes,
+        SwitchReport::NEUTRAL.encode()
+    );
+    controller.close();
+    runtime.close();
+}
+
+#[test]
+fn cancel_after_direct_acceptance_still_reaches_cancelled() {
+    let (clock, runtime, fake, controller) = connected();
+    fake.block_next_write_after_acceptance();
+    let operation = controller
+        .direct(ControllerAction::ButtonDown(Button::A))
+        .expect("direct");
+    assert!(fake.wait_until_write_blocked(Duration::from_secs(2)));
+
+    operation.cancel();
+    clock.advance_to(30_000_000);
+    wait_terminal(&operation);
+
+    assert_eq!(operation.snapshot().state, OperationState::Cancelled);
+    assert_eq!(fake.accepted_writes().len(), 2);
+    assert_eq!(
+        fake.accepted_writes()[1].bytes,
+        SwitchReport::NEUTRAL.encode()
+    );
+    controller.close();
+    runtime.close();
+}
+
+#[test]
+fn direct_cancel_rebuilds_later_reports_from_neutral() {
+    let (clock, runtime, fake, controller) = connected();
+    let first = controller
+        .direct(ControllerAction::ButtonDown(Button::X))
+        .expect("first direct");
+    wait_terminal(&first);
+    let cancelled = controller
+        .direct(ControllerAction::ButtonDown(Button::A))
+        .expect("cancelled direct");
+    let later = controller
+        .direct(ControllerAction::ButtonDown(Button::B))
+        .expect("later direct");
+    wait_until(|| {
+        controller.snapshot().desired_report.buttons()
+            == Button::X.mask() | Button::A.mask() | Button::B.mask()
+    });
+
+    cancelled.cancel();
+    clock.advance_to(30_000_000);
+    wait_terminal(&cancelled);
+    assert_eq!(cancelled.snapshot().state, OperationState::Cancelled);
+    assert_eq!(
+        fake.accepted_writes()[1].bytes,
+        SwitchReport::NEUTRAL.encode()
+    );
+
+    clock.advance_to(60_000_000);
+    wait_terminal(&later);
+    assert_eq!(later.snapshot().state, OperationState::Succeeded);
+    assert_eq!(
+        fake.accepted_writes()[2].bytes,
+        SwitchReport::new(
+            Button::B.mask(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        )
+        .encode()
+    );
+    controller.close();
+    runtime.close();
+}
+
+#[test]
+fn ack_waits_for_an_earlier_report_in_the_fifo_lane() {
+    let (clock, runtime, fake, controller) = connected();
+    let first = controller
+        .direct(ControllerAction::ButtonDown(Button::A))
+        .expect("first direct");
+    wait_terminal(&first);
+    let pending = controller
+        .direct(ControllerAction::ButtonDown(Button::B))
+        .expect("pending direct");
+    fake.push_ack(AckOutcome::Frame {
+        generation: 1,
+        byte: 0xff,
+        elapsed_ns: 0,
+    });
+    let ack = controller
+        .command_with_ack(Arc::<[u8]>::from([0xA5, 0x91]), 0xff, 100)
+        .expect("ACK command");
+    assert_eq!(ack.wait(WaitTimeout::Poll), WaitResult::Timeout);
+
+    clock.advance_to(30_000_000);
+    wait_terminal(&pending);
+    wait_terminal(&ack);
+
+    assert_eq!(ack.snapshot().state, OperationState::Succeeded);
+    assert_eq!(
+        fake.accepted_writes()
+            .iter()
+            .map(|write| write.context.kind)
+            .collect::<Vec<_>>(),
+        [WriteKind::Report, WriteKind::Report, WriteKind::Command]
+    );
+    controller.close();
+    runtime.close();
+}
+
+#[test]
+fn close_interrupts_a_blocked_report_write_and_joins() {
+    let (_clock, runtime, fake, controller) = connected();
+    fake.block_next_write_before_acceptance();
+    let operation = controller
+        .direct(ControllerAction::ButtonDown(Button::A))
+        .expect("direct");
+    assert!(fake.wait_until_write_blocked(Duration::from_secs(2)));
+
+    controller.close();
+    wait_terminal(&operation);
+
+    assert_eq!(operation.snapshot().state, OperationState::Cancelled);
+    assert_eq!(controller.snapshot().state, ControllerState::Closed);
+    assert!(
+        fake.accepted_writes()
+            .iter()
+            .all(|write| write.bytes == SwitchReport::NEUTRAL.encode())
+    );
+    runtime.close();
+}
+
+#[test]
+fn blocked_report_write_obeys_its_io_deadline() {
+    let (clock, runtime, fake, controller) = connected();
+    fake.block_next_write_before_acceptance();
+    let operation = controller
+        .direct(ControllerAction::ButtonDown(Button::A))
+        .expect("direct");
+    assert!(fake.wait_until_write_blocked(Duration::from_secs(2)));
+
+    clock.advance_to(ControllerOptions::default().write_timeout_ns);
+    wait_terminal(&operation);
+
+    assert_eq!(operation.snapshot().state, OperationState::Failed);
+    assert_eq!(
+        operation.snapshot().error.expect("write timeout").code(),
+        ErrorCode::Transport
+    );
+    assert_eq!(fake.accepted_writes().len(), 1);
+    assert_eq!(
+        fake.accepted_writes()[0].bytes,
+        SwitchReport::NEUTRAL.encode()
+    );
+    controller.close();
+    runtime.close();
+}
+
+#[test]
+fn runtime_close_does_not_execute_direct_queued_behind_ack() {
+    let (_clock, runtime, fake, controller) = connected();
+    fake.push_ack(AckOutcome::BlockUntilCancelled);
+    let ack = controller
+        .command_with_ack(Arc::<[u8]>::from([0xA5, 0x91]), 0xff, 100)
+        .expect("ACK command");
+    assert!(fake.wait_until_ack_blocked(Duration::from_secs(2)));
+    let direct = controller
+        .direct(ControllerAction::ButtonDown(Button::A))
+        .expect("queued direct");
+
+    runtime.close();
+
+    wait_terminal(&ack);
+    wait_terminal(&direct);
+    assert_eq!(ack.snapshot().state, OperationState::Cancelled);
+    assert_eq!(direct.snapshot().state, OperationState::Cancelled);
+    assert!(
+        fake.accepted_writes()
+            .iter()
+            .all(|write| write.context.kind != WriteKind::Report)
+    );
+    assert_eq!(controller.snapshot().state, ControllerState::Closed);
+    assert_eq!(
+        runtime.counts(),
+        RuntimeCounts {
+            active_operations: 0,
+            active_resources: 0,
+            active_tasks: 0,
+        }
+    );
 }
 
 #[test]

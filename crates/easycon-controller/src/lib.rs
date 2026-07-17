@@ -14,7 +14,7 @@ pub use session::{
 };
 pub use transport::{
     AUTO_BAUD_RATES, AckFrame, AckRequest, ControllerTransport, HANDSHAKE_REPLY, HANDSHAKE_REQUEST,
-    HandshakeRequest, TransportError, TransportErrorKind, WriteContext, WriteKind,
+    HandshakeRequest, TransportError, TransportErrorKind, WriteContext, WriteKind, WriteRequest,
 };
 
 /// Behavior schema version implemented by this crate.

@@ -16,7 +16,7 @@ use crate::protocol::SwitchReport;
 use crate::sequence::PreciseSequence;
 use crate::transport::{
     AUTO_BAUD_RATES, AckRequest, ControllerTransport, HANDSHAKE_REPLY, HANDSHAKE_REQUEST,
-    HandshakeRequest, TransportError, TransportErrorKind, WriteContext, WriteKind,
+    HandshakeRequest, TransportError, TransportErrorKind, WriteContext, WriteKind, WriteRequest,
 };
 
 /// Controller connection/resource state.
@@ -77,12 +77,15 @@ impl Default for ControllerSnapshot {
 pub struct ControllerOptions {
     /// Minimum interval between complete report acceptances.
     pub minimum_report_interval_ns: u64,
+    /// Maximum duration allowed for one complete logical transport write.
+    pub write_timeout_ns: u64,
 }
 
 impl Default for ControllerOptions {
     fn default() -> Self {
         Self {
             minimum_report_interval_ns: 30_000_000,
+            write_timeout_ns: 1_000_000_000,
         }
     }
 }
@@ -190,6 +193,8 @@ struct ControllerInner {
     worker: Mutex<WorkerState>,
     worker_ready: Condvar,
     close_gate: Mutex<()>,
+    admission_gate: Mutex<()>,
+    closing: AtomicBool,
     registration: Mutex<Option<ResourceRegistration>>,
     resource_cancellation: easycon_runtime::CancellationToken,
 }
@@ -234,6 +239,34 @@ enum LaneCommand {
     },
 }
 
+impl LaneCommand {
+    fn operation(&self) -> Option<&Operation> {
+        match self {
+            Self::Connect { operation, .. }
+            | Self::Direct { operation, .. }
+            | Self::Sequence { operation, .. }
+            | Self::Ack { operation, .. } => Some(operation),
+            Self::AcquireAutomationLease { .. }
+            | Self::ReleaseAutomationLease { .. }
+            | Self::Wake
+            | Self::Close { .. } => None,
+        }
+    }
+
+    fn into_operation(self) -> Option<Operation> {
+        match self {
+            Self::Connect { operation, .. }
+            | Self::Direct { operation, .. }
+            | Self::Sequence { operation, .. }
+            | Self::Ack { operation, .. } => Some(operation),
+            Self::AcquireAutomationLease { .. }
+            | Self::ReleaseAutomationLease { .. }
+            | Self::Wake
+            | Self::Close { .. } => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum LeaseAccess {
     Direct,
@@ -271,6 +304,7 @@ struct ScheduledReport {
     deadline_id: DeadlineId,
     operation: Operation,
     report: SwitchReport,
+    mutation: Option<ControllerAction>,
     kind: WriteKind,
     completion: ReportCompletion,
 }
@@ -286,6 +320,7 @@ struct ControllerLane {
     task: Option<TaskRegistration>,
     desired_report: SwitchReport,
     pending_reports: VecDeque<ScheduledReport>,
+    deferred_commands: VecDeque<LaneCommand>,
     last_dispatch_ns: Option<u64>,
     next_write_sequence: u64,
     resource_cancellation: easycon_runtime::CancellationToken,
@@ -301,11 +336,11 @@ impl ControllerSession {
         transport: Box<dyn ControllerTransport>,
         options: ControllerOptions,
     ) -> Result<Self, EasyConError> {
-        if options.minimum_report_interval_ns == 0 {
+        if options.minimum_report_interval_ns == 0 || options.write_timeout_ns == 0 {
             return Err(EasyConError::new(
                 ErrorDomain::Validation,
                 ErrorCode::InvalidArgument,
-                "minimum report interval must be non-zero",
+                "minimum report interval and write timeout must be non-zero",
             ));
         }
         let (sender, receiver) = mpsc::channel();
@@ -319,6 +354,8 @@ impl ControllerSession {
             worker: Mutex::new(WorkerState::Starting),
             worker_ready: Condvar::new(),
             close_gate: Mutex::new(()),
+            admission_gate: Mutex::new(()),
+            closing: AtomicBool::new(false),
             registration: Mutex::new(None),
             resource_cancellation: resource_cancellation.clone(),
         });
@@ -359,6 +396,7 @@ impl ControllerSession {
             task: Some(task),
             desired_report: SwitchReport::NEUTRAL,
             pending_reports: VecDeque::new(),
+            deferred_commands: VecDeque::new(),
             last_dispatch_ns: None,
             next_write_sequence: 1,
             resource_cancellation,
@@ -422,23 +460,9 @@ impl ControllerSession {
                 "protocol timeout must be non-zero",
             ));
         }
-        let operation = self
-            .inner
-            .runtime
-            .create_operation(options.operation_deadline_ns)?;
-        self.attach_wake(&operation);
-        if self
-            .inner
-            .sender
-            .send(LaneCommand::Connect {
-                operation: operation.clone(),
-                options,
-            })
-            .is_err()
-        {
-            fail_closed_lane(&operation);
-        }
-        Ok(operation)
+        self.enqueue_operation(options.operation_deadline_ns, |operation| {
+            LaneCommand::Connect { operation, options }
+        })
     }
 
     /// Submits one direct desired-state mutation.
@@ -464,20 +488,10 @@ impl ControllerSession {
 
     /// Submits a validated precise sequence with an exclusive write lease.
     pub fn precise_sequence(&self, sequence: PreciseSequence) -> Result<Operation, EasyConError> {
-        let operation = self.inner.runtime.create_operation(None)?;
-        self.attach_wake(&operation);
-        if self
-            .inner
-            .sender
-            .send(LaneCommand::Sequence {
-                operation: operation.clone(),
-                sequence,
-            })
-            .is_err()
-        {
-            fail_closed_lane(&operation);
-        }
-        Ok(operation)
+        self.enqueue_operation(None, |operation| LaneCommand::Sequence {
+            operation,
+            sequence,
+        })
     }
 
     /// Submits a serialized command whose success requires a generation-matched ACK.
@@ -495,22 +509,12 @@ impl ControllerSession {
                 "ACK command and protocol timeout must be non-empty",
             ));
         }
-        let operation = self.inner.runtime.create_operation(None)?;
-        self.attach_wake(&operation);
-        if self
-            .inner
-            .sender
-            .send(LaneCommand::Ack {
-                operation: operation.clone(),
-                command,
-                expected_reply,
-                protocol_timeout_ns,
-            })
-            .is_err()
-        {
-            fail_closed_lane(&operation);
-        }
-        Ok(operation)
+        self.enqueue_operation(None, |operation| LaneCommand::Ack {
+            operation,
+            command,
+            expected_reply,
+            protocol_timeout_ns,
+        })
     }
 
     /// Acquires the low-level Automation arbitration primitive without implementing ECS.
@@ -525,13 +529,23 @@ impl ControllerSession {
             ));
         }
         let (completed, receiver) = mpsc::sync_channel(0);
-        self.inner
-            .sender
-            .send(LaneCommand::AcquireAutomationLease {
-                lease_id,
-                completed,
-            })
-            .map_err(|_| closed_lane_error())?;
+        {
+            let _admission = self
+                .inner
+                .admission_gate
+                .lock()
+                .expect("controller admission lock poisoned");
+            if self.inner.closing.load(Ordering::Acquire) {
+                return Err(closed_lane_error());
+            }
+            self.inner
+                .sender
+                .send(LaneCommand::AcquireAutomationLease {
+                    lease_id,
+                    completed,
+                })
+                .map_err(|_| closed_lane_error())?;
+        }
         receiver.recv().map_err(|_| closed_lane_error())??;
         Ok(AutomationLease {
             controller_id: self.id(),
@@ -546,18 +560,29 @@ impl ControllerSession {
         action: ControllerAction,
         lease_access: LeaseAccess,
     ) -> Result<Operation, EasyConError> {
-        let operation = self.inner.runtime.create_operation(None)?;
-        self.attach_wake(&operation);
-        if self
+        self.enqueue_operation(None, |operation| LaneCommand::Direct {
+            operation,
+            action,
+            lease_access,
+        })
+    }
+
+    fn enqueue_operation(
+        &self,
+        deadline_ns: Option<u64>,
+        command: impl FnOnce(Operation) -> LaneCommand,
+    ) -> Result<Operation, EasyConError> {
+        let _admission = self
             .inner
-            .sender
-            .send(LaneCommand::Direct {
-                operation: operation.clone(),
-                action,
-                lease_access,
-            })
-            .is_err()
-        {
+            .admission_gate
+            .lock()
+            .expect("controller admission lock poisoned");
+        if self.inner.closing.load(Ordering::Acquire) {
+            return Err(closed_lane_error());
+        }
+        let operation = self.inner.runtime.create_operation(deadline_ns)?;
+        self.attach_wake(&operation);
+        if self.inner.sender.send(command(operation.clone())).is_err() {
             fail_closed_lane(&operation);
         }
         Ok(operation)
@@ -583,7 +608,6 @@ impl ControllerSession {
 
 impl ControllerInner {
     fn close_internal(&self) {
-        self.resource_cancellation.cancel();
         let _close = self
             .close_gate
             .lock()
@@ -597,11 +621,29 @@ impl ControllerInner {
         }
         let running = matches!(*worker_state, WorkerState::Running(_));
         drop(worker_state);
-        if running {
+        let completion = if running {
             let (completed, receiver) = mpsc::sync_channel(0);
-            if self.sender.send(LaneCommand::Close { completed }).is_ok() {
-                let _ = receiver.recv();
-            }
+            let sent = {
+                let _admission = self
+                    .admission_gate
+                    .lock()
+                    .expect("controller admission lock poisoned");
+                self.closing.store(true, Ordering::Release);
+                self.resource_cancellation.cancel();
+                self.sender.send(LaneCommand::Close { completed }).is_ok()
+            };
+            if sent { Some(receiver) } else { None }
+        } else {
+            let _admission = self
+                .admission_gate
+                .lock()
+                .expect("controller admission lock poisoned");
+            self.closing.store(true, Ordering::Release);
+            self.resource_cancellation.cancel();
+            None
+        };
+        if let Some(receiver) = completion {
+            let _ = receiver.recv();
         }
         let worker = {
             let mut worker_state = self.worker.lock().expect("controller worker lock poisoned");
@@ -640,14 +682,7 @@ impl ControllerLane {
             self.dispatch_due_reports();
             self.activate_waiting_sequence();
 
-            let command = match self.next_wait_duration() {
-                Some(duration) => match self.receiver.recv_timeout(duration) {
-                    Ok(command) => Some(command),
-                    Err(RecvTimeoutError::Timeout) => Some(LaneCommand::Wake),
-                    Err(RecvTimeoutError::Disconnected) => None,
-                },
-                None => self.receiver.recv().ok(),
-            };
+            let command = self.next_command();
             let Some(command) = command else {
                 self.close_lane(None);
                 break;
@@ -675,7 +710,16 @@ impl ControllerLane {
                     expected_reply,
                     protocol_timeout_ns,
                 } => {
-                    self.handle_ack(operation, command, expected_reply, protocol_timeout_ns);
+                    if self.should_defer_ack() {
+                        self.deferred_commands.push_front(LaneCommand::Ack {
+                            operation,
+                            command,
+                            expected_reply,
+                            protocol_timeout_ns,
+                        });
+                    } else {
+                        self.handle_ack(operation, command, expected_reply, protocol_timeout_ns);
+                    }
                 }
                 LaneCommand::AcquireAutomationLease {
                     lease_id,
@@ -696,6 +740,43 @@ impl ControllerLane {
         self.task.take();
     }
 
+    fn next_command(&mut self) -> Option<LaneCommand> {
+        loop {
+            let deferred_ack_blocked = self
+                .deferred_commands
+                .front()
+                .is_some_and(|command| matches!(command, LaneCommand::Ack { .. }))
+                && self.should_defer_ack();
+            if !deferred_ack_blocked && let Some(command) = self.deferred_commands.pop_front() {
+                return Some(command);
+            }
+
+            let command = match self.next_wait_duration() {
+                Some(duration) => match self.receiver.recv_timeout(duration) {
+                    Ok(command) => Some(command),
+                    Err(RecvTimeoutError::Timeout) => Some(LaneCommand::Wake),
+                    Err(RecvTimeoutError::Disconnected) => None,
+                },
+                None => self.receiver.recv().ok(),
+            };
+            match command {
+                Some(command @ LaneCommand::Close { .. }) | Some(command @ LaneCommand::Wake) => {
+                    return Some(command);
+                }
+                Some(command) if deferred_ack_blocked => {
+                    self.deferred_commands.push_back(command);
+                }
+                command => return command,
+            }
+        }
+    }
+
+    fn should_defer_ack(&self) -> bool {
+        self.lease_owner.is_none()
+            && self.waiting_sequence.is_none()
+            && !self.pending_reports.is_empty()
+    }
+
     fn next_wait_duration(&self) -> Option<std::time::Duration> {
         self.pending_reports
             .front()
@@ -703,19 +784,21 @@ impl ControllerLane {
     }
 
     fn handle_connect(&mut self, operation: Operation, options: ConnectOptions) {
-        if operation.snapshot().state == OperationState::Cancelling {
-            operation.finish_cancelled();
+        if self.finish_if_cancelled_before_start(&operation) {
             return;
         }
-        if operation.start() != TransitionOutcome::Applied {
+        if !start_or_finish_cancelled(&operation) {
             return;
         }
         if self.state() != ControllerState::Disconnected {
-            operation.fail(EasyConError::new(
-                ErrorDomain::Controller,
-                ErrorCode::ResourceBusy,
-                "controller is not disconnected",
-            ));
+            fail_or_finish_cancelled(
+                &operation,
+                EasyConError::new(
+                    ErrorDomain::Controller,
+                    ErrorCode::ResourceBusy,
+                    "controller is not disconnected",
+                ),
+            );
             return;
         }
         self.set_state(
@@ -757,12 +840,25 @@ impl ControllerLane {
             };
             match self.transport.handshake(request) {
                 Ok(()) if !self.cancel_or_deadline(&operation, options.operation_deadline_ns) => {
-                    self.set_state(
-                        ControllerState::Connected,
-                        "controller.connected",
-                        Some(operation.id()),
-                    );
-                    operation.succeed(OperationValue::Unit);
+                    let operation_id = operation.id();
+                    let outcome = operation.succeed_after_cleanup(OperationValue::Unit, || {
+                        self.set_state(
+                            ControllerState::Connected,
+                            "controller.connected",
+                            Some(operation_id),
+                        );
+                    });
+                    if outcome == TransitionOutcome::Invalid
+                        && operation.snapshot().state == OperationState::Cancelling
+                    {
+                        self.transport.close();
+                        self.set_state(
+                            ControllerState::Disconnected,
+                            "controller.disconnected",
+                            None,
+                        );
+                        operation.finish_cancelled();
+                    }
                     return;
                 }
                 Ok(()) => {
@@ -800,7 +896,7 @@ impl ControllerLane {
             "controller.disconnected",
             None,
         );
-        operation.fail(map_transport_error(last_error));
+        fail_or_finish_cancelled(&operation, map_transport_error(last_error));
     }
 
     fn cancel_or_deadline(&self, operation: &Operation, deadline_ns: Option<u64>) -> bool {
@@ -824,19 +920,21 @@ impl ControllerLane {
         action: ControllerAction,
         lease_access: LeaseAccess,
     ) {
-        if operation.snapshot().state == OperationState::Cancelling {
-            operation.finish_cancelled();
+        if self.finish_if_cancelled_before_start(&operation) {
             return;
         }
-        if operation.start() != TransitionOutcome::Applied {
+        if !start_or_finish_cancelled(&operation) {
             return;
         }
         if self.state() != ControllerState::Connected {
-            operation.fail(EasyConError::new(
-                ErrorDomain::Controller,
-                ErrorCode::DeviceDisconnected,
-                "controller is not connected",
-            ));
+            fail_or_finish_cancelled(
+                &operation,
+                EasyConError::new(
+                    ErrorDomain::Controller,
+                    ErrorCode::DeviceDisconnected,
+                    "controller is not connected",
+                ),
+            );
             return;
         }
         let lease_allowed = match (self.lease_owner, lease_access) {
@@ -847,7 +945,10 @@ impl ControllerLane {
             _ => false,
         };
         if !lease_allowed {
-            operation.fail(resource_busy_error("controller write lease is owned"));
+            fail_or_finish_cancelled(
+                &operation,
+                resource_busy_error("controller write lease is owned"),
+            );
             return;
         }
 
@@ -865,29 +966,35 @@ impl ControllerLane {
             deadline_id,
             operation,
             report: self.desired_report,
+            mutation: Some(action),
             kind: WriteKind::Report,
             completion: ReportCompletion::Direct,
         });
     }
 
     fn handle_sequence(&mut self, operation: Operation, sequence: PreciseSequence) {
-        if operation.snapshot().state == OperationState::Cancelling {
-            operation.finish_cancelled();
+        if self.finish_if_cancelled_before_start(&operation) {
             return;
         }
-        if operation.start() != TransitionOutcome::Applied {
+        if !start_or_finish_cancelled(&operation) {
             return;
         }
         if self.state() != ControllerState::Connected {
-            operation.fail(EasyConError::new(
-                ErrorDomain::Controller,
-                ErrorCode::DeviceDisconnected,
-                "controller is not connected",
-            ));
+            fail_or_finish_cancelled(
+                &operation,
+                EasyConError::new(
+                    ErrorDomain::Controller,
+                    ErrorCode::DeviceDisconnected,
+                    "controller is not connected",
+                ),
+            );
             return;
         }
         if self.lease_owner.is_some() {
-            operation.fail(resource_busy_error("controller write lease is owned"));
+            fail_or_finish_cancelled(
+                &operation,
+                resource_busy_error("controller write lease is owned"),
+            );
             return;
         }
         self.set_lease_owner(Some(LeaseOwner::Sequence(operation.id())));
@@ -918,6 +1025,7 @@ impl ControllerLane {
 
     fn schedule_sequence(&mut self, waiting: WaitingSequence) {
         let origin_ns = self.clock.now_ns();
+        let mut planned_report = self.desired_report;
         let mut groups = waiting
             .sequence
             .steps()
@@ -928,7 +1036,7 @@ impl ControllerLane {
             .map(|last| last.saturating_add(self.options.minimum_report_interval_ns));
         for (index, group) in groups.by_ref().enumerate() {
             for step in group {
-                step.action.apply(&mut self.desired_report);
+                step.action.apply(&mut planned_report);
             }
             let Some(target_ns) = origin_ns.checked_add(group[0].offset_ns) else {
                 self.pending_reports
@@ -955,14 +1063,14 @@ impl ControllerLane {
                 due_ns,
                 deadline_id,
                 operation: waiting.operation.clone(),
-                report: self.desired_report,
+                report: planned_report,
+                mutation: None,
                 kind: WriteKind::Report,
                 completion: ReportCompletion::Sequence {
                     final_report: index + 1 == group_count,
                 },
             });
         }
-        self.update_desired_snapshot();
     }
 
     fn handle_ack(
@@ -972,28 +1080,28 @@ impl ControllerLane {
         expected_reply: u8,
         protocol_timeout_ns: u64,
     ) {
-        if operation.snapshot().state == OperationState::Cancelling {
-            operation.finish_cancelled();
+        if self.finish_if_cancelled_before_start(&operation) {
             return;
         }
-        if operation.start() != TransitionOutcome::Applied {
+        if !start_or_finish_cancelled(&operation) {
             return;
         }
         if self.state() != ControllerState::Connected {
-            operation.fail(EasyConError::new(
-                ErrorDomain::Controller,
-                ErrorCode::DeviceDisconnected,
-                "controller is not connected",
-            ));
+            fail_or_finish_cancelled(
+                &operation,
+                EasyConError::new(
+                    ErrorDomain::Controller,
+                    ErrorCode::DeviceDisconnected,
+                    "controller is not connected",
+                ),
+            );
             return;
         }
-        if self.lease_owner.is_some()
-            || self.waiting_sequence.is_some()
-            || !self.pending_reports.is_empty()
-        {
-            operation.fail(resource_busy_error(
-                "controller lane has pending report work",
-            ));
+        if self.lease_owner.is_some() || self.waiting_sequence.is_some() {
+            fail_or_finish_cancelled(
+                &operation,
+                resource_busy_error("controller write lease is owned"),
+            );
             return;
         }
 
@@ -1003,10 +1111,9 @@ impl ControllerLane {
             .checked_add(1)
             .expect("ACK generation exhausted");
         let now = self.clock.now_ns();
-        if let Err(error) =
-            self.write_payload(Some(operation.id()), WriteKind::Command, now, &command)
+        if let Err(error) = self.write_payload(Some(&operation), WriteKind::Command, now, &command)
         {
-            operation.fail(map_transport_error(error));
+            fail_or_finish_cancelled(&operation, map_transport_error(error));
             return;
         }
         let deadline_ns = now.saturating_add(protocol_timeout_ns);
@@ -1032,15 +1139,22 @@ impl ControllerLane {
                     );
                 }
                 Ok(frame) if frame.generation == generation && frame.byte == expected_reply => {
-                    operation.succeed(OperationValue::Unit);
+                    if operation.succeed(OperationValue::Unit) == TransitionOutcome::Invalid
+                        && operation.snapshot().state == OperationState::Cancelling
+                    {
+                        operation.finish_cancelled();
+                    }
                     return;
                 }
                 Ok(_) => {
-                    operation.fail(EasyConError::new(
-                        ErrorDomain::Controller,
-                        ErrorCode::ProtocolError,
-                        "ACK generation or reply byte did not match",
-                    ));
+                    fail_or_finish_cancelled(
+                        &operation,
+                        EasyConError::new(
+                            ErrorDomain::Controller,
+                            ErrorCode::ProtocolError,
+                            "ACK generation or reply byte did not match",
+                        ),
+                    );
                     return;
                 }
                 Err(error) if error.kind() == TransportErrorKind::Cancelled => {
@@ -1058,7 +1172,7 @@ impl ControllerLane {
                             None,
                         );
                     }
-                    operation.fail(map_transport_error(error));
+                    fail_or_finish_cancelled(&operation, map_transport_error(error));
                     return;
                 }
             }
@@ -1066,7 +1180,7 @@ impl ControllerLane {
     }
 
     fn acquire_automation_lease(&mut self, lease_id: u64) -> Result<(), EasyConError> {
-        if self.state() != ControllerState::Connected {
+        if self.resource_cancellation.is_cancelled() || self.state() != ControllerState::Connected {
             return Err(EasyConError::new(
                 ErrorDomain::Controller,
                 ErrorCode::DeviceDisconnected,
@@ -1083,6 +1197,20 @@ impl ControllerLane {
         Ok(())
     }
 
+    fn finish_if_cancelled_before_start(&self, operation: &Operation) -> bool {
+        if self.resource_cancellation.is_cancelled()
+            || operation.cancellation_token().is_cancelled()
+        {
+            let _ = operation.request_cancel(easycon_runtime::CancellationReason::ParentClose);
+        }
+        if operation.snapshot().state == OperationState::Cancelling {
+            operation.finish_cancelled();
+            true
+        } else {
+            false
+        }
+    }
+
     fn release_automation_lease(&mut self, lease_id: u64) {
         if self.lease_owner == Some(LeaseOwner::Automation(lease_id)) {
             self.set_lease_owner(None);
@@ -1090,6 +1218,38 @@ impl ControllerLane {
     }
 
     fn observe_cancellation(&mut self) {
+        if self.resource_cancellation.is_cancelled() {
+            for operation in self
+                .pending_reports
+                .iter()
+                .map(|pending| &pending.operation)
+                .chain(
+                    self.waiting_sequence
+                        .iter()
+                        .map(|waiting| &waiting.operation),
+                )
+                .chain(
+                    self.deferred_commands
+                        .iter()
+                        .filter_map(LaneCommand::operation),
+                )
+            {
+                let _ = operation.request_cancel(easycon_runtime::CancellationReason::ParentClose);
+            }
+        }
+        if let Some(index) = self.deferred_commands.iter().position(|command| {
+            command
+                .operation()
+                .is_some_and(|operation| operation.snapshot().state == OperationState::Cancelling)
+        }) {
+            let command = self
+                .deferred_commands
+                .remove(index)
+                .expect("deferred command index came from the same queue");
+            if let Some(operation) = command.into_operation() {
+                operation.finish_cancelled();
+            }
+        }
         if self.pending_reports.is_empty()
             && self.waiting_sequence.as_ref().is_some_and(|waiting| {
                 waiting.operation.snapshot().state == OperationState::Cancelling
@@ -1120,8 +1280,7 @@ impl ControllerLane {
     }
 
     fn schedule_cancel_cleanup(&mut self, operation: Operation, release_sequence: bool) {
-        self.desired_report.reset();
-        self.update_desired_snapshot();
+        self.rebuild_pending_after_neutral();
         let now = self.clock.now_ns();
         let due_ns = self.last_dispatch_ns.map_or(now, |last| {
             last.saturating_add(self.options.minimum_report_interval_ns)
@@ -1134,6 +1293,7 @@ impl ControllerLane {
             deadline_id,
             operation,
             report: SwitchReport::NEUTRAL,
+            mutation: None,
             kind: WriteKind::Neutralize,
             completion: ReportCompletion::Cancelled { release_sequence },
         });
@@ -1145,8 +1305,7 @@ impl ControllerLane {
         error: EasyConError,
         release_sequence: bool,
     ) {
-        self.desired_report.reset();
-        self.update_desired_snapshot();
+        self.rebuild_pending_after_neutral();
         let now = self.clock.now_ns();
         let due_ns = self.last_dispatch_ns.map_or(now, |last| {
             last.saturating_add(self.options.minimum_report_interval_ns)
@@ -1159,12 +1318,25 @@ impl ControllerLane {
             deadline_id,
             operation,
             report: SwitchReport::NEUTRAL,
+            mutation: None,
             kind: WriteKind::Neutralize,
             completion: ReportCompletion::Failed {
                 error,
                 release_sequence,
             },
         });
+    }
+
+    fn rebuild_pending_after_neutral(&mut self) {
+        let mut desired = SwitchReport::NEUTRAL;
+        for pending in &mut self.pending_reports {
+            if let Some(action) = pending.mutation {
+                action.apply(&mut desired);
+                pending.report = desired;
+            }
+        }
+        self.desired_report = desired;
+        self.update_desired_snapshot();
     }
 
     fn dispatch_due_reports(&mut self) {
@@ -1196,26 +1368,45 @@ impl ControllerLane {
             }
 
             let bytes = pending.report.encode();
-            match self.write_payload(Some(pending.operation.id()), pending.kind, now, &bytes) {
+            match self.write_payload(Some(&pending.operation), pending.kind, now, &bytes) {
                 Ok(()) => {
                     self.clock.record_dispatch(pending.deadline_id, now);
                     self.last_dispatch_ns = Some(now);
-                    self.record_report_acceptance(
-                        now,
-                        pending.report,
-                        pending.operation.id(),
-                        bytes,
-                    );
+                    self.record_report_acceptance(now, pending.operation.id(), bytes);
+                    if matches!(&pending.completion, ReportCompletion::Sequence { .. }) {
+                        self.desired_report = pending.report;
+                        self.update_desired_snapshot();
+                    }
+                    if pending.kind == WriteKind::Report
+                        && pending.operation.snapshot().state == OperationState::Cancelling
+                    {
+                        self.cancel_after_accepted_report(pending);
+                        continue;
+                    }
                     match pending.completion {
                         ReportCompletion::Direct => {
-                            pending.operation.succeed(OperationValue::Unit);
+                            if pending.operation.succeed(OperationValue::Unit)
+                                == TransitionOutcome::Invalid
+                                && pending.operation.snapshot().state == OperationState::Cancelling
+                            {
+                                self.schedule_cancel_cleanup(pending.operation, false);
+                            }
                         }
                         ReportCompletion::Sequence {
                             final_report: false,
                         } => {}
                         ReportCompletion::Sequence { final_report: true } => {
-                            self.release_sequence(pending.operation.id());
-                            pending.operation.succeed(OperationValue::Unit);
+                            let operation_id = pending.operation.id();
+                            let outcome = pending
+                                .operation
+                                .succeed_after_cleanup(OperationValue::Unit, || {
+                                    self.release_sequence(operation_id)
+                                });
+                            if outcome == TransitionOutcome::Invalid
+                                && pending.operation.snapshot().state == OperationState::Cancelling
+                            {
+                                self.schedule_cancel_cleanup(pending.operation, true);
+                            }
                         }
                         ReportCompletion::Cancelled { release_sequence } => {
                             if release_sequence {
@@ -1227,10 +1418,22 @@ impl ControllerLane {
                             error,
                             release_sequence,
                         } => {
-                            if release_sequence {
-                                self.release_sequence(pending.operation.id());
+                            let operation_id = pending.operation.id();
+                            let outcome = if release_sequence {
+                                pending.operation.fail_after_cleanup(error, || {
+                                    self.release_sequence(operation_id);
+                                })
+                            } else {
+                                pending.operation.fail(error)
+                            };
+                            if outcome == TransitionOutcome::Invalid
+                                && pending.operation.snapshot().state == OperationState::Cancelling
+                            {
+                                if release_sequence {
+                                    self.release_sequence(operation_id);
+                                }
+                                pending.operation.finish_cancelled();
                             }
-                            pending.operation.fail(error);
                         }
                     }
                 }
@@ -1241,6 +1444,14 @@ impl ControllerLane {
         }
     }
 
+    fn cancel_after_accepted_report(&mut self, pending: ScheduledReport) {
+        let operation_id = pending.operation.id();
+        let release_sequence = self.lease_owner == Some(LeaseOwner::Sequence(operation_id));
+        self.pending_reports
+            .retain(|queued| queued.operation.id() != operation_id);
+        self.schedule_cancel_cleanup(pending.operation, release_sequence);
+    }
+
     fn handle_report_write_failure(&mut self, pending: ScheduledReport, error: TransportError) {
         let operation_id = pending.operation.id();
         let release_sequence = self.lease_owner == Some(LeaseOwner::Sequence(operation_id));
@@ -1249,6 +1460,14 @@ impl ControllerLane {
         self.desired_report.reset();
         self.update_desired_snapshot();
 
+        if error.kind() == TransportErrorKind::Cancelled
+            && pending.operation.snapshot().state != OperationState::Cancelling
+        {
+            pending
+                .operation
+                .request_cancel(easycon_runtime::CancellationReason::ParentClose);
+        }
+        let cancelling = pending.operation.snapshot().state == OperationState::Cancelling;
         if pending.kind == WriteKind::Neutralize || error.kind() == TransportErrorKind::Disconnected
         {
             if error.kind() == TransportErrorKind::Disconnected {
@@ -1267,15 +1486,28 @@ impl ControllerLane {
                     pending.operation.finish_cancelled();
                 }
                 ReportCompletion::Failed { error, .. } => {
-                    pending.operation.fail(error);
+                    if cancelling {
+                        pending.operation.finish_cancelled();
+                    } else {
+                        fail_or_finish_cancelled(&pending.operation, error);
+                    }
                 }
                 ReportCompletion::Direct | ReportCompletion::Sequence { .. } => {
-                    pending.operation.fail(map_transport_error(error));
+                    if cancelling {
+                        pending.operation.finish_cancelled();
+                    } else {
+                        fail_or_finish_cancelled(&pending.operation, map_transport_error(error));
+                    }
                 }
             }
             if self.state() == ControllerState::Disconnected {
                 self.fail_pending_disconnected();
             }
+            return;
+        }
+
+        if cancelling {
+            self.schedule_cancel_cleanup(pending.operation, release_sequence);
             return;
         }
 
@@ -1288,11 +1520,12 @@ impl ControllerLane {
 
     fn write_payload(
         &mut self,
-        operation_id: Option<OperationId>,
+        operation: Option<&Operation>,
         kind: WriteKind,
         timestamp_ns: u64,
         bytes: &[u8],
     ) -> Result<(), TransportError> {
+        let operation_id = operation.map(Operation::id);
         let sequence = self.next_write_sequence;
         self.next_write_sequence = self
             .next_write_sequence
@@ -1306,9 +1539,31 @@ impl ControllerLane {
             total_len: bytes.len(),
             kind,
         };
+        let cancellation = if matches!(kind, WriteKind::Report | WriteKind::Command) {
+            operation.map_or_else(easycon_runtime::CancellationToken::root, |operation| {
+                operation.cancellation_token()
+            })
+        } else {
+            easycon_runtime::CancellationToken::root()
+        };
+        let resource_cancellation = if kind == WriteKind::Neutralize {
+            easycon_runtime::CancellationToken::root()
+        } else {
+            self.resource_cancellation.clone()
+        };
+        let deadline_ns = self
+            .clock
+            .now_ns()
+            .saturating_add(self.options.write_timeout_ns);
         let mut written = 0;
         while written < bytes.len() {
-            let accepted = self.transport.write(context, &bytes[written..])?;
+            let accepted = self.transport.write(WriteRequest {
+                context,
+                bytes: &bytes[written..],
+                deadline_ns,
+                cancellation: cancellation.clone(),
+                resource_cancellation: resource_cancellation.clone(),
+            })?;
             if accepted == 0 || accepted > bytes.len() - written {
                 return Err(TransportError::new(
                     TransportErrorKind::Io,
@@ -1323,7 +1578,6 @@ impl ControllerLane {
     fn record_report_acceptance(
         &self,
         timestamp_ns: u64,
-        report: SwitchReport,
         operation_id: OperationId,
         bytes: [u8; 8],
     ) {
@@ -1331,7 +1585,6 @@ impl ControllerLane {
             .snapshot
             .lock()
             .expect("controller snapshot lock poisoned");
-        snapshot.desired_report = report;
         snapshot.accepted_report_count = snapshot
             .accepted_report_count
             .checked_add(1)
@@ -1360,20 +1613,26 @@ impl ControllerLane {
             if pending.operation.snapshot().state == OperationState::Cancelling {
                 pending.operation.finish_cancelled();
             } else {
-                pending.operation.fail(EasyConError::new(
-                    ErrorDomain::Io,
-                    ErrorCode::DeviceDisconnected,
-                    "controller disconnected before report acceptance",
-                ));
+                fail_or_finish_cancelled(
+                    &pending.operation,
+                    EasyConError::new(
+                        ErrorDomain::Io,
+                        ErrorCode::DeviceDisconnected,
+                        "controller disconnected before report acceptance",
+                    ),
+                );
             }
         }
         if let Some(waiting) = self.waiting_sequence.take() {
             self.release_sequence(waiting.operation.id());
-            waiting.operation.fail(EasyConError::new(
-                ErrorDomain::Io,
-                ErrorCode::DeviceDisconnected,
-                "controller disconnected before sequence dispatch",
-            ));
+            fail_or_finish_cancelled(
+                &waiting.operation,
+                EasyConError::new(
+                    ErrorDomain::Io,
+                    ErrorCode::DeviceDisconnected,
+                    "controller disconnected before sequence dispatch",
+                ),
+            );
         }
         self.transport.close();
     }
@@ -1392,6 +1651,25 @@ impl ControllerLane {
             .drain(..)
             .map(|pending| pending.operation)
             .collect();
+        let mut close_waiters = Vec::new();
+        let queued: Vec<_> = self
+            .deferred_commands
+            .drain(..)
+            .chain(self.receiver.try_iter())
+            .collect();
+        for command in queued {
+            match command {
+                LaneCommand::Connect { operation, .. }
+                | LaneCommand::Direct { operation, .. }
+                | LaneCommand::Sequence { operation, .. }
+                | LaneCommand::Ack { operation, .. } => operations.push(operation),
+                LaneCommand::AcquireAutomationLease { completed, .. } => {
+                    let _ = completed.send(Err(closed_lane_error()));
+                }
+                LaneCommand::Close { completed } => close_waiters.push(completed),
+                LaneCommand::ReleaseAutomationLease { .. } | LaneCommand::Wake => {}
+            }
+        }
         if let Some(waiting) = self.waiting_sequence.take() {
             operations.push(waiting.operation);
         }
@@ -1428,6 +1706,9 @@ impl ControllerLane {
         self.transport.close();
         self.set_state(ControllerState::Closed, "controller.closed", None);
         if let Some(completed) = completed {
+            let _ = completed.send(());
+        }
+        for completed in close_waiters {
             let _ = completed.send(());
         }
     }
@@ -1540,6 +1821,7 @@ impl ControllerLane {
 fn map_transport_error(error: TransportError) -> EasyConError {
     let (domain, code) = match error.kind() {
         TransportErrorKind::Timeout => (ErrorDomain::Controller, ErrorCode::ProtocolTimeout),
+        TransportErrorKind::WriteTimeout => (ErrorDomain::Io, ErrorCode::Transport),
         TransportErrorKind::Cancelled => (ErrorDomain::Runtime, ErrorCode::Cancelled),
         TransportErrorKind::Disconnected => (ErrorDomain::Io, ErrorCode::DeviceDisconnected),
         TransportErrorKind::Io => (ErrorDomain::Io, ErrorCode::Transport),
@@ -1549,7 +1831,28 @@ fn map_transport_error(error: TransportError) -> EasyConError {
 }
 
 fn fail_closed_lane(operation: &Operation) {
-    operation.fail(closed_lane_error());
+    fail_or_finish_cancelled(operation, closed_lane_error());
+}
+
+fn fail_or_finish_cancelled(operation: &Operation, error: EasyConError) {
+    if operation.fail(error) == TransitionOutcome::Invalid
+        && operation.snapshot().state == OperationState::Cancelling
+    {
+        operation.finish_cancelled();
+    }
+}
+
+fn start_or_finish_cancelled(operation: &Operation) -> bool {
+    match operation.start() {
+        TransitionOutcome::Applied => true,
+        TransitionOutcome::Invalid if operation.snapshot().state == OperationState::Cancelling => {
+            operation.finish_cancelled();
+            false
+        }
+        TransitionOutcome::Unchanged
+        | TransitionOutcome::AlreadyTerminal
+        | TransitionOutcome::Invalid => false,
+    }
 }
 
 fn closed_lane_error() -> EasyConError {

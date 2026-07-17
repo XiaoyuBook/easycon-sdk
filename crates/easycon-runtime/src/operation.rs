@@ -179,9 +179,37 @@ impl Operation {
         self.inner.finish_success(result)
     }
 
+    /// Runs non-blocking owner cleanup under the transition lock, then commits success once.
+    ///
+    /// The cleanup must not call back into this operation.
+    pub fn succeed_after_cleanup(
+        &self,
+        result: OperationValue,
+        cleanup: impl FnOnce(),
+    ) -> TransitionOutcome {
+        self.inner.finish_terminal_after_cleanup(
+            OperationState::Succeeded,
+            Some(result),
+            None,
+            cleanup,
+        )
+    }
+
     /// Commits failure once.
     pub fn fail(&self, error: EasyConError) -> TransitionOutcome {
         self.inner.finish_failure(error)
+    }
+
+    /// Runs non-blocking owner cleanup under the transition lock, then commits failure once.
+    ///
+    /// The cleanup must not call back into this operation.
+    pub fn fail_after_cleanup(
+        &self,
+        error: EasyConError,
+        cleanup: impl FnOnce(),
+    ) -> TransitionOutcome {
+        self.inner
+            .finish_terminal_after_cleanup(OperationState::Failed, None, Some(error), cleanup)
     }
 
     /// Commits `Cancelled` after owner-specific cleanup completes.
@@ -279,6 +307,16 @@ impl OperationInner {
         result: Option<OperationValue>,
         error: Option<EasyConError>,
     ) -> TransitionOutcome {
+        self.finish_terminal_after_cleanup(terminal, result, error, || {})
+    }
+
+    fn finish_terminal_after_cleanup(
+        &self,
+        terminal: OperationState,
+        result: Option<OperationValue>,
+        error: Option<EasyConError>,
+        cleanup: impl FnOnce(),
+    ) -> TransitionOutcome {
         let mut data = self.state.lock().expect("operation state lock poisoned");
         match data.state {
             OperationState::Pending if terminal == OperationState::Failed => {}
@@ -286,6 +324,7 @@ impl OperationInner {
             state if state.is_terminal() => return TransitionOutcome::AlreadyTerminal,
             _ => return TransitionOutcome::Invalid,
         }
+        cleanup();
         data.state = terminal;
         data.result = result;
         data.error = error;

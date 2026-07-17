@@ -82,11 +82,27 @@ pub struct WriteContext {
     pub kind: WriteKind,
 }
 
+/// One bounded, cancellable partial-write attempt.
+pub struct WriteRequest<'a> {
+    /// Stable context shared by every partial call for the logical payload.
+    pub context: WriteContext,
+    /// Remaining bytes; a successful call accepts a non-zero prefix.
+    pub bytes: &'a [u8],
+    /// Absolute I/O deadline on the Runtime clock.
+    pub deadline_ns: u64,
+    /// Operation cancellation for normal report or command work.
+    pub cancellation: CancellationToken,
+    /// Controller resource cancellation used by deterministic close.
+    pub resource_cancellation: CancellationToken,
+}
+
 /// Stable fake/system transport failure category.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransportErrorKind {
     /// One bounded handshake or ACK exchange timed out.
     Timeout,
+    /// A bounded transport write failed to make progress before its I/O deadline.
+    WriteTimeout,
     /// Cancellation interrupted a blocking exchange.
     Cancelled,
     /// The device or port disconnected.
@@ -140,8 +156,8 @@ pub trait ControllerTransport: Send + 'static {
     /// Opens at one baud and completes the source-exact hello exchange by `deadline_ns`.
     fn handshake(&mut self, request: HandshakeRequest) -> Result<(), TransportError>;
 
-    /// Accepts some non-zero prefix of `bytes`, allowing deterministic partial-I/O tests.
-    fn write(&mut self, context: WriteContext, bytes: &[u8]) -> Result<usize, TransportError>;
+    /// Accepts a non-zero prefix and must wake for cancellation or the supplied deadline.
+    fn write(&mut self, request: WriteRequest<'_>) -> Result<usize, TransportError>;
 
     /// Waits for one generation-tagged ACK frame or a bounded/cancelled outcome.
     fn wait_for_ack(&mut self, request: AckRequest) -> Result<AckFrame, TransportError>;
