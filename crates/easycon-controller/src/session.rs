@@ -893,6 +893,15 @@ impl ControllerLane {
                 Err(error) => {
                     last_error = error;
                     self.transport.close();
+                    if self.cancel_or_deadline(&operation, options.operation_deadline_ns) {
+                        self.set_state(
+                            ControllerState::Disconnected,
+                            "controller.disconnected",
+                            None,
+                        );
+                        operation.finish_cancelled();
+                        return;
+                    }
                 }
             }
         }

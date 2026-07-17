@@ -8,8 +8,9 @@ use easycon_controller::{
 };
 use easycon_model::{Button, ErrorCode, Hat, StickPosition};
 use easycon_runtime::{
-    Clock, OperationState, Runtime, RuntimeCounts, SubscriptionOptions, SubscriptionRead,
-    TransitionOutcome, VirtualClock, WaitResult, WaitTimeout,
+    Clock, ClockChangeRegistration, DeadlineId, OperationState, Runtime, RuntimeCounts,
+    SubscriptionOptions, SubscriptionRead, TransitionOutcome, VirtualClock, WaitResult,
+    WaitTimeout,
 };
 use easycon_test_support::{FakeControllerTransport, HandshakeOutcome};
 
@@ -28,6 +29,40 @@ fn wait_for_report_acceptance(controller: &ControllerSession, count: u64) {
             "controller acceptance timed out"
         );
         std::thread::yield_now();
+    }
+}
+
+// Keeps the Runtime worker quiescent so the test exercises the lane's own deadline check.
+struct ControllerDeadlineClock {
+    inner: Arc<VirtualClock>,
+}
+
+impl Clock for ControllerDeadlineClock {
+    fn now_ns(&self) -> u64 {
+        if std::thread::current()
+            .name()
+            .is_some_and(|name| name.starts_with("easycon-deadline-"))
+        {
+            0
+        } else {
+            self.inner.now_ns()
+        }
+    }
+
+    fn on_change(&self, hook: Arc<dyn Fn() + Send + Sync>) -> ClockChangeRegistration {
+        ClockChangeRegistration::new(hook)
+    }
+
+    fn register_deadline(&self, target_ns: u64) -> DeadlineId {
+        self.inner.register_deadline(target_ns)
+    }
+
+    fn record_dispatch(&self, id: DeadlineId, actual_ns: u64) {
+        self.inner.record_dispatch(id, actual_ns);
+    }
+
+    fn real_wait_duration(&self, _target_ns: u64) -> Option<Duration> {
+        None
     }
 }
 
@@ -330,6 +365,41 @@ fn operation_deadline_cancels_connect_before_second_baud_attempt() {
         ErrorCode::DeadlineExceeded
     );
     assert_eq!(fake.handshake_attempts().len(), 1);
+    controller.close();
+    runtime.close();
+}
+
+#[test]
+fn operation_deadline_on_final_baud_is_not_a_protocol_timeout() {
+    let virtual_clock = Arc::new(VirtualClock::default());
+    let clock = Arc::new(ControllerDeadlineClock {
+        inner: virtual_clock.clone(),
+    });
+    let runtime = Runtime::new(clock);
+    let fake = FakeControllerTransport::new(virtual_clock);
+    fake.push_handshake(115_200, HandshakeOutcome::Timeout { elapsed_ns: 40 });
+    fake.push_handshake(9_600, HandshakeOutcome::Timeout { elapsed_ns: 100 });
+    let controller = ControllerSession::new(
+        runtime.clone(),
+        Box::new(fake.clone()),
+        ControllerOptions::default(),
+    )
+    .expect("controller");
+
+    let connect = controller
+        .connect(ConnectOptions {
+            operation_deadline_ns: Some(50),
+            protocol_timeout_ns: 1_000,
+        })
+        .expect("connect");
+    wait_terminal(&connect);
+
+    assert_eq!(connect.snapshot().state, OperationState::Cancelled);
+    assert_eq!(
+        connect.snapshot().error.expect("deadline").code(),
+        ErrorCode::DeadlineExceeded
+    );
+    assert_eq!(fake.handshake_attempts().len(), 2);
     controller.close();
     runtime.close();
 }
