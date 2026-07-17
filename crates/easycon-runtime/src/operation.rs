@@ -344,10 +344,10 @@ impl OperationInner {
 
     fn terminal_committed(&self) {
         self.cancellation.deactivate();
-        self.changed.notify_all();
         if let Some(runtime) = self.runtime.upgrade() {
             runtime.unregister_operation(self.id);
         }
+        self.changed.notify_all();
     }
 
     fn snapshot(&self) -> OperationSnapshot {

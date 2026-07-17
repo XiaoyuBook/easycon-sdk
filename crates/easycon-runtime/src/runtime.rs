@@ -841,6 +841,27 @@ mod tests {
     }
 
     #[test]
+    fn terminal_wait_observes_the_operation_already_unregistered() {
+        let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+        let operation = runtime.create_operation(None).expect("operation");
+        operation.start();
+        let observed_runtime = runtime.clone();
+        let observed_operation = operation.clone();
+        let waiter = std::thread::spawn(move || {
+            assert!(matches!(
+                observed_operation.wait(WaitTimeout::Infinite),
+                WaitResult::Completed(_)
+            ));
+            observed_runtime.counts().active_operations
+        });
+
+        operation.succeed(OperationValue::Unit);
+
+        assert_eq!(waiter.join().expect("operation waiter"), 0);
+        runtime.close();
+    }
+
+    #[test]
     fn wait_timeout_does_not_cancel_operation() {
         let runtime = Runtime::new(Arc::new(VirtualClock::default()));
         let operation = runtime.create_operation(None).expect("operation");
