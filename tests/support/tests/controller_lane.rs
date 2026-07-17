@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::sync::Barrier;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use easycon_controller::{
     ConnectOptions, ControllerAction, ControllerOptions, ControllerSession, ControllerState,
@@ -18,6 +18,17 @@ fn wait_terminal(operation: &easycon_runtime::Operation) {
         operation.wait(WaitTimeout::For(Duration::from_secs(2))),
         WaitResult::Completed(_)
     ));
+}
+
+fn wait_for_report_acceptance(controller: &ControllerSession, count: u64) {
+    let started = Instant::now();
+    while controller.snapshot().accepted_report_count < count {
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "controller acceptance timed out"
+        );
+        std::thread::yield_now();
+    }
 }
 
 #[test]
@@ -174,7 +185,7 @@ fn report_spacing_and_snapshot_use_transport_acceptance_time() {
     assert_eq!(second.wait(WaitTimeout::Poll), WaitResult::Timeout);
     assert_eq!(fake.accepted_writes().len(), 1);
     clock.advance_to(50_000_000);
-    assert!(fake.wait_for_accepted_count(2, Duration::from_secs(2)));
+    wait_for_report_acceptance(&controller, 2);
     wait_terminal(&second);
     assert_eq!(
         fake.accepted_writes()[1].bytes,
@@ -224,7 +235,7 @@ fn hat_sticks_and_reset_all_flow_through_the_report_lane() {
         if index != 0 {
             clock.advance_by(Duration::from_millis(30));
         }
-        assert!(fake.wait_for_accepted_count(index + 1, Duration::from_secs(2)));
+        wait_for_report_acceptance(&controller, u64::try_from(index + 1).expect("report count"));
         wait_terminal(&operation);
         assert_eq!(operation.snapshot().state, OperationState::Succeeded);
     }
@@ -420,7 +431,7 @@ fn concurrent_callers_still_use_one_writer_thread() {
         .collect();
     for accepted in 1..=4 {
         clock.advance_by(Duration::from_millis(30));
-        assert!(fake.wait_for_accepted_count(accepted, Duration::from_secs(2)));
+        wait_for_report_acceptance(&controller, accepted);
     }
     for operation in &operations {
         wait_terminal(operation);

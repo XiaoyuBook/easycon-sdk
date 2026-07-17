@@ -73,6 +73,10 @@ fn wait_until(mut predicate: impl FnMut() -> bool) {
     }
 }
 
+fn wait_for_report_acceptance(controller: &ControllerSession, count: u64) {
+    wait_until(|| controller.snapshot().accepted_report_count >= count);
+}
+
 fn load_sequence_trace(id: &str) -> SequenceTrace {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -217,11 +221,11 @@ fn precise_sequence_matches_absolute_offset_fixture_without_drift() {
         .precise_sequence(sequence)
         .expect("sequence submit");
 
-    assert!(fake.wait_for_accepted_count(1, Duration::from_secs(2)));
+    wait_for_report_acceptance(&controller, 1);
     assert_eq!(operation.wait(WaitTimeout::Poll), WaitResult::Timeout);
     for (index, report) in trace.expected_reports.iter().enumerate().skip(1) {
         clock.advance_to(report.timestamp_ns);
-        assert!(fake.wait_for_accepted_count(index + 1, Duration::from_secs(2)));
+        wait_for_report_acceptance(&controller, u64::try_from(index + 1).expect("report count"));
     }
     wait_terminal(&operation);
 
@@ -271,7 +275,7 @@ fn sequence_cancel_neutralizes_and_releases_before_terminal() {
     let operation = controller
         .precise_sequence(sequence)
         .expect("sequence submit");
-    assert!(fake.wait_for_accepted_count(1, Duration::from_secs(2)));
+    wait_for_report_acceptance(&controller, 1);
 
     let busy = controller
         .direct(ControllerAction::ButtonDown(Button::X))
@@ -299,7 +303,7 @@ fn sequence_cancel_neutralizes_and_releases_before_terminal() {
             .expect("neutral report")
             .timestamp_ns,
     );
-    assert!(fake.wait_for_accepted_count(2, Duration::from_secs(2)));
+    wait_for_report_acceptance(&controller, 2);
     wait_terminal(&operation);
     assert_eq!(operation.snapshot().state, OperationState::Cancelled);
     assert_eq!(
@@ -357,11 +361,11 @@ fn minimum_interval_delays_steps_without_dropping_transitions() {
     let operation = controller
         .precise_sequence(sequence)
         .expect("sequence submit");
-    assert!(fake.wait_for_accepted_count(1, Duration::from_secs(2)));
+    wait_for_report_acceptance(&controller, 1);
     clock.advance_to(30_000_000);
-    assert!(fake.wait_for_accepted_count(2, Duration::from_secs(2)));
+    wait_for_report_acceptance(&controller, 2);
     clock.advance_to(60_000_000);
-    assert!(fake.wait_for_accepted_count(3, Duration::from_secs(2)));
+    wait_for_report_acceptance(&controller, 3);
     wait_terminal(&operation);
 
     assert_eq!(
@@ -800,7 +804,7 @@ fn ack_disconnect_resets_desired_state_before_explicit_reconnect() {
         .direct(ControllerAction::ButtonDown(Button::B))
         .expect("post-reconnect report");
     clock.advance_to(30_000_000);
-    assert!(fake.wait_for_accepted_count(3, Duration::from_secs(2)));
+    wait_for_report_acceptance(&controller, 2);
     wait_terminal(&next);
     let reports: Vec<_> = fake
         .accepted_writes()
@@ -971,7 +975,7 @@ fn sequence_disconnect_releases_lease_and_exposes_neutral_warning() {
     let operation = controller
         .precise_sequence(sequence)
         .expect("sequence submit");
-    assert!(fake.wait_for_accepted_count(1, Duration::from_secs(2)));
+    wait_for_report_acceptance(&controller, 1);
     fake.disconnect();
     clock.advance_to(30_000_000);
     wait_terminal(&operation);

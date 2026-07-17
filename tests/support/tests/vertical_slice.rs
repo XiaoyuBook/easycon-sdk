@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use easycon_controller::{
     ConnectOptions, ControllerAction, ControllerLeaseState, ControllerOptions, ControllerSession,
@@ -17,6 +17,17 @@ fn wait_terminal(operation: &Operation) {
         operation.wait(WaitTimeout::For(Duration::from_secs(2))),
         WaitResult::Completed(_)
     ));
+}
+
+fn wait_for_report_acceptance(controller: &ControllerSession, count: u64) {
+    let started = Instant::now();
+    while controller.snapshot().accepted_report_count < count {
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "controller acceptance timed out"
+        );
+        std::thread::yield_now();
+    }
 }
 
 #[test]
@@ -63,9 +74,9 @@ fn runtime_controller_fake_vertical_slice_has_exact_trace_and_clean_shutdown() {
     let sequence_operation = controller
         .precise_sequence(sequence)
         .expect("sequence submit");
-    assert!(fake.wait_for_accepted_count(2, Duration::from_secs(2)));
+    wait_for_report_acceptance(&controller, 2);
     clock.advance_to(70_000_000);
-    assert!(fake.wait_for_accepted_count(3, Duration::from_secs(2)));
+    wait_for_report_acceptance(&controller, 3);
 
     clock.advance_to(80_000_000);
     sequence_operation.cancel();
@@ -78,7 +89,7 @@ fn runtime_controller_fake_vertical_slice_has_exact_trace_and_clean_shutdown() {
         ControllerLeaseState::Sequence(id) if id == sequence_operation.id()
     ));
     clock.advance_to(100_000_000);
-    assert!(fake.wait_for_accepted_count(4, Duration::from_secs(2)));
+    wait_for_report_acceptance(&controller, 4);
     wait_terminal(&sequence_operation);
     assert_eq!(
         sequence_operation.snapshot().state,
