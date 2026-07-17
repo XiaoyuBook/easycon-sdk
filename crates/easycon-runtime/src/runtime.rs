@@ -64,6 +64,7 @@ pub(crate) struct RuntimeInner {
     resources: Mutex<HashMap<ResourceId, Weak<dyn ManagedResource>>>,
     tasks: Mutex<HashSet<TaskId>>,
     tasks_changed: Condvar,
+    deadline_task_id: TaskId,
     subscriptions: Mutex<Vec<Weak<SubscriptionInner>>>,
     events_closed: AtomicBool,
     deadline_sender: Sender<DeadlineSignal>,
@@ -158,18 +159,26 @@ impl Runtime {
         assert!(runtime_number != 0, "Runtime ID space exhausted");
         let (deadline_sender, deadline_receiver) = mpsc::channel();
         let runtime_id = RuntimeId::new(runtime_number);
+        let next_id = AtomicU64::new(1);
+        let deadline_task_number = next_id.fetch_add(1, Ordering::Relaxed);
+        assert!(
+            deadline_task_number != 0,
+            "Runtime-local ID space exhausted"
+        );
+        let task_id = TaskId::new(deadline_task_number);
         let inner = Arc::new(RuntimeInner {
             id: runtime_id,
             state: Mutex::new(RuntimeState::Active),
             state_changed: Condvar::new(),
             root_cancellation: CancellationToken::root_for_runtime(runtime_id),
             clock,
-            next_id: AtomicU64::new(1),
+            next_id,
             next_sequence: AtomicU64::new(1),
             operations: Mutex::new(HashMap::new()),
             resources: Mutex::new(HashMap::new()),
-            tasks: Mutex::new(HashSet::new()),
+            tasks: Mutex::new(HashSet::from([task_id])),
             tasks_changed: Condvar::new(),
+            deadline_task_id: task_id,
             subscriptions: Mutex::new(Vec::new()),
             events_closed: AtomicBool::new(false),
             deadline_sender: deadline_sender.clone(),
@@ -177,12 +186,6 @@ impl Runtime {
             clock_hook: Mutex::new(None),
         });
 
-        let task_id = TaskId::new(inner.allocate_id());
-        inner
-            .tasks
-            .lock()
-            .expect("task registry lock poisoned")
-            .insert(task_id);
         let deadline_task = TaskRegistration {
             runtime: Arc::downgrade(&inner),
             id: task_id,
@@ -522,6 +525,8 @@ impl Runtime {
         }
         drop(resources);
 
+        self.inner.wait_for_external_tasks();
+
         for operation in &operations {
             if !operation.snapshot().state.is_terminal() {
                 let _ = operation.finish_cancelled();
@@ -695,6 +700,16 @@ impl RuntimeInner {
     fn wait_for_tasks(&self) {
         let mut tasks = self.tasks.lock().expect("task registry lock poisoned");
         while !tasks.is_empty() {
+            tasks = self
+                .tasks_changed
+                .wait(tasks)
+                .expect("task registry lock poisoned while closing");
+        }
+    }
+
+    fn wait_for_external_tasks(&self) {
+        let mut tasks = self.tasks.lock().expect("task registry lock poisoned");
+        while tasks.iter().any(|id| *id != self.deadline_task_id) {
             tasks = self
                 .tasks_changed
                 .wait(tasks)
@@ -1450,6 +1465,8 @@ mod tests {
     fn close_waits_for_a_supervised_task_to_finish_cleanup() {
         let runtime = Runtime::new(Arc::new(VirtualClock::default()));
         let cancellation = runtime.child_cancellation_token();
+        let operation = runtime.create_operation(None).expect("operation");
+        operation.start();
         let task = runtime.register_task().expect("task");
         let (wake, woken) = mpsc::channel();
         cancellation.on_cancel(move || {
@@ -1457,10 +1474,12 @@ mod tests {
         });
         let (cleanup_started, observed_cleanup) = mpsc::channel();
         let (release_cleanup, released) = mpsc::channel();
+        let cleanup_operation = operation.clone();
         let worker = std::thread::spawn(move || {
             woken.recv().expect("root cancellation");
             cleanup_started.send(()).expect("cleanup observer");
             released.recv().expect("cleanup release");
+            cleanup_operation.finish_cancelled();
             drop(task);
         });
         let (closed, observed_close) = mpsc::channel();
@@ -1477,6 +1496,11 @@ mod tests {
             observed_close.try_recv(),
             Err(mpsc::TryRecvError::Empty)
         ));
+        assert_eq!(operation.snapshot().state, OperationState::Cancelling);
+        assert_eq!(
+            operation.wait(WaitTimeout::For(Duration::from_millis(50))),
+            WaitResult::Timeout
+        );
         release_cleanup.send(()).expect("release task cleanup");
         observed_close
             .recv_timeout(Duration::from_secs(2))
@@ -1486,6 +1510,7 @@ mod tests {
 
         assert_eq!(runtime.state(), RuntimeState::Closed);
         assert_eq!(runtime.counts().active_tasks, 0);
+        assert_eq!(operation.snapshot().state, OperationState::Cancelled);
     }
 
     #[test]

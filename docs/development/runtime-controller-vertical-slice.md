@@ -38,7 +38,9 @@
 - ACK command 在同一 FIFO lane 中等待前序 direct report，只有独占 sequence/Automation lease 才
   返回 `RESOURCE_BUSY`；ACK 路径发现断线时重置 desired report、记录中立化 warning 并关闭 transport。
 - Runtime close 先取消根树，再关闭/中立化并 join Controller，最后发布 `runtime.closed`；关闭后
-  operation/resource/task 计数全部为零，`runtime.closed` 之后的事件发布会被拒绝。
+  会等待普通受监管 task 完成取消清理，再兜底终结遗留 operation 和发布 `runtime.closed`；内部
+  deadline worker 随后 join。关闭后 operation/resource/task 计数全部为零，`runtime.closed`
+  之后的事件发布会被拒绝。
 
 ## 本地验证
 
