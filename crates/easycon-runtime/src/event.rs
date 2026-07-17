@@ -190,9 +190,14 @@ pub(crate) struct SubscriptionInner {
 
 #[derive(Default)]
 struct QueueState {
-    events: VecDeque<Event>,
-    pending_gap: Option<PendingGap>,
+    entries: VecDeque<QueueEntry>,
+    event_count: usize,
     closed: bool,
+}
+
+enum QueueEntry {
+    Event(Event),
+    Gap(PendingGap),
 }
 
 #[derive(Clone, Copy)]
@@ -227,8 +232,7 @@ impl EventSubscription {
             .state
             .lock()
             .expect("subscription queue lock poisoned")
-            .events
-            .len()
+            .event_count
     }
 }
 
@@ -245,30 +249,34 @@ impl SubscriptionInner {
             return;
         }
 
-        if state.events.len() >= self.options.capacity {
+        if state.event_count >= self.options.capacity {
             let ordinary = state
-                .events
+                .entries
                 .iter()
-                .position(|queued| queued.class == EventClass::Ordinary);
+                .position(|queued| {
+                    matches!(queued, QueueEntry::Event(event) if event.class == EventClass::Ordinary)
+                });
             match (event.class, ordinary) {
                 (_, Some(index)) => {
-                    let dropped = state
-                        .events
-                        .remove(index)
-                        .expect("event index came from the same queue");
-                    record_gap(&mut state, &dropped);
-                    state.events.push_back(event);
+                    drop_event_at(&mut state, index);
+                    push_event(&mut state, event);
                 }
                 (EventClass::Critical, None) => {
-                    if let Some(dropped) = state.events.pop_front() {
-                        record_gap(&mut state, &dropped);
-                    }
-                    state.events.push_back(event);
+                    let index = state
+                        .entries
+                        .iter()
+                        .position(|entry| matches!(entry, QueueEntry::Event(_)))
+                        .expect("a full queue contains a concrete event");
+                    drop_event_at(&mut state, index);
+                    push_event(&mut state, event);
                 }
-                (EventClass::Ordinary, None) => record_gap(&mut state, &event),
+                (EventClass::Ordinary, None) => {
+                    let index = state.entries.len();
+                    record_gap_at(&mut state, index, &event);
+                }
             }
         } else {
-            state.events.push_back(event);
+            push_event(&mut state, event);
         }
         drop(state);
         self.changed.notify_one();
@@ -278,25 +286,14 @@ impl SubscriptionInner {
         let started = Instant::now();
         let mut state = self.state.lock().expect("subscription queue lock poisoned");
         loop {
-            if let Some(gap) = state.pending_gap.take() {
-                return SubscriptionRead::Event(Event {
-                    sequence: gap.last,
-                    timestamp_ns: gap.timestamp_ns,
-                    class: EventClass::Critical,
-                    kind: EventKind::Gap(EventGap {
-                        first_sequence: gap.first,
-                        last_sequence: gap.last,
-                        dropped_count: gap.count,
-                    }),
-                    code: "runtime.event_gap",
-                    severity: Severity::Warning,
-                    operation_id: None,
-                    resource_id: None,
-                    detail: None,
-                });
-            }
-            if let Some(event) = state.events.pop_front() {
-                return SubscriptionRead::Event(event);
+            if let Some(entry) = state.entries.pop_front() {
+                return match entry {
+                    QueueEntry::Event(event) => {
+                        state.event_count -= 1;
+                        SubscriptionRead::Event(event)
+                    }
+                    QueueEntry::Gap(gap) => SubscriptionRead::Event(gap.into_event()),
+                };
             }
             if state.closed {
                 return SubscriptionRead::Closed;
@@ -319,10 +316,7 @@ impl SubscriptionInner {
                         .wait_timeout(state, remaining)
                         .expect("subscription queue lock poisoned while waiting");
                     state = next;
-                    if timed_out.timed_out()
-                        && state.pending_gap.is_none()
-                        && state.events.is_empty()
-                    {
+                    if timed_out.timed_out() && state.entries.is_empty() {
                         return SubscriptionRead::Timeout;
                     }
                 }
@@ -339,18 +333,77 @@ impl SubscriptionInner {
     }
 }
 
-fn record_gap(state: &mut QueueState, dropped: &Event) {
-    if let Some(gap) = &mut state.pending_gap {
-        gap.first = gap.first.min(dropped.sequence);
-        gap.last = gap.last.max(dropped.sequence);
-        gap.count = gap.count.saturating_add(1);
-        gap.timestamp_ns = gap.timestamp_ns.max(dropped.timestamp_ns);
-    } else {
-        state.pending_gap = Some(PendingGap {
+impl PendingGap {
+    fn from_event(dropped: &Event) -> Self {
+        Self {
             first: dropped.sequence,
             last: dropped.sequence,
             count: 1,
             timestamp_ns: dropped.timestamp_ns,
-        });
+        }
     }
+
+    fn merge(&mut self, other: Self) {
+        self.first = self.first.min(other.first);
+        self.last = self.last.max(other.last);
+        self.count = self.count.saturating_add(other.count);
+        self.timestamp_ns = self.timestamp_ns.max(other.timestamp_ns);
+    }
+
+    fn into_event(self) -> Event {
+        Event {
+            sequence: self.last,
+            timestamp_ns: self.timestamp_ns,
+            class: EventClass::Critical,
+            kind: EventKind::Gap(EventGap {
+                first_sequence: self.first,
+                last_sequence: self.last,
+                dropped_count: self.count,
+            }),
+            code: "runtime.event_gap",
+            severity: Severity::Warning,
+            operation_id: None,
+            resource_id: None,
+            detail: None,
+        }
+    }
+}
+
+fn push_event(state: &mut QueueState, event: Event) {
+    state.entries.push_back(QueueEntry::Event(event));
+    state.event_count += 1;
+}
+
+fn drop_event_at(state: &mut QueueState, index: usize) {
+    let QueueEntry::Event(dropped) = state
+        .entries
+        .remove(index)
+        .expect("event index came from the same queue")
+    else {
+        unreachable!("only concrete event indices are selected");
+    };
+    state.event_count -= 1;
+    record_gap_at(state, index, &dropped);
+}
+
+fn record_gap_at(state: &mut QueueState, mut index: usize, dropped: &Event) {
+    let mut gap = PendingGap::from_event(dropped);
+    if index > 0 && matches!(state.entries.get(index - 1), Some(QueueEntry::Gap(_))) {
+        let QueueEntry::Gap(previous) = state
+            .entries
+            .remove(index - 1)
+            .expect("previous gap exists")
+        else {
+            unreachable!("entry was checked as a gap");
+        };
+        gap.merge(previous);
+        index -= 1;
+    }
+    if matches!(state.entries.get(index), Some(QueueEntry::Gap(_))) {
+        let QueueEntry::Gap(next) = state.entries.remove(index).expect("next gap exists") else {
+            unreachable!("entry was checked as a gap");
+        };
+        gap.merge(next);
+    }
+    state.entries.insert(index, QueueEntry::Gap(gap));
 }

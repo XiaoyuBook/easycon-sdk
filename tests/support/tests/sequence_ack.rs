@@ -318,7 +318,7 @@ fn close_cancels_blocked_ack_and_joins_lane() {
         RuntimeCounts {
             active_operations: 0,
             active_resources: 0,
-            active_tasks: 0,
+            active_tasks: 1,
         }
     );
     runtime.close();

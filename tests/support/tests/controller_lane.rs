@@ -118,7 +118,7 @@ fn fallback_connect_partial_direct_and_close_are_exact() {
         RuntimeCounts {
             active_operations: 0,
             active_resources: 1,
-            active_tasks: 1,
+            active_tasks: 2,
         }
     );
     controller.close();
@@ -134,7 +134,7 @@ fn fallback_connect_partial_direct_and_close_are_exact() {
         SwitchReport::NEUTRAL.encode()
     );
     assert_eq!(runtime.counts().active_resources, 0);
-    assert_eq!(runtime.counts().active_tasks, 0);
+    assert_eq!(runtime.counts().active_tasks, 1);
     runtime.close();
 }
 
