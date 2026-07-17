@@ -236,6 +236,76 @@ fn handshake_protocol_timeout_is_failed_not_cancelled() {
 }
 
 #[test]
+fn operation_deadline_cancels_connect_before_second_baud_attempt() {
+    let clock = Arc::new(VirtualClock::default());
+    let runtime = Runtime::new(clock.clone());
+    let fake = FakeControllerTransport::new(clock);
+    fake.push_handshake(115_200, HandshakeOutcome::Timeout { elapsed_ns: 100 });
+    let controller = ControllerSession::new(
+        runtime.clone(),
+        Box::new(fake.clone()),
+        ControllerOptions::default(),
+    )
+    .expect("controller");
+
+    let connect = controller
+        .connect(ConnectOptions {
+            operation_deadline_ns: Some(50),
+            protocol_timeout_ns: 1_000,
+        })
+        .expect("connect");
+    wait_terminal(&connect);
+    assert_eq!(connect.snapshot().state, OperationState::Cancelled);
+    assert_eq!(
+        connect.snapshot().error.expect("deadline").code(),
+        ErrorCode::DeadlineExceeded
+    );
+    assert_eq!(fake.handshake_attempts().len(), 1);
+    controller.close();
+    runtime.close();
+}
+
+#[test]
+fn handshake_protocol_errors_use_bounded_fallback_then_fail() {
+    let clock = Arc::new(VirtualClock::default());
+    let runtime = Runtime::new(clock.clone());
+    let fake = FakeControllerTransport::new(clock);
+    fake.push_handshake(
+        115_200,
+        HandshakeOutcome::Error {
+            kind: easycon_controller::TransportErrorKind::Protocol,
+            message: "wrong hello".into(),
+        },
+    );
+    fake.push_handshake(
+        9_600,
+        HandshakeOutcome::Error {
+            kind: easycon_controller::TransportErrorKind::Protocol,
+            message: "wrong hello".into(),
+        },
+    );
+    let controller = ControllerSession::new(
+        runtime.clone(),
+        Box::new(fake.clone()),
+        ControllerOptions::default(),
+    )
+    .expect("controller");
+
+    let connect = controller
+        .connect(ConnectOptions::default())
+        .expect("connect");
+    wait_terminal(&connect);
+    assert_eq!(connect.snapshot().state, OperationState::Failed);
+    assert_eq!(
+        connect.snapshot().error.expect("protocol").code(),
+        ErrorCode::ProtocolError
+    );
+    assert_eq!(fake.handshake_attempts().len(), 2);
+    controller.close();
+    runtime.close();
+}
+
+#[test]
 fn direct_while_disconnected_fails_without_transport_write() {
     let clock = Arc::new(VirtualClock::default());
     let runtime = Runtime::new(clock.clone());

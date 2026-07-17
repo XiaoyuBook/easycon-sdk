@@ -4,11 +4,16 @@ EasyCon SDK 是基于 EasyCon 源码进行二次开发的多语言 SDK 项目，
 
 ## 当前状态
 
-仓库目前处于架构设计阶段，尚未发布稳定 API、ABI 或可用 SDK 实现。
+仓库已经冻结 SDK v1 架构，并完成首个可测试开发里程碑：Rust Runtime、Controller
+协议/单写者调度、FakeControllerTransport 和无硬件 vertical slice。当前仍未发布稳定公共
+API 或 ABI，也不包含物理串口 backend、Vision、ECS、语言绑定、固件或 UI。
 
 此前的实验性共享运行基线已经移除，不再作为本项目的产品架构或兼容性约束。共享核心、C ABI 和各语言绑定将在架构与行为规范固定后重新实现。
 
-完整架构已经固定在 [docs/README.md](docs/README.md)，包括源码能力映射、Rust/C++/C ABI 边界、生命周期与并发、四语言绑定、构建发布、测试和实施路线。当前提交只包含设计，不包含功能项目或业务实现。
+完整架构固定在 [docs/README.md](docs/README.md)，包括源码能力映射、Rust/C++/C ABI
+边界、生命周期与并发、四语言绑定、构建发布、测试和实施路线。首个里程碑的实现范围、
+行为边界和验证命令见
+[Runtime + Controller fake vertical slice](docs/development/runtime-controller-vertical-slice.md)。
 
 ## SDK v1 目标
 

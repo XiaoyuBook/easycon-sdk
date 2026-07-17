@@ -41,6 +41,14 @@
 | Vision | 采集、最新帧截图、`.IL` 图像标签、模板匹配、OCR、HSV 颜色检测 | UI 搜图控制台、未完成的 `.ILX` 契约、未接通的旧像素匹配算法 |
 | 产品外壳 | C++、.NET、Python、Node.js/TypeScript SDK | 浏览器、独立服务进程、UI、配置界面、远程助手 |
 
+## 当前实施状态
+
+架构冻结后的首个开发里程碑已经实现 Rust Runtime + Controller fake vertical slice。它覆盖
+operation、取消、事件溢出、确定性关闭、源码精确 report、单写者调度、精确序列、底层
+Automation lease 与 generation-aware ACK；不代表正式 C ABI、系统串口 backend 或物理硬件
+支持已经完成。实现说明和本地验收命令见
+[Runtime + Controller fake vertical slice](development/runtime-controller-vertical-slice.md)。
+
 ## 首发基线
 
 - **[已决定]** v1.0 GA 只承诺 Windows 10/11 x64，目标三元组为 `x86_64-pc-windows-msvc`。

@@ -22,3 +22,10 @@ Run the local validator with:
 ```powershell
 python tools/validate_specs.py
 ```
+
+Repository and documentation guards are separate so failures stay attributable:
+
+```powershell
+python tools/check_markdown_links.py
+python tools/check_repository_guards.py
+```
