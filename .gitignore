@@ -1,0 +1,55 @@
+# .NET
+**/bin/
+**/obj/
+.tools/
+artifacts/
+TestResults/
+*.binlog
+
+# Bundled EasyCon source snapshot
+/EasyCon/
+
+# IDEs
+.vs/
+.idea/
+.vscode/
+*.user
+*.suo
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+
+# Rust
+target/
+
+# Node.js and TypeScript
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+.turbo/
+
+# C++ and CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+cmake-build-*/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.local.json
