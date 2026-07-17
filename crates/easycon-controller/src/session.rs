@@ -1523,6 +1523,9 @@ impl ControllerLane {
             if release_sequence {
                 self.release_sequence(operation_id);
             }
+            if self.state() != ControllerState::Disconnected {
+                self.rebuild_pending_after_neutral();
+            }
             match pending.completion {
                 ReportCompletion::Cancelled { .. } => {
                     pending.operation.finish_cancelled();
@@ -1544,8 +1547,6 @@ impl ControllerLane {
             }
             if self.state() == ControllerState::Disconnected {
                 self.fail_pending_disconnected();
-            } else {
-                self.rebuild_pending_after_neutral();
             }
             return;
         }

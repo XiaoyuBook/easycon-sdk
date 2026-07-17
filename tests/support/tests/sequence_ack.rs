@@ -544,14 +544,14 @@ fn failed_cancel_neutral_keeps_later_desired_report_authoritative() {
     wait_until(|| controller.snapshot().desired_report.buttons() == Button::B.mask());
     clock.advance_to(30_000_000);
     wait_terminal(&cancelled);
-    wait_terminal(&later);
-
     assert_eq!(cancelled.snapshot().state, OperationState::Cancelled);
-    assert_eq!(later.snapshot().state, OperationState::Succeeded);
     assert_eq!(
         controller.snapshot().desired_report.buttons(),
         Button::B.mask()
     );
+
+    wait_terminal(&later);
+    assert_eq!(later.snapshot().state, OperationState::Succeeded);
     assert_eq!(fake.accepted_writes().len(), 2);
     assert_eq!(
         fake.accepted_writes()[1].bytes,
