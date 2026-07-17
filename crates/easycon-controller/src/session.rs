@@ -321,7 +321,7 @@ struct ControllerLane {
     desired_report: SwitchReport,
     pending_reports: VecDeque<ScheduledReport>,
     deferred_commands: VecDeque<LaneCommand>,
-    last_dispatch_ns: Option<u64>,
+    last_report_acceptance_ns: Option<u64>,
     next_write_sequence: u64,
     resource_cancellation: easycon_runtime::CancellationToken,
     lease_owner: Option<LeaseOwner>,
@@ -397,7 +397,7 @@ impl ControllerSession {
             desired_report: SwitchReport::NEUTRAL,
             pending_reports: VecDeque::new(),
             deferred_commands: VecDeque::new(),
-            last_dispatch_ns: None,
+            last_report_acceptance_ns: None,
             next_write_sequence: 1,
             resource_cancellation,
             lease_owner: None,
@@ -955,7 +955,7 @@ impl ControllerLane {
         action.apply(&mut self.desired_report);
         self.update_desired_snapshot();
         let now = self.clock.now_ns();
-        let target_ns = self.last_dispatch_ns.map_or(now, |last| {
+        let target_ns = self.last_report_acceptance_ns.map_or(now, |last| {
             last.saturating_add(self.options.minimum_report_interval_ns)
                 .max(now)
         });
@@ -1032,7 +1032,7 @@ impl ControllerLane {
             .chunk_by(|left, right| left.offset_ns == right.offset_ns);
         let group_count = groups.clone().count();
         let mut previous_due = self
-            .last_dispatch_ns
+            .last_report_acceptance_ns
             .map(|last| last.saturating_add(self.options.minimum_report_interval_ns));
         for (index, group) in groups.by_ref().enumerate() {
             for step in group {
@@ -1166,11 +1166,15 @@ impl ControllerLane {
                 }
                 Err(error) => {
                     if error.kind() == TransportErrorKind::Disconnected {
+                        self.desired_report.reset();
+                        self.update_desired_snapshot();
                         self.set_state(
                             ControllerState::Disconnected,
                             "controller.disconnected",
                             None,
                         );
+                        self.publish_neutralization_warning(Some(operation.id()), &error);
+                        self.fail_pending_disconnected();
                     }
                     fail_or_finish_cancelled(&operation, map_transport_error(error));
                     return;
@@ -1282,7 +1286,7 @@ impl ControllerLane {
     fn schedule_cancel_cleanup(&mut self, operation: Operation, release_sequence: bool) {
         self.rebuild_pending_after_neutral();
         let now = self.clock.now_ns();
-        let due_ns = self.last_dispatch_ns.map_or(now, |last| {
+        let due_ns = self.last_report_acceptance_ns.map_or(now, |last| {
             last.saturating_add(self.options.minimum_report_interval_ns)
                 .max(now)
         });
@@ -1307,7 +1311,7 @@ impl ControllerLane {
     ) {
         self.rebuild_pending_after_neutral();
         let now = self.clock.now_ns();
-        let due_ns = self.last_dispatch_ns.map_or(now, |last| {
+        let due_ns = self.last_report_acceptance_ns.map_or(now, |last| {
             last.saturating_add(self.options.minimum_report_interval_ns)
                 .max(now)
         });
@@ -1356,7 +1360,7 @@ impl ControllerLane {
                 self.observe_cancellation();
                 continue;
             }
-            let earliest = self.last_dispatch_ns.map_or(now, |last| {
+            let earliest = self.last_report_acceptance_ns.map_or(now, |last| {
                 last.saturating_add(self.options.minimum_report_interval_ns)
             });
             if earliest > now {
@@ -1370,9 +1374,14 @@ impl ControllerLane {
             let bytes = pending.report.encode();
             match self.write_payload(Some(&pending.operation), pending.kind, now, &bytes) {
                 Ok(()) => {
+                    let accepted_at_ns = self.clock.now_ns();
                     self.clock.record_dispatch(pending.deadline_id, now);
-                    self.last_dispatch_ns = Some(now);
-                    self.record_report_acceptance(now, pending.operation.id(), bytes);
+                    self.last_report_acceptance_ns = Some(accepted_at_ns);
+                    self.record_report_acceptance(
+                        accepted_at_ns,
+                        Some(pending.operation.id()),
+                        bytes,
+                    );
                     if matches!(&pending.completion, ReportCompletion::Sequence { .. }) {
                         self.desired_report = pending.report;
                         self.update_desired_snapshot();
@@ -1578,7 +1587,7 @@ impl ControllerLane {
     fn record_report_acceptance(
         &self,
         timestamp_ns: u64,
-        operation_id: OperationId,
+        operation_id: Option<OperationId>,
         bytes: [u8; 8],
     ) {
         let mut snapshot = self
@@ -1591,16 +1600,17 @@ impl ControllerLane {
             .expect("accepted report counter exhausted");
         snapshot.last_report_timestamp_ns = Some(timestamp_ns);
         drop(snapshot);
-        self.runtime.publish(
-            EventDraft::ordinary(
-                EventKind::Data,
-                "controller.report.transport_accepted",
-                Severity::Info,
-            )
-            .with_resource(self.resource_id)
-            .with_operation(operation_id)
-            .with_detail(format!("bytes={bytes:02x?}; hardware_execution=false")),
-        );
+        let mut event = EventDraft::ordinary(
+            EventKind::Data,
+            "controller.report.transport_accepted",
+            Severity::Info,
+        )
+        .with_resource(self.resource_id)
+        .with_detail(format!("bytes={bytes:02x?}; hardware_execution=false"));
+        if let Some(operation_id) = operation_id {
+            event = event.with_operation(operation_id);
+        }
+        self.runtime.publish(event);
     }
 
     fn fail_pending_disconnected(&mut self) {
@@ -1685,16 +1695,23 @@ impl ControllerLane {
         if was_connected {
             let bytes = SwitchReport::NEUTRAL.encode();
             let now = self.clock.now_ns();
-            if let Err(error) = self.write_payload(None, WriteKind::Neutralize, now, &bytes) {
-                self.runtime.publish(
-                    EventDraft::critical(
-                        EventKind::Warning,
-                        "controller.neutralization.not_delivered",
-                        Severity::Warning,
-                    )
-                    .with_resource(self.resource_id)
-                    .with_detail(error.to_string()),
-                );
+            match self.write_payload(None, WriteKind::Neutralize, now, &bytes) {
+                Ok(()) => {
+                    let accepted_at_ns = self.clock.now_ns();
+                    self.last_report_acceptance_ns = Some(accepted_at_ns);
+                    self.record_report_acceptance(accepted_at_ns, None, bytes);
+                }
+                Err(error) => {
+                    self.runtime.publish(
+                        EventDraft::critical(
+                            EventKind::Warning,
+                            "controller.neutralization.not_delivered",
+                            Severity::Warning,
+                        )
+                        .with_resource(self.resource_id)
+                        .with_detail(error.to_string()),
+                    );
+                }
             }
         }
         self.set_lease_owner(None);

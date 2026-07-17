@@ -94,6 +94,11 @@ fn runtime_controller_fake_vertical_slice_has_exact_trace_and_clean_shutdown() {
     assert_eq!(connect.snapshot().state, OperationState::Succeeded);
     assert_eq!(direct.snapshot().state, OperationState::Succeeded);
     assert_eq!(controller.snapshot().state, ControllerState::Closed);
+    assert_eq!(controller.snapshot().accepted_report_count, 5);
+    assert_eq!(
+        controller.snapshot().last_report_timestamp_ns,
+        Some(130_000_000)
+    );
     assert_eq!(
         runtime.counts(),
         RuntimeCounts {

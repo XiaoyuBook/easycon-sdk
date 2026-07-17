@@ -8,7 +8,7 @@ use easycon_controller::{
 };
 use easycon_model::{Button, ErrorCode, Hat, StickPosition};
 use easycon_runtime::{
-    OperationState, Runtime, RuntimeCounts, SubscriptionOptions, SubscriptionRead,
+    Clock, OperationState, Runtime, RuntimeCounts, SubscriptionOptions, SubscriptionRead,
     TransitionOutcome, VirtualClock, WaitResult, WaitTimeout,
 };
 use easycon_test_support::{FakeControllerTransport, HandshakeOutcome};
@@ -135,6 +135,64 @@ fn fallback_connect_partial_direct_and_close_are_exact() {
     );
     assert_eq!(runtime.counts().active_resources, 0);
     assert_eq!(runtime.counts().active_tasks, 1);
+    runtime.close();
+}
+
+#[test]
+fn report_spacing_and_snapshot_use_transport_acceptance_time() {
+    let clock = Arc::new(VirtualClock::default());
+    let runtime = Runtime::new(clock.clone());
+    let fake = FakeControllerTransport::new(clock.clone());
+    fake.push_handshake(115_200, HandshakeOutcome::Success { elapsed_ns: 0 });
+    let controller = ControllerSession::new(
+        runtime.clone(),
+        Box::new(fake.clone()),
+        ControllerOptions::default(),
+    )
+    .expect("controller");
+    let connect = controller
+        .connect(ConnectOptions::default())
+        .expect("connect");
+    wait_terminal(&connect);
+
+    fake.delay_next_write_by(20_000_000);
+    let first = controller
+        .direct(ControllerAction::ButtonDown(Button::A))
+        .expect("first report");
+    wait_terminal(&first);
+    assert_eq!(clock.now_ns(), 20_000_000);
+    assert_eq!(controller.snapshot().accepted_report_count, 1);
+    assert_eq!(
+        controller.snapshot().last_report_timestamp_ns,
+        Some(20_000_000)
+    );
+
+    let second = controller
+        .direct(ControllerAction::ButtonDown(Button::B))
+        .expect("second report");
+    clock.advance_to(49_999_999);
+    assert_eq!(second.wait(WaitTimeout::Poll), WaitResult::Timeout);
+    assert_eq!(fake.accepted_writes().len(), 1);
+    clock.advance_to(50_000_000);
+    assert!(fake.wait_for_accepted_count(2, Duration::from_secs(2)));
+    wait_terminal(&second);
+    assert_eq!(
+        fake.accepted_writes()[1].bytes,
+        SwitchReport::new(
+            Button::A.mask() | Button::B.mask(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        )
+        .encode()
+    );
+
+    controller.close();
+    assert_eq!(controller.snapshot().accepted_report_count, 3);
+    assert_eq!(
+        controller.snapshot().last_report_timestamp_ns,
+        Some(50_000_000)
+    );
     runtime.close();
 }
 

@@ -29,9 +29,10 @@
 - sequence 取消或可恢复失败时，先让 transport 接受 neutral report，再释放 lease 并提交终态。
   断线导致 neutral 无法送达时发布 warning，绝不声称硬件已经中立。
 - 普通 report operation 的 `Succeeded` 只表示完整字节被 transport 接受。事件 detail 明确记录
-  `hardware_execution=false`。
+  `hardware_execution=false`；acceptance timestamp 在完整 write 返回后采样，close neutral report 也计入
+  report acceptance 观测。
 - ACK command 在同一 FIFO lane 中等待前序 direct report，只有独占 sequence/Automation lease 才
-  返回 `RESOURCE_BUSY`。
+  返回 `RESOURCE_BUSY`；ACK 路径发现断线时重置 desired report、记录中立化 warning 并关闭 transport。
 - Runtime close 先取消根树，再关闭/中立化并 join Controller，最后发布 `runtime.closed`；关闭后
   operation/resource/task 计数全部为零。
 

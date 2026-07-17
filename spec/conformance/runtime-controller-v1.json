@@ -29,12 +29,14 @@
         "poll a running operation with zero wait timeout",
         "advance past an operation deadline without manually polling Runtime",
         "inject a handshake protocol timeout in a separate operation",
+        "block an ACK wait until its protocol deadline",
         "block a report write until its independent I/O deadline"
       ],
       "assertions": [
         "wait timeout leaves the operation Running",
         "deadline requests cancellation and finishes Cancelled after cleanup",
         "protocol timeout finishes Failed with controller error",
+        "a blocked ACK finishes Failed when its protocol deadline elapses",
         "write timeout finishes Failed with transport error"
       ]
     },
@@ -47,6 +49,7 @@
         "queue an ACK behind a report that is waiting for its minimum interval",
         "cancel after direct and final sequence bytes are accepted but before write returns",
         "close while a report write is blocked before acceptance",
+        "disconnect during an ACK and reconnect explicitly",
         "disconnect during a sequence",
         "close while an ACK read is blocked"
       ],
@@ -56,6 +59,7 @@
         "ACK waits for the earlier report instead of returning resource busy",
         "accepted-byte cancellation neutralizes and reaches Cancelled exactly once",
         "close interrupts blocked write and joins the lane",
+        "ACK disconnect resets desired state and closes transport before reconnect",
         "disconnect fails pending work and exposes neutralization warning",
         "transport close wakes the blocked read and the lane joins"
       ]

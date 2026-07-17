@@ -428,6 +428,7 @@ fn cancel_after_final_sequence_acceptance_still_neutralizes() {
     assert_eq!(fake.accepted_writes().len(), 1);
 
     operation.cancel();
+    wait_until(|| controller.snapshot().accepted_report_count == 1);
     clock.advance_to(30_000_000);
     wait_terminal(&operation);
 
@@ -452,6 +453,7 @@ fn cancel_after_direct_acceptance_still_reaches_cancelled() {
     assert!(fake.wait_until_write_blocked(Duration::from_secs(2)));
 
     operation.cancel();
+    wait_until(|| controller.snapshot().accepted_report_count == 1);
     clock.advance_to(30_000_000);
     wait_terminal(&operation);
 
@@ -731,6 +733,71 @@ fn ack_matcher_ignores_late_generation_and_rejects_wrong_reply() {
 }
 
 #[test]
+fn ack_disconnect_resets_desired_state_before_explicit_reconnect() {
+    let (clock, runtime, fake, controller) = connected();
+    let events = runtime
+        .subscribe(SubscriptionOptions::default())
+        .expect("events");
+    let down = controller
+        .direct(ControllerAction::ButtonDown(Button::A))
+        .expect("initial report");
+    wait_terminal(&down);
+
+    fake.push_ack(AckOutcome::Error {
+        kind: TransportErrorKind::Disconnected,
+        message: Arc::from("device disconnected during ACK"),
+    });
+    let command = controller
+        .command_with_ack(Arc::<[u8]>::from([0xA5, 0x91]), 0xff, 100)
+        .expect("ACK command");
+    wait_terminal(&command);
+
+    assert_eq!(command.snapshot().state, OperationState::Failed);
+    assert_eq!(
+        command.snapshot().error.expect("disconnect").code(),
+        ErrorCode::DeviceDisconnected
+    );
+    assert_eq!(controller.snapshot().state, ControllerState::Disconnected);
+    assert_eq!(controller.snapshot().desired_report, SwitchReport::NEUTRAL);
+    assert!(fake.is_closed());
+    assert!(drain_events(&events).iter().any(|event| {
+        event.code == "controller.neutralization.not_delivered"
+            && event.operation_id == Some(command.id())
+    }));
+
+    fake.push_handshake(115_200, HandshakeOutcome::Success { elapsed_ns: 0 });
+    let reconnect = controller
+        .connect(ConnectOptions::default())
+        .expect("explicit reconnect");
+    wait_terminal(&reconnect);
+    let next = controller
+        .direct(ControllerAction::ButtonDown(Button::B))
+        .expect("post-reconnect report");
+    clock.advance_to(30_000_000);
+    assert!(fake.wait_for_accepted_count(3, Duration::from_secs(2)));
+    wait_terminal(&next);
+    let reports: Vec<_> = fake
+        .accepted_writes()
+        .into_iter()
+        .filter(|write| write.context.kind == WriteKind::Report)
+        .collect();
+    assert_eq!(reports.len(), 2);
+    assert_eq!(
+        reports[1].bytes,
+        SwitchReport::new(
+            Button::B.mask(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        )
+        .encode()
+    );
+
+    controller.close();
+    runtime.close();
+}
+
+#[test]
 fn close_cancels_blocked_ack_and_joins_lane() {
     let (_clock, runtime, fake, controller) = connected();
     fake.push_ack(AckOutcome::BlockUntilCancelled);
@@ -751,6 +818,28 @@ fn close_cancels_blocked_ack_and_joins_lane() {
             active_tasks: 1,
         }
     );
+    runtime.close();
+}
+
+#[test]
+fn blocked_ack_obeys_its_protocol_deadline() {
+    let (clock, runtime, fake, controller) = connected();
+    fake.push_ack(AckOutcome::BlockUntilCancelled);
+    let operation = controller
+        .command_with_ack(Arc::<[u8]>::from([0xA5, 0x91]), 0xff, 100)
+        .expect("ACK command");
+    assert!(fake.wait_until_ack_blocked(Duration::from_secs(2)));
+
+    clock.advance_to(100);
+    wait_terminal(&operation);
+
+    assert_eq!(operation.snapshot().state, OperationState::Failed);
+    assert_eq!(
+        operation.snapshot().error.expect("timeout").code(),
+        ErrorCode::ProtocolTimeout
+    );
+    assert_eq!(controller.snapshot().state, ControllerState::Connected);
+    controller.close();
     runtime.close();
 }
 

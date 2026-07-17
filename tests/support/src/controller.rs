@@ -39,7 +39,7 @@ pub enum AckOutcome {
         kind: TransportErrorKind,
         message: Arc<str>,
     },
-    /// Blocks until operation/resource cancellation or transport close wakes it.
+    /// Blocks until its deadline, operation/resource cancellation, or transport close wakes it.
     BlockUntilCancelled,
 }
 
@@ -89,6 +89,7 @@ struct FakeState {
     maximum_write_chunk: usize,
     write_calls: usize,
     fail_write_call: Option<(usize, TransportError)>,
+    next_write_delay_ns: Option<u64>,
     write_block: Option<WriteBlockMode>,
     write_waiting: bool,
     write_release: bool,
@@ -130,6 +131,7 @@ impl FakeControllerTransport {
                 maximum_write_chunk: usize::MAX,
                 write_calls: 0,
                 fail_write_call: None,
+                next_write_delay_ns: None,
                 write_block: None,
                 write_waiting: false,
                 write_release: false,
@@ -173,6 +175,20 @@ impl FakeControllerTransport {
             .lock()
             .expect("fake transport lock poisoned")
             .fail_write_call = Some((call, error));
+    }
+
+    /// Advances virtual time before the next logical write accepts its first byte.
+    pub fn delay_next_write_by(&self, elapsed_ns: u64) {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .expect("fake transport lock poisoned");
+        assert!(
+            state.next_write_delay_ns.is_none(),
+            "a write delay is already scripted"
+        );
+        state.next_write_delay_ns = Some(elapsed_ns);
     }
 
     /// Blocks the next logical write before any byte is accepted until cancellation/close.
@@ -445,10 +461,13 @@ impl ControllerTransport for FakeControllerTransport {
                 "write I/O deadline elapsed",
             ));
         }
-        let block = if state.partial.is_none() {
-            state.write_block.take()
+        let (block, delay_ns) = if state.partial.is_none() {
+            (
+                state.write_block.take(),
+                state.next_write_delay_ns.take().unwrap_or(0),
+            )
         } else {
-            None
+            (None, 0)
         };
         if block == Some(WriteBlockMode::BeforeAcceptance) {
             state.write_waiting = true;
@@ -486,6 +505,37 @@ impl ControllerTransport for FakeControllerTransport {
                 return Err(TransportError::new(
                     TransportErrorKind::WriteTimeout,
                     "write I/O deadline elapsed",
+                ));
+            }
+        }
+        if delay_ns != 0 {
+            drop(state);
+            self.clock
+                .advance_to(self.clock.now_ns().saturating_add(delay_ns));
+            state = self
+                .shared
+                .state
+                .lock()
+                .expect("fake transport lock poisoned after write delay");
+            if state.closed || !state.open {
+                state.partial = None;
+                return Err(TransportError::new(
+                    TransportErrorKind::Disconnected,
+                    "fake transport disconnected during write delay",
+                ));
+            }
+            if operation_cancel.is_cancelled() || resource_cancel.is_cancelled() {
+                state.partial = None;
+                return Err(TransportError::new(
+                    TransportErrorKind::Cancelled,
+                    "write cancelled during transport delay",
+                ));
+            }
+            if self.clock.now_ns() >= request.deadline_ns {
+                state.partial = None;
+                return Err(TransportError::new(
+                    TransportErrorKind::WriteTimeout,
+                    "write I/O deadline elapsed during transport delay",
                 ));
             }
         }
@@ -629,6 +679,7 @@ impl ControllerTransport for FakeControllerTransport {
                 while !operation_cancel.is_cancelled()
                     && !resource_cancel.is_cancelled()
                     && !state.closed
+                    && self.clock.now_ns() < request.deadline_ns
                 {
                     state = self
                         .shared
@@ -643,10 +694,15 @@ impl ControllerTransport for FakeControllerTransport {
                         TransportErrorKind::Cancelled,
                         "ACK wait cancelled",
                     ))
-                } else {
+                } else if state.closed {
                     Err(TransportError::new(
                         TransportErrorKind::Disconnected,
                         "transport closed during ACK wait",
+                    ))
+                } else {
+                    Err(TransportError::new(
+                        TransportErrorKind::Timeout,
+                        "ACK protocol deadline elapsed",
                     ))
                 }
             }
