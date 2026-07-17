@@ -1119,10 +1119,13 @@ impl ControllerLane {
         let now = self.clock.now_ns();
         if let Err(error) = self.write_payload(Some(&operation), WriteKind::Command, now, &command)
         {
+            if error.kind() == TransportErrorKind::Disconnected {
+                self.handle_transport_disconnect(Some(operation.id()), &error);
+            }
             fail_or_finish_cancelled(&operation, map_transport_error(error));
             return;
         }
-        let deadline_ns = now.saturating_add(protocol_timeout_ns);
+        let deadline_ns = self.clock.now_ns().saturating_add(protocol_timeout_ns);
         loop {
             let request = AckRequest {
                 operation_id: operation.id(),
@@ -1172,21 +1175,29 @@ impl ControllerLane {
                 }
                 Err(error) => {
                     if error.kind() == TransportErrorKind::Disconnected {
-                        self.desired_report.reset();
-                        self.update_desired_snapshot();
-                        self.set_state(
-                            ControllerState::Disconnected,
-                            "controller.disconnected",
-                            None,
-                        );
-                        self.publish_neutralization_warning(Some(operation.id()), &error);
-                        self.fail_pending_disconnected();
+                        self.handle_transport_disconnect(Some(operation.id()), &error);
                     }
                     fail_or_finish_cancelled(&operation, map_transport_error(error));
                     return;
                 }
             }
         }
+    }
+
+    fn handle_transport_disconnect(
+        &mut self,
+        operation_id: Option<OperationId>,
+        error: &TransportError,
+    ) {
+        self.desired_report.reset();
+        self.update_desired_snapshot();
+        self.set_state(
+            ControllerState::Disconnected,
+            "controller.disconnected",
+            None,
+        );
+        self.publish_neutralization_warning(operation_id, error);
+        self.fail_pending_disconnected();
     }
 
     fn acquire_automation_lease(&mut self, lease_id: u64) -> Result<(), EasyConError> {

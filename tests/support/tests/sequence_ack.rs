@@ -9,7 +9,7 @@ use easycon_controller::{
 };
 use easycon_model::{Button, ErrorCode, Hat, StickPosition};
 use easycon_runtime::{
-    Event, Operation, OperationState, Runtime, RuntimeCounts, SubscriptionOptions,
+    Clock, Event, Operation, OperationState, Runtime, RuntimeCounts, SubscriptionOptions,
     SubscriptionRead, VirtualClock, WaitResult, WaitTimeout,
 };
 use easycon_test_support::{AckOutcome, FakeControllerTransport, HandshakeOutcome};
@@ -798,6 +798,46 @@ fn ack_disconnect_resets_desired_state_before_explicit_reconnect() {
 }
 
 #[test]
+fn ack_command_write_disconnect_resets_controller_state() {
+    let (_clock, runtime, fake, controller) = connected();
+    let events = runtime
+        .subscribe(SubscriptionOptions::default())
+        .expect("events");
+    let down = controller
+        .direct(ControllerAction::ButtonDown(Button::A))
+        .expect("initial report");
+    wait_terminal(&down);
+    fake.fail_write_call(
+        fake.write_call_count() + 1,
+        TransportError::new(
+            TransportErrorKind::Disconnected,
+            "device disconnected during command write",
+        ),
+    );
+
+    let command = controller
+        .command_with_ack(Arc::<[u8]>::from([0xA5, 0x91]), 0xff, 100)
+        .expect("ACK command");
+    wait_terminal(&command);
+
+    assert_eq!(command.snapshot().state, OperationState::Failed);
+    assert_eq!(
+        command.snapshot().error.expect("disconnect").code(),
+        ErrorCode::DeviceDisconnected
+    );
+    assert_eq!(controller.snapshot().state, ControllerState::Disconnected);
+    assert_eq!(controller.snapshot().desired_report, SwitchReport::NEUTRAL);
+    assert!(fake.is_closed());
+    assert!(drain_events(&events).iter().any(|event| {
+        event.code == "controller.neutralization.not_delivered"
+            && event.operation_id == Some(command.id())
+    }));
+
+    controller.close();
+    runtime.close();
+}
+
+#[test]
 fn close_cancels_blocked_ack_and_joins_lane() {
     let (_clock, runtime, fake, controller) = connected();
     fake.push_ack(AckOutcome::BlockUntilCancelled);
@@ -838,6 +878,28 @@ fn blocked_ack_obeys_its_protocol_deadline() {
         operation.snapshot().error.expect("timeout").code(),
         ErrorCode::ProtocolTimeout
     );
+    assert_eq!(controller.snapshot().state, ControllerState::Connected);
+    controller.close();
+    runtime.close();
+}
+
+#[test]
+fn ack_protocol_timeout_starts_after_command_write_acceptance() {
+    let (clock, runtime, fake, controller) = connected();
+    fake.delay_next_write_by(90);
+    fake.push_ack(AckOutcome::Frame {
+        generation: 1,
+        byte: 0xff,
+        elapsed_ns: 20,
+    });
+
+    let operation = controller
+        .command_with_ack(Arc::<[u8]>::from([0xA5, 0x91]), 0xff, 100)
+        .expect("ACK command");
+    wait_terminal(&operation);
+
+    assert_eq!(operation.snapshot().state, OperationState::Succeeded);
+    assert_eq!(clock.now_ns(), 110);
     assert_eq!(controller.snapshot().state, ControllerState::Connected);
     controller.close();
     runtime.close();
