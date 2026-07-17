@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://easycon.invalid/schemas/conformance-v1.schema.json",
+  "title": "EasyCon runtime/controller conformance fixture v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "milestone", "license", "scenarios"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "milestone": { "const": "runtime-controller-fake-v1" },
+    "license": { "const": "GPL-3.0-only" },
+    "scenarios": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "steps", "assertions"],
+        "properties": {
+          "id": { "type": "string" },
+          "steps": { "type": "array" },
+          "assertions": { "type": "array" }
+        }
+      }
+    }
+  }
+}

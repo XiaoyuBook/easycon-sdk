@@ -1,0 +1,15 @@
+[package]
+name = "easycon-controller"
+description = "Controller protocol and scheduling for EasyCon SDK"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+easycon-model = { path = "../easycon-model" }
+easycon-runtime = { path = "../easycon-runtime" }
+
+[lints]
+workspace = true

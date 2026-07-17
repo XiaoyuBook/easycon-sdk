@@ -1,0 +1,129 @@
+{
+  "schema_version": 1,
+  "classification": "source-exact",
+  "license": "GPL-3.0-only",
+  "provenance": {
+    "snapshot_role": "read-only audit evidence; never a build or test dependency",
+    "evidence": [
+      "EasyCon/src/EasyCon.Device/Utils/SwitchCommand.cs::SwitchButton",
+      "EasyCon/src/EasyCon.Device/Utils/SwitchCommand.cs::SwitchHAT",
+      "EasyCon/src/EasyCon.Device/Utils/SwitchReport.cs::GetBytes",
+      "EasyCon/src/EasyCon.Device/Connection/TTLSerialClient.cs::Loop"
+    ]
+  },
+  "buttons": {
+    "Y": 1,
+    "B": 2,
+    "A": 4,
+    "X": 8,
+    "L": 16,
+    "R": 32,
+    "ZL": 64,
+    "ZR": 128,
+    "MINUS": 256,
+    "PLUS": 512,
+    "LCLICK": 1024,
+    "RCLICK": 2048,
+    "HOME": 4096,
+    "CAPTURE": 8192
+  },
+  "hats": {
+    "TOP": 0,
+    "TOP_RIGHT": 1,
+    "RIGHT": 2,
+    "BOTTOM_RIGHT": 3,
+    "BOTTOM": 4,
+    "BOTTOM_LEFT": 5,
+    "LEFT": 6,
+    "TOP_LEFT": 7,
+    "CENTER": 8
+  },
+  "sticks": { "minimum": 0, "center": 128, "maximum": 255 },
+  "handshake": {
+    "auto_baud_order": [115200, 9600],
+    "request": [165, 165, 129],
+    "success_reply": [128]
+  },
+  "reports": [
+    {
+      "name": "neutral",
+      "state": { "button_mask": 0, "hat": 8, "lx": 128, "ly": 128, "rx": 128, "ry": 128 },
+      "encoded": [0, 0, 1, 8, 4, 2, 1, 128]
+    },
+    {
+      "name": "button-a",
+      "state": { "button_mask": 4, "hat": 8, "lx": 128, "ly": 128, "rx": 128, "ry": 128 },
+      "encoded": [0, 1, 1, 8, 4, 2, 1, 128]
+    },
+    {
+      "name": "buttons-y-b-home",
+      "state": { "button_mask": 4099, "hat": 8, "lx": 128, "ly": 128, "rx": 128, "ry": 128 },
+      "encoded": [8, 0, 97, 8, 4, 2, 1, 128]
+    },
+    {
+      "name": "hat-top",
+      "state": { "button_mask": 0, "hat": 0, "lx": 128, "ly": 128, "rx": 128, "ry": 128 },
+      "encoded": [0, 0, 0, 8, 4, 2, 1, 128]
+    },
+    {
+      "name": "hat-top-right",
+      "state": { "button_mask": 0, "hat": 1, "lx": 128, "ly": 128, "rx": 128, "ry": 128 },
+      "encoded": [0, 0, 0, 24, 4, 2, 1, 128]
+    },
+    {
+      "name": "hat-right",
+      "state": { "button_mask": 0, "hat": 2, "lx": 128, "ly": 128, "rx": 128, "ry": 128 },
+      "encoded": [0, 0, 0, 40, 4, 2, 1, 128]
+    },
+    {
+      "name": "hat-bottom-right",
+      "state": { "button_mask": 0, "hat": 3, "lx": 128, "ly": 128, "rx": 128, "ry": 128 },
+      "encoded": [0, 0, 0, 56, 4, 2, 1, 128]
+    },
+    {
+      "name": "hat-bottom",
+      "state": { "button_mask": 0, "hat": 4, "lx": 128, "ly": 128, "rx": 128, "ry": 128 },
+      "encoded": [0, 0, 0, 72, 4, 2, 1, 128]
+    },
+    {
+      "name": "hat-bottom-left",
+      "state": { "button_mask": 0, "hat": 5, "lx": 128, "ly": 128, "rx": 128, "ry": 128 },
+      "encoded": [0, 0, 0, 88, 4, 2, 1, 128]
+    },
+    {
+      "name": "hat-left",
+      "state": { "button_mask": 0, "hat": 6, "lx": 128, "ly": 128, "rx": 128, "ry": 128 },
+      "encoded": [0, 0, 0, 104, 4, 2, 1, 128]
+    },
+    {
+      "name": "hat-top-left",
+      "state": { "button_mask": 0, "hat": 7, "lx": 128, "ly": 128, "rx": 128, "ry": 128 },
+      "encoded": [0, 0, 0, 120, 4, 2, 1, 128]
+    },
+    {
+      "name": "stick-boundaries",
+      "state": { "button_mask": 0, "hat": 8, "lx": 0, "ly": 255, "rx": 255, "ry": 0 },
+      "encoded": [0, 0, 1, 0, 7, 127, 126, 128]
+    }
+  ],
+  "corrected_behaviors": [
+    {
+      "id": "keystroke-future-time",
+      "classification": "corrected",
+      "source_observation": "KeyStroke accepts a time but stores DateTime.Now",
+      "required_behavior": "use validated absolute offsets from a monotonic lane start"
+    },
+    {
+      "id": "cancel-missing-release",
+      "classification": "corrected",
+      "source_observation": "cancellation may bypass button release",
+      "required_behavior": "neutral report acceptance precedes Cancelled when connected"
+    },
+    {
+      "id": "competing-ack-listeners",
+      "classification": "corrected",
+      "source_observation": "temporary listeners can compete on one receive stream",
+      "required_behavior": "one generation-aware ACK matcher serializes requests"
+    }
+  ]
+}

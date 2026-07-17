@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "milestone": "runtime-controller-fake-v1",
+  "license": "GPL-3.0-only",
+  "clock": "virtual-monotonic-nanoseconds",
+  "traces": [
+    {
+      "id": "absolute-offsets-and-same-offset-merge",
+      "classification": "corrected",
+      "lane_start_ns": 100000000,
+      "minimum_report_interval_ns": 30000000,
+      "steps": [
+        { "offset_ns": 0, "action": "button_down", "button": "A" },
+        { "offset_ns": 0, "action": "hat", "hat": "RIGHT" },
+        { "offset_ns": 30000000, "action": "left_stick", "x": 0, "y": 255 },
+        { "offset_ns": 70000000, "action": "button_up", "button": "A" }
+      ],
+      "expected_reports": [
+        { "timestamp_ns": 100000000, "bytes": [0, 1, 0, 40, 4, 2, 1, 128] },
+        { "timestamp_ns": 130000000, "bytes": [0, 1, 0, 32, 7, 126, 1, 128] },
+        { "timestamp_ns": 170000000, "bytes": [0, 0, 0, 32, 7, 126, 1, 128] }
+      ],
+      "operation_states": ["Pending", "Running", "Succeeded"]
+    },
+    {
+      "id": "cancel-before-future-step-neutralizes",
+      "classification": "corrected",
+      "lane_start_ns": 200000000,
+      "minimum_report_interval_ns": 30000000,
+      "steps": [
+        { "offset_ns": 0, "action": "button_down", "button": "B" },
+        { "offset_ns": 30000000, "action": "button_down", "button": "A" }
+      ],
+      "cancel_at_ns": 215000000,
+      "expected_reports": [
+        { "timestamp_ns": 200000000, "bytes": [0, 0, 65, 8, 4, 2, 1, 128] },
+        { "timestamp_ns": 230000000, "bytes": [0, 0, 1, 8, 4, 2, 1, 128], "purpose": "neutralize" }
+      ],
+      "operation_states": ["Pending", "Running", "Cancelling", "Cancelled"],
+      "terminal_preconditions": ["neutral report accepted", "sequence lease released"]
+    }
+  ]
+}

@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://easycon.invalid/schemas/controller-fixture-v1.schema.json",
+  "title": "EasyCon source-exact controller protocol fixture v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "classification",
+    "license",
+    "provenance",
+    "buttons",
+    "hats",
+    "sticks",
+    "handshake",
+    "reports",
+    "corrected_behaviors"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "classification": { "const": "source-exact" },
+    "license": { "const": "GPL-3.0-only" },
+    "provenance": { "type": "object" },
+    "buttons": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 1, "maximum": 8192 } },
+    "hats": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0, "maximum": 8 } },
+    "sticks": {
+      "type": "object",
+      "required": ["minimum", "center", "maximum"],
+      "properties": {
+        "minimum": { "const": 0 },
+        "center": { "const": 128 },
+        "maximum": { "const": 255 }
+      }
+    },
+    "handshake": { "type": "object" },
+    "reports": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "state", "encoded"],
+        "properties": {
+          "name": { "type": "string" },
+          "state": { "type": "object" },
+          "encoded": {
+            "type": "array",
+            "minItems": 8,
+            "maxItems": 8,
+            "items": { "type": "integer", "minimum": 0, "maximum": 255 }
+          }
+        }
+      }
+    },
+    "corrected_behaviors": { "type": "array" }
+  }
+}

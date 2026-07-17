@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "milestone": "runtime-controller-fake-v1",
+  "license": "GPL-3.0-only",
+  "operations": {
+    "states": ["Pending", "Running", "Cancelling", "Succeeded", "Failed", "Cancelled"],
+    "terminal_states": ["Succeeded", "Failed", "Cancelled"],
+    "transitions": [
+      { "from": "Pending", "to": "Running", "cause": "admitted" },
+      { "from": "Pending", "to": "Cancelling", "cause": "cancel, deadline, or parent close" },
+      { "from": "Pending", "to": "Failed", "cause": "admission or dependency failure" },
+      { "from": "Running", "to": "Cancelling", "cause": "cancel, deadline, or parent close" },
+      { "from": "Running", "to": "Succeeded", "cause": "result committed once" },
+      { "from": "Running", "to": "Failed", "cause": "error committed once" },
+      { "from": "Cancelling", "to": "Cancelled", "cause": "cleanup complete" }
+    ],
+    "timeouts": {
+      "wait_timeout": "ends only the caller wait and never cancels the operation",
+      "operation_deadline": "requests cancellation and normally ends Cancelled with reason deadline",
+      "protocol_timeout": "fails the operation in the controller or I/O error domain after bounded attempts"
+    },
+    "terminal_commit": "exactly once; immutable result and error are mutually exclusive"
+  },
+  "runtime": {
+    "states": ["Active", "Closing", "Closed"],
+    "close_is_idempotent": true,
+    "close_order": [
+      "enter Closing and reject admission",
+      "cancel root operation tree",
+      "close controller resources and neutralize",
+      "finish non-terminal operations",
+      "publish RuntimeClosed and close producers",
+      "join supervised tasks",
+      "assert task and resource registries are empty",
+      "enter Closed"
+    ],
+    "closed_counts": { "active_tasks": 0, "active_resources": 0, "active_operations": 0 }
+  },
+  "events": {
+    "delivery": "per-subscriber bounded pull queue",
+    "sequence": "strictly increasing across one Runtime",
+    "overflow": "oldest ordinary events are summarized by EventGap; authoritative state remains queryable",
+    "close": "RuntimeClosed is published before subscriptions become closed and queued events remain drainable"
+  },
+  "controller": {
+    "single_writer": true,
+    "default_minimum_report_interval_ns": 30000000,
+    "direct_success_boundary": "the complete report bytes were accepted by transport",
+    "hardware_execution_claimed": false,
+    "sequence": {
+      "origin": "monotonic time when the command lane acquires the sequence",
+      "offsets": "absolute from origin and monotonically non-decreasing",
+      "same_offset": "apply in input order and emit one merged report",
+      "early_dispatch": false,
+      "drift": "targets never derive from the previous dispatch",
+      "cancel_or_failure": "remove pending steps, accept a neutral report when connected, then release lease and commit terminal state"
+    },
+    "automation_lease": "exclusive arbitration primitive only; ECS is outside this milestone"
+  },
+  "classifications": [
+    {
+      "id": "controller-protocol-values",
+      "classification": "source-exact",
+      "rule": "button, HAT, stick, handshake, and 7-bit report bytes match the audited source"
+    },
+    {
+      "id": "keystroke-time",
+      "classification": "corrected",
+      "rule": "sequence timing uses validated absolute monotonic offsets instead of the source constructor defect"
+    },
+    {
+      "id": "cancel-release",
+      "classification": "corrected",
+      "rule": "cancellation and failure neutralize before terminal observation and lease release is observable"
+    },
+    {
+      "id": "ack-generation",
+      "classification": "corrected",
+      "rule": "late ACK generations cannot complete a later request"
+    }
+  ]
+}

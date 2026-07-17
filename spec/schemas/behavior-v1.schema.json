@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://easycon.invalid/schemas/behavior-v1.schema.json",
+  "title": "EasyCon runtime/controller behavior v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "milestone",
+    "license",
+    "operations",
+    "runtime",
+    "events",
+    "controller",
+    "classifications"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "milestone": { "const": "runtime-controller-fake-v1" },
+    "license": { "const": "GPL-3.0-only" },
+    "operations": {
+      "type": "object",
+      "required": ["states", "terminal_states", "transitions", "timeouts"],
+      "properties": {
+        "states": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+        "terminal_states": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+        "transitions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["from", "to", "cause"],
+            "properties": {
+              "from": { "type": "string" },
+              "to": { "type": "string" },
+              "cause": { "type": "string" }
+            }
+          }
+        },
+        "timeouts": { "type": "object" }
+      }
+    },
+    "runtime": { "type": "object" },
+    "events": { "type": "object" },
+    "controller": { "type": "object" },
+    "classifications": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "classification", "rule"],
+        "properties": {
+          "id": { "type": "string" },
+          "classification": { "enum": ["source-exact", "corrected"] },
+          "rule": { "type": "string" }
+        }
+      }
+    }
+  }
+}

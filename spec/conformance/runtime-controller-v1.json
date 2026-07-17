@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "milestone": "runtime-controller-fake-v1",
+  "license": "GPL-3.0-only",
+  "scenarios": [
+    {
+      "id": "vertical-slice",
+      "steps": [
+        "create Runtime with VirtualClock",
+        "subscribe to bounded events",
+        "create fake Controller transport",
+        "connect at 115200 with hello response",
+        "submit direct action and observe transport acceptance",
+        "submit precise sequence with absolute offsets",
+        "cancel before a future step and accept neutral report",
+        "close Runtime twice",
+        "drain RuntimeClosed and close subscription"
+      ],
+      "assertions": [
+        "operation states and events follow the canonical transitions",
+        "report bytes and virtual timestamps match tracked fixtures",
+        "direct success claims transport acceptance only",
+        "active operation, task, and resource counts are zero after close"
+      ]
+    },
+    {
+      "id": "timeout-separation",
+      "steps": [
+        "poll a running operation with zero wait timeout",
+        "advance past an operation deadline",
+        "inject a handshake protocol timeout in a separate operation"
+      ],
+      "assertions": [
+        "wait timeout leaves the operation Running",
+        "deadline requests cancellation and finishes Cancelled after cleanup",
+        "protocol timeout finishes Failed with controller or I/O error"
+      ]
+    },
+    {
+      "id": "transport-faults",
+      "steps": [
+        "accept a report using partial writes",
+        "ignore a late ACK from an older generation",
+        "reject an error ACK",
+        "disconnect during a sequence",
+        "close while an ACK read is blocked"
+      ],
+      "assertions": [
+        "bytes are neither duplicated nor truncated",
+        "late ACK cannot complete the current operation",
+        "disconnect fails pending work and exposes neutralization warning",
+        "transport close wakes the blocked read and the lane joins"
+      ]
+    },
+    {
+      "id": "event-overflow",
+      "steps": [
+        "create a capacity-one subscription",
+        "publish more ordinary events than capacity",
+        "complete an operation",
+        "read the subscription and query the operation"
+      ],
+      "assertions": [
+        "EventGap reports the dropped sequence interval",
+        "producer never blocks",
+        "authoritative terminal state remains queryable"
+      ]
+    }
+  ]
+}
