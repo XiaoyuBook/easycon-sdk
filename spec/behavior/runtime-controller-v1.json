@@ -29,9 +29,10 @@
       "enter Closing and reject admission",
       "cancel root operation tree",
       "close controller resources and neutralize",
-      "finish non-terminal operations",
+      "wait for ordinary supervised task cleanup",
+      "finish remaining non-terminal operations",
       "publish RuntimeClosed and close producers",
-      "join supervised tasks",
+      "join the internal deadline worker",
       "assert task and resource registries are empty",
       "enter Closed"
     ],

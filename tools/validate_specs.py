@@ -242,6 +242,19 @@ def validate_behavior():
         == {"active_tasks": 0, "active_resources": 0, "active_operations": 0},
         "closed registry counts must all be zero",
     )
+    expected_close_order = [
+        "enter Closing and reject admission",
+        "cancel root operation tree",
+        "close controller resources and neutralize",
+        "wait for ordinary supervised task cleanup",
+        "finish remaining non-terminal operations",
+        "publish RuntimeClosed and close producers",
+        "join the internal deadline worker",
+        "assert task and resource registries are empty",
+        "enter Closed",
+    ]
+    require(behavior["runtime"]["close_order"] == expected_close_order,
+            "Runtime close order changed")
     require(
         behavior["controller"]["default_minimum_report_interval_ns"] == 30_000_000,
         "controller interval must remain 30 ms",
