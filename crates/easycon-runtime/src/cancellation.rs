@@ -108,7 +108,8 @@ impl CancellationToken {
         self.register_hook(Arc::new(hook), None);
     }
 
-    /// Registers a wake hook that becomes inactive when the returned guard is dropped.
+    /// Registers a wake hook that later cancellations skip after the returned guard is dropped.
+    /// A hook already selected by a concurrent cancellation may still finish.
     #[must_use]
     pub fn on_cancel_scoped(
         &self,

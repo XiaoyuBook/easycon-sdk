@@ -1119,6 +1119,13 @@ impl ControllerLane {
         let now = self.clock.now_ns();
         if let Err(error) = self.write_payload(Some(&operation), WriteKind::Command, now, &command)
         {
+            if error.kind() == TransportErrorKind::Cancelled {
+                if operation.snapshot().state != OperationState::Cancelling {
+                    operation.request_cancel(easycon_runtime::CancellationReason::ParentClose);
+                }
+                operation.finish_cancelled();
+                return;
+            }
             if error.kind() == TransportErrorKind::Disconnected {
                 self.handle_transport_disconnect(Some(operation.id()), &error);
             }

@@ -838,6 +838,32 @@ fn ack_command_write_disconnect_resets_controller_state() {
 }
 
 #[test]
+fn ack_command_write_cancelled_error_commits_cancelled() {
+    let (_clock, runtime, fake, controller) = connected();
+    fake.fail_write_call(
+        1,
+        TransportError::new(
+            TransportErrorKind::Cancelled,
+            "command write interrupted by parent cancellation",
+        ),
+    );
+
+    let command = controller
+        .command_with_ack(Arc::<[u8]>::from([0xA5, 0x91]), 0xff, 100)
+        .expect("ACK command");
+    wait_terminal(&command);
+
+    assert_eq!(command.snapshot().state, OperationState::Cancelled);
+    assert_eq!(
+        command.snapshot().error.expect("cancellation").code(),
+        ErrorCode::Cancelled
+    );
+    assert_eq!(controller.snapshot().state, ControllerState::Connected);
+    controller.close();
+    runtime.close();
+}
+
+#[test]
 fn close_cancels_blocked_ack_and_joins_lane() {
     let (_clock, runtime, fake, controller) = connected();
     fake.push_ack(AckOutcome::BlockUntilCancelled);

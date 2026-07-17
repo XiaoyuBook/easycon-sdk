@@ -30,6 +30,8 @@ pub struct DeadlineTrace {
 type ClockChangeHook = dyn Fn() + Send + Sync;
 
 /// RAII ownership for one explicit clock-change callback.
+///
+/// A callback already selected by a concurrent clock advance may finish after this guard drops.
 #[derive(Clone)]
 pub struct ClockChangeRegistration {
     _hook: Arc<ClockChangeHook>,
@@ -49,7 +51,7 @@ pub trait Clock: Send + Sync + 'static {
     fn now_ns(&self) -> u64;
 
     /// Registers a non-blocking hook invoked after an explicit clock change.
-    /// Dropping the returned registration disables the hook.
+    /// Dropping the returned registration prevents selection by later clock changes.
     #[must_use]
     fn on_change(&self, hook: Arc<ClockChangeHook>) -> ClockChangeRegistration;
 
@@ -189,9 +191,9 @@ impl Clock for VirtualClock {
     }
 
     fn register_deadline(&self, target_ns: u64) -> DeadlineId {
+        let mut state = self.state.lock().expect("virtual clock lock poisoned");
         let id = DeadlineId(self.next_deadline.fetch_add(1, Ordering::Relaxed));
         assert!(id.0 != 0, "virtual deadline ID space exhausted");
-        let mut state = self.state.lock().expect("virtual clock lock poisoned");
         let woken = target_ns <= self.now_ns();
         state.deadlines.push(DeadlineTrace {
             id,
