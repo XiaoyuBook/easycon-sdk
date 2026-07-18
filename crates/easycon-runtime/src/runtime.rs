@@ -12,7 +12,9 @@ use easycon_model::{
 
 use crate::cancellation::CancellationToken;
 use crate::clock::{Clock, ClockChangeRegistration};
-use crate::concurrency::{runtime_close_rejected, task_join_rejected};
+use crate::concurrency::{
+    TaskLifecycleState, TaskOwnerBinding, runtime_close_rejected, task_join_rejected,
+};
 use crate::event::{
     Event, EventDraft, EventKind, EventSubscription, Severity, SubscriptionInner,
     SubscriptionOptions, close_subscriptions_with_final,
@@ -22,7 +24,8 @@ use crate::operation::{CancellationReason, Operation, OperationInner};
 static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
 
 thread_local! {
-    static CURRENT_SUPERVISED_TASK: Cell<Option<(RuntimeId, TaskId)>> = const { Cell::new(None) };
+    static CURRENT_SUPERVISED_TASK: Cell<Option<TaskOwnerBinding<RuntimeId, TaskId>>> =
+        const { Cell::new(None) };
 }
 
 /// Root lifecycle state.
@@ -226,6 +229,7 @@ struct TaskRecord {
     owner: Option<ThreadId>,
     handle: Option<JoinHandle<()>>,
     completion: Arc<TaskCompletion>,
+    lifecycle: TaskLifecycleState<SupervisedTaskOutcome>,
 }
 
 struct TaskCompletion {
@@ -991,16 +995,22 @@ impl RuntimeInner {
             let Some(record) = tasks.get_mut(&id) else {
                 return Ok(outcome);
             };
-            record.handle.take()
-        };
-        if let Some(handle) = handle {
-            debug_assert_ne!(handle.thread().id(), current);
-            let joined = handle.join();
-            debug_assert!(
-                joined.is_ok(),
-                "supervised wrapper catches task body panics"
+            debug_assert_eq!(record.lifecycle.body_outcome(), Some(outcome));
+            assert!(
+                record.lifecycle.claim_join_handle(),
+                "completed supervised task retains one join handle"
             );
-        }
+            record
+                .handle
+                .take()
+                .expect("supervised lifecycle and handle registry stay aligned")
+        };
+        debug_assert_ne!(handle.thread().id(), current);
+        let joined = handle.join();
+        debug_assert!(
+            joined.is_ok(),
+            "supervised wrapper catches task body panics"
+        );
         if outcome == SupervisedTaskOutcome::Panicked {
             let mut failures = self
                 .task_failures
@@ -1010,10 +1020,32 @@ impl RuntimeInner {
                 failures.push(id);
             }
         }
-        self.tasks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&id);
+        {
+            let mut tasks = self
+                .tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let record = tasks
+                .get_mut(&id)
+                .expect("joined supervised task remains linked until diagnostics are durable");
+            assert!(
+                record.lifecycle.finish_join(),
+                "join completion follows handle claim"
+            );
+            if outcome == SupervisedTaskOutcome::Panicked {
+                assert!(
+                    record.lifecycle.persist_panic_diagnostic(),
+                    "panicked task records one durable diagnostic"
+                );
+            }
+            assert!(
+                record
+                    .lifecycle
+                    .unlink_registry(outcome == SupervisedTaskOutcome::Panicked),
+                "task unlink follows join and durable panic diagnostics"
+            );
+            tasks.remove(&id);
+        }
         #[cfg(test)]
         let after_unlink = self
             .task_join_after_unlink
@@ -1267,14 +1299,17 @@ where
                 owner: None,
                 handle: None,
                 completion: Arc::clone(&completion),
+                lifecycle: TaskLifecycleState::registered(),
             },
         );
 
     let (start, started) = mpsc::channel();
     let task_completion = Arc::clone(&completion);
     let runtime_id = runtime.id;
+    let task_runtime = Arc::downgrade(runtime);
+    let owner_binding = TaskOwnerBinding::new(runtime_id, id);
     let worker = match std::thread::Builder::new().name(name).spawn(move || {
-        CURRENT_SUPERVISED_TASK.set(Some((runtime_id, id)));
+        CURRENT_SUPERVISED_TASK.set(Some(owner_binding));
         if started.recv().is_err() {
             task_completion.finish(SupervisedTaskOutcome::Panicked);
             return;
@@ -1284,15 +1319,35 @@ where
         } else {
             SupervisedTaskOutcome::Panicked
         };
+        if let Some(runtime) = task_runtime.upgrade() {
+            let mut tasks = runtime
+                .tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let record = tasks
+                .get_mut(&id)
+                .expect("running supervised task remains registered until join");
+            assert!(
+                record.lifecycle.complete_body(outcome),
+                "supervised body completes once after owner and handle installation"
+            );
+        }
         task_completion.finish(outcome);
     }) {
         Ok(worker) => worker,
         Err(error) => {
-            runtime
+            let mut tasks = runtime
                 .tasks
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&id);
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let record = tasks
+                .get_mut(&id)
+                .expect("failed spawn leaves its provisional task registration");
+            assert!(
+                record.lifecycle.abort_spawn(),
+                "spawn failure unlinks only an unbound task"
+            );
+            tasks.remove(&id);
             return Err(EasyConError::new(
                 ErrorDomain::Runtime,
                 ErrorCode::Internal,
@@ -1311,6 +1366,10 @@ where
             .expect("supervised task remains registered before its start gate opens");
         record.owner = Some(owner);
         record.handle = Some(worker);
+        assert!(
+            record.lifecycle.bind_owner_and_retain_handle(),
+            "supervised task installs owner and handle exactly once"
+        );
     }
     start
         .send(())
@@ -1325,7 +1384,7 @@ where
     })
 }
 
-fn current_supervised_task() -> Option<(RuntimeId, TaskId)> {
+fn current_supervised_task() -> Option<TaskOwnerBinding<RuntimeId, TaskId>> {
     CURRENT_SUPERVISED_TASK.try_with(Cell::get).ok().flatten()
 }
 

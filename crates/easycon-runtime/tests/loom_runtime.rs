@@ -4,9 +4,9 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use easycon_runtime::runtime_model::{
-    CancellationNode, admit_child_while_locked, cancellation_admission_open, claim_cancellation,
-    invoke_isolated, runtime_close_rejected, seal_cancelled_tree, seal_deactivated_tree,
-    task_join_rejected, unlink_then_notify,
+    CancellationNode, TaskLifecycleState, TaskOwnerBinding, admit_child_while_locked,
+    cancellation_admission_open, claim_cancellation, invoke_isolated, runtime_close_rejected,
+    seal_cancelled_tree, seal_deactivated_tree, task_join_rejected, unlink_then_notify,
 };
 use loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use loom::sync::{Arc, Condvar, Mutex};
@@ -205,15 +205,20 @@ struct TaskModel {
     changed: Condvar,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ModelTaskOutcome {
+    Completed,
+    Panicked,
+}
+
 struct TaskState {
     runtime: ModelRuntimeState,
-    body_finished: bool,
-    thread_exited: bool,
+    lifecycle: TaskLifecycleState<ModelTaskOutcome>,
+    handle: Option<thread::JoinHandle<()>>,
     close_attempted: bool,
     body_close_rejected: bool,
     exit_close_rejected: bool,
     exit_join_rejected: bool,
-    join_handle_retained: bool,
 }
 
 impl TaskModel {
@@ -221,67 +226,103 @@ impl TaskModel {
         Self {
             state: Mutex::new(TaskState {
                 runtime: ModelRuntimeState::Active,
-                body_finished: false,
-                thread_exited: false,
+                lifecycle: TaskLifecycleState::registered(),
+                handle: None,
                 close_attempted: false,
                 body_close_rejected: false,
                 exit_close_rejected: false,
                 exit_join_rejected: false,
-                join_handle_retained: true,
             }),
             changed: Condvar::new(),
         }
     }
 }
 
-#[test]
-fn supervised_task_self_close_is_rejected_through_thread_exit() {
-    loom::model(|| {
+fn model_supervised_task_lifecycle(outcome: ModelTaskOutcome) {
+    loom::model(move || {
         let model = Arc::new(TaskModel::new());
         let task_model = Arc::clone(&model);
         let task = thread::spawn(move || {
-            let owner = Some((1_usize, 7_usize));
+            let owner = TaskOwnerBinding::new(1_usize, 7_usize);
             {
                 let mut state = task_model.state.lock().expect("task state");
-                state.body_close_rejected = runtime_close_rejected(owner, 1);
+                while !state.lifecycle.owner_bound() {
+                    state = task_model.changed.wait(state).expect("task state");
+                }
+                let before = state.runtime;
+                state.body_close_rejected = runtime_close_rejected(Some(owner), 1);
+                assert_eq!(state.runtime, before);
                 state.close_attempted = true;
-                state.body_finished = true;
+                assert!(state.lifecycle.complete_body(outcome));
                 task_model.changed.notify_all();
             }
             thread::yield_now();
             let mut state = task_model.state.lock().expect("task state");
-            state.exit_close_rejected = runtime_close_rejected(owner, 1);
-            state.exit_join_rejected = task_join_rejected(owner, 1, 7);
-            state.thread_exited = true;
+            state.exit_close_rejected = runtime_close_rejected(Some(owner), 1);
+            state.exit_join_rejected = task_join_rejected(Some(owner), 1, 7);
             task_model.changed.notify_all();
         });
+        {
+            let mut state = model.state.lock().expect("task state");
+            state.handle = Some(task);
+            assert!(state.lifecycle.bind_owner_and_retain_handle());
+            model.changed.notify_all();
+        }
 
         let closer_model = Arc::clone(&model);
         let closer = thread::spawn(move || {
+            let handle = {
+                let mut state = closer_model.state.lock().expect("task state");
+                while !state.close_attempted || state.lifecycle.body_outcome().is_none() {
+                    state = closer_model.changed.wait(state).expect("task state");
+                }
+                state.runtime = ModelRuntimeState::Closing;
+                assert!(state.lifecycle.claim_join_handle());
+                state.handle.take().expect("retained task handle")
+            };
+            handle
+                .join()
+                .expect("supervised wrapper catches body panic");
+
             let mut state = closer_model.state.lock().expect("task state");
-            while !state.close_attempted {
-                state = closer_model.changed.wait(state).expect("task state");
+            assert!(state.lifecycle.finish_join());
+            let panic_diagnostic_required = outcome == ModelTaskOutcome::Panicked;
+            if panic_diagnostic_required {
+                assert!(!state.lifecycle.unlink_registry(true));
+                assert!(state.lifecycle.persist_panic_diagnostic());
             }
-            state.runtime = ModelRuntimeState::Closing;
-            while !state.thread_exited {
-                state = closer_model.changed.wait(state).expect("task state");
-            }
-            state.join_handle_retained = false;
+            assert!(state.lifecycle.unlink_registry(panic_diagnostic_required));
             state.runtime = ModelRuntimeState::Closed;
             closer_model.changed.notify_all();
         });
 
-        task.join().expect("supervised task");
         closer.join().expect("external closer");
         let state = model.state.lock().expect("task state");
-        assert!(state.body_finished);
+        assert!(state.lifecycle.owner_bound());
+        assert_eq!(state.lifecycle.body_outcome(), Some(outcome));
         assert!(state.body_close_rejected);
         assert!(state.exit_close_rejected);
         assert!(state.exit_join_rejected);
-        assert!(state.thread_exited);
-        assert!(!state.join_handle_retained);
+        assert!(state.lifecycle.thread_joined());
+        assert!(!state.lifecycle.join_handle_retained());
+        assert_eq!(
+            state.lifecycle.panic_diagnostic_durable(),
+            outcome == ModelTaskOutcome::Panicked
+        );
+        assert!(!state.lifecycle.registry_linked());
+        assert!(state.handle.is_none());
         assert_eq!(state.runtime, ModelRuntimeState::Closed);
     });
+}
+
+#[test]
+fn supervised_task_self_close_is_rejected_through_thread_exit() {
+    model_supervised_task_lifecycle(ModelTaskOutcome::Completed);
+}
+
+#[test]
+fn supervised_task_panic_is_durable_before_registry_unlink() {
+    model_supervised_task_lifecycle(ModelTaskOutcome::Panicked);
 }
 
 struct TerminalModel {

@@ -60,16 +60,180 @@ pub fn invoke_isolated(action: impl FnOnce()) -> bool {
     catch_unwind(AssertUnwindSafe(action)).is_ok()
 }
 
-pub fn runtime_close_rejected<R: PartialEq, T>(current: Option<(R, T)>, runtime: R) -> bool {
-    matches!(current, Some((owner, _)) if owner == runtime)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TaskOwnerBinding<R, T> {
+    runtime: R,
+    task: T,
+}
+
+impl<R, T> TaskOwnerBinding<R, T> {
+    pub const fn new(runtime: R, task: T) -> Self {
+        Self { runtime, task }
+    }
+}
+
+impl<R: PartialEq, T: PartialEq> TaskOwnerBinding<R, T> {
+    pub fn rejects_runtime_close(&self, runtime: &R) -> bool {
+        self.runtime == *runtime
+    }
+
+    pub fn rejects_task_join(&self, runtime: &R, task: &T) -> bool {
+        self.runtime == *runtime && self.task == *task
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TaskHandleState {
+    Missing,
+    Retained,
+    Joining,
+    Joined,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskLifecycleState<O> {
+    owner_bound: bool,
+    body_outcome: Option<O>,
+    handle: TaskHandleState,
+    panic_diagnostic_durable: bool,
+    registry_linked: bool,
+}
+
+impl<O: Copy> TaskLifecycleState<O> {
+    pub const fn registered() -> Self {
+        Self {
+            owner_bound: false,
+            body_outcome: None,
+            handle: TaskHandleState::Missing,
+            panic_diagnostic_durable: false,
+            registry_linked: true,
+        }
+    }
+
+    pub fn bind_owner_and_retain_handle(&mut self) -> bool {
+        if !self.registry_linked
+            || self.owner_bound
+            || self.body_outcome.is_some()
+            || self.handle != TaskHandleState::Missing
+        {
+            return false;
+        }
+        self.owner_bound = true;
+        self.handle = TaskHandleState::Retained;
+        true
+    }
+
+    pub fn complete_body(&mut self, outcome: O) -> bool {
+        if !self.registry_linked
+            || !self.owner_bound
+            || self.body_outcome.is_some()
+            || self.handle != TaskHandleState::Retained
+        {
+            return false;
+        }
+        self.body_outcome = Some(outcome);
+        true
+    }
+
+    pub fn claim_join_handle(&mut self) -> bool {
+        if !self.registry_linked
+            || self.body_outcome.is_none()
+            || self.handle != TaskHandleState::Retained
+        {
+            return false;
+        }
+        self.handle = TaskHandleState::Joining;
+        true
+    }
+
+    pub fn finish_join(&mut self) -> bool {
+        if !self.registry_linked
+            || self.body_outcome.is_none()
+            || self.handle != TaskHandleState::Joining
+        {
+            return false;
+        }
+        self.handle = TaskHandleState::Joined;
+        true
+    }
+
+    pub fn persist_panic_diagnostic(&mut self) -> bool {
+        if !self.registry_linked
+            || self.handle != TaskHandleState::Joined
+            || self.panic_diagnostic_durable
+        {
+            return false;
+        }
+        self.panic_diagnostic_durable = true;
+        true
+    }
+
+    pub fn unlink_registry(&mut self, panic_diagnostic_required: bool) -> bool {
+        if !self.registry_linked
+            || self.handle != TaskHandleState::Joined
+            || (panic_diagnostic_required && !self.panic_diagnostic_durable)
+        {
+            return false;
+        }
+        self.registry_linked = false;
+        true
+    }
+
+    pub fn abort_spawn(&mut self) -> bool {
+        if !self.registry_linked
+            || self.owner_bound
+            || self.body_outcome.is_some()
+            || self.handle != TaskHandleState::Missing
+        {
+            return false;
+        }
+        self.registry_linked = false;
+        true
+    }
+
+    #[cfg(feature = "runtime-model")]
+    pub const fn owner_bound(&self) -> bool {
+        self.owner_bound
+    }
+
+    pub const fn body_outcome(&self) -> Option<O> {
+        self.body_outcome
+    }
+
+    #[cfg(feature = "runtime-model")]
+    pub const fn join_handle_retained(&self) -> bool {
+        matches!(self.handle, TaskHandleState::Retained)
+    }
+
+    #[cfg(feature = "runtime-model")]
+    pub const fn thread_joined(&self) -> bool {
+        matches!(self.handle, TaskHandleState::Joined)
+    }
+
+    #[cfg(feature = "runtime-model")]
+    pub const fn panic_diagnostic_durable(&self) -> bool {
+        self.panic_diagnostic_durable
+    }
+
+    #[cfg(feature = "runtime-model")]
+    pub const fn registry_linked(&self) -> bool {
+        self.registry_linked
+    }
+}
+
+pub fn runtime_close_rejected<R: PartialEq, T: PartialEq>(
+    current: Option<TaskOwnerBinding<R, T>>,
+    runtime: R,
+) -> bool {
+    current.is_some_and(|owner| owner.rejects_runtime_close(&runtime))
 }
 
 pub fn task_join_rejected<R: PartialEq, T: PartialEq>(
-    current: Option<(R, T)>,
+    current: Option<TaskOwnerBinding<R, T>>,
     runtime: R,
     task: T,
 ) -> bool {
-    current == Some((runtime, task))
+    current.is_some_and(|owner| owner.rejects_task_join(&runtime, &task))
 }
 
 pub fn unlink_then_notify(unlink: impl FnOnce(), notify: impl FnOnce()) {

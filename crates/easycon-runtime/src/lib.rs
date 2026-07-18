@@ -31,9 +31,9 @@ pub use wait::WaitTimeout;
 #[doc(hidden)]
 pub mod runtime_model {
     pub use crate::concurrency::{
-        CancellationNode, admit_child_while_locked, cancellation_admission_open,
-        claim_cancellation, invoke_isolated, runtime_close_rejected, seal_cancelled_tree,
-        seal_deactivated_tree, task_join_rejected, unlink_then_notify,
+        CancellationNode, TaskLifecycleState, TaskOwnerBinding, admit_child_while_locked,
+        cancellation_admission_open, claim_cancellation, invoke_isolated, runtime_close_rejected,
+        seal_cancelled_tree, seal_deactivated_tree, task_join_rejected, unlink_then_notify,
     };
 }
 
