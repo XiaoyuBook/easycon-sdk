@@ -98,6 +98,7 @@ def main():
         for path in tracked
         if (path.startswith("crates/") or path.startswith("tests/"))
         and Path(path).suffix in {".rs", ".toml"}
+        and (ROOT / path).is_file()
     ]
     for relative in source_paths:
         text = (ROOT / relative).read_text(encoding="utf-8")
@@ -107,6 +108,13 @@ def main():
             if pattern.search(text):
                 failures.append("legacy {} architecture keyword in {}".format(label, relative))
 
+    runtime_source = (ROOT / "crates/easycon-runtime/src/runtime.rs").read_text(
+        encoding="utf-8"
+    )
+    for forbidden in ("spawn_finalizer", "easycon-finalizer", "close_after_final_handle_drop"):
+        if forbidden in runtime_source:
+            failures.append("Runtime Drop finalizer remains: {}".format(forbidden))
+
     if failures:
         print("repository guard check failed:", file=sys.stderr)
         for failure in sorted(set(failures)):
@@ -114,7 +122,7 @@ def main():
         return 1
     print(
         "repository guards passed: scoped workspace, dependency direction, GPL license, "
-        "source boundary, and legacy service-process scan"
+        "source boundary, Drop finalizer ban, and legacy service-process scan"
     )
     return 0
 

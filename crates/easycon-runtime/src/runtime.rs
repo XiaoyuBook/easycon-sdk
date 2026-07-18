@@ -126,17 +126,18 @@ pub trait ManagedResource: Send + Sync + 'static {
 }
 
 /// Cloneable root owner for operations, resources, tasks, events, and cancellation.
-/// Dropping the final owning handle delegates shutdown to a dedicated finalizer. Call
-/// [`Runtime::close`] when the caller must synchronously observe `Closed`.
+/// Call [`Runtime::close`] for deterministic cleanup. Dropping the final owning handle only rejects
+/// admission and requests root cancellation.
 pub struct Runtime {
     pub(crate) inner: Arc<RuntimeInner>,
-    close_on_drop: bool,
+    counts_as_owner: bool,
 }
 
 pub(crate) struct RuntimeInner {
     id: RuntimeId,
     runtime_handles: AtomicUsize,
     state: Mutex<RuntimeState>,
+    close_in_progress: AtomicBool,
     state_changed: Condvar,
     close_outcome: Mutex<Option<CloseOutcome>>,
     root_cancellation: CancellationToken,
@@ -320,6 +321,7 @@ impl Runtime {
             id: runtime_id,
             runtime_handles: AtomicUsize::new(1),
             state: Mutex::new(RuntimeState::Active),
+            close_in_progress: AtomicBool::new(false),
             state_changed: Condvar::new(),
             close_outcome: Mutex::new(None),
             root_cancellation: CancellationToken::root_for_runtime(runtime_id),
@@ -361,7 +363,7 @@ impl Runtime {
 
         Self {
             inner,
-            close_on_drop: true,
+            counts_as_owner: true,
         }
     }
 
@@ -399,7 +401,7 @@ impl Runtime {
     pub fn clone_for_supervision(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
-            close_on_drop: false,
+            counts_as_owner: false,
         }
     }
 
@@ -580,9 +582,24 @@ impl Runtime {
                 match *state {
                     RuntimeState::Active => {
                         *state = RuntimeState::Closing;
+                        let acquired = self.inner.close_in_progress.compare_exchange(
+                            false,
+                            true,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        );
+                        debug_assert!(acquired.is_ok(), "Active Runtime has no close owner");
                         break true;
                     }
                     RuntimeState::Closing => {
+                        if self
+                            .inner
+                            .close_in_progress
+                            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                            .is_ok()
+                        {
+                            break true;
+                        }
                         state = self
                             .inner
                             .state_changed
@@ -745,7 +762,7 @@ impl Runtime {
 
 impl Clone for Runtime {
     fn clone(&self) -> Self {
-        if self.close_on_drop {
+        if self.counts_as_owner {
             self.inner
                 .runtime_handles
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |handles| {
@@ -755,14 +772,14 @@ impl Clone for Runtime {
         }
         Self {
             inner: Arc::clone(&self.inner),
-            close_on_drop: self.close_on_drop,
+            counts_as_owner: self.counts_as_owner,
         }
     }
 }
 
 impl Drop for Runtime {
     fn drop(&mut self) {
-        if !self.close_on_drop {
+        if !self.counts_as_owner {
             return;
         }
         let Ok(previous) = self.inner.runtime_handles.fetch_update(
@@ -773,7 +790,7 @@ impl Drop for Runtime {
             return;
         };
         if previous == 1 {
-            let finalize = {
+            let cancel = {
                 let mut state = match self.inner.state.lock() {
                     Ok(state) => state,
                     Err(poisoned) => poisoned.into_inner(),
@@ -785,8 +802,10 @@ impl Drop for Runtime {
                     false
                 }
             };
-            if finalize {
-                spawn_finalizer(Arc::clone(&self.inner));
+            if cancel {
+                let _ = catch_unwind(AssertUnwindSafe(|| {
+                    self.inner.root_cancellation.cancel();
+                }));
             }
         }
     }
@@ -1142,12 +1161,6 @@ impl RuntimeInner {
     }
 }
 
-impl Drop for RuntimeInner {
-    fn drop(&mut self) {
-        let _ = self.stop_deadline_worker();
-    }
-}
-
 fn spawn_supervised_inner<F>(
     runtime: &Arc<RuntimeInner>,
     id: TaskId,
@@ -1246,30 +1259,6 @@ fn deadline_worker(runtime: Weak<RuntimeInner>, receiver: Receiver<DeadlineSigna
             Some(DeadlineSignal::Wake) => {}
             Some(DeadlineSignal::Shutdown) | None => break,
         }
-    }
-}
-
-fn close_after_final_handle_drop(inner: Arc<RuntimeInner>) {
-    let runtime = Runtime {
-        inner,
-        close_on_drop: false,
-    };
-    let outcome = runtime.finish_close();
-    runtime.inner.complete_close(outcome);
-}
-
-fn spawn_finalizer(inner: Arc<RuntimeInner>) {
-    let failure_fallback = Arc::clone(&inner);
-    if std::thread::Builder::new()
-        .name(format!("easycon-finalizer-{}", inner.id.get()))
-        .spawn(move || close_after_final_handle_drop(inner))
-        .is_err()
-    {
-        let outcome = failure_fallback.failed_close_outcome(CloseFailure::new(
-            ClosePhase::Start,
-            "Runtime finalizer thread could not be started",
-        ));
-        failure_fallback.complete_close(outcome);
     }
 }
 
@@ -2024,18 +2013,6 @@ mod tests {
         assert_eq!(state_after_close, OperationState::Cancelling);
     }
 
-    struct ThreadReportingResource {
-        registration: Mutex<Option<ResourceRegistration>>,
-        closed_on: mpsc::Sender<std::thread::ThreadId>,
-    }
-
-    impl ManagedResource for ThreadReportingResource {
-        fn close(&self) {
-            let _ = self.closed_on.send(std::thread::current().id());
-            self.registration.lock().expect("registration lock").take();
-        }
-    }
-
     struct OrderedResource {
         marker: u8,
         order: Arc<Mutex<Vec<u8>>>,
@@ -2212,31 +2189,52 @@ mod tests {
         assert_eq!(error.code(), ErrorCode::RuntimeClosing);
     }
 
+    // conformance: runtime.drop-limited
     #[test]
-    fn dropping_last_runtime_handle_eventually_closes_operations_and_events() {
+    fn final_owning_drop_only_rejects_admission_and_requests_cancellation() {
         let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+        let supervised = runtime.clone_for_supervision();
+        let cancellation = runtime.child_cancellation_token();
         let events = runtime
             .subscribe(SubscriptionOptions::default())
             .expect("subscribe");
         let operation = runtime.create_operation(None).expect("operation");
         operation.start();
+        let resource = Arc::new(TestResource::default());
+        let managed: Arc<dyn ManagedResource> = resource.clone();
+        *resource.registration.lock().expect("registration lock") =
+            Some(runtime.register_resource(managed).expect("resource"));
 
         drop(runtime);
 
-        assert!(matches!(
-            operation.wait(WaitTimeout::For(Duration::from_secs(2))),
-            WaitResult::Completed(_)
-        ));
-        assert_eq!(operation.snapshot().state, OperationState::Cancelled);
-        let mut last_code = None;
+        assert_eq!(supervised.state(), RuntimeState::Closing);
+        assert!(cancellation.is_cancelled());
+        assert_eq!(operation.snapshot().state, OperationState::Cancelling);
+        assert_eq!(operation.wait(WaitTimeout::Poll), WaitResult::Timeout);
+        assert!(!resource.closed.load(Ordering::Acquire));
+        assert!(!supervised.inner.events_closed.load(Ordering::Acquire));
+        let error = match supervised.create_operation(None) {
+            Err(error) => error,
+            Ok(_) => panic!("Drop must reject new admission synchronously"),
+        };
+        assert_eq!(error.code(), ErrorCode::RuntimeClosing);
+        let mut codes = Vec::new();
         loop {
-            match events.read(WaitTimeout::For(Duration::from_secs(2))) {
-                SubscriptionRead::Event(event) => last_code = Some(event.code),
-                SubscriptionRead::Closed => break,
-                SubscriptionRead::Timeout => panic!("last Runtime drop must close subscriptions"),
+            match events.read(WaitTimeout::Poll) {
+                SubscriptionRead::Event(event) => codes.push(event.code),
+                SubscriptionRead::Timeout => break,
+                SubscriptionRead::Closed => panic!("Drop must not close event production"),
             }
         }
-        assert_eq!(last_code, Some("runtime.closed"));
+        assert!(!codes.contains(&"runtime.closed"));
+        assert!(!codes.contains(&"runtime.close_failed"));
+
+        assert_eq!(
+            supervised.close().expect("explicit close takeover"),
+            CloseOutcome::Closed
+        );
+        assert!(resource.closed.load(Ordering::Acquire));
+        assert_eq!(operation.snapshot().state, OperationState::Cancelled);
     }
 
     // conformance: runtime.healthy-cleanup-after-panic
@@ -2498,26 +2496,32 @@ mod tests {
     }
 
     #[test]
-    fn dropping_last_runtime_handle_rejects_admission_before_returning() {
+    fn explicit_close_can_take_ownership_after_final_owning_drop() {
         let runtime = Runtime::new(Arc::new(VirtualClock::default()));
         let supervised = runtime.clone_for_supervision();
+        let cancellation = runtime.child_cancellation_token();
         let tasks = supervised.inner.tasks.lock().expect("task registry lock");
 
         drop(runtime);
 
         assert_eq!(supervised.state(), RuntimeState::Closing);
+        assert!(!supervised.inner.close_in_progress.load(Ordering::Acquire));
+        assert!(cancellation.is_cancelled());
         let error = match supervised.create_operation(None) {
             Err(error) => error,
             Ok(_) => panic!("final handle drop must reject admission synchronously"),
         };
         assert_eq!(error.code(), ErrorCode::RuntimeClosing);
         drop(tasks);
-        supervised.close().expect("supervised Runtime close");
+        assert_eq!(
+            supervised.close().expect("explicit close takeover"),
+            CloseOutcome::Closed
+        );
         assert_eq!(supervised.state(), RuntimeState::Closed);
     }
 
     #[test]
-    fn dropping_final_runtime_handle_inside_a_supervised_task_does_not_self_deadlock() {
+    fn final_owning_drop_inside_a_supervised_task_is_nonblocking_and_nonfinalizing() {
         let runtime = Runtime::new(Arc::new(VirtualClock::default()));
         let events = runtime
             .subscribe(SubscriptionOptions::default())
@@ -2543,49 +2547,16 @@ mod tests {
             task.join().expect("supervised task cannot join itself"),
             SupervisedTaskOutcome::Completed
         );
-        let mut last_code = None;
+        let mut codes = Vec::new();
         loop {
-            match events.read(WaitTimeout::For(Duration::from_secs(2))) {
-                SubscriptionRead::Event(event) => last_code = Some(event.code),
-                SubscriptionRead::Closed => break,
-                SubscriptionRead::Timeout => panic!("delegated Runtime close did not finish"),
+            match events.read(WaitTimeout::Poll) {
+                SubscriptionRead::Event(event) => codes.push(event.code),
+                SubscriptionRead::Timeout => break,
+                SubscriptionRead::Closed => panic!("Drop must not finalize event production"),
             }
         }
-        assert_eq!(last_code, Some("runtime.closed"));
-    }
-
-    #[test]
-    fn dropping_last_runtime_handle_does_not_close_resources_inline() {
-        let runtime = Runtime::new(Arc::new(VirtualClock::default()));
-        let events = runtime
-            .subscribe(SubscriptionOptions::default())
-            .expect("subscribe");
-        let (closed_on, observed_close) = mpsc::channel();
-        let resource = Arc::new(ThreadReportingResource {
-            registration: Mutex::new(None),
-            closed_on,
-        });
-        let managed: Arc<dyn ManagedResource> = resource.clone();
-        *resource.registration.lock().expect("registration lock") = Some(
-            runtime
-                .register_resource(managed)
-                .expect("resource registration"),
-        );
-        let dropping_thread = std::thread::current().id();
-
-        drop(runtime);
-
-        let close_thread = observed_close
-            .recv_timeout(Duration::from_secs(2))
-            .expect("delegated resource close");
-        assert_ne!(close_thread, dropping_thread);
-        loop {
-            match events.read(WaitTimeout::For(Duration::from_secs(2))) {
-                SubscriptionRead::Event(_) => {}
-                SubscriptionRead::Closed => break,
-                SubscriptionRead::Timeout => panic!("delegated Runtime close did not finish"),
-            }
-        }
+        assert!(!codes.contains(&"runtime.closed"));
+        assert!(!codes.contains(&"runtime.close_failed"));
     }
 
     #[test]

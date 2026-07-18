@@ -500,7 +500,7 @@ fn direct_while_disconnected_fails_without_transport_write() {
 }
 
 #[test]
-fn dropping_last_runtime_handle_eventually_closes_a_live_controller() {
+fn dropping_last_runtime_handle_requires_explicit_controller_close() {
     let clock = Arc::new(VirtualClock::default());
     let runtime = Runtime::new(clock.clone());
     let fake = FakeControllerTransport::new(clock.clone());
@@ -523,14 +523,10 @@ fn dropping_last_runtime_handle_eventually_closes_a_live_controller() {
     drop(runtime);
     clock.advance_to(ControllerOptions::default().minimum_report_interval_ns);
 
-    let started = Instant::now();
-    while controller.snapshot().state != ControllerState::Closed {
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "delegated Runtime close did not close the controller"
-        );
-        std::thread::yield_now();
-    }
+    assert_ne!(controller.snapshot().state, ControllerState::Closed);
+    assert!(!fake.is_closed());
+    controller.close();
+    assert_eq!(controller.snapshot().state, ControllerState::Closed);
     assert!(fake.is_closed());
 }
 

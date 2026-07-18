@@ -48,7 +48,7 @@
     },
     {
       "id": "runtime-stabilization",
-      "test": "tests/support/tests/runtime_conformance.rs::runtime_stabilization_reference_actions_are_executable",
+      "test": "crates/easycon-runtime/src/runtime.rs::resource_panic_saves_one_report_without_forcing_owner_terminal",
       "steps": [
         { "id": "runtime.spawn-self-close", "action": "spawn a supervised task through Runtime and call synchronous close from its task body" },
         { "id": "runtime.external-close", "action": "close the same Runtime externally after the supervised task exits" },
@@ -73,7 +73,7 @@
         {
           "id": "runtime.drop-limited",
           "expect": "final owning Drop rejects admission and requests root cancellation but runs no resource callback, starts no finalizer, and emits no RuntimeClosed",
-          "test": "tests/support/tests/runtime_conformance.rs::runtime_stabilization_reference_actions_are_executable"
+          "test": "crates/easycon-runtime/src/runtime.rs::final_owning_drop_only_rejects_admission_and_requests_cancellation"
         },
         {
           "id": "runtime.healthy-cleanup-after-panic",
