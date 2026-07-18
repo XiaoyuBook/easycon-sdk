@@ -28,7 +28,7 @@
         "operation states and events follow the canonical transitions",
         "report bytes and virtual timestamps match tracked fixtures",
         "direct success claims transport acceptance only",
-        "active operation, task, and resource counts are zero after close",
+        "active operation, task, and resource counts are zero after every successful close",
         "post-close event production is rejected",
         "final-handle drop does not wait for the task that is dropping it",
         "explicit close from a bound supervised task fails promptly and leaves Runtime Active for an external closer",

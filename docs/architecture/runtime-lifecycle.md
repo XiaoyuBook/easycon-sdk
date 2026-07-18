@@ -320,4 +320,6 @@ stateDiagram-v2
 - Automation 终态前 controller lease 已释放且 desired report 为中立状态。
 - Frame buffer 在最后借用 operation 结束前不释放。
 - queue overflow 不丢失可查询状态，也不阻塞生产者。
-- panic/exception 后没有跨边界 unwind，资源计数回到基线。
+- panic/exception 不跨越 ABI 边界。可恢复 operation/native 调用失败后资源计数回到基线；若 close callback
+  panic 导致真实释放无法确认，Runtime 必须保持 Closing，并保留对应 resource/task 诊断注册，直到 owner
+  实际释放，不能通过强制清零伪造 Closed。
