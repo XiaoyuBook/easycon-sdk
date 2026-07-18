@@ -5,6 +5,7 @@ use std::time::Instant;
 use easycon_model::{EasyConError, ErrorCode, ErrorDomain, OperationId};
 
 use crate::cancellation::CancellationToken;
+use crate::concurrency::unlink_then_notify;
 use crate::event::{EventDraft, EventKind, Severity};
 use crate::runtime::RuntimeInner;
 use crate::wait::WaitTimeout;
@@ -114,16 +115,6 @@ struct OperationData {
     error: Option<EasyConError>,
     cancellation_reason: Option<CancellationReason>,
     terminal_in_progress: bool,
-}
-
-struct TerminalNotification<'a> {
-    changed: &'a Condvar,
-}
-
-impl Drop for TerminalNotification<'_> {
-    fn drop(&mut self) {
-        self.changed.notify_all();
-    }
 }
 
 impl Operation {
@@ -320,9 +311,6 @@ impl OperationInner {
                     return TransitionOutcome::Unchanged;
                 }
                 data.terminal_in_progress = true;
-                let notification = TerminalNotification {
-                    changed: &self.changed,
-                };
                 let propagation = self.cancellation.deactivate_deferred();
                 drop(data);
                 propagation.propagate();
@@ -343,9 +331,13 @@ impl OperationInner {
                 data.error = Some(EasyConError::new(ErrorDomain::Runtime, code, message));
                 data.state = OperationState::Cancelled;
                 self.publish(&data);
-                self.unlink_registry();
-                drop(data);
-                drop(notification);
+                unlink_then_notify(
+                    || self.unlink_registry(),
+                    || {
+                        drop(data);
+                        self.changed.notify_all();
+                    },
+                );
                 TransitionOutcome::Applied
             }
             state if state.is_terminal() => TransitionOutcome::AlreadyTerminal,
@@ -381,9 +373,6 @@ impl OperationInner {
             OperationState::Running => {}
             _ => return TransitionOutcome::Invalid,
         }
-        let notification = TerminalNotification {
-            changed: &self.changed,
-        };
         data.terminal_in_progress = true;
         let propagation = self.cancellation.deactivate_deferred();
         drop(data);
@@ -406,9 +395,13 @@ impl OperationInner {
             TransitionOutcome::Applied
         };
         self.publish(&data);
-        self.unlink_registry();
-        drop(data);
-        drop(notification);
+        unlink_then_notify(
+            || self.unlink_registry(),
+            || {
+                drop(data);
+                self.changed.notify_all();
+            },
+        );
         outcome
     }
 

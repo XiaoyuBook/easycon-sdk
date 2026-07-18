@@ -29,6 +29,8 @@ def main():
         "easycon-runtime",
         "--test",
         "loom_runtime",
+        "--features",
+        "runtime-model",
         "--",
         "--test-threads=1",
     ]

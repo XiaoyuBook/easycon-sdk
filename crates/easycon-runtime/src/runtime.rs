@@ -12,6 +12,7 @@ use easycon_model::{
 
 use crate::cancellation::CancellationToken;
 use crate::clock::{Clock, ClockChangeRegistration};
+use crate::concurrency::{runtime_close_rejected, task_join_rejected};
 use crate::event::{
     Event, EventDraft, EventKind, EventSubscription, Severity, SubscriptionInner,
     SubscriptionOptions, close_subscriptions_with_final,
@@ -264,7 +265,7 @@ impl SupervisedTask {
     ///
     /// Returns [`TaskJoinError::SelfJoin`] when called by the supervised task itself.
     pub fn join(&self) -> Result<SupervisedTaskOutcome, TaskJoinError> {
-        if current_supervised_task() == Some((self.runtime_id, self.id)) {
+        if task_join_rejected(current_supervised_task(), self.runtime_id, self.id) {
             debug_assert_eq!(self.owner, std::thread::current().id());
             return Err(TaskJoinError::SelfJoin);
         }
@@ -584,7 +585,7 @@ impl Runtime {
     /// one of this Runtime's supervised tasks.
     ///
     pub fn close(&self) -> Result<CloseOutcome, CloseRejection> {
-        if self.inner.current_thread_owns_task() {
+        if runtime_close_rejected(current_supervised_task(), self.inner.id) {
             return Err(CloseRejection::SupervisedTask);
         }
         Ok(self.close_impl())
@@ -918,30 +919,20 @@ impl RuntimeInner {
         }
     }
 
-    fn current_thread_owns_task(&self) -> bool {
-        let Some((runtime_id, task_id)) = current_supervised_task() else {
-            return false;
-        };
-        if runtime_id != self.id {
-            return false;
-        }
-        debug_assert!(
-            self.tasks
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(&task_id)
-                .is_some_and(|record| record.owner == Some(std::thread::current().id()))
-        );
-        true
-    }
-
     fn join_supervised_task(
         &self,
         id: TaskId,
         completion: &Arc<TaskCompletion>,
     ) -> Result<SupervisedTaskOutcome, TaskJoinError> {
         let current = std::thread::current().id();
-        if current_supervised_task() == Some((self.id, id)) {
+        if task_join_rejected(current_supervised_task(), self.id, id) {
+            debug_assert!(
+                self.tasks
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&id)
+                    .is_some_and(|record| record.owner == Some(current))
+            );
             return Err(TaskJoinError::SelfJoin);
         }
 

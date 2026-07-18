@@ -1,7 +1,13 @@
 #![allow(linker_messages)]
+#![cfg(feature = "runtime-model")]
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
+use easycon_runtime::runtime_model::{
+    CancellationNode, admit_child_while_locked, cancellation_admission_open, claim_cancellation,
+    invoke_isolated, runtime_close_rejected, seal_cancelled_tree, seal_deactivated_tree,
+    task_join_rejected, unlink_then_notify,
+};
 use loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use loom::sync::{Arc, Condvar, Mutex};
 use loom::thread;
@@ -19,43 +25,108 @@ fn with_silent_panic_hook(action: impl FnOnce()) {
     }
 }
 
-struct ParentNode {
-    state: Mutex<ParentState>,
+enum ModelHook {
+    Panic,
+    AssertChildCancelled(Arc<ModelCancellationNode>),
+    Count(Arc<AtomicUsize>),
 }
 
-struct ParentState {
-    sealed: bool,
-    children: Vec<Arc<AtomicBool>>,
+struct ModelCancellationNode {
+    active: AtomicBool,
+    cancelled: AtomicBool,
+    children: Mutex<Vec<Arc<ModelCancellationNode>>>,
+    hooks: Mutex<Vec<ModelHook>>,
 }
 
-impl ParentNode {
+impl ModelCancellationNode {
     fn new() -> Self {
         Self {
-            state: Mutex::new(ParentState {
-                sealed: false,
-                children: Vec::new(),
-            }),
+            active: AtomicBool::new(true),
+            cancelled: AtomicBool::new(false),
+            children: Mutex::new(Vec::new()),
+            hooks: Mutex::new(Vec::new()),
         }
     }
 
-    fn admit_child(&self) -> Option<Arc<AtomicBool>> {
-        let mut state = self.state.lock().expect("parent state");
-        if state.sealed {
-            return None;
-        }
-        let cancelled = Arc::new(AtomicBool::new(false));
-        state.children.push(Arc::clone(&cancelled));
-        Some(cancelled)
+    fn admit_child(&self) -> Option<Arc<Self>> {
+        let child = Arc::new(Self::new());
+        let linked_child = Arc::clone(&child);
+        let cancelled_child = Arc::clone(&child);
+        let mut children = self.children.lock().expect("child registry");
+        let admitted = admit_child_while_locked(
+            || {
+                cancellation_admission_open(
+                    self.active.load(Ordering::Acquire),
+                    self.cancelled.load(Ordering::Acquire),
+                )
+            },
+            || children.push(linked_child),
+            || {
+                let mut hooks = Vec::new();
+                seal_cancelled_tree(&*cancelled_child, &mut hooks);
+                propagate_model_hooks(hooks);
+            },
+        );
+        admitted.then_some(child)
     }
 
     fn seal_and_cancel(&self) {
-        let children = {
-            let mut state = self.state.lock().expect("parent state");
-            state.sealed = true;
-            std::mem::take(&mut state.children)
-        };
-        for child in children {
-            child.store(true, Ordering::Release);
+        let mut hooks = Vec::new();
+        seal_deactivated_tree(self, &mut hooks);
+        propagate_model_hooks(hooks);
+    }
+}
+
+impl CancellationNode for ModelCancellationNode {
+    type Hook = ModelHook;
+    type Child = Arc<Self>;
+
+    fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
+    fn claim_cancel(&self) -> bool {
+        claim_cancellation(self.cancelled.swap(true, Ordering::AcqRel))
+    }
+
+    fn claim_deactivate(&self) -> bool {
+        self.active.swap(false, Ordering::AcqRel)
+    }
+
+    fn take_active_hooks(&self) -> Vec<Self::Hook> {
+        std::mem::take(&mut *self.hooks.lock().expect("cancellation hooks"))
+    }
+
+    fn clear_hooks(&self) {
+        self.hooks.lock().expect("cancellation hooks").clear();
+    }
+
+    fn take_live_children(&self) -> Vec<Self::Child> {
+        let mut children = self.children.lock().expect("child registry");
+        let live = children
+            .iter()
+            .filter(|child| child.is_active())
+            .cloned()
+            .collect();
+        children.clear();
+        live
+    }
+}
+
+fn propagate_model_hooks(hooks: Vec<ModelHook>) {
+    for hook in hooks {
+        match hook {
+            ModelHook::Panic => {
+                let _ = invoke_isolated(|| panic!("scripted cancellation hook panic"));
+            }
+            ModelHook::AssertChildCancelled(child) => {
+                let _ = invoke_isolated(|| assert!(child.cancelled.load(Ordering::Acquire)));
+            }
+            ModelHook::Count(calls) => {
+                let _ = invoke_isolated(|| {
+                    calls.fetch_add(1, Ordering::AcqRel);
+                });
+            }
         }
     }
 }
@@ -63,7 +134,7 @@ impl ParentNode {
 #[test]
 fn parent_terminal_linearizes_against_child_admission() {
     loom::model(|| {
-        let parent = Arc::new(ParentNode::new());
+        let parent = Arc::new(ModelCancellationNode::new());
         let observed_child = Arc::new(Mutex::new(None));
 
         let admitting_parent = Arc::clone(&parent);
@@ -78,47 +149,36 @@ fn parent_terminal_linearizes_against_child_admission() {
         admitting.join().expect("admitting thread");
         terminal.join().expect("terminal thread");
         if let Some(child) = observed_child.lock().expect("child observation").as_ref() {
-            assert!(child.load(Ordering::Acquire));
+            assert!(child.cancelled.load(Ordering::Acquire));
         }
         assert!(parent.admit_child().is_none());
     });
-}
-
-fn cancel_with_isolated_hooks(
-    cancelled: &AtomicBool,
-    later_hook_calls: &AtomicUsize,
-    child_cancelled: &AtomicBool,
-) {
-    if cancelled.swap(true, Ordering::AcqRel) {
-        return;
-    }
-    let hooks: [Box<dyn Fn() + Send>; 2] = [
-        Box::new(|| panic!("scripted cancellation hook panic")),
-        Box::new(|| {
-            later_hook_calls.fetch_add(1, Ordering::AcqRel);
-        }),
-    ];
-    for hook in hooks {
-        let _ = catch_unwind(AssertUnwindSafe(hook));
-    }
-    child_cancelled.store(true, Ordering::Release);
 }
 
 #[test]
 fn cancellation_hook_panic_does_not_truncate_propagation() {
     with_silent_panic_hook(|| {
         loom::model(|| {
-            let cancelled = Arc::new(AtomicBool::new(false));
+            let root = Arc::new(ModelCancellationNode::new());
+            let child = Arc::new(ModelCancellationNode::new());
             let later_hook_calls = Arc::new(AtomicUsize::new(0));
-            let child_cancelled = Arc::new(AtomicBool::new(false));
+            root.children
+                .lock()
+                .expect("child registry")
+                .push(Arc::clone(&child));
+            root.hooks.lock().expect("cancellation hooks").extend([
+                ModelHook::Panic,
+                ModelHook::AssertChildCancelled(Arc::clone(&child)),
+                ModelHook::Count(Arc::clone(&later_hook_calls)),
+            ]);
 
             let callers: Vec<_> = (0..2)
                 .map(|_| {
-                    let cancelled = Arc::clone(&cancelled);
-                    let later_hook_calls = Arc::clone(&later_hook_calls);
-                    let child_cancelled = Arc::clone(&child_cancelled);
+                    let root = Arc::clone(&root);
                     thread::spawn(move || {
-                        cancel_with_isolated_hooks(&cancelled, &later_hook_calls, &child_cancelled);
+                        let mut hooks = Vec::new();
+                        seal_cancelled_tree(&*root, &mut hooks);
+                        propagate_model_hooks(hooks);
                     })
                 })
                 .collect();
@@ -126,9 +186,9 @@ fn cancellation_hook_panic_does_not_truncate_propagation() {
                 caller.join().expect("cancel caller");
             }
 
-            assert!(cancelled.load(Ordering::Acquire));
+            assert!(root.cancelled.load(Ordering::Acquire));
             assert_eq!(later_hook_calls.load(Ordering::Acquire), 1);
-            assert!(child_cancelled.load(Ordering::Acquire));
+            assert!(child.cancelled.load(Ordering::Acquire));
         });
     });
 }
@@ -147,9 +207,12 @@ struct TaskModel {
 
 struct TaskState {
     runtime: ModelRuntimeState,
-    task_active: bool,
+    body_finished: bool,
+    thread_exited: bool,
     close_attempted: bool,
-    self_close_rejected: bool,
+    body_close_rejected: bool,
+    exit_close_rejected: bool,
+    exit_join_rejected: bool,
     join_handle_retained: bool,
 }
 
@@ -158,9 +221,12 @@ impl TaskModel {
         Self {
             state: Mutex::new(TaskState {
                 runtime: ModelRuntimeState::Active,
-                task_active: true,
+                body_finished: false,
+                thread_exited: false,
                 close_attempted: false,
-                self_close_rejected: false,
+                body_close_rejected: false,
+                exit_close_rejected: false,
+                exit_join_rejected: false,
                 join_handle_retained: true,
             }),
             changed: Condvar::new(),
@@ -169,21 +235,24 @@ impl TaskModel {
 }
 
 #[test]
-fn supervised_task_self_close_is_rejected_before_external_close() {
+fn supervised_task_self_close_is_rejected_through_thread_exit() {
     loom::model(|| {
         let model = Arc::new(TaskModel::new());
         let task_model = Arc::clone(&model);
         let task = thread::spawn(move || {
+            let owner = Some((1_usize, 7_usize));
             {
                 let mut state = task_model.state.lock().expect("task state");
-                let before = state.runtime;
-                state.self_close_rejected = true;
-                assert_eq!(state.runtime, before);
+                state.body_close_rejected = runtime_close_rejected(owner, 1);
                 state.close_attempted = true;
+                state.body_finished = true;
                 task_model.changed.notify_all();
             }
+            thread::yield_now();
             let mut state = task_model.state.lock().expect("task state");
-            state.task_active = false;
+            state.exit_close_rejected = runtime_close_rejected(owner, 1);
+            state.exit_join_rejected = task_join_rejected(owner, 1, 7);
+            state.thread_exited = true;
             task_model.changed.notify_all();
         });
 
@@ -194,7 +263,7 @@ fn supervised_task_self_close_is_rejected_before_external_close() {
                 state = closer_model.changed.wait(state).expect("task state");
             }
             state.runtime = ModelRuntimeState::Closing;
-            while state.task_active {
+            while !state.thread_exited {
                 state = closer_model.changed.wait(state).expect("task state");
             }
             state.join_handle_retained = false;
@@ -205,8 +274,11 @@ fn supervised_task_self_close_is_rejected_before_external_close() {
         task.join().expect("supervised task");
         closer.join().expect("external closer");
         let state = model.state.lock().expect("task state");
-        assert!(state.self_close_rejected);
-        assert!(!state.task_active);
+        assert!(state.body_finished);
+        assert!(state.body_close_rejected);
+        assert!(state.exit_close_rejected);
+        assert!(state.exit_join_rejected);
+        assert!(state.thread_exited);
         assert!(!state.join_handle_retained);
         assert_eq!(state.runtime, ModelRuntimeState::Closed);
     });
@@ -218,63 +290,80 @@ struct TerminalModel {
 }
 
 struct TerminalState {
-    child_admission_open: bool,
-    owner_cleanup_finished: bool,
     terminal_committed: bool,
     event_fault_isolated: bool,
     registry_fault_isolated: bool,
     registry_linked: bool,
+    notified: bool,
 }
 
 impl TerminalModel {
     fn new() -> Self {
         Self {
             state: Mutex::new(TerminalState {
-                child_admission_open: true,
-                owner_cleanup_finished: false,
                 terminal_committed: false,
                 event_fault_isolated: false,
                 registry_fault_isolated: false,
                 registry_linked: true,
+                notified: false,
             }),
             changed: Condvar::new(),
         }
     }
 
-    fn commit_with_faults(&self) {
-        let mut state = self.state.lock().expect("terminal state");
-        state.child_admission_open = false;
-        state.owner_cleanup_finished = true;
-        state.terminal_committed = true;
-        state.event_fault_isolated = Result::<(), ()>::Err(()).is_err();
-        state.registry_fault_isolated = Result::<(), ()>::Err(()).is_err();
-        state.registry_linked = false;
-        self.changed.notify_all();
-    }
-
     fn wait_terminal(&self) -> bool {
         let mut state = self.state.lock().expect("terminal state");
-        while !state.terminal_committed {
+        while !state.notified {
             state = self.changed.wait(state).expect("terminal state");
         }
-        state.owner_cleanup_finished
+        state.terminal_committed
             && state.event_fault_isolated
             && state.registry_fault_isolated
             && !state.registry_linked
-            && !state.child_admission_open
     }
 }
 
 #[test]
 fn terminal_commit_unlinks_registry_before_waiter_notification() {
-    loom::model(|| {
-        let model = Arc::new(TerminalModel::new());
-        let waiter_model = Arc::clone(&model);
-        let waiter = thread::spawn(move || waiter_model.wait_terminal());
-        let terminal_model = Arc::clone(&model);
-        let terminal = thread::spawn(move || terminal_model.commit_with_faults());
+    with_silent_panic_hook(|| {
+        loom::model(|| {
+            let model = Arc::new(TerminalModel::new());
+            let waiter_model = Arc::clone(&model);
+            let waiter = thread::spawn(move || waiter_model.wait_terminal());
 
-        terminal.join().expect("terminal transaction");
-        assert!(waiter.join().expect("terminal waiter"));
+            let terminal_model = Arc::clone(&model);
+            let terminal = thread::spawn(move || {
+                terminal_model
+                    .state
+                    .lock()
+                    .expect("terminal state")
+                    .terminal_committed = true;
+                let event_ok = invoke_isolated(|| panic!("scripted terminal event fault"));
+                terminal_model
+                    .state
+                    .lock()
+                    .expect("terminal state")
+                    .event_fault_isolated = !event_ok;
+
+                let unlink_model = Arc::clone(&terminal_model);
+                let notify_model = Arc::clone(&terminal_model);
+                unlink_then_notify(
+                    move || {
+                        let unlink_ok =
+                            invoke_isolated(|| panic!("scripted registry unlink fault"));
+                        let mut state = unlink_model.state.lock().expect("terminal state");
+                        state.registry_fault_isolated = !unlink_ok;
+                        state.registry_linked = false;
+                    },
+                    move || {
+                        notify_model.state.lock().expect("terminal state").notified = true;
+                        notify_model.changed.notify_all();
+                    },
+                );
+            });
+
+            terminal.join().expect("terminal transaction");
+            assert!(waiter.join().expect("terminal waiter"));
+        });
     });
 }

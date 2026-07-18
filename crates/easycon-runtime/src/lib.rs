@@ -3,6 +3,7 @@
 
 mod cancellation;
 mod clock;
+mod concurrency;
 mod event;
 mod operation;
 mod runtime;
@@ -25,6 +26,16 @@ pub use runtime::{
     Runtime, RuntimeCounts, RuntimeState, SupervisedTask, SupervisedTaskOutcome, TaskJoinError,
 };
 pub use wait::WaitTimeout;
+
+#[cfg(feature = "runtime-model")]
+#[doc(hidden)]
+pub mod runtime_model {
+    pub use crate::concurrency::{
+        CancellationNode, admit_child_while_locked, cancellation_admission_open,
+        claim_cancellation, invoke_isolated, runtime_close_rejected, seal_cancelled_tree,
+        seal_deactivated_tree, task_join_rejected, unlink_then_notify,
+    };
+}
 
 /// Behavior schema version implemented by this crate.
 pub const BEHAVIOR_SCHEMA_VERSION: u32 = easycon_model::BEHAVIOR_SCHEMA_VERSION;

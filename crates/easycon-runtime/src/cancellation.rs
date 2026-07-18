@@ -1,8 +1,12 @@
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use easycon_model::RuntimeId;
+
+use crate::concurrency::{
+    CancellationNode, admit_child_while_locked, cancellation_admission_open, claim_cancellation,
+    invoke_isolated, seal_cancelled_tree, seal_deactivated_tree,
+};
 
 type CancelHook = Arc<dyn Fn() + Send + Sync + 'static>;
 
@@ -50,6 +54,46 @@ struct CancellationInner {
     hooks: Mutex<Vec<CancelHookEntry>>,
 }
 
+impl CancellationNode for CancellationInner {
+    type Hook = CancelHook;
+    type Child = Arc<Self>;
+
+    fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
+    fn claim_cancel(&self) -> bool {
+        claim_cancellation(self.cancelled.swap(true, Ordering::AcqRel))
+    }
+
+    fn claim_deactivate(&self) -> bool {
+        self.active.swap(false, Ordering::AcqRel)
+    }
+
+    fn take_active_hooks(&self) -> Vec<Self::Hook> {
+        std::mem::take(&mut *lock_recover(&self.hooks))
+            .into_iter()
+            .filter(CancelHookEntry::is_active)
+            .map(|entry| entry.hook)
+            .collect()
+    }
+
+    fn clear_hooks(&self) {
+        lock_recover(&self.hooks).clear();
+    }
+
+    fn take_live_children(&self) -> Vec<Self::Child> {
+        let mut children = lock_recover(&self.children);
+        let live = children
+            .iter()
+            .filter_map(Weak::upgrade)
+            .filter(|child| child.is_active())
+            .collect();
+        children.clear();
+        live
+    }
+}
+
 impl CancellationToken {
     /// Creates an uncancelled root token.
     #[must_use]
@@ -95,14 +139,20 @@ impl CancellationToken {
                 .upgrade()
                 .is_some_and(|child| child.active.load(Ordering::Acquire))
         });
-        if !self.inner.active.load(Ordering::Acquire) || self.is_cancelled() {
+        let admitted = admit_child_while_locked(
+            || {
+                cancellation_admission_open(
+                    self.inner.active.load(Ordering::Acquire),
+                    self.is_cancelled(),
+                )
+            },
+            || children.push(Arc::downgrade(&child.inner)),
+            || child.cancel(),
+        );
+        if !admitted {
             return None;
         }
-        children.push(Arc::downgrade(&child.inner));
         drop(children);
-        if !self.inner.active.load(Ordering::Acquire) || self.is_cancelled() {
-            child.cancel();
-        }
         Some(child)
     }
 
@@ -168,65 +218,19 @@ impl CancellationToken {
 
     pub(crate) fn deactivate_deferred(&self) -> CancellationPropagation {
         let mut hooks = Vec::new();
-        seal_deactivated_inner(&self.inner, &mut hooks);
+        seal_deactivated_tree(&*self.inner, &mut hooks);
         CancellationPropagation { hooks }
     }
 }
 
 fn cancel_inner(inner: &Arc<CancellationInner>) {
     let mut hooks = Vec::new();
-    seal_cancelled_inner(inner, &mut hooks);
+    seal_cancelled_tree(&**inner, &mut hooks);
     CancellationPropagation { hooks }.propagate();
 }
 
-fn seal_cancelled_inner(inner: &Arc<CancellationInner>, hooks: &mut Vec<CancelHook>) {
-    if !inner.active.load(Ordering::Acquire) {
-        return;
-    }
-    if inner.cancelled.swap(true, Ordering::AcqRel) {
-        return;
-    }
-
-    hooks.extend(
-        std::mem::take(&mut *lock_recover(&inner.hooks))
-            .into_iter()
-            .filter(CancelHookEntry::is_active)
-            .map(|entry| entry.hook),
-    );
-
-    let children = {
-        let mut children = lock_recover(&inner.children);
-        let live: Vec<_> = children
-            .iter()
-            .filter_map(Weak::upgrade)
-            .filter(|child| child.active.load(Ordering::Acquire))
-            .collect();
-        children.clear();
-        live
-    };
-    for child in children {
-        seal_cancelled_inner(&child, hooks);
-    }
-}
-
-fn seal_deactivated_inner(inner: &Arc<CancellationInner>, hooks: &mut Vec<CancelHook>) {
-    if !inner.active.swap(false, Ordering::AcqRel) {
-        return;
-    }
-    lock_recover(&inner.hooks).clear();
-    let children: Vec<_> = {
-        let mut children = lock_recover(&inner.children);
-        let live = children.iter().filter_map(Weak::upgrade).collect();
-        children.clear();
-        live
-    };
-    for child in children {
-        seal_cancelled_inner(&child, hooks);
-    }
-}
-
 fn invoke_hook(hook: &CancelHook) {
-    let _ = catch_unwind(AssertUnwindSafe(|| hook()));
+    let _ = invoke_isolated(|| hook());
 }
 
 fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
