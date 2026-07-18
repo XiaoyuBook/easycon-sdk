@@ -318,7 +318,8 @@ stateDiagram-v2
 所有长期 task 只能由 `Runtime::spawn_supervised` 或等价 API 创建。Runtime 在 task body 执行前登记
 task，自动绑定 owner thread、持有完成通知和 `JoinHandle`，并在退出/join 后注销；public API 不暴露
 `TaskRegistration` 或手工 `bind_to_current_thread` 协议。受监管 task 内同步 close 在改变 Runtime 状态前
-返回 caller rejection，避免 self-wait。
+返回 caller rejection，避免 self-wait。deterministic close owner 线程中的 resource callback 重入同一
+Runtime 的同步 close 同样在等待前返回 `CloseOwner`，外层 close 继续并保存唯一 outcome。
 
 带 caller wait timeout 的正式 `close(timeout)` 可以只结束本次等待；已经开始的关闭仍由同一个 owner
 继续，后续 caller 观察相同 outcome。最后 owning Runtime handle 的 `Drop` 只同步拒绝 admission 并请求

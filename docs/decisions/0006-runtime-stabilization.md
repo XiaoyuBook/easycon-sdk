@@ -41,6 +41,8 @@ binding、固件或 UI。
 1. Runtime 状态固定为 `Active`、`Closing`、`Closed`、`CloseFailed`。
 2. 第一个外部 close caller 原子取得 close ownership 并从 `Active` 进入 `Closing`。从这一刻起，
    admission 永久拒绝；并发 caller 等待同一次 close。
+   close owner 线程中的 resource callback 若重入同一 Runtime 的同步 `close`，必须在等待前返回明确的
+   `CloseOwner` caller rejection；不得等待自身完成。
 3. 成功关闭保存 `CloseOutcome::Closed`。任一不可恢复的 resource、task、event 或 registry 故障保存
    `CloseOutcome::Failed(CloseReport)`，进入 `CloseFailed`，发布 `runtime.close_failed` 作为最终事件，
    关闭事件生产端并唤醒全部 close waiter。

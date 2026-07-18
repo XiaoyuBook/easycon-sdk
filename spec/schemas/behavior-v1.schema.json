@@ -71,11 +71,12 @@
     "runtime": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["states", "close_is_idempotent", "explicit_close", "final_handle_drop", "supervised_tasks", "close_failure", "close_order", "closed_counts"],
+      "required": ["states", "close_is_idempotent", "explicit_close", "reentrant_close", "final_handle_drop", "supervised_tasks", "close_failure", "close_order", "closed_counts"],
       "properties": {
         "states": { "type": "array", "minItems": 4, "items": { "type": "string" }, "uniqueItems": true },
         "close_is_idempotent": { "type": "boolean" },
         "explicit_close": { "type": "string" },
+        "reentrant_close": { "type": "string" },
         "final_handle_drop": { "type": "string" },
         "supervised_tasks": { "type": "string" },
         "close_failure": { "type": "string" },

@@ -113,6 +113,8 @@ pub enum TaskJoinError {
 pub enum CloseRejection {
     /// A supervised task cannot synchronously close the Runtime that owns it.
     SupervisedTask,
+    /// The deterministic close owner cannot synchronously re-enter its own Runtime close.
+    CloseOwner,
 }
 
 /// Observation and explicit join handle for a Runtime-owned task.
@@ -144,6 +146,7 @@ pub(crate) struct RuntimeInner {
     runtime_handles: AtomicUsize,
     state: Mutex<RuntimeState>,
     close_in_progress: AtomicBool,
+    close_owner: Mutex<Option<ThreadId>>,
     state_changed: Condvar,
     close_outcome: Mutex<Option<CloseOutcome>>,
     root_cancellation: CancellationToken,
@@ -183,6 +186,19 @@ struct CloseFailure {
     diagnostic: &'static str,
     resource_id: Option<ResourceId>,
     task_id: Option<TaskId>,
+}
+
+struct CloseOwnerGuard<'a> {
+    owner: &'a Mutex<Option<ThreadId>>,
+}
+
+impl Drop for CloseOwnerGuard<'_> {
+    fn drop(&mut self) {
+        *self
+            .owner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
 }
 
 impl CloseFailure {
@@ -332,6 +348,7 @@ impl Runtime {
             runtime_handles: AtomicUsize::new(1),
             state: Mutex::new(RuntimeState::Active),
             close_in_progress: AtomicBool::new(false),
+            close_owner: Mutex::new(None),
             state_changed: Condvar::new(),
             close_outcome: Mutex::new(None),
             root_cancellation: CancellationToken::root_for_runtime(runtime_id),
@@ -588,6 +605,9 @@ impl Runtime {
         if runtime_close_rejected(current_supervised_task(), self.inner.id) {
             return Err(CloseRejection::SupervisedTask);
         }
+        if self.inner.current_thread_owns_close() {
+            return Err(CloseRejection::CloseOwner);
+        }
         Ok(self.close_impl())
     }
 
@@ -634,6 +654,7 @@ impl Runtime {
             return self.inner.saved_close_outcome();
         }
 
+        let _close_owner = self.inner.bind_close_owner();
         let outcome = self.finish_close();
         self.inner.complete_close(outcome.clone());
         outcome
@@ -832,6 +853,27 @@ impl Drop for Runtime {
 }
 
 impl RuntimeInner {
+    fn current_thread_owns_close(&self) -> bool {
+        *self
+            .close_owner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            == Some(std::thread::current().id())
+    }
+
+    fn bind_close_owner(&self) -> CloseOwnerGuard<'_> {
+        let mut owner = self
+            .close_owner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        debug_assert!(owner.is_none(), "deterministic close has one owner thread");
+        *owner = Some(std::thread::current().id());
+        drop(owner);
+        CloseOwnerGuard {
+            owner: &self.close_owner,
+        }
+    }
+
     fn saved_close_outcome(&self) -> CloseOutcome {
         self.close_outcome
             .lock()
@@ -2174,6 +2216,20 @@ mod tests {
         registration: Mutex<Option<ResourceRegistration>>,
     }
 
+    struct ReentrantCloseResource {
+        runtime: Runtime,
+        result: mpsc::SyncSender<Result<CloseOutcome, CloseRejection>>,
+        registration: Mutex<Option<ResourceRegistration>>,
+    }
+
+    impl ManagedResource for ReentrantCloseResource {
+        fn close(&self) {
+            let result = self.runtime.close();
+            let _ = self.result.send(result);
+            self.registration.lock().expect("registration lock").take();
+        }
+    }
+
     impl ManagedResource for CancellationObservingResource {
         fn close(&self) {
             self.saw_cancelling.store(
@@ -2202,6 +2258,35 @@ mod tests {
 
         assert!(resource.saw_cancelling.load(Ordering::Acquire));
         assert_eq!(operation.snapshot().state, OperationState::Cancelled);
+    }
+
+    // conformance: runtime.reentrant-close
+    #[test]
+    fn resource_callback_reentrant_close_is_rejected_without_self_wait() {
+        let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+        let (result, observed_result) = mpsc::sync_channel(1);
+        let resource = Arc::new(ReentrantCloseResource {
+            runtime: runtime.clone(),
+            result,
+            registration: Mutex::new(None),
+        });
+        let managed: Arc<dyn ManagedResource> = resource.clone();
+        *resource.registration.lock().expect("registration lock") =
+            Some(runtime.register_resource(managed).expect("resource"));
+
+        let closing_runtime = runtime.clone();
+        let closer = std::thread::spawn(move || closing_runtime.close());
+        assert_eq!(
+            observed_result
+                .recv_timeout(Duration::from_secs(2))
+                .expect("reentrant close must fail without self-wait"),
+            Err(CloseRejection::CloseOwner)
+        );
+        assert_eq!(
+            closer.join().expect("outer close"),
+            Ok(CloseOutcome::Closed)
+        );
+        assert_eq!(runtime.state(), RuntimeState::Closed);
     }
 
     #[test]

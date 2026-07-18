@@ -58,6 +58,7 @@
         "crates/easycon-runtime/src/runtime.rs::task_exit_destructor_close_is_rejected_before_state_change",
         "crates/easycon-runtime/src/runtime.rs::task_exit_destructor_cannot_join_its_own_thread",
         "crates/easycon-runtime/src/runtime.rs::concurrent_external_join_cannot_hide_a_task_panic_from_close",
+        "crates/easycon-runtime/src/runtime.rs::resource_callback_reentrant_close_is_rejected_without_self_wait",
         "crates/easycon-runtime/src/runtime.rs::final_owning_drop_only_rejects_admission_and_requests_cancellation",
         "crates/easycon-runtime/src/runtime.rs::resource_panic_saves_one_report_without_forcing_owner_terminal",
         "crates/easycon-runtime/src/runtime.rs::final_event_failure_never_exposes_runtime_closed"
@@ -66,6 +67,7 @@
         { "id": "runtime.spawn-self-close", "action": "spawn a supervised task through Runtime and call synchronous close from its task body" },
         { "id": "runtime.task-exit-destructor", "action": "call close and self-join from task-owned TLS destructors after the body completion signal" },
         { "id": "runtime.task-panic-race", "action": "pause an external panic-task join at registry unlink while another thread closes Runtime" },
+        { "id": "runtime.resource-reentrant-close", "action": "re-enter synchronous Runtime close from a ManagedResource callback on the deterministic close owner thread" },
         { "id": "runtime.external-close", "action": "close the same Runtime externally after the supervised task exits" },
         { "id": "runtime.final-drop", "action": "drop the final owning handle of a fresh Runtime with a live resource and subscription" },
         { "id": "runtime.drop-observe", "action": "observe admission rejection and root cancellation without releasing the resource owner" },
@@ -100,6 +102,11 @@
           "id": "runtime.task-panic-race",
           "expect": "external join cannot unlink a panicked task before its diagnostic is durable to concurrent close",
           "test": "crates/easycon-runtime/src/runtime.rs::concurrent_external_join_cannot_hide_a_task_panic_from_close"
+        },
+        {
+          "id": "runtime.reentrant-close",
+          "expect": "a resource callback on the close owner thread receives CloseOwner before waiting and the outer close still reaches its saved outcome",
+          "test": "crates/easycon-runtime/src/runtime.rs::resource_callback_reentrant_close_is_rejected_without_self_wait"
         },
         {
           "id": "runtime.drop-limited",
