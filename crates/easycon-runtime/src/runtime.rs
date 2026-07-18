@@ -159,6 +159,7 @@ pub(crate) struct RuntimeInner {
     clock: Arc<dyn Clock>,
     next_id: AtomicU64,
     next_sequence: AtomicU64,
+    last_event_timestamp_ns: AtomicU64,
     operations: Mutex<HashMap<OperationId, Arc<OperationInner>>>,
     resources: Mutex<HashMap<ResourceId, Weak<dyn ManagedResource>>>,
     tasks: Mutex<HashMap<TaskId, TaskRecord>>,
@@ -426,6 +427,7 @@ impl Runtime {
             clock,
             next_id,
             next_sequence: AtomicU64::new(1),
+            last_event_timestamp_ns: AtomicU64::new(0),
             operations: Mutex::new(HashMap::new()),
             resources: Mutex::new(HashMap::new()),
             tasks: Mutex::new(HashMap::new()),
@@ -1019,7 +1021,9 @@ impl RuntimeInner {
             catch_unwind(AssertUnwindSafe(|| self.close_events(first_attempt))),
             Ok(Ok(()))
         ) && !matches!(
-            catch_unwind(AssertUnwindSafe(|| self.close_events(event))),
+            catch_unwind(AssertUnwindSafe(|| {
+                self.close_events_recovering_clock(event)
+            })),
             Ok(Ok(()))
         ) {
             self.force_close_event_producers();
@@ -1222,6 +1226,18 @@ impl RuntimeInner {
     }
 
     fn close_events(&self, draft: EventDraft) -> Result<(), ()> {
+        self.close_events_with_clock_recovery(draft, false)
+    }
+
+    fn close_events_recovering_clock(&self, draft: EventDraft) -> Result<(), ()> {
+        self.close_events_with_clock_recovery(draft, true)
+    }
+
+    fn close_events_with_clock_recovery(
+        &self,
+        draft: EventDraft,
+        recover_clock_panic: bool,
+    ) -> Result<(), ()> {
         let mut subscriptions = self
             .subscriptions
             .lock()
@@ -1258,18 +1274,41 @@ impl RuntimeInner {
         {
             observer(self.counts_recover());
         }
-        let event = self.next_event(draft);
+        let event = if recover_clock_panic {
+            self.next_event_recovering_clock(draft)
+        } else {
+            self.next_event(draft)
+        };
         close_subscriptions_with_final(&live, event);
         self.events_closed.store(true, Ordering::Release);
         Ok(())
     }
 
     fn next_event(&self, draft: EventDraft) -> Event {
+        let sequence = self.allocate_event_sequence();
+        let timestamp_ns = self.clock.now_ns();
+        self.finish_event(sequence, timestamp_ns, draft)
+    }
+
+    fn next_event_recovering_clock(&self, draft: EventDraft) -> Event {
+        let sequence = self.allocate_event_sequence();
+        let timestamp_ns = catch_unwind(AssertUnwindSafe(|| self.clock.now_ns()))
+            .unwrap_or_else(|_| self.last_event_timestamp_ns.load(Ordering::Acquire));
+        self.finish_event(sequence, timestamp_ns, draft)
+    }
+
+    fn allocate_event_sequence(&self) -> u64 {
         let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
         assert!(sequence != 0, "event sequence space exhausted");
+        sequence
+    }
+
+    fn finish_event(&self, sequence: u64, timestamp_ns: u64, draft: EventDraft) -> Event {
+        self.last_event_timestamp_ns
+            .store(timestamp_ns, Ordering::Release);
         Event {
             sequence,
-            timestamp_ns: self.clock.now_ns(),
+            timestamp_ns,
             class: draft.class,
             kind: draft.kind,
             code: draft.code,
@@ -1543,6 +1582,46 @@ mod tests {
     };
 
     use super::*;
+
+    struct PanickingNowClock {
+        inner: VirtualClock,
+        panic_now: AtomicBool,
+    }
+
+    impl PanickingNowClock {
+        fn new(now_ns: u64) -> Self {
+            Self {
+                inner: VirtualClock::new(now_ns),
+                panic_now: AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl Clock for PanickingNowClock {
+        fn now_ns(&self) -> u64 {
+            assert!(
+                !self.panic_now.load(Ordering::Acquire),
+                "scripted clock.now_ns panic"
+            );
+            self.inner.now_ns()
+        }
+
+        fn on_change(&self, hook: Arc<dyn Fn() + Send + Sync>) -> ClockChangeRegistration {
+            self.inner.on_change(hook)
+        }
+
+        fn register_deadline(&self, target_ns: u64) -> crate::DeadlineId {
+            self.inner.register_deadline(target_ns)
+        }
+
+        fn record_dispatch(&self, id: crate::DeadlineId, actual_ns: u64) {
+            self.inner.record_dispatch(id, actual_ns);
+        }
+
+        fn real_wait_duration(&self, target_ns: u64) -> Option<Duration> {
+            self.inner.real_wait_duration(target_ns)
+        }
+    }
 
     struct CloseRuntimeOnThreadExit {
         runtime: Runtime,
@@ -3318,6 +3397,55 @@ mod tests {
             }
             assert_eq!(codes.last(), Some(&"runtime.close_failed"));
             assert!(!codes.contains(&"runtime.closed"));
+        }
+
+        let clock = Arc::new(PanickingNowClock::new(41));
+        let runtime = Runtime::new(clock.clone());
+        let first = runtime
+            .subscribe(SubscriptionOptions::default())
+            .expect("first subscription");
+        let second = runtime
+            .subscribe(SubscriptionOptions::default())
+            .expect("second subscription");
+        runtime
+            .publish(EventDraft::critical(
+                EventKind::State,
+                "test.before_clock_failure",
+                Severity::Info,
+            ))
+            .expect("event before clock failure");
+        clock.panic_now.store(true, Ordering::Release);
+
+        let CloseOutcome::Failed(report) = runtime.close().expect("Runtime close") else {
+            panic!("persistent final event failure cannot report Closed");
+        };
+        assert_eq!(report.phase, ClosePhase::Start);
+        assert_eq!(runtime.state(), RuntimeState::CloseFailed);
+
+        for subscription in [&first, &second] {
+            let mut observed = Vec::new();
+            loop {
+                match subscription.read(WaitTimeout::Poll) {
+                    SubscriptionRead::Event(event) => observed.push(event),
+                    SubscriptionRead::Closed => break,
+                    SubscriptionRead::Timeout => {
+                        panic!("failed-close subscription must be closed")
+                    }
+                }
+            }
+            assert_eq!(
+                observed.last().map(|event| event.code),
+                Some("runtime.close_failed")
+            );
+            assert_eq!(observed.last().map(|event| event.timestamp_ns), Some(41));
+            assert_eq!(
+                observed
+                    .iter()
+                    .filter(|event| event.code == "runtime.close_failed")
+                    .count(),
+                1
+            );
+            assert!(!observed.iter().any(|event| event.code == "runtime.closed"));
         }
     }
 
