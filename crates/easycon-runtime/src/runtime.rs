@@ -805,17 +805,6 @@ impl Runtime {
         let mut resource_failure = None;
         for (id, resource) in &resources {
             if catch_isolated(|| resource.close()).is_err() {
-                let _ = self.inner.try_publish_event(
-                    EventDraft::critical(
-                        EventKind::Warning,
-                        "runtime.resource.close_panicked",
-                        Severity::Error,
-                    )
-                    .with_resource(*id)
-                    .with_detail(
-                        "ManagedResource::close panicked; registration remains supervised",
-                    ),
-                );
                 if resource_failure.is_none() {
                     resource_failure = Some(
                         CloseFailure::new(
@@ -825,6 +814,19 @@ impl Runtime {
                         .with_resource(*id),
                     );
                 }
+                let _ = catch_isolated(|| {
+                    let _ = self.inner.try_publish_event(
+                        EventDraft::critical(
+                            EventKind::Warning,
+                            "runtime.resource.close_panicked",
+                            Severity::Error,
+                        )
+                        .with_resource(*id)
+                        .with_detail(
+                            "ManagedResource::close panicked; registration remains supervised",
+                        ),
+                    );
+                });
             }
         }
         drop(resources);
@@ -1631,6 +1633,55 @@ mod tests {
             if should_panic {
                 panic_with_drop_panicking_payload(Arc::clone(&self.payload_drops));
             }
+            self.inner.now_ns()
+        }
+
+        fn on_change(&self, hook: Arc<dyn Fn() + Send + Sync>) -> ClockChangeRegistration {
+            self.inner.on_change(hook)
+        }
+
+        fn register_deadline(&self, target_ns: u64) -> crate::DeadlineId {
+            self.inner.register_deadline(target_ns)
+        }
+
+        fn record_dispatch(&self, id: crate::DeadlineId, actual_ns: u64) {
+            self.inner.record_dispatch(id, actual_ns);
+        }
+
+        fn real_wait_duration(&self, target_ns: u64) -> Option<Duration> {
+            self.inner.real_wait_duration(target_ns)
+        }
+    }
+
+    #[derive(Default)]
+    struct OneShotThreadClock {
+        inner: VirtualClock,
+        panic_thread: Mutex<Option<ThreadId>>,
+    }
+
+    impl OneShotThreadClock {
+        fn panic_next_on_current_thread(&self) {
+            *self.panic_thread.lock().expect("panic thread lock") =
+                Some(std::thread::current().id());
+        }
+    }
+
+    impl Clock for OneShotThreadClock {
+        fn now_ns(&self) -> u64 {
+            let current = std::thread::current().id();
+            let should_panic = {
+                let mut panic_thread = self
+                    .panic_thread
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if *panic_thread == Some(current) {
+                    *panic_thread = None;
+                    true
+                } else {
+                    false
+                }
+            };
+            assert!(!should_panic, "scripted warning event clock panic");
             self.inner.now_ns()
         }
 
@@ -2462,6 +2513,18 @@ mod tests {
         }
     }
 
+    struct WarningEventPanickingResource {
+        clock: Arc<OneShotThreadClock>,
+        registration: Mutex<Option<ResourceRegistration>>,
+    }
+
+    impl ManagedResource for WarningEventPanickingResource {
+        fn close(&self) {
+            self.clock.panic_next_on_current_thread();
+            panic!("scripted resource close panic before warning event fault");
+        }
+    }
+
     struct BlockingPanickingResource {
         registration: Mutex<Option<ResourceRegistration>>,
         close_count: AtomicUsize,
@@ -2933,6 +2996,62 @@ mod tests {
                 active_tasks: 0,
             }
         );
+
+        let clock = Arc::new(OneShotThreadClock::default());
+        let runtime = Runtime::new(clock.clone());
+        let events = runtime
+            .subscribe(SubscriptionOptions::default())
+            .expect("warning-fault events");
+        let panicking = Arc::new(WarningEventPanickingResource {
+            clock,
+            registration: Mutex::new(None),
+        });
+        let managed: Arc<dyn ManagedResource> = panicking.clone();
+        let registration = runtime.register_resource(managed).expect("resource");
+        let panicking_id = registration.id();
+        *panicking.registration.lock().expect("registration lock") = Some(registration);
+        let healthy = Arc::new(TestResource::default());
+        let managed: Arc<dyn ManagedResource> = healthy.clone();
+        *healthy.registration.lock().expect("registration lock") =
+            Some(runtime.register_resource(managed).expect("resource"));
+
+        let CloseOutcome::Failed(report) = runtime.close().expect("Runtime close") else {
+            panic!("resource and warning event failure cannot report Closed");
+        };
+        assert_eq!(report.phase, ClosePhase::ResourceCleanup);
+        assert_eq!(report.resource_id, Some(panicking_id));
+        assert_eq!(
+            report.diagnostic.as_ref(),
+            "ManagedResource::close panicked"
+        );
+        assert_eq!(
+            report.counts,
+            RuntimeCounts {
+                active_operations: 0,
+                active_resources: 1,
+                active_tasks: 0,
+            }
+        );
+        assert!(healthy.closed.load(Ordering::Acquire));
+
+        let mut codes = Vec::new();
+        loop {
+            match events.read(WaitTimeout::Poll) {
+                SubscriptionRead::Event(event) => codes.push(event.code),
+                SubscriptionRead::Closed => break,
+                SubscriptionRead::Timeout => panic!("failed close queue must be closed"),
+            }
+        }
+        assert_eq!(codes.last(), Some(&"runtime.close_failed"));
+        assert!(!codes.contains(&"runtime.resource.close_panicked"));
+        assert!(!codes.contains(&"runtime.closed"));
+
+        panicking
+            .registration
+            .lock()
+            .expect("registration lock")
+            .take();
+        assert_eq!(runtime.counts().active_resources, 0);
     }
 
     #[test]
