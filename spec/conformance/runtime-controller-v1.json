@@ -78,22 +78,22 @@
         {
           "id": "runtime.healthy-cleanup-after-panic",
           "expect": "resource callback panic does not prevent healthy resource cleanup",
-          "test": "tests/support/tests/runtime_conformance.rs::runtime_stabilization_reference_actions_are_executable"
+          "test": "crates/easycon-runtime/src/runtime.rs::resource_panic_saves_one_report_without_forcing_owner_terminal"
         },
         {
           "id": "runtime.saved-close-failed",
           "expect": "all concurrent and later close callers receive one saved CloseFailed outcome and runtime.close_failed is the final event",
-          "test": "tests/support/tests/runtime_conformance.rs::runtime_stabilization_reference_actions_are_executable"
+          "test": "crates/easycon-runtime/src/runtime.rs::resource_panic_saves_one_report_without_forcing_owner_terminal"
         },
         {
           "id": "runtime.owner-terminal-order",
           "expect": "an operation remains non-terminal until its real owner cleanup and owner task exit",
-          "test": "tests/support/tests/runtime_conformance.rs::runtime_stabilization_reference_actions_are_executable"
+          "test": "crates/easycon-runtime/src/runtime.rs::resource_panic_saves_one_report_without_forcing_owner_terminal"
         },
         {
           "id": "runtime.close-report",
           "expect": "CloseFailed retains diagnostic resource or task IDs and non-converged registry counts",
-          "test": "tests/support/tests/runtime_conformance.rs::runtime_stabilization_reference_actions_are_executable"
+          "test": "crates/easycon-runtime/src/runtime.rs::resource_panic_saves_one_report_without_forcing_owner_terminal"
         }
       ]
     },

@@ -231,7 +231,7 @@ impl EventSubscription {
         self.inner
             .state
             .lock()
-            .expect("subscription queue lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .event_count
     }
 }
@@ -252,7 +252,10 @@ impl SubscriptionInner {
     }
 
     fn enqueue_accepted(&self, event: Event) {
-        let mut state = self.state.lock().expect("subscription queue lock poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.closed {
             return;
         }
@@ -292,7 +295,10 @@ impl SubscriptionInner {
 
     fn read(&self, wait: WaitTimeout) -> SubscriptionRead {
         let started = Instant::now();
-        let mut state = self.state.lock().expect("subscription queue lock poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         loop {
             if let Some(entry) = state.entries.pop_front() {
                 return match entry {
@@ -313,7 +319,7 @@ impl SubscriptionInner {
                     state = self
                         .changed
                         .wait(state)
-                        .expect("subscription queue lock poisoned while waiting");
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                 }
                 WaitTimeout::For(limit) => {
                     let Some(remaining) = limit.checked_sub(started.elapsed()) else {
@@ -322,7 +328,7 @@ impl SubscriptionInner {
                     let (next, timed_out) = self
                         .changed
                         .wait_timeout(state, remaining)
-                        .expect("subscription queue lock poisoned while waiting");
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     state = next;
                     if timed_out.timed_out() && state.entries.is_empty() {
                         return SubscriptionRead::Timeout;
@@ -335,7 +341,7 @@ impl SubscriptionInner {
     pub(crate) fn close(&self) {
         self.state
             .lock()
-            .expect("subscription queue lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .closed = true;
         self.changed.notify_all();
     }

@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -28,6 +29,8 @@ pub enum RuntimeState {
     Closing,
     /// All supervised task, resource, and operation registries are empty.
     Closed,
+    /// Deterministic close stopped at a saved, diagnosable failure.
+    CloseFailed,
 }
 
 /// Debug counters used by lifecycle conformance tests.
@@ -39,6 +42,49 @@ pub struct RuntimeCounts {
     pub active_resources: usize,
     /// Active task guards owned by supervised workers.
     pub active_tasks: usize,
+}
+
+/// Stable phase identifying where deterministic close stopped.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClosePhase {
+    /// Closing notification or root cancellation setup.
+    Start,
+    /// Runtime-owned resource cleanup.
+    ResourceCleanup,
+    /// Ordinary supervised task join.
+    TaskJoin,
+    /// Fallback terminal completion after owners exited.
+    OperationFinalization,
+    /// Runtime-internal task shutdown and join.
+    InternalTaskJoin,
+    /// Final registry convergence check.
+    RegistryConvergence,
+    /// Final event publication and producer close.
+    FinalEvent,
+}
+
+/// Saved diagnostic for an unrecoverable deterministic-close failure.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CloseReport {
+    /// Phase that produced the primary failure.
+    pub phase: ClosePhase,
+    /// Stable diagnostic suitable for logs and binding error translation.
+    pub diagnostic: Arc<str>,
+    /// Resource associated with the failure, when applicable.
+    pub resource_id: Option<ResourceId>,
+    /// Task associated with the failure, when applicable.
+    pub task_id: Option<TaskId>,
+    /// Registry counts captured after failure containment.
+    pub counts: RuntimeCounts,
+}
+
+/// Saved result returned to every concurrent and later close caller.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CloseOutcome {
+    /// Deterministic close completed and all registries converged.
+    Closed,
+    /// Deterministic close stopped with one saved diagnostic report.
+    Failed(Arc<CloseReport>),
 }
 
 /// Saved result of one supervised task body.
@@ -92,7 +138,7 @@ pub(crate) struct RuntimeInner {
     runtime_handles: AtomicUsize,
     state: Mutex<RuntimeState>,
     state_changed: Condvar,
-    close_failed: AtomicBool,
+    close_outcome: Mutex<Option<CloseOutcome>>,
     root_cancellation: CancellationToken,
     clock: Arc<dyn Clock>,
     next_id: AtomicU64,
@@ -112,6 +158,35 @@ pub(crate) struct RuntimeInner {
 enum DeadlineSignal {
     Wake,
     Shutdown,
+}
+
+#[derive(Clone, Copy)]
+struct CloseFailure {
+    phase: ClosePhase,
+    diagnostic: &'static str,
+    resource_id: Option<ResourceId>,
+    task_id: Option<TaskId>,
+}
+
+impl CloseFailure {
+    const fn new(phase: ClosePhase, diagnostic: &'static str) -> Self {
+        Self {
+            phase,
+            diagnostic,
+            resource_id: None,
+            task_id: None,
+        }
+    }
+
+    const fn with_resource(mut self, resource_id: ResourceId) -> Self {
+        self.resource_id = Some(resource_id);
+        self
+    }
+
+    const fn with_task(mut self, task_id: TaskId) -> Self {
+        self.task_id = Some(task_id);
+        self
+    }
 }
 
 struct TaskRecord {
@@ -158,6 +233,13 @@ impl TaskCompletion {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
     }
+
+    fn is_finished(&self) -> bool {
+        self.outcome
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
 }
 
 impl SupervisedTask {
@@ -173,7 +255,7 @@ impl SupervisedTask {
     ///
     /// Returns [`TaskJoinError::SelfJoin`] when called by the supervised task itself.
     pub fn join(&self) -> Result<SupervisedTaskOutcome, TaskJoinError> {
-        if self.owner == std::thread::current().id() {
+        if self.owner == std::thread::current().id() && !self.completion.is_finished() {
             return Err(TaskJoinError::SelfJoin);
         }
         if let Some(runtime) = self.runtime.upgrade() {
@@ -239,7 +321,7 @@ impl Runtime {
             runtime_handles: AtomicUsize::new(1),
             state: Mutex::new(RuntimeState::Active),
             state_changed: Condvar::new(),
-            close_failed: AtomicBool::new(false),
+            close_outcome: Mutex::new(None),
             root_cancellation: CancellationToken::root_for_runtime(runtime_id),
             clock,
             next_id,
@@ -296,7 +378,7 @@ impl Runtime {
             .inner
             .state
             .lock()
-            .expect("Runtime state lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Returns the Runtime monotonic clock.
@@ -470,102 +552,90 @@ impl Runtime {
     /// Returns current supervised counts without changing lifecycle.
     #[must_use]
     pub fn counts(&self) -> RuntimeCounts {
-        RuntimeCounts {
-            active_operations: self
-                .inner
-                .operations
-                .lock()
-                .expect("operation registry lock poisoned")
-                .len(),
-            active_resources: self
-                .inner
-                .resources
-                .lock()
-                .expect("resource registry lock poisoned")
-                .len(),
-            active_tasks: self
-                .inner
-                .tasks
-                .lock()
-                .expect("task registry lock poisoned")
-                .len(),
-        }
+        self.inner.counts_recover()
     }
 
-    /// Idempotently closes resources, finishes operations, closes events, and enters `Closed`.
-    /// Unlike final-handle drop, this method waits for the full close sequence to finish.
+    /// Idempotently runs deterministic close and returns its saved terminal outcome.
     ///
     /// # Errors
     ///
     /// Returns [`CloseRejection::SupervisedTask`] without changing Runtime state when called from
     /// one of this Runtime's supervised tasks.
     ///
-    /// # Panics
-    ///
-    /// Panics when an internal close phase fails unexpectedly. Concurrent and later close callers
-    /// are woken and report the same failed-close condition instead of waiting indefinitely.
-    pub fn close(&self) -> Result<(), CloseRejection> {
+    pub fn close(&self) -> Result<CloseOutcome, CloseRejection> {
         if self.inner.current_thread_owns_task() {
             return Err(CloseRejection::SupervisedTask);
         }
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.close_impl()));
-        if let Err(payload) = result {
-            self.inner.fail_close_after_panic();
-            std::panic::resume_unwind(payload);
-        }
-        Ok(())
+        Ok(self.close_impl())
     }
 
-    fn close_impl(&self) {
+    fn close_impl(&self) -> CloseOutcome {
         let owner = {
             let mut state = self
                 .inner
                 .state
                 .lock()
-                .expect("Runtime state lock poisoned");
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             loop {
-                if self.inner.close_failed.load(Ordering::Acquire) {
-                    break None;
-                }
                 match *state {
                     RuntimeState::Active => {
                         *state = RuntimeState::Closing;
-                        break Some(true);
+                        break true;
                     }
                     RuntimeState::Closing => {
                         state = self
                             .inner
                             .state_changed
                             .wait(state)
-                            .expect("Runtime state lock poisoned while closing");
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
                     }
-                    RuntimeState::Closed => break Some(false),
+                    RuntimeState::Closed | RuntimeState::CloseFailed => break false,
                 }
             }
         };
-        let Some(owner) = owner else {
-            panic!("Runtime close previously failed");
-        };
         if !owner {
-            return;
+            return self.inner.saved_close_outcome();
         }
 
-        self.finish_close();
+        let outcome = self.finish_close();
+        self.inner.complete_close(outcome.clone());
+        outcome
     }
 
-    fn finish_close(&self) {
-        let _ = self.inner.try_publish_event(EventDraft::critical(
-            EventKind::State,
-            "runtime.closing",
-            Severity::Info,
-        ));
+    fn finish_close(&self) -> CloseOutcome {
+        let phase = Cell::new(ClosePhase::Start);
+        let result = catch_unwind(AssertUnwindSafe(|| self.finish_close_success_path(&phase)));
+        match result {
+            Ok(Ok(())) => CloseOutcome::Closed,
+            Ok(Err(failure)) => self.inner.failed_close_outcome(failure),
+            Err(_) => self.inner.failed_close_outcome(CloseFailure::new(
+                phase.get(),
+                "Runtime close phase panicked",
+            )),
+        }
+    }
+
+    fn finish_close_success_path(&self, phase: &Cell<ClosePhase>) -> Result<(), CloseFailure> {
+        self.inner
+            .try_publish_event(EventDraft::critical(
+                EventKind::State,
+                "runtime.closing",
+                Severity::Info,
+            ))
+            .map_err(|_| {
+                CloseFailure::new(
+                    ClosePhase::Start,
+                    "Runtime closing event could not be published",
+                )
+            })?;
         self.inner.root_cancellation.cancel();
 
+        phase.set(ClosePhase::OperationFinalization);
         let mut operations: Vec<_> = self
             .inner
             .operations
             .lock()
-            .expect("operation registry lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .values()
             .cloned()
             .map(|inner| Operation { inner })
@@ -577,12 +647,13 @@ impl Runtime {
             }
         }
 
+        phase.set(ClosePhase::ResourceCleanup);
         let mut resources = {
             let mut registry = self
                 .inner
                 .resources
                 .lock()
-                .expect("resource registry lock poisoned");
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut stale = Vec::new();
             let mut live = Vec::new();
             for (&id, resource) in registry.iter() {
@@ -598,12 +669,9 @@ impl Runtime {
             live
         };
         resources.sort_by_key(|(id, _)| *id);
-        let mut resource_close_panic = None;
+        let mut resource_failure = None;
         for (id, resource) in &resources {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                resource.close();
-            }));
-            if let Err(payload) = result {
+            if catch_unwind(AssertUnwindSafe(|| resource.close())).is_err() {
                 let _ = self.inner.try_publish_event(
                     EventDraft::critical(
                         EventKind::Warning,
@@ -615,18 +683,26 @@ impl Runtime {
                         "ManagedResource::close panicked; registration remains supervised",
                     ),
                 );
-                if resource_close_panic.is_none() {
-                    resource_close_panic = Some(payload);
+                if resource_failure.is_none() {
+                    resource_failure = Some(
+                        CloseFailure::new(
+                            ClosePhase::ResourceCleanup,
+                            "ManagedResource::close panicked",
+                        )
+                        .with_resource(*id),
+                    );
                 }
             }
         }
         drop(resources);
-        if let Some(payload) = resource_close_panic {
-            std::panic::resume_unwind(payload);
+        if let Some(failure) = resource_failure {
+            return Err(failure);
         }
 
-        self.inner.join_external_tasks();
+        phase.set(ClosePhase::TaskJoin);
+        self.inner.join_external_tasks()?;
 
+        phase.set(ClosePhase::OperationFinalization);
         for operation in &operations {
             if !operation.snapshot().state.is_terminal() {
                 let _ = operation.finish_cancelled();
@@ -634,31 +710,36 @@ impl Runtime {
         }
         drop(operations);
 
-        self.inner.stop_deadline_worker();
-        assert_eq!(
-            self.counts(),
-            RuntimeCounts {
+        phase.set(ClosePhase::InternalTaskJoin);
+        self.inner.stop_deadline_worker()?;
+        phase.set(ClosePhase::RegistryConvergence);
+        if self.inner.counts_recover()
+            != (RuntimeCounts {
                 active_operations: 0,
                 active_resources: 0,
                 active_tasks: 0,
-            },
-            "supervised work remained after deterministic close"
-        );
+            })
+        {
+            return Err(CloseFailure::new(
+                ClosePhase::RegistryConvergence,
+                "Runtime registries did not converge during close",
+            ));
+        }
 
-        self.inner.close_events(EventDraft::critical(
-            EventKind::State,
-            "runtime.closed",
-            Severity::Info,
-        ));
-
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .expect("Runtime state lock poisoned");
-        *state = RuntimeState::Closed;
-        drop(state);
-        self.inner.state_changed.notify_all();
+        phase.set(ClosePhase::FinalEvent);
+        self.inner
+            .close_events(EventDraft::critical(
+                EventKind::State,
+                "runtime.closed",
+                Severity::Info,
+            ))
+            .map_err(|()| {
+                CloseFailure::new(
+                    ClosePhase::FinalEvent,
+                    "Runtime final event delivery failed",
+                )
+            })?;
+        Ok(())
     }
 }
 
@@ -712,15 +793,102 @@ impl Drop for Runtime {
 }
 
 impl RuntimeInner {
+    fn saved_close_outcome(&self) -> CloseOutcome {
+        self.close_outcome
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .expect("terminal Runtime state has one saved close outcome")
+    }
+
+    fn complete_close(&self, outcome: CloseOutcome) {
+        let target = match &outcome {
+            CloseOutcome::Closed => RuntimeState::Closed,
+            CloseOutcome::Failed(_) => RuntimeState::CloseFailed,
+        };
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut saved = self
+            .close_outcome
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        debug_assert!(saved.is_none(), "close outcome is committed once");
+        *saved = Some(outcome);
+        *state = target;
+        drop(saved);
+        drop(state);
+        self.state_changed.notify_all();
+    }
+
+    fn counts_recover(&self) -> RuntimeCounts {
+        RuntimeCounts {
+            active_operations: self
+                .operations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            active_resources: self
+                .resources
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            active_tasks: self
+                .tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+        }
+    }
+
+    fn failed_close_outcome(&self, failure: CloseFailure) -> CloseOutcome {
+        let _ = catch_unwind(AssertUnwindSafe(|| self.root_cancellation.cancel()));
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            let _ = self.stop_deadline_worker();
+        }));
+        let report = Arc::new(CloseReport {
+            phase: failure.phase,
+            diagnostic: Arc::from(failure.diagnostic),
+            resource_id: failure.resource_id,
+            task_id: failure.task_id,
+            counts: self.counts_recover(),
+        });
+        let mut event =
+            EventDraft::critical(EventKind::State, "runtime.close_failed", Severity::Error)
+                .with_detail(Arc::clone(&report.diagnostic));
+        if let Some(resource_id) = report.resource_id {
+            event = event.with_resource(resource_id);
+        }
+        if !matches!(
+            catch_unwind(AssertUnwindSafe(|| self.close_events(event))),
+            Ok(Ok(()))
+        ) {
+            self.force_close_event_producers();
+        }
+        CloseOutcome::Failed(report)
+    }
+
+    fn force_close_event_producers(&self) {
+        self.events_closed.store(true, Ordering::Release);
+        let subscriptions = self
+            .subscriptions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for subscription in subscriptions.iter().filter_map(Weak::upgrade) {
+            let _ = catch_unwind(AssertUnwindSafe(|| subscription.close()));
+        }
+    }
+
     fn current_thread_owns_task(&self) -> bool {
         let current = std::thread::current().id();
         let tasks = match self.tasks.lock() {
             Ok(tasks) => tasks,
             Err(poisoned) => poisoned.into_inner(),
         };
-        tasks
-            .values()
-            .any(|record| record.owner.is_some_and(|owner| owner == current))
+        tasks.values().any(|record| {
+            record.owner.is_some_and(|owner| owner == current) && !record.completion.is_finished()
+        })
     }
 
     fn join_supervised_task(
@@ -734,11 +902,10 @@ impl RuntimeInner {
                 .tasks
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if tasks
-                .get(&id)
-                .and_then(|record| record.owner)
-                .is_some_and(|owner| owner == current)
-            {
+            if tasks.get(&id).is_some_and(|record| {
+                record.owner.is_some_and(|owner| owner == current)
+                    && !record.completion.is_finished()
+            }) {
                 return Err(TaskJoinError::SelfJoin);
             }
         }
@@ -756,9 +923,6 @@ impl RuntimeInner {
             let Some(record) = tasks.get_mut(&id) else {
                 return Ok(outcome);
             };
-            if record.owner.is_some_and(|owner| owner == current) {
-                return Err(TaskJoinError::SelfJoin);
-            }
             record.handle.take()
         };
         if let Some(handle) = handle {
@@ -785,7 +949,7 @@ impl RuntimeInner {
         Ok(outcome)
     }
 
-    fn join_external_tasks(&self) {
+    fn join_external_tasks(&self) -> Result<(), CloseFailure> {
         let mut tasks: Vec<_> = self
             .tasks
             .lock()
@@ -797,9 +961,13 @@ impl RuntimeInner {
         tasks.sort_by_key(|(id, _)| *id);
         let mut panicked = Vec::new();
         for (id, completion) in tasks {
-            let outcome = self
-                .join_supervised_task(id, &completion)
-                .expect("external Runtime close cannot join itself");
+            let outcome = self.join_supervised_task(id, &completion).map_err(|_| {
+                CloseFailure::new(
+                    ClosePhase::TaskJoin,
+                    "Runtime close attempted to join its calling task",
+                )
+                .with_task(id)
+            })?;
             if outcome == SupervisedTaskOutcome::Panicked {
                 panicked.push(id);
             }
@@ -814,10 +982,13 @@ impl RuntimeInner {
                 panicked.push(id);
             }
         }
-        assert!(
-            panicked.is_empty(),
-            "supervised task bodies panicked: {panicked:?}"
-        );
+        if let Some(id) = panicked.into_iter().min() {
+            return Err(
+                CloseFailure::new(ClosePhase::TaskJoin, "supervised task body panicked")
+                    .with_task(id),
+            );
+        }
+        Ok(())
     }
 
     fn allocate_id(&self) -> u64 {
@@ -846,106 +1017,33 @@ impl RuntimeInner {
         Ok(event)
     }
 
-    fn close_events(&self, draft: EventDraft) {
+    fn close_events(&self, draft: EventDraft) -> Result<(), ()> {
         let mut subscriptions = self
             .subscriptions
             .lock()
-            .expect("subscription registry lock poisoned");
-        if self.events_closed.swap(true, Ordering::AcqRel) {
-            return;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.events_closed.load(Ordering::Acquire) {
+            return Ok(());
         }
         let event = self.next_event(draft);
+        self.events_closed.store(true, Ordering::Release);
+        let mut failed = false;
         subscriptions.retain(|subscription| {
             let Some(subscription) = subscription.upgrade() else {
                 return false;
             };
-            subscription.enqueue_final(event.clone());
-            subscription.close();
+            if catch_unwind(AssertUnwindSafe(|| {
+                subscription.enqueue_final(event.clone());
+                subscription.close();
+            }))
+            .is_err()
+            {
+                failed = true;
+                let _ = catch_unwind(AssertUnwindSafe(|| subscription.close()));
+            }
             true
         });
-    }
-
-    fn fail_close_after_panic(&self) {
-        {
-            let mut state = match self.state.lock() {
-                Ok(state) => state,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            if *state == RuntimeState::Active {
-                *state = RuntimeState::Closing;
-            }
-            self.close_failed.store(true, Ordering::Release);
-        }
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.root_cancellation.cancel();
-        }));
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.finish_operations_after_close_failure();
-        }));
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.stop_deadline_worker();
-        }));
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.close_events(EventDraft::critical(
-                EventKind::State,
-                "runtime.close_panicked",
-                Severity::Error,
-            ));
-        }));
-        self.state_changed.notify_all();
-    }
-
-    fn fail_close_without_finalizer(&self) {
-        {
-            let mut state = match self.state.lock() {
-                Ok(state) => state,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            if *state == RuntimeState::Active {
-                *state = RuntimeState::Closing;
-            }
-            self.close_failed.store(true, Ordering::Release);
-        }
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.root_cancellation.cancel();
-        }));
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.finish_operations_after_close_failure();
-        }));
-        let _ = self.deadline_sender.send(DeadlineSignal::Shutdown);
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.close_events(EventDraft::critical(
-                EventKind::State,
-                "runtime.close_panicked",
-                Severity::Error,
-            ));
-        }));
-        self.state_changed.notify_all();
-    }
-
-    fn finish_operations_after_close_failure(&self) {
-        let mut operations: Vec<_> = match self.operations.lock() {
-            Ok(operations) => operations
-                .values()
-                .cloned()
-                .map(|inner| Operation { inner })
-                .collect(),
-            Err(poisoned) => poisoned
-                .into_inner()
-                .values()
-                .cloned()
-                .map(|inner| Operation { inner })
-                .collect(),
-        };
-        operations.sort_by_key(Operation::id);
-        for operation in operations {
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _ = operation.request_cancel(CancellationReason::ParentClose);
-            }));
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _ = operation.finish_cancelled();
-            }));
-        }
+        if failed { Err(()) } else { Ok(()) }
     }
 
     fn next_event(&self, draft: EventDraft) -> Event {
@@ -1012,33 +1110,41 @@ impl RuntimeInner {
         operations
     }
 
-    fn stop_deadline_worker(&self) {
+    fn stop_deadline_worker(&self) -> Result<(), CloseFailure> {
         self.clock_hook
             .lock()
-            .expect("deadline clock hook lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         let _ = self.deadline_sender.send(DeadlineSignal::Shutdown);
         let task = self
             .deadline_task
             .lock()
-            .expect("deadline task lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         if let Some(task) = task {
-            let outcome = task
-                .join()
-                .expect("Runtime deadline task cannot synchronously join itself");
-            assert_eq!(
-                outcome,
-                SupervisedTaskOutcome::Completed,
-                "Runtime deadline task must not panic"
-            );
+            let id = task.id();
+            let outcome = task.join().map_err(|_| {
+                CloseFailure::new(
+                    ClosePhase::InternalTaskJoin,
+                    "Runtime deadline task attempted to join itself",
+                )
+                .with_task(id)
+            })?;
+            if outcome == SupervisedTaskOutcome::Panicked {
+                return Err(CloseFailure::new(
+                    ClosePhase::InternalTaskJoin,
+                    "Runtime deadline task panicked",
+                )
+                .with_task(id));
+            }
         }
+        Ok(())
     }
 }
 
 impl Drop for RuntimeInner {
     fn drop(&mut self) {
-        self.stop_deadline_worker();
+        let _ = self.stop_deadline_worker();
     }
 }
 
@@ -1148,12 +1254,8 @@ fn close_after_final_handle_drop(inner: Arc<RuntimeInner>) {
         inner,
         close_on_drop: false,
     };
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        runtime.finish_close();
-    }));
-    if result.is_err() {
-        runtime.inner.fail_close_after_panic();
-    }
+    let outcome = runtime.finish_close();
+    runtime.inner.complete_close(outcome);
 }
 
 fn spawn_finalizer(inner: Arc<RuntimeInner>) {
@@ -1163,10 +1265,11 @@ fn spawn_finalizer(inner: Arc<RuntimeInner>) {
         .spawn(move || close_after_final_handle_drop(inner))
         .is_err()
     {
-        failure_fallback.fail_close_without_finalizer();
-        // No thread exists that can safely own deterministic cleanup. Retaining storage is safer
-        // than running resource callbacks inline from Drop or freeing state still used by workers.
-        std::mem::forget(failure_fallback);
+        let outcome = failure_fallback.failed_close_outcome(CloseFailure::new(
+            ClosePhase::Start,
+            "Runtime finalizer thread could not be started",
+        ));
+        failure_fallback.complete_close(outcome);
     }
 }
 
@@ -1202,7 +1305,7 @@ fn ensure_active(state: RuntimeState) -> Result<(), EasyConError> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::sync::{Arc, Barrier, Mutex};
     use std::time::{Duration, Instant};
@@ -1852,13 +1955,73 @@ mod tests {
     #[derive(Default)]
     struct PanickingResource {
         registration: Mutex<Option<ResourceRegistration>>,
-        task: Mutex<Option<SupervisedTask>>,
     }
 
     impl ManagedResource for PanickingResource {
         fn close(&self) {
             panic!("scripted resource close panic");
         }
+    }
+
+    struct BlockingPanickingResource {
+        registration: Mutex<Option<ResourceRegistration>>,
+        close_count: AtomicUsize,
+        callback_started: mpsc::Sender<()>,
+        release_callback: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl ManagedResource for BlockingPanickingResource {
+        fn close(&self) {
+            self.close_count.fetch_add(1, Ordering::AcqRel);
+            self.callback_started
+                .send(())
+                .expect("resource close observer");
+            self.release_callback
+                .lock()
+                .expect("resource close release lock")
+                .recv()
+                .expect("resource close release");
+            panic!("scripted blocking resource close panic");
+        }
+    }
+
+    #[test]
+    fn resource_close_panic_does_not_unwind_or_force_owner_terminal() {
+        let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+        let operation = runtime.create_operation(None).expect("operation");
+        operation.start();
+        let panicking = Arc::new(PanickingResource::default());
+        let managed: Arc<dyn ManagedResource> = panicking.clone();
+        *panicking.registration.lock().expect("registration lock") =
+            Some(runtime.register_resource(managed).expect("resource"));
+        let (release_owner, owner_released) = mpsc::channel();
+        let owner_operation = operation.clone();
+        let owner = runtime
+            .spawn_supervised("operation-owner", move || {
+                owner_released.recv().expect("owner cleanup release");
+                owner_operation.finish_cancelled();
+            })
+            .expect("owner task");
+
+        let close_result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime.close()));
+        let state_after_close = operation.snapshot().state;
+        release_owner.send(()).expect("release owner cleanup");
+        assert_eq!(
+            owner.join().expect("owner task join"),
+            SupervisedTaskOutcome::Completed
+        );
+        panicking
+            .registration
+            .lock()
+            .expect("registration lock")
+            .take();
+
+        assert!(
+            close_result.is_ok(),
+            "close failure crossed the API boundary"
+        );
+        assert_eq!(state_after_close, OperationState::Cancelling);
     }
 
     struct ThreadReportingResource {
@@ -2008,8 +2171,14 @@ mod tests {
         let operation = runtime.create_operation(None).expect("operation");
         operation.start();
 
-        runtime.close().expect("Runtime close");
-        runtime.close().expect("Runtime close");
+        assert_eq!(
+            runtime.close().expect("first Runtime close"),
+            CloseOutcome::Closed
+        );
+        assert_eq!(
+            runtime.close().expect("repeated Runtime close"),
+            CloseOutcome::Closed
+        );
 
         assert!(resource.closed.load(Ordering::Acquire));
         assert_eq!(runtime.state(), RuntimeState::Closed);
@@ -2070,50 +2239,111 @@ mod tests {
         assert_eq!(last_code, Some("runtime.closed"));
     }
 
+    // conformance: runtime.healthy-cleanup-after-panic
+    // conformance: runtime.saved-close-failed
+    // conformance: runtime.owner-terminal-order
+    // conformance: runtime.close-report
     #[test]
-    fn final_handle_drop_resource_panic_fails_without_waiting_for_its_task() {
+    fn resource_panic_saves_one_report_without_forcing_owner_terminal() {
         let runtime = Runtime::new(Arc::new(VirtualClock::default()));
-        let supervised = runtime.clone_for_supervision();
         let events = runtime
             .subscribe(SubscriptionOptions::default())
             .expect("subscribe");
         let operation = runtime.create_operation(None).expect("operation");
         operation.start();
-        let panicking = Arc::new(PanickingResource::default());
+        let (owner_wake, owner_woken) = mpsc::channel();
+        operation.on_cancel(move || owner_wake.send(()).expect("owner cancellation wake"));
+        let (cleanup_started, observed_cleanup) = mpsc::channel();
+        let (release_cleanup, cleanup_released) = mpsc::channel();
+        let owner_operation = operation.clone();
+        let owner = runtime
+            .spawn_supervised("failed-resource-owner", move || {
+                owner_woken.recv().expect("owner cancellation");
+                cleanup_started.send(()).expect("cleanup observer");
+                cleanup_released.recv().expect("cleanup release");
+                owner_operation.finish_cancelled();
+            })
+            .expect("owner task");
+
+        let (callback_started, observed_callback) = mpsc::channel();
+        let (release_callback, callback_released) = mpsc::channel();
+        let panicking = Arc::new(BlockingPanickingResource {
+            registration: Mutex::new(None),
+            close_count: AtomicUsize::new(0),
+            callback_started,
+            release_callback: Mutex::new(callback_released),
+        });
         let managed: Arc<dyn ManagedResource> = panicking.clone();
         let registration = runtime.register_resource(managed).expect("resource");
-        let task = runtime
-            .spawn_supervised("panicking-resource", || {})
-            .expect("task");
         let panicking_id = registration.id();
         *panicking.registration.lock().expect("registration lock") = Some(registration);
-        *panicking.task.lock().expect("task lock") = Some(task);
         let healthy = Arc::new(TestResource::default());
         let managed: Arc<dyn ManagedResource> = healthy.clone();
         *healthy.registration.lock().expect("registration lock") =
             Some(runtime.register_resource(managed).expect("resource"));
 
-        drop(runtime);
-        assert!(
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| supervised.close())).is_err(),
-            "resource panic must wake close callers with failure"
-        );
+        let barrier = Arc::new(Barrier::new(3));
+        let callers: Vec<_> = (0..2)
+            .map(|_| {
+                let closing = runtime.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    closing.close().expect("external close caller")
+                })
+            })
+            .collect();
+        barrier.wait();
+        observed_callback
+            .recv_timeout(Duration::from_secs(2))
+            .expect("resource callback started");
+        observed_cleanup
+            .recv_timeout(Duration::from_secs(2))
+            .expect("owner cleanup started");
+        assert_eq!(operation.snapshot().state, OperationState::Cancelling);
+        release_callback
+            .send(())
+            .expect("release resource callback");
 
-        assert_eq!(supervised.state(), RuntimeState::Closing);
-        assert!(healthy.closed.load(Ordering::Acquire));
-        assert!(matches!(
-            operation.wait(WaitTimeout::Poll),
-            WaitResult::Completed(_)
-        ));
-        assert_eq!(operation.snapshot().state, OperationState::Cancelled);
+        let outcomes: Vec<_> = callers
+            .into_iter()
+            .map(|caller| caller.join().expect("close caller"))
+            .collect();
+        let reports: Vec<_> = outcomes
+            .iter()
+            .map(|outcome| match outcome {
+                CloseOutcome::Failed(report) => Arc::clone(report),
+                CloseOutcome::Closed => panic!("resource panic cannot report Closed"),
+            })
+            .collect();
+        assert!(Arc::ptr_eq(&reports[0], &reports[1]));
+        assert_eq!(reports[0].phase, ClosePhase::ResourceCleanup);
+        assert_eq!(reports[0].resource_id, Some(panicking_id));
+        assert_eq!(reports[0].task_id, None);
         assert_eq!(
-            supervised.counts(),
+            reports[0].diagnostic.as_ref(),
+            "ManagedResource::close panicked"
+        );
+        assert_eq!(
+            reports[0].counts,
             RuntimeCounts {
-                active_operations: 0,
+                active_operations: 1,
                 active_resources: 1,
                 active_tasks: 1,
             }
         );
+        assert_eq!(runtime.state(), RuntimeState::CloseFailed);
+        assert_eq!(panicking.close_count.load(Ordering::Acquire), 1);
+        assert!(healthy.closed.load(Ordering::Acquire));
+        assert_eq!(operation.snapshot().state, OperationState::Cancelling);
+        assert_eq!(operation.wait(WaitTimeout::Poll), WaitResult::Timeout);
+        let later = runtime.close().expect("later close caller");
+        let CloseOutcome::Failed(later_report) = later else {
+            panic!("saved close failure changed to Closed");
+        };
+        assert!(Arc::ptr_eq(&reports[0], &later_report));
+        assert_eq!(panicking.close_count.load(Ordering::Acquire), 1);
+
         let mut observed = Vec::new();
         loop {
             match events.read(WaitTimeout::Poll) {
@@ -2129,31 +2359,34 @@ mod tests {
         }));
         assert_eq!(
             observed.last().map(|event| event.code),
-            Some("runtime.close_panicked")
+            Some("runtime.close_failed")
         );
         assert!(!observed.iter().any(|event| event.code == "runtime.closed"));
 
-        let task = panicking
-            .task
-            .lock()
-            .expect("task lock")
-            .take()
-            .expect("panicking resource task");
+        release_cleanup.send(()).expect("release owner cleanup");
         assert_eq!(
-            task.join().expect("test task cannot join itself"),
+            owner.join().expect("owner task join"),
             SupervisedTaskOutcome::Completed
         );
+        assert_eq!(operation.snapshot().state, OperationState::Cancelled);
         panicking
             .registration
             .lock()
             .expect("registration lock")
             .take();
+        assert_eq!(
+            runtime.counts(),
+            RuntimeCounts {
+                active_operations: 0,
+                active_resources: 0,
+                active_tasks: 0,
+            }
+        );
     }
 
     #[test]
-    fn final_handle_drop_reports_a_deadline_worker_panic_before_success() {
+    fn deadline_task_panic_is_a_saved_close_failure() {
         let runtime = Runtime::new(Arc::new(VirtualClock::default()));
-        let supervised = runtime.clone_for_supervision();
         let events = runtime
             .subscribe(SubscriptionOptions::default())
             .expect("events");
@@ -2195,12 +2428,15 @@ mod tests {
             std::thread::yield_now();
         }
 
-        drop(runtime);
-        assert!(
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| supervised.close())).is_err(),
-            "worker panic must wake close callers with failure"
-        );
-        assert_eq!(supervised.state(), RuntimeState::Closing);
+        let deadline_id = runtime.inner.deadline_task_id;
+        let outcome = runtime.close().expect("Runtime close caller");
+        let CloseOutcome::Failed(report) = outcome else {
+            panic!("deadline task panic cannot report Closed");
+        };
+        assert_eq!(report.phase, ClosePhase::InternalTaskJoin);
+        assert_eq!(report.task_id, Some(deadline_id));
+        assert_eq!(report.resource_id, None);
+        assert_eq!(runtime.state(), RuntimeState::CloseFailed);
         let mut codes = Vec::new();
         loop {
             match events.read(WaitTimeout::Poll) {
@@ -2209,12 +2445,12 @@ mod tests {
                 SubscriptionRead::Timeout => panic!("failed close queue must be closed"),
             }
         }
-        assert_eq!(codes.last(), Some(&"runtime.close_panicked"));
+        assert_eq!(codes.last(), Some(&"runtime.close_failed"));
         assert!(!codes.contains(&"runtime.closed"));
     }
 
     #[test]
-    fn unexpected_close_panic_wakes_concurrent_callers_and_closes_events() {
+    fn poisoned_close_registry_recovers_and_concurrent_callers_observe_closed() {
         let runtime = Runtime::new(Arc::new(VirtualClock::default()));
         let events = runtime
             .subscribe(SubscriptionOptions::default())
@@ -2223,10 +2459,10 @@ mod tests {
         assert!(
             std::thread::spawn(move || {
                 let _guard = poisoned_runtime
-                    .operations
+                    .resources
                     .lock()
-                    .expect("operation registry lock");
-                panic!("scripted operation registry poison");
+                    .expect("resource registry lock");
+                panic!("scripted resource registry poison");
             })
             .join()
             .is_err()
@@ -2238,8 +2474,7 @@ mod tests {
                 let barrier = barrier.clone();
                 std::thread::spawn(move || {
                     barrier.wait();
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| closing.close()))
-                        .is_err()
+                    closing.close().expect("close caller")
                 })
             })
             .collect();
@@ -2248,9 +2483,9 @@ mod tests {
         assert!(
             callers
                 .into_iter()
-                .all(|caller| caller.join().expect("close caller"))
+                .all(|caller| caller.join().expect("close caller") == CloseOutcome::Closed)
         );
-        assert_eq!(runtime.state(), RuntimeState::Closing);
+        assert_eq!(runtime.state(), RuntimeState::Closed);
         let mut codes = Vec::new();
         loop {
             match events.read(WaitTimeout::Poll) {
@@ -2259,7 +2494,7 @@ mod tests {
                 SubscriptionRead::Timeout => panic!("failed close queue must be closed"),
             }
         }
-        assert_eq!(codes.last(), Some(&"runtime.close_panicked"));
+        assert_eq!(codes.last(), Some(&"runtime.closed"));
     }
 
     #[test]
@@ -2414,6 +2649,29 @@ mod tests {
         assert_eq!(right.join().expect("right close"), RuntimeState::Closed);
         assert_eq!(operation.snapshot().state, OperationState::Cancelled);
         assert_eq!(runtime.counts().active_tasks, 0);
+    }
+
+    #[test]
+    fn supervised_task_panic_is_caught_joined_and_saved_with_its_id() {
+        let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+        let task = runtime
+            .spawn_supervised("panicking-task", || panic!("scripted task panic"))
+            .expect("task");
+        let task_id = task.id();
+
+        let outcome = runtime.close().expect("Runtime close");
+        let CloseOutcome::Failed(report) = outcome else {
+            panic!("task panic cannot report Closed");
+        };
+        assert_eq!(report.phase, ClosePhase::TaskJoin);
+        assert_eq!(report.task_id, Some(task_id));
+        assert_eq!(report.resource_id, None);
+        assert_eq!(runtime.state(), RuntimeState::CloseFailed);
+        assert_eq!(task.join(), Ok(SupervisedTaskOutcome::Panicked));
+        let CloseOutcome::Failed(later) = runtime.close().expect("repeated Runtime close") else {
+            panic!("saved task failure changed to Closed");
+        };
+        assert!(Arc::ptr_eq(&report, &later));
     }
 
     // conformance: runtime.self-close-rejected

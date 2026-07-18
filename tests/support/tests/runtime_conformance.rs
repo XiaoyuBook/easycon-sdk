@@ -152,10 +152,6 @@ fn ids<'a>(scenario: &'a Value, field: &str) -> BTreeSet<&'a str> {
 }
 
 // conformance: runtime.drop-limited
-// conformance: runtime.healthy-cleanup-after-panic
-// conformance: runtime.saved-close-failed
-// conformance: runtime.owner-terminal-order
-// conformance: runtime.close-report
 #[test]
 fn runtime_stabilization_reference_actions_are_executable() {
     let mut successful = RuntimeContractModel::new();
