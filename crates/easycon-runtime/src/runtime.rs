@@ -1723,11 +1723,14 @@ mod tests {
         );
     }
 
+    // conformance: operation.unlink-before-wake
     #[test]
     fn terminal_wait_observes_the_operation_already_unregistered() {
         let runtime = Runtime::new(Arc::new(VirtualClock::default()));
         let operation = runtime.create_operation(None).expect("operation");
         operation.start();
+        let (blocked, observed_block) = mpsc::channel();
+        operation.observe_next_wait_blocked(blocked);
         let observed_runtime = runtime.clone();
         let observed_operation = operation.clone();
         let waiter = std::thread::spawn(move || {
@@ -1737,6 +1740,9 @@ mod tests {
             ));
             observed_runtime.counts().active_operations
         });
+        observed_block
+            .recv_timeout(Duration::from_secs(2))
+            .expect("operation waiter blocked");
 
         operation.succeed(OperationValue::Unit);
 
@@ -1881,7 +1887,6 @@ mod tests {
         runtime.close().expect("Runtime close");
     }
 
-    // conformance: operation.unlink-before-wake
     // conformance: operation.failure-notify
     #[test]
     fn terminal_faults_still_unlink_and_wake_waiters() {

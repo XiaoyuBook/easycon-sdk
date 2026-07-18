@@ -155,6 +155,7 @@
         "crates/easycon-runtime/src/runtime.rs::parent_terminal_seals_child_admission_before_owner_cleanup",
         "crates/easycon-runtime/src/cancellation.rs::hook_panic_does_not_skip_later_hooks_or_children",
         "crates/easycon-runtime/src/runtime.rs::operation_commits_terminal_state_and_event_once",
+        "crates/easycon-runtime/src/runtime.rs::terminal_wait_observes_the_operation_already_unregistered",
         "crates/easycon-runtime/src/runtime.rs::terminal_faults_still_unlink_and_wake_waiters",
         "crates/easycon-runtime/src/runtime.rs::terminal_child_hook_can_observe_parent_without_deadlock",
         "crates/easycon-runtime/src/runtime.rs::poisoned_operation_registry_does_not_kill_deadline_supervision"
@@ -186,7 +187,7 @@
         {
           "id": "operation.unlink-before-wake",
           "expect": "registry unlink occurs before every terminal waiter returns",
-          "test": "crates/easycon-runtime/src/runtime.rs::terminal_faults_still_unlink_and_wake_waiters"
+          "test": "crates/easycon-runtime/src/runtime.rs::terminal_wait_observes_the_operation_already_unregistered"
         },
         {
           "id": "operation.failure-notify",
