@@ -945,7 +945,11 @@ impl RuntimeInner {
         if let Some(resource_id) = report.resource_id {
             event = event.with_resource(resource_id);
         }
+        let first_attempt = event.clone();
         if !matches!(
+            catch_unwind(AssertUnwindSafe(|| self.close_events(first_attempt))),
+            Ok(Ok(()))
+        ) && !matches!(
             catch_unwind(AssertUnwindSafe(|| self.close_events(event))),
             Ok(Ok(()))
         ) {
@@ -2913,6 +2917,43 @@ mod tests {
             panic!("injected final event failure cannot report Closed");
         };
         assert_eq!(report.phase, ClosePhase::FinalEvent);
+        assert_eq!(runtime.state(), RuntimeState::CloseFailed);
+
+        for subscription in [&first, &second] {
+            let mut codes = Vec::new();
+            loop {
+                match subscription.read(WaitTimeout::Poll) {
+                    SubscriptionRead::Event(event) => codes.push(event.code),
+                    SubscriptionRead::Closed => break,
+                    SubscriptionRead::Timeout => {
+                        panic!("failed-close subscription must be closed")
+                    }
+                }
+            }
+            assert_eq!(codes.last(), Some(&"runtime.close_failed"));
+            assert!(!codes.contains(&"runtime.closed"));
+        }
+
+        let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+        let first = runtime
+            .subscribe(SubscriptionOptions::default())
+            .expect("first subscription");
+        let second = runtime
+            .subscribe(SubscriptionOptions::default())
+            .expect("second subscription");
+        let resource = Arc::new(PanickingResource::default());
+        let managed: Arc<dyn ManagedResource> = resource.clone();
+        *resource.registration.lock().expect("registration lock") =
+            Some(runtime.register_resource(managed).expect("resource"));
+        runtime
+            .inner
+            .final_event_failure_at
+            .store(1, Ordering::Release);
+
+        let CloseOutcome::Failed(report) = runtime.close().expect("Runtime close") else {
+            panic!("resource and final-event failure cannot report Closed");
+        };
+        assert_eq!(report.phase, ClosePhase::ResourceCleanup);
         assert_eq!(runtime.state(), RuntimeState::CloseFailed);
 
         for subscription in [&first, &second] {

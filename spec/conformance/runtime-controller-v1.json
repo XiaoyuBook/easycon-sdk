@@ -74,7 +74,7 @@
         { "id": "runtime.resource-panic", "action": "explicitly close another Runtime whose first resource callback panics and whose healthy resource can close" },
         { "id": "runtime.failed-owner-cleanup", "action": "hold the failed resource owner task in cleanup while concurrent close callers wait" },
         { "id": "runtime.finish-real-cleanup", "action": "finish the real owner cleanup after every close caller receives the saved outcome" },
-        { "id": "runtime.final-event-failure", "action": "fail final-event preflight for the second subscription before atomically committing any Runtime final event" },
+        { "id": "runtime.final-event-failure", "action": "fail final-event preflight both for an otherwise-successful close and after resource cleanup has already failed" },
         { "id": "runtime.repeat-close-failed", "action": "call close again after CloseFailed" }
       ],
       "assertions": [
@@ -135,7 +135,7 @@
         },
         {
           "id": "runtime.final-event-failure",
-          "expect": "a failed final-event transaction exposes only runtime.close_failed and never a partial runtime.closed",
+          "expect": "a failed final-event transaction during either successful or already-failing close recovers to runtime.close_failed and never exposes a partial runtime.closed",
           "test": "crates/easycon-runtime/src/runtime.rs::final_event_failure_never_exposes_runtime_closed"
         }
       ]
