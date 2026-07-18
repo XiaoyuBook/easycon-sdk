@@ -1,6 +1,5 @@
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Condvar, Mutex, Weak};
@@ -13,7 +12,8 @@ use easycon_model::{
 use crate::cancellation::CancellationToken;
 use crate::clock::{Clock, ClockChangeRegistration};
 use crate::concurrency::{
-    TaskLifecycleState, TaskOwnerBinding, runtime_close_rejected, task_join_rejected,
+    TaskLifecycleState, TaskOwnerBinding, catch_isolated, contain_panic, runtime_close_rejected,
+    task_join_rejected,
 };
 use crate::event::{
     Event, EventDraft, EventKind, EventSubscription, Severity, SubscriptionInner,
@@ -329,7 +329,7 @@ impl TaskCompletion {
             {
                 let _ = observer.send(());
             }
-            let joined = handle.join();
+            let joined = contain_panic(handle.join());
             debug_assert!(
                 joined.is_ok(),
                 "supervised wrapper catches task body panics"
@@ -737,7 +737,7 @@ impl Runtime {
 
     fn finish_close(&self) -> CloseOutcome {
         let phase = Cell::new(ClosePhase::Start);
-        let result = catch_unwind(AssertUnwindSafe(|| self.finish_close_success_path(&phase)));
+        let result = catch_isolated(|| self.finish_close_success_path(&phase));
         match result {
             Ok(Ok(())) => CloseOutcome::Closed,
             Ok(Err(failure)) => self.inner.failed_close_outcome(failure),
@@ -804,7 +804,7 @@ impl Runtime {
         resources.sort_by_key(|(id, _)| *id);
         let mut resource_failure = None;
         for (id, resource) in &resources {
-            if catch_unwind(AssertUnwindSafe(|| resource.close())).is_err() {
+            if catch_isolated(|| resource.close()).is_err() {
                 let _ = self.inner.try_publish_event(
                     EventDraft::critical(
                         EventKind::Warning,
@@ -919,9 +919,9 @@ impl Drop for Runtime {
                 }
             };
             if cancel {
-                let _ = catch_unwind(AssertUnwindSafe(|| {
+                let _ = catch_isolated(|| {
                     self.inner.root_cancellation.cancel();
-                }));
+                });
             }
         }
     }
@@ -999,10 +999,10 @@ impl RuntimeInner {
     }
 
     fn failed_close_outcome(&self, failure: CloseFailure) -> CloseOutcome {
-        let _ = catch_unwind(AssertUnwindSafe(|| self.root_cancellation.cancel()));
-        let _ = catch_unwind(AssertUnwindSafe(|| {
+        let _ = catch_isolated(|| self.root_cancellation.cancel());
+        let _ = catch_isolated(|| {
             let _ = self.stop_deadline_worker();
-        }));
+        });
         let report = Arc::new(CloseReport {
             phase: failure.phase,
             diagnostic: Arc::from(failure.diagnostic),
@@ -1018,12 +1018,10 @@ impl RuntimeInner {
         }
         let first_attempt = event.clone();
         if !matches!(
-            catch_unwind(AssertUnwindSafe(|| self.close_events(first_attempt))),
+            catch_isolated(|| self.close_events(first_attempt)),
             Ok(Ok(()))
         ) && !matches!(
-            catch_unwind(AssertUnwindSafe(|| {
-                self.close_events_recovering_clock(event)
-            })),
+            catch_isolated(|| self.close_events_recovering_clock(event)),
             Ok(Ok(()))
         ) {
             self.force_close_event_producers();
@@ -1038,7 +1036,7 @@ impl RuntimeInner {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for subscription in subscriptions.iter().filter_map(Weak::upgrade) {
-            let _ = catch_unwind(AssertUnwindSafe(|| subscription.close()));
+            let _ = catch_isolated(|| subscription.close());
         }
     }
 
@@ -1082,7 +1080,7 @@ impl RuntimeInner {
             .take_handle()
             .expect("supervised lifecycle and handle registry stay aligned");
         debug_assert_ne!(handle.thread().id(), current);
-        let joined = handle.join();
+        let joined = contain_panic(handle.join());
         debug_assert!(
             joined.is_ok(),
             "supervised wrapper catches task body panics"
@@ -1292,7 +1290,7 @@ impl RuntimeInner {
 
     fn next_event_recovering_clock(&self, draft: EventDraft) -> Event {
         let sequence = self.allocate_event_sequence();
-        let timestamp_ns = catch_unwind(AssertUnwindSafe(|| self.clock.now_ns()))
+        let timestamp_ns = catch_isolated(|| self.clock.now_ns())
             .unwrap_or_else(|_| self.last_event_timestamp_ns.load(Ordering::Acquire));
         self.finish_event(sequence, timestamp_ns, draft)
     }
@@ -1433,7 +1431,7 @@ where
             task_completion.finish(SupervisedTaskOutcome::Panicked);
             return;
         }
-        let outcome = if catch_unwind(AssertUnwindSafe(task)).is_ok() {
+        let outcome = if catch_isolated(task).is_ok() {
             SupervisedTaskOutcome::Completed
         } else {
             SupervisedTaskOutcome::Panicked
@@ -1583,26 +1581,56 @@ mod tests {
 
     use super::*;
 
+    struct DropPanickingPayload {
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for DropPanickingPayload {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::AcqRel);
+            panic!("scripted panic payload drop");
+        }
+    }
+
+    fn panic_with_drop_panicking_payload(drops: Arc<AtomicUsize>) -> ! {
+        std::panic::panic_any(DropPanickingPayload { drops });
+    }
+
     struct PanickingNowClock {
         inner: VirtualClock,
-        panic_now: AtomicBool,
+        panic_thread: Mutex<Option<ThreadId>>,
+        payload_drops: Arc<AtomicUsize>,
     }
 
     impl PanickingNowClock {
         fn new(now_ns: u64) -> Self {
             Self {
                 inner: VirtualClock::new(now_ns),
-                panic_now: AtomicBool::new(false),
+                panic_thread: Mutex::new(None),
+                payload_drops: Arc::new(AtomicUsize::new(0)),
             }
+        }
+
+        fn panic_on_current_thread(&self) {
+            *self.panic_thread.lock().expect("panic thread lock") =
+                Some(std::thread::current().id());
+        }
+
+        fn payload_drop_count(&self) -> usize {
+            self.payload_drops.load(Ordering::Acquire)
         }
     }
 
     impl Clock for PanickingNowClock {
         fn now_ns(&self) -> u64 {
-            assert!(
-                !self.panic_now.load(Ordering::Acquire),
-                "scripted clock.now_ns panic"
-            );
+            let should_panic = *self
+                .panic_thread
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                == Some(std::thread::current().id());
+            if should_panic {
+                panic_with_drop_panicking_payload(Arc::clone(&self.payload_drops));
+            }
             self.inner.now_ns()
         }
 
@@ -2020,10 +2048,12 @@ mod tests {
         let runtime = Runtime::new(Arc::new(VirtualClock::default()));
         let operation = runtime.create_operation(None).expect("operation");
         operation.start();
+        let payload_drops = Arc::new(AtomicUsize::new(0));
+        let observed_payload_drops = Arc::clone(&payload_drops);
 
         let finish = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            operation.succeed_after_cleanup(OperationValue::Unit, || {
-                panic!("scripted owner cleanup panic");
+            operation.succeed_after_cleanup(OperationValue::Unit, move || {
+                panic_with_drop_panicking_payload(observed_payload_drops);
             })
         }));
 
@@ -2041,6 +2071,7 @@ mod tests {
             operation.wait(WaitTimeout::Poll),
             WaitResult::Completed(_)
         ));
+        assert_eq!(payload_drops.load(Ordering::Acquire), 1);
         assert_eq!(runtime.counts().active_operations, 0);
         runtime.close().expect("Runtime close");
     }
@@ -3419,7 +3450,7 @@ mod tests {
                 Severity::Info,
             ))
             .expect("event before clock failure");
-        clock.panic_now.store(true, Ordering::Release);
+        clock.panic_on_current_thread();
 
         let CloseOutcome::Failed(report) = runtime.close().expect("Runtime close") else {
             panic!("persistent final event failure cannot report Closed");
@@ -3452,6 +3483,7 @@ mod tests {
             );
             assert!(!observed.iter().any(|event| event.code == "runtime.closed"));
         }
+        assert!(clock.payload_drop_count() > 0);
     }
 
     #[test]
@@ -3486,10 +3518,27 @@ mod tests {
     #[test]
     fn supervised_task_panic_is_caught_joined_and_saved_with_its_id() {
         let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+        let payload_drops = Arc::new(AtomicUsize::new(0));
+        let observed_payload_drops = Arc::clone(&payload_drops);
         let task = runtime
-            .spawn_supervised("panicking-task", || panic!("scripted task panic"))
+            .spawn_supervised("panicking-task", move || {
+                panic_with_drop_panicking_payload(observed_payload_drops);
+            })
             .expect("task");
         let task_id = task.id();
+        let joining_task = task.clone();
+        let (joined, observed_join) = mpsc::channel();
+        let joiner = std::thread::spawn(move || {
+            let _ = joined.send(joining_task.join());
+        });
+        assert_eq!(
+            observed_join
+                .recv_timeout(Duration::from_secs(2))
+                .expect("panicked task join must complete"),
+            Ok(SupervisedTaskOutcome::Panicked)
+        );
+        joiner.join().expect("task join observer");
+        assert_eq!(payload_drops.load(Ordering::Acquire), 1);
 
         let outcome = runtime.close().expect("Runtime close");
         let CloseOutcome::Failed(report) = outcome else {

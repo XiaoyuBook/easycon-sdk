@@ -241,10 +241,21 @@ fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc;
 
     use super::*;
+
+    struct DropPanickingPayload {
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for DropPanickingPayload {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::AcqRel);
+            panic!("scripted panic payload drop");
+        }
+    }
 
     #[test]
     fn parent_cancel_propagates_and_wakes_once() {
@@ -363,7 +374,13 @@ mod tests {
         let root = CancellationToken::root();
         let child = root.child();
         let grandchild = child.child();
-        root.on_cancel(|| panic!("scripted cancellation hook panic"));
+        let payload_drops = Arc::new(AtomicUsize::new(0));
+        let observed_payload_drops = Arc::clone(&payload_drops);
+        root.on_cancel(move || {
+            std::panic::panic_any(DropPanickingPayload {
+                drops: Arc::clone(&observed_payload_drops),
+            });
+        });
         let later_hook_called = Arc::new(AtomicBool::new(false));
         let observed_later_hook = Arc::clone(&later_hook_called);
         root.on_cancel(move || {
@@ -385,6 +402,7 @@ mod tests {
         assert!(child_hook_called.load(Ordering::Acquire));
         assert!(child.is_cancelled());
         assert!(grandchild.is_cancelled());
+        assert_eq!(payload_drops.load(Ordering::Acquire), 1);
     }
 
     #[test]

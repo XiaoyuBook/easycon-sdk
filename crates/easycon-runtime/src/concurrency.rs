@@ -56,8 +56,25 @@ pub const fn claim_cancellation(already_cancelled: bool) -> bool {
     !already_cancelled
 }
 
+pub fn contain_panic<T>(result: std::thread::Result<T>) -> Result<T, ()> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(payload) => {
+            if let Err(secondary) = catch_unwind(AssertUnwindSafe(|| drop(payload))) {
+                // Dropping a user-controlled secondary payload could start an unbounded panic loop.
+                std::mem::forget(secondary);
+            }
+            Err(())
+        }
+    }
+}
+
+pub fn catch_isolated<T>(action: impl FnOnce() -> T) -> Result<T, ()> {
+    contain_panic(catch_unwind(AssertUnwindSafe(action)))
+}
+
 pub fn invoke_isolated(action: impl FnOnce()) -> bool {
-    catch_unwind(AssertUnwindSafe(action)).is_ok()
+    catch_isolated(action).is_ok()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

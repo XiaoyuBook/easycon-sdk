@@ -1,11 +1,10 @@
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Instant;
 
 use easycon_model::{EasyConError, ErrorCode, ErrorDomain, OperationId};
 
 use crate::cancellation::CancellationToken;
-use crate::concurrency::unlink_then_notify;
+use crate::concurrency::{catch_isolated, unlink_then_notify};
 use crate::event::{EventDraft, EventKind, Severity};
 use crate::runtime::RuntimeInner;
 use crate::wait::WaitTimeout;
@@ -308,7 +307,7 @@ impl OperationInner {
             }
         };
         if outcome == TransitionOutcome::Applied {
-            let _ = catch_unwind(AssertUnwindSafe(|| self.cancellation.cancel()));
+            let _ = catch_isolated(|| self.cancellation.cancel());
             self.changed.notify_all();
         }
         outcome
@@ -396,7 +395,7 @@ impl OperationInner {
         let propagation = self.cancellation.deactivate_deferred();
         drop(data);
         propagation.propagate();
-        let cleanup_failed = catch_unwind(AssertUnwindSafe(cleanup)).is_err();
+        let cleanup_failed = catch_isolated(cleanup).is_err();
         let mut data = self.lock_state();
         let outcome = if cleanup_failed {
             data.state = OperationState::Failed;
@@ -426,15 +425,15 @@ impl OperationInner {
 
     fn unlink_registry(&self) {
         if let Some(runtime) = self.runtime.upgrade() {
-            let unlinked = catch_unwind(AssertUnwindSafe(|| {
+            let unlinked = catch_isolated(|| {
                 assert!(
                     !runtime.take_operation_registry_unlink_failpoint(),
                     "failpoint:runtime.operation.registry_unlink"
                 );
                 runtime.unregister_operation(self.id);
-            }));
+            });
             if unlinked.is_err() {
-                let _ = catch_unwind(AssertUnwindSafe(|| runtime.unregister_operation(self.id)));
+                let _ = catch_isolated(|| runtime.unregister_operation(self.id));
             }
         }
     }
@@ -505,13 +504,13 @@ impl OperationInner {
             (EventKind::State, state_code(data.state), Severity::Info)
         };
         let draft = EventDraft::critical(kind, code, severity);
-        let _ = catch_unwind(AssertUnwindSafe(|| {
+        let _ = catch_isolated(|| {
             assert!(
                 !(data.state.is_terminal() && runtime.take_operation_terminal_event_failpoint()),
                 "failpoint:runtime.operation.terminal_event"
             );
             let _ = runtime.try_publish_event(draft.with_operation(self.id));
-        }));
+        });
     }
 }
 
