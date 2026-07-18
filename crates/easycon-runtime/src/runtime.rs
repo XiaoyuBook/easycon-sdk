@@ -20,6 +20,10 @@ use crate::operation::{CancellationReason, Operation, OperationInner};
 
 static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
 
+thread_local! {
+    static CURRENT_SUPERVISED_TASK: Cell<Option<(RuntimeId, TaskId)>> = const { Cell::new(None) };
+}
+
 /// Root lifecycle state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeState {
@@ -114,6 +118,7 @@ pub enum CloseRejection {
 #[derive(Clone)]
 pub struct SupervisedTask {
     runtime: Weak<RuntimeInner>,
+    runtime_id: RuntimeId,
     id: TaskId,
     owner: ThreadId,
     completion: Arc<TaskCompletion>,
@@ -148,6 +153,8 @@ pub(crate) struct RuntimeInner {
     resources: Mutex<HashMap<ResourceId, Weak<dyn ManagedResource>>>,
     tasks: Mutex<HashMap<TaskId, TaskRecord>>,
     task_failures: Mutex<Vec<TaskId>>,
+    #[cfg(test)]
+    task_join_after_unlink: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     deadline_task_id: TaskId,
     subscriptions: Mutex<Vec<Weak<SubscriptionInner>>>,
     events_closed: AtomicBool,
@@ -234,13 +241,6 @@ impl TaskCompletion {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
     }
-
-    fn is_finished(&self) -> bool {
-        self.outcome
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some()
-    }
 }
 
 impl SupervisedTask {
@@ -256,7 +256,8 @@ impl SupervisedTask {
     ///
     /// Returns [`TaskJoinError::SelfJoin`] when called by the supervised task itself.
     pub fn join(&self) -> Result<SupervisedTaskOutcome, TaskJoinError> {
-        if self.owner == std::thread::current().id() && !self.completion.is_finished() {
+        if current_supervised_task() == Some((self.runtime_id, self.id)) {
+            debug_assert_eq!(self.owner, std::thread::current().id());
             return Err(TaskJoinError::SelfJoin);
         }
         if let Some(runtime) = self.runtime.upgrade() {
@@ -332,6 +333,8 @@ impl Runtime {
             resources: Mutex::new(HashMap::new()),
             tasks: Mutex::new(HashMap::new()),
             task_failures: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            task_join_after_unlink: Mutex::new(None),
             deadline_task_id: task_id,
             subscriptions: Mutex::new(Vec::new()),
             events_closed: AtomicBool::new(false),
@@ -900,14 +903,20 @@ impl RuntimeInner {
     }
 
     fn current_thread_owns_task(&self) -> bool {
-        let current = std::thread::current().id();
-        let tasks = match self.tasks.lock() {
-            Ok(tasks) => tasks,
-            Err(poisoned) => poisoned.into_inner(),
+        let Some((runtime_id, task_id)) = current_supervised_task() else {
+            return false;
         };
-        tasks.values().any(|record| {
-            record.owner.is_some_and(|owner| owner == current) && !record.completion.is_finished()
-        })
+        if runtime_id != self.id {
+            return false;
+        }
+        debug_assert!(
+            self.tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&task_id)
+                .is_some_and(|record| record.owner == Some(std::thread::current().id()))
+        );
+        true
     }
 
     fn join_supervised_task(
@@ -916,17 +925,8 @@ impl RuntimeInner {
         completion: &Arc<TaskCompletion>,
     ) -> Result<SupervisedTaskOutcome, TaskJoinError> {
         let current = std::thread::current().id();
-        {
-            let tasks = self
-                .tasks
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if tasks.get(&id).is_some_and(|record| {
-                record.owner.is_some_and(|owner| owner == current)
-                    && !record.completion.is_finished()
-            }) {
-                return Err(TaskJoinError::SelfJoin);
-            }
+        if current_supervised_task() == Some((self.id, id)) {
+            return Err(TaskJoinError::SelfJoin);
         }
 
         let _join = completion
@@ -952,10 +952,6 @@ impl RuntimeInner {
                 "supervised wrapper catches task body panics"
             );
         }
-        self.tasks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&id);
         if outcome == SupervisedTaskOutcome::Panicked {
             let mut failures = self
                 .task_failures
@@ -964,6 +960,20 @@ impl RuntimeInner {
             if !failures.contains(&id) {
                 failures.push(id);
             }
+        }
+        self.tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&id);
+        #[cfg(test)]
+        let after_unlink = self
+            .task_join_after_unlink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        #[cfg(test)]
+        if let Some(hook) = after_unlink {
+            hook();
         }
         Ok(outcome)
     }
@@ -1186,7 +1196,9 @@ where
 
     let (start, started) = mpsc::channel();
     let task_completion = Arc::clone(&completion);
+    let runtime_id = runtime.id;
     let worker = match std::thread::Builder::new().name(name).spawn(move || {
+        CURRENT_SUPERVISED_TASK.set(Some((runtime_id, id)));
         if started.recv().is_err() {
             task_completion.finish(SupervisedTaskOutcome::Panicked);
             return;
@@ -1230,10 +1242,15 @@ where
 
     Ok(SupervisedTask {
         runtime: Arc::downgrade(runtime),
+        runtime_id,
         id,
         owner,
         completion,
     })
+}
+
+fn current_supervised_task() -> Option<(RuntimeId, TaskId)> {
+    CURRENT_SUPERVISED_TASK.try_with(Cell::get).ok().flatten()
 }
 
 fn deadline_worker(runtime: Weak<RuntimeInner>, receiver: Receiver<DeadlineSignal>) {
@@ -1294,6 +1311,7 @@ fn ensure_active(state: RuntimeState) -> Result<(), EasyConError> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::sync::{Arc, Barrier, Mutex};
@@ -1306,6 +1324,35 @@ mod tests {
     };
 
     use super::*;
+
+    struct CloseRuntimeOnThreadExit {
+        runtime: Runtime,
+        result: mpsc::SyncSender<Result<CloseOutcome, CloseRejection>>,
+    }
+
+    impl Drop for CloseRuntimeOnThreadExit {
+        fn drop(&mut self) {
+            let _ = self.result.send(self.runtime.close());
+        }
+    }
+
+    struct JoinTaskOnThreadExit {
+        task: SupervisedTask,
+        result: mpsc::SyncSender<Result<SupervisedTaskOutcome, TaskJoinError>>,
+    }
+
+    impl Drop for JoinTaskOnThreadExit {
+        fn drop(&mut self) {
+            let _ = self.result.send(self.task.join());
+        }
+    }
+
+    thread_local! {
+        static CLOSE_RUNTIME_ON_THREAD_EXIT: RefCell<Option<CloseRuntimeOnThreadExit>> =
+            const { RefCell::new(None) };
+        static JOIN_TASK_ON_THREAD_EXIT: RefCell<Option<JoinTaskOnThreadExit>> =
+            const { RefCell::new(None) };
+    }
 
     // conformance: operation.immutable-terminal
     #[test]
@@ -2683,6 +2730,50 @@ mod tests {
         assert!(Arc::ptr_eq(&report, &later));
     }
 
+    #[test]
+    fn concurrent_external_join_cannot_hide_a_task_panic_from_close() {
+        let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+        let task = runtime
+            .spawn_supervised("panicking-task", || panic!("scripted task panic"))
+            .expect("task");
+        assert_eq!(task.completion.wait(), SupervisedTaskOutcome::Panicked);
+
+        let unlinked = Arc::new(Barrier::new(2));
+        let release_join = Arc::new(Barrier::new(2));
+        let hook_unlinked = Arc::clone(&unlinked);
+        let hook_release = Arc::clone(&release_join);
+        *runtime
+            .inner
+            .task_join_after_unlink
+            .lock()
+            .expect("task join hook lock") = Some(Arc::new(move || {
+            hook_unlinked.wait();
+            hook_release.wait();
+        }));
+
+        let joining_task = task.clone();
+        let joiner = std::thread::spawn(move || joining_task.join());
+        unlinked.wait();
+        runtime
+            .inner
+            .task_join_after_unlink
+            .lock()
+            .expect("task join hook lock")
+            .take();
+        let outcome = runtime.close().expect("Runtime close");
+        release_join.wait();
+        assert_eq!(
+            joiner.join().expect("external joiner"),
+            Ok(SupervisedTaskOutcome::Panicked)
+        );
+
+        let CloseOutcome::Failed(report) = outcome else {
+            panic!("an observed supervised task panic cannot report Closed");
+        };
+        assert_eq!(report.phase, ClosePhase::TaskJoin);
+        assert_eq!(report.task_id, Some(task.id()));
+    }
+
     // conformance: runtime.self-close-rejected
     // conformance: runtime.task-owned
     #[test]
@@ -2719,6 +2810,62 @@ mod tests {
         assert_eq!(task.join(), Ok(SupervisedTaskOutcome::Completed));
         assert_eq!(runtime.state(), RuntimeState::Closed);
         assert_eq!(runtime.counts().active_tasks, 0);
+    }
+
+    #[test]
+    fn task_exit_destructor_close_is_rejected_before_state_change() {
+        let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+        let worker_runtime = runtime.clone_for_supervision();
+        let (result, observed_result) = mpsc::sync_channel(1);
+        let task = runtime
+            .spawn_supervised("exit-close", move || {
+                CLOSE_RUNTIME_ON_THREAD_EXIT.with(|slot| {
+                    *slot.borrow_mut() = Some(CloseRuntimeOnThreadExit {
+                        runtime: worker_runtime,
+                        result,
+                    });
+                });
+            })
+            .expect("task");
+
+        assert_eq!(
+            observed_result
+                .recv_timeout(Duration::from_secs(2))
+                .expect("thread-exit close result"),
+            Err(CloseRejection::SupervisedTask)
+        );
+        assert_eq!(runtime.state(), RuntimeState::Active);
+        assert_eq!(task.join(), Ok(SupervisedTaskOutcome::Completed));
+        assert_eq!(runtime.close(), Ok(CloseOutcome::Closed));
+    }
+
+    #[test]
+    fn task_exit_destructor_cannot_join_its_own_thread() {
+        let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+        let (publish_task, receive_task) = mpsc::sync_channel(0);
+        let (result, observed_result) = mpsc::sync_channel(1);
+        let task = runtime
+            .spawn_supervised("exit-join", move || {
+                let own_task = receive_task.recv().expect("own task handle");
+                JOIN_TASK_ON_THREAD_EXIT.with(|slot| {
+                    *slot.borrow_mut() = Some(JoinTaskOnThreadExit {
+                        task: own_task,
+                        result,
+                    });
+                });
+            })
+            .expect("task");
+        publish_task.send(task.clone()).expect("publish own task");
+
+        assert_eq!(
+            observed_result
+                .recv_timeout(Duration::from_secs(2))
+                .expect("thread-exit join result"),
+            Err(TaskJoinError::SelfJoin)
+        );
+        assert_eq!(runtime.state(), RuntimeState::Active);
+        assert_eq!(task.join(), Ok(SupervisedTaskOutcome::Completed));
+        assert_eq!(runtime.close(), Ok(CloseOutcome::Closed));
     }
 
     #[test]
