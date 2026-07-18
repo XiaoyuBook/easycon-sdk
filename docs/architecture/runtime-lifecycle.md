@@ -320,6 +320,8 @@ task，自动绑定 owner thread、持有完成通知和 `JoinHandle`，并在�
 `TaskRegistration` 或手工 `bind_to_current_thread` 协议。受监管 task 内同步 close 在改变 Runtime 状态前
 返回 caller rejection，避免 self-wait。deterministic close owner 线程中的 resource callback 重入同一
 Runtime 的同步 close 同样在等待前返回 `CloseOwner`，外层 close 继续并保存唯一 outcome。
+Runtime registry 与显式 `SupervisedTask` handle 共享单一可消费 join ownership；最后 Runtime storage 的
+非确定性释放本身不等待，但不能让后续 task `join` 在 TLS destructor 或 OS thread 退出前伪报完成。
 
 带 caller wait timeout 的正式 `close(timeout)` 可以只结束本次等待；已经开始的关闭仍由同一个 owner
 继续，后续 caller 观察相同 outcome。最后 owning Runtime handle 的 `Drop` 只同步拒绝 admission 并请求

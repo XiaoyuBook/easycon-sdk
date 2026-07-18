@@ -227,7 +227,6 @@ impl CloseFailure {
 
 struct TaskRecord {
     owner: Option<ThreadId>,
-    handle: Option<JoinHandle<()>>,
     completion: Arc<TaskCompletion>,
     lifecycle: TaskLifecycleState<SupervisedTaskOutcome>,
 }
@@ -236,6 +235,9 @@ struct TaskCompletion {
     outcome: Mutex<Option<SupervisedTaskOutcome>>,
     changed: Condvar,
     join_gate: Mutex<()>,
+    handle: Mutex<Option<JoinHandle<()>>>,
+    #[cfg(test)]
+    detached_join_before_thread_join: Mutex<Option<Sender<()>>>,
 }
 
 impl TaskCompletion {
@@ -244,7 +246,26 @@ impl TaskCompletion {
             outcome: Mutex::new(None),
             changed: Condvar::new(),
             join_gate: Mutex::new(()),
+            handle: Mutex::new(None),
+            #[cfg(test)]
+            detached_join_before_thread_join: Mutex::new(None),
         }
+    }
+
+    fn install_handle(&self, handle: JoinHandle<()>) {
+        let mut slot = self
+            .handle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(slot.is_none(), "supervised task installs one join handle");
+        *slot = Some(handle);
+    }
+
+    fn take_handle(&self) -> Option<JoinHandle<()>> {
+        self.handle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 
     fn finish(&self, outcome: SupervisedTaskOutcome) {
@@ -270,6 +291,46 @@ impl TaskCompletion {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
     }
+
+    fn join_without_registry(
+        &self,
+        current: ThreadId,
+    ) -> Result<SupervisedTaskOutcome, TaskJoinError> {
+        let _join = self
+            .join_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        {
+            let handle = self
+                .handle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if handle
+                .as_ref()
+                .is_some_and(|handle| handle.thread().id() == current)
+            {
+                return Err(TaskJoinError::SelfJoin);
+            }
+        }
+        let outcome = self.wait();
+        if let Some(handle) = self.take_handle() {
+            #[cfg(test)]
+            if let Some(observer) = self
+                .detached_join_before_thread_join
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                let _ = observer.send(());
+            }
+            let joined = handle.join();
+            debug_assert!(
+                joined.is_ok(),
+                "supervised wrapper catches task body panics"
+            );
+        }
+        Ok(outcome)
+    }
 }
 
 impl SupervisedTask {
@@ -292,7 +353,8 @@ impl SupervisedTask {
         if let Some(runtime) = self.runtime.upgrade() {
             runtime.join_supervised_task(self.id, &self.completion)
         } else {
-            Ok(self.completion.wait())
+            self.completion
+                .join_without_registry(std::thread::current().id())
         }
     }
 }
@@ -991,7 +1053,7 @@ impl RuntimeInner {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let outcome = completion.wait();
-        let handle = {
+        {
             let mut tasks = self
                 .tasks
                 .lock()
@@ -1004,11 +1066,10 @@ impl RuntimeInner {
                 record.lifecycle.claim_join_handle(),
                 "completed supervised task retains one join handle"
             );
-            record
-                .handle
-                .take()
-                .expect("supervised lifecycle and handle registry stay aligned")
-        };
+        }
+        let handle = completion
+            .take_handle()
+            .expect("supervised lifecycle and handle registry stay aligned");
         debug_assert_ne!(handle.thread().id(), current);
         let joined = handle.join();
         debug_assert!(
@@ -1301,7 +1362,6 @@ where
             id,
             TaskRecord {
                 owner: None,
-                handle: None,
                 completion: Arc::clone(&completion),
                 lifecycle: TaskLifecycleState::registered(),
             },
@@ -1360,6 +1420,7 @@ where
         }
     };
     let owner = worker.thread().id();
+    completion.install_handle(worker);
     {
         let mut tasks = runtime
             .tasks
@@ -1369,7 +1430,6 @@ where
             .get_mut(&id)
             .expect("supervised task remains registered before its start gate opens");
         record.owner = Some(owner);
-        record.handle = Some(worker);
         assert!(
             record.lifecycle.bind_owner_and_retain_handle(),
             "supervised task installs owner and handle exactly once"
@@ -1490,11 +1550,30 @@ mod tests {
         }
     }
 
+    struct BlockThreadExit {
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+        order: Arc<AtomicUsize>,
+        exit_order: Arc<AtomicUsize>,
+    }
+
+    impl Drop for BlockThreadExit {
+        fn drop(&mut self) {
+            let _ = self.entered.send(());
+            let _ = self.release.recv();
+            self.exit_order.store(
+                self.order.fetch_add(1, Ordering::AcqRel) + 1,
+                Ordering::Release,
+            );
+        }
+    }
+
     thread_local! {
         static CLOSE_RUNTIME_ON_THREAD_EXIT: RefCell<Option<CloseRuntimeOnThreadExit>> =
             const { RefCell::new(None) };
         static JOIN_TASK_ON_THREAD_EXIT: RefCell<Option<JoinTaskOnThreadExit>> =
             const { RefCell::new(None) };
+        static BLOCK_THREAD_EXIT: RefCell<Option<BlockThreadExit>> = const { RefCell::new(None) };
     }
 
     // conformance: operation.immutable-terminal
@@ -2864,6 +2943,93 @@ mod tests {
         assert!(!codes.contains(&"runtime.close_failed"));
     }
 
+    // conformance: runtime.detached-task-join
+    #[test]
+    fn task_join_after_runtime_storage_drop_waits_for_thread_exit() {
+        let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+        let runtime_storage = Arc::downgrade(&runtime.inner);
+        let (body_started, observed_body_start) = mpsc::channel();
+        let (release_body, body_release) = mpsc::channel();
+        let (exit_entered, observed_exit_entry) = mpsc::channel();
+        let (release_exit, exit_release) = mpsc::channel();
+        let order = Arc::new(AtomicUsize::new(0));
+        let exit_order = Arc::new(AtomicUsize::new(0));
+        let join_order = Arc::new(AtomicUsize::new(0));
+        let task_order = Arc::clone(&order);
+        let task_exit_order = Arc::clone(&exit_order);
+        let task = runtime
+            .spawn_supervised("detached-join", move || {
+                BLOCK_THREAD_EXIT.with(|slot| {
+                    *slot.borrow_mut() = Some(BlockThreadExit {
+                        entered: exit_entered,
+                        release: exit_release,
+                        order: task_order,
+                        exit_order: task_exit_order,
+                    });
+                });
+                body_started.send(()).expect("body start observer");
+                body_release.recv().expect("body release");
+            })
+            .expect("task");
+        observed_body_start
+            .recv_timeout(Duration::from_secs(2))
+            .expect("task body started");
+
+        drop(runtime);
+        let storage_wait = Instant::now();
+        while runtime_storage.upgrade().is_some() {
+            assert!(
+                storage_wait.elapsed() < Duration::from_secs(2),
+                "Runtime storage did not release after final owning Drop"
+            );
+            std::thread::yield_now();
+        }
+
+        let (joiner_ready, observed_joiner_ready) = mpsc::channel();
+        let (begin_join, join_release) = mpsc::channel();
+        let (join_claimed, observed_join_claim) = mpsc::channel();
+        *task
+            .completion
+            .detached_join_before_thread_join
+            .lock()
+            .expect("detached join observer") = Some(join_claimed);
+        let (joined, observed_join) = mpsc::channel();
+        let joining_order = Arc::clone(&order);
+        let observed_join_order = Arc::clone(&join_order);
+        let joiner = std::thread::spawn(move || {
+            joiner_ready.send(()).expect("joiner ready observer");
+            join_release.recv().expect("join release");
+            let outcome = task.join();
+            observed_join_order.store(
+                joining_order.fetch_add(1, Ordering::AcqRel) + 1,
+                Ordering::Release,
+            );
+            joined.send(outcome).expect("join result observer");
+        });
+        observed_joiner_ready
+            .recv_timeout(Duration::from_secs(2))
+            .expect("task joiner ready");
+
+        release_body.send(()).expect("release task body");
+        observed_exit_entry
+            .recv_timeout(Duration::from_secs(2))
+            .expect("thread-exit destructor entered");
+
+        begin_join.send(()).expect("start task join");
+        observed_join_claim
+            .recv_timeout(Duration::from_secs(2))
+            .expect("detached join claimed OS handle");
+
+        release_exit.send(()).expect("release thread exit");
+        let outcome = observed_join
+            .recv_timeout(Duration::from_secs(2))
+            .expect("join after thread exit");
+        joiner.join().expect("task joiner");
+        assert_eq!(exit_order.load(Ordering::Acquire), 1);
+        assert_eq!(join_order.load(Ordering::Acquire), 2);
+        assert_eq!(outcome, Ok(SupervisedTaskOutcome::Completed));
+    }
+
     #[test]
     fn dropping_a_nonfinal_runtime_handle_keeps_the_runtime_active() {
         let runtime = Runtime::new(Arc::new(VirtualClock::default()));
@@ -3097,7 +3263,14 @@ mod tests {
             .get(&task_id)
             .expect("Runtime retains task until join");
         assert!(record.owner.is_some());
-        assert!(record.handle.is_some());
+        assert!(
+            record
+                .completion
+                .handle
+                .lock()
+                .expect("task handle slot")
+                .is_some()
+        );
         assert!(Arc::ptr_eq(&record.completion, &task.completion));
         drop(tasks);
 

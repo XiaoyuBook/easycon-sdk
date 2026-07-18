@@ -31,6 +31,8 @@ binding、固件或 UI。
 1. 长期任务只能通过 `Runtime::spawn_supervised` 或等价的 Runtime-owned API 创建。
 2. Runtime 在任务代码执行前完成 admission 和 task registry 登记；wrapper 自动绑定 owner thread，
    保存完成通知与 `JoinHandle`，捕获 task panic，并在退出/join 后自动注销。
+   Runtime registry 与返回的 `SupervisedTask` 共享同一个可消费的 join ownership；最后 Runtime storage
+   非确定性释放后，显式 task `join` 仍必须等待 TLS destructor 和 OS thread 真实退出。
 3. `TaskRegistration`、`bind_to_current_thread` 和“调用方必须在正确线程 drop guard”的协议不再是
    public correctness primitive。
 4. 受监管 task 内同步调用同一 Runtime 的 `close` 必须在 Runtime 状态变化和关闭副作用之前返回

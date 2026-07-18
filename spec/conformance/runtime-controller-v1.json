@@ -57,6 +57,7 @@
         "crates/easycon-runtime/src/runtime.rs::task_close_without_manual_binding_does_not_self_wait",
         "crates/easycon-runtime/src/runtime.rs::task_exit_destructor_close_is_rejected_before_state_change",
         "crates/easycon-runtime/src/runtime.rs::task_exit_destructor_cannot_join_its_own_thread",
+        "crates/easycon-runtime/src/runtime.rs::task_join_after_runtime_storage_drop_waits_for_thread_exit",
         "crates/easycon-runtime/src/runtime.rs::concurrent_external_join_cannot_hide_a_task_panic_from_close",
         "crates/easycon-runtime/src/runtime.rs::resource_callback_reentrant_close_is_rejected_without_self_wait",
         "crates/easycon-runtime/src/runtime.rs::final_owning_drop_only_rejects_admission_and_requests_cancellation",
@@ -66,6 +67,7 @@
       "steps": [
         { "id": "runtime.spawn-self-close", "action": "spawn a supervised task through Runtime and call synchronous close from its task body" },
         { "id": "runtime.task-exit-destructor", "action": "call close and self-join from task-owned TLS destructors after the body completion signal" },
+        { "id": "runtime.detached-task-join", "action": "drop the final Runtime storage while a supervised task is alive, then join its explicit task handle while TLS exit cleanup is blocked" },
         { "id": "runtime.task-panic-race", "action": "pause an external panic-task join at registry unlink while another thread closes Runtime" },
         { "id": "runtime.resource-reentrant-close", "action": "re-enter synchronous Runtime close from a ManagedResource callback on the deterministic close owner thread" },
         { "id": "runtime.external-close", "action": "close the same Runtime externally after the supervised task exits" },
@@ -97,6 +99,11 @@
           "id": "runtime.task-exit-self-join",
           "expect": "a task-owned TLS destructor cannot join its own Runtime-owned thread",
           "test": "crates/easycon-runtime/src/runtime.rs::task_exit_destructor_cannot_join_its_own_thread"
+        },
+        {
+          "id": "runtime.detached-task-join",
+          "expect": "explicit task join retains consumable OS join ownership after final Runtime storage release and waits for TLS destructors and thread exit",
+          "test": "crates/easycon-runtime/src/runtime.rs::task_join_after_runtime_storage_drop_waits_for_thread_exit"
         },
         {
           "id": "runtime.task-panic-race",

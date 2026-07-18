@@ -77,7 +77,8 @@ ECS 的 ControllerPort、VisionPort、OutputPort 记录按顺序的 typed call�
 - event filter、sequence、reserved capacity、gap 合并和 drain；
 - Runtime explicit close 的逐步顺序、保存的 Closed/CloseFailed outcome、幂等和并发 waiter；
 - final owning Drop 只拒绝 admission/请求根取消，不执行 callback、join、finalizer 或最终事件；
-- supervised spawn 自动 owner binding、完成通知、join/unregister，以及 task 内 close 的 pre-state rejection；
+- supervised spawn 自动 owner binding、共享完成/JoinHandle ownership、真实 thread join/unregister，以及
+  task 内 close 的 pre-state rejection；
 - operation terminal transaction 在 cleanup/event/registry 故障下仍注销并通知全部 waiter；
 - cancellation hook panic 逐个隔离，poisoned synchronization state 可恢复；
 - 用 Loom 模型覆盖 parent terminal/child admission、hook panic/child propagation、supervised task
