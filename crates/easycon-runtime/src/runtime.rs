@@ -155,6 +155,8 @@ pub(crate) struct RuntimeInner {
     task_failures: Mutex<Vec<TaskId>>,
     #[cfg(test)]
     task_join_after_unlink: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    deadline_worker_panic: AtomicBool,
     deadline_task_id: TaskId,
     subscriptions: Mutex<Vec<Weak<SubscriptionInner>>>,
     events_closed: AtomicBool,
@@ -291,7 +293,7 @@ impl ResourceRegistration {
             runtime
                 .resources
                 .lock()
-                .expect("resource registry lock poisoned")
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(&self.id);
         }
     }
@@ -335,6 +337,8 @@ impl Runtime {
             task_failures: Mutex::new(Vec::new()),
             #[cfg(test)]
             task_join_after_unlink: Mutex::new(None),
+            #[cfg(test)]
+            deadline_worker_panic: AtomicBool::new(false),
             deadline_task_id: task_id,
             subscriptions: Mutex::new(Vec::new()),
             events_closed: AtomicBool::new(false),
@@ -350,7 +354,7 @@ impl Runtime {
         *inner
             .clock_hook
             .lock()
-            .expect("deadline clock hook lock poisoned") = Some(clock_hook);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(clock_hook);
         let runtime = Arc::downgrade(&inner);
         let task = spawn_supervised_inner(
             &inner,
@@ -362,7 +366,7 @@ impl Runtime {
         *inner
             .deadline_task
             .lock()
-            .expect("deadline task lock poisoned") = Some(task);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(task);
 
         Self {
             inner,
@@ -427,7 +431,7 @@ impl Runtime {
             .inner
             .state
             .lock()
-            .expect("Runtime state lock poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         ensure_active(*state)?;
         if parent.owner() != Some(self.inner.id) {
             return Err(EasyConError::new(
@@ -451,7 +455,7 @@ impl Runtime {
         self.inner
             .operations
             .lock()
-            .expect("operation registry lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(id, Arc::clone(&operation.inner));
         drop(state);
         if deadline_ns.is_some() {
@@ -481,14 +485,14 @@ impl Runtime {
             .inner
             .state
             .lock()
-            .expect("Runtime state lock poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         ensure_active(*state)?;
         let subscription = EventSubscription::new(options);
         let mut subscriptions = self
             .inner
             .subscriptions
             .lock()
-            .expect("subscription registry lock poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         subscriptions.retain(|existing| existing.strong_count() != 0);
         subscriptions.push(Arc::downgrade(&subscription.inner));
         drop(subscriptions);
@@ -514,13 +518,13 @@ impl Runtime {
             .inner
             .state
             .lock()
-            .expect("Runtime state lock poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         ensure_active(*state)?;
         let id = ResourceId::new(self.inner.allocate_id());
         self.inner
             .resources
             .lock()
-            .expect("resource registry lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(id, Arc::downgrade(&resource));
         drop(state);
         Ok(ResourceRegistration {
@@ -546,7 +550,7 @@ impl Runtime {
             .inner
             .state
             .lock()
-            .expect("Runtime state lock poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         ensure_active(*state)?;
         let id = TaskId::new(self.inner.allocate_id());
         let supervised = spawn_supervised_inner(&self.inner, id, name.into(), task)?;
@@ -1130,7 +1134,7 @@ impl RuntimeInner {
         let mut operations: Vec<_> = self
             .operations
             .lock()
-            .expect("operation registry lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .values()
             .cloned()
             .map(|inner| Operation { inner })
@@ -1258,6 +1262,10 @@ fn deadline_worker(runtime: Weak<RuntimeInner>, receiver: Receiver<DeadlineSigna
         let Some(runtime) = runtime.upgrade() else {
             break;
         };
+        #[cfg(test)]
+        if runtime.deadline_worker_panic.swap(false, Ordering::AcqRel) {
+            panic!("failpoint:runtime.deadline_worker.panic");
+        }
         runtime.poll_deadlines();
         let wait = runtime
             .next_deadline_ns()
@@ -2473,18 +2481,10 @@ mod tests {
         let events = runtime
             .subscribe(SubscriptionOptions::default())
             .expect("events");
-        let poisoned_runtime = Arc::clone(&runtime.inner);
-        assert!(
-            std::thread::spawn(move || {
-                let _guard = poisoned_runtime
-                    .operations
-                    .lock()
-                    .expect("operation registry lock");
-                panic!("scripted operation registry poison");
-            })
-            .join()
-            .is_err()
-        );
+        runtime
+            .inner
+            .deadline_worker_panic
+            .store(true, Ordering::Release);
         let _ = runtime.inner.deadline_sender.send(DeadlineSignal::Wake);
         let started = Instant::now();
         loop {
@@ -2530,6 +2530,39 @@ mod tests {
         }
         assert_eq!(codes.last(), Some(&"runtime.close_failed"));
         assert!(!codes.contains(&"runtime.closed"));
+    }
+
+    #[test]
+    fn poisoned_operation_registry_does_not_kill_deadline_supervision() {
+        let clock = Arc::new(VirtualClock::default());
+        let runtime = Runtime::new(clock.clone());
+        let operation = runtime.create_operation(Some(10)).expect("operation");
+        operation.start();
+        let (cancelled, observed_cancel) = mpsc::sync_channel(1);
+        operation.on_cancel(move || {
+            let _ = cancelled.send(());
+        });
+
+        let poisoned_runtime = Arc::clone(&runtime.inner);
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = poisoned_runtime
+                    .operations
+                    .lock()
+                    .expect("operation registry lock");
+                panic!("scripted operation registry poison");
+            })
+            .join()
+            .is_err()
+        );
+        clock.advance_to(10);
+
+        observed_cancel
+            .recv_timeout(Duration::from_secs(2))
+            .expect("deadline worker must recover the operation registry");
+        assert_eq!(operation.snapshot().state, OperationState::Cancelling);
+        assert_eq!(operation.finish_cancelled(), TransitionOutcome::Applied);
+        assert_eq!(runtime.close(), Ok(CloseOutcome::Closed));
     }
 
     #[test]

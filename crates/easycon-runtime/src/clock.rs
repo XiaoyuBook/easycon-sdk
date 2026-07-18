@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 /// Identifier for one registered monotonic deadline.
@@ -96,7 +96,7 @@ impl VirtualClock {
     ///
     /// Panics if `target_ns` is earlier than the current monotonic time.
     pub fn advance_to(&self, target_ns: u64) {
-        let mut state = self.state.lock().expect("virtual clock lock poisoned");
+        let mut state = lock_recover(&self.state);
         let previous = self.now_ns.load(Ordering::Acquire);
         if target_ns < previous {
             drop(state);
@@ -115,7 +115,7 @@ impl VirtualClock {
     /// Panics if the new timestamp would overflow `u64`.
     pub fn advance_by(&self, duration: Duration) {
         let delta = u64::try_from(duration.as_nanos()).expect("duration exceeds u64 nanoseconds");
-        let mut state = self.state.lock().expect("virtual clock lock poisoned");
+        let mut state = lock_recover(&self.state);
         let previous = self.now_ns.load(Ordering::Acquire);
         let Some(target_ns) = previous.checked_add(delta) else {
             drop(state);
@@ -130,21 +130,13 @@ impl VirtualClock {
     /// Returns deadline records in registration order.
     #[must_use]
     pub fn deadline_trace(&self) -> Vec<DeadlineTrace> {
-        self.state
-            .lock()
-            .expect("virtual clock lock poisoned")
-            .deadlines
-            .clone()
+        lock_recover(&self.state).deadlines.clone()
     }
 
     /// Returns deadline identifiers in deterministic wake order.
     #[must_use]
     pub fn wake_order(&self) -> Vec<DeadlineId> {
-        self.state
-            .lock()
-            .expect("virtual clock lock poisoned")
-            .wake_order
-            .clone()
+        lock_recover(&self.state).wake_order.clone()
     }
 }
 
@@ -184,14 +176,14 @@ impl Clock for VirtualClock {
     }
 
     fn on_change(&self, hook: Arc<ClockChangeHook>) -> ClockChangeRegistration {
-        let mut state = self.state.lock().expect("virtual clock lock poisoned");
+        let mut state = lock_recover(&self.state);
         state.hooks.retain(|existing| existing.strong_count() != 0);
         state.hooks.push(Arc::downgrade(&hook));
         ClockChangeRegistration::new(hook)
     }
 
     fn register_deadline(&self, target_ns: u64) -> DeadlineId {
-        let mut state = self.state.lock().expect("virtual clock lock poisoned");
+        let mut state = lock_recover(&self.state);
         let id = DeadlineId(self.next_deadline.fetch_add(1, Ordering::Relaxed));
         assert!(id.0 != 0, "virtual deadline ID space exhausted");
         let woken = target_ns <= self.now_ns();
@@ -208,10 +200,7 @@ impl Clock for VirtualClock {
     }
 
     fn record_dispatch(&self, id: DeadlineId, actual_ns: u64) {
-        if let Some(deadline) = self
-            .state
-            .lock()
-            .expect("virtual clock lock poisoned")
+        if let Some(deadline) = lock_recover(&self.state)
             .deadlines
             .iter_mut()
             .find(|deadline| deadline.id == id)
@@ -223,6 +212,12 @@ impl Clock for VirtualClock {
     fn real_wait_duration(&self, _target_ns: u64) -> Option<Duration> {
         None
     }
+}
+
+fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Production monotonic clock backed by [`Instant`].
@@ -339,6 +334,26 @@ mod tests {
 
         assert!(clock.deadline_trace()[0].woken);
         assert_eq!(clock.wake_order(), [deadline]);
+    }
+
+    #[test]
+    fn virtual_clock_recovers_poisoned_state() {
+        let clock = Arc::new(VirtualClock::default());
+        let poisoned_clock = Arc::clone(&clock);
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = poisoned_clock.state.lock().expect("virtual clock state");
+                panic!("scripted virtual clock poison");
+            })
+            .join()
+            .is_err()
+        );
+
+        let deadline = clock.register_deadline(10);
+        clock.advance_to(10);
+
+        assert_eq!(clock.wake_order(), [deadline]);
+        assert_eq!(clock.deadline_trace()[0].target_ns, 10);
     }
 
     #[test]
