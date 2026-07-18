@@ -15,28 +15,53 @@
         "cancel before a future step and accept neutral report",
         "close Runtime twice",
         "drain RuntimeClosed and close subscription",
-        "attempt an event publish after RuntimeClosed",
-        "repeat with a fresh Runtime whose supervised task owns the final handle",
-        "drop the final Runtime clone from inside that task and drain RuntimeClosed",
-        "bind a supervised task to its worker thread and call explicit Runtime close from that task",
-        "repeat final-handle drop with a live managed resource",
-        "hold coordinator progress while dropping the final handle and attempt new admission",
-        "panic one managed resource close callback before closing a healthy resource",
-        "inject an unexpected internal close panic while concurrent close callers wait"
+        "attempt an event publish after RuntimeClosed"
       ],
       "assertions": [
         "operation states and events follow the canonical transitions",
         "report bytes and virtual timestamps match tracked fixtures",
         "direct success claims transport acceptance only",
         "active operation, task, and resource counts are zero after every successful close",
-        "post-close event production is rejected",
-        "final-handle drop does not wait for the task that is dropping it",
-        "explicit close from a bound supervised task fails promptly and leaves Runtime Active for an external closer",
-        "the dedicated finalizer completes the normal close order after task cleanup",
-        "managed resource close callbacks do not run on the dropping thread",
-        "final-handle drop enters Closing and rejects admission before returning",
-        "a resource close panic emits an error event while healthy resources close, commits remaining operations as Cancelled with ParentClose, retains failed resource supervision, wakes waiters, and never claims Closed",
-        "an unexpected internal close panic wakes every close waiter without claiming Closed and terminates the event stream with a failure event when production remains open"
+        "RuntimeClosed occurs after worker join and registry convergence and post-close event production is rejected"
+      ]
+    },
+    {
+      "id": "runtime-stabilization",
+      "steps": [
+        "spawn a supervised task through Runtime and call synchronous close from its task body",
+        "close the same Runtime externally after the supervised task exits",
+        "drop the final owning handle of a fresh Runtime with a live resource and subscription",
+        "observe admission rejection and root cancellation without releasing the resource owner",
+        "explicitly close another Runtime whose first resource callback panics and whose healthy resource can close",
+        "hold the failed resource owner task in cleanup while concurrent close callers wait",
+        "finish the real owner cleanup after every close caller receives the saved outcome",
+        "call close again after CloseFailed"
+      ],
+      "assertions": [
+        "supervised task close is rejected before Runtime state changes and external close later succeeds",
+        "Runtime owns task completion, JoinHandle, owner binding, join, and unregister without a public task registration protocol",
+        "final owning Drop rejects admission and requests root cancellation but runs no resource callback, starts no finalizer, and emits no RuntimeClosed",
+        "resource callback panic does not prevent healthy resource cleanup",
+        "all concurrent and later close callers receive one saved CloseFailed outcome and runtime.close_failed is the final event",
+        "an operation remains non-terminal until its real owner cleanup and owner task exit",
+        "CloseFailed retains diagnostic resource or task IDs and non-converged registry counts"
+      ]
+    },
+    {
+      "id": "operation-terminal-transaction",
+      "steps": [
+        "race parent terminal start against child operation admission",
+        "register two cancellation hooks and a child where the first hook panics",
+        "inject terminal event delivery failure while an operation waiter is blocked",
+        "inject operation registry unlink failure while a second waiter is blocked",
+        "poison each recoverable Runtime synchronization lock before retrying its operation"
+      ],
+      "assertions": [
+        "child admission linearized after parent terminal sealing is rejected and an earlier child is cancelled",
+        "one cancellation hook panic does not skip later hooks or any live child",
+        "terminal state and payload are immutable and committed exactly once after owner cleanup",
+        "registry unlink occurs before every terminal waiter returns",
+        "event, registry, hook, and poisoned-lock faults cannot suppress waiter notification"
       ]
     },
     {

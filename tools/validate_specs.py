@@ -226,6 +226,18 @@ def validate_behavior():
         behavior["operations"]["terminal_states"] == ["Succeeded", "Failed", "Cancelled"],
         "operation terminal states changed",
     )
+    require(
+        behavior["operations"]["terminal_transaction"]["order"]
+        == [
+            "seal child admission",
+            "close and cancel the admitted cancellation subtree",
+            "complete owner cleanup",
+            "commit one immutable terminal state and terminal event",
+            "unlink the operation registry entry",
+            "notify every waiter unconditionally",
+        ],
+        "operation terminal transaction order changed",
+    )
     transitions = {(item["from"], item["to"]) for item in behavior["operations"]["transitions"]}
     required = {
         ("Pending", "Running"),
@@ -242,16 +254,21 @@ def validate_behavior():
         == {"active_tasks": 0, "active_resources": 0, "active_operations": 0},
         "closed registry counts must all be zero",
     )
+    require(
+        behavior["runtime"]["states"]
+        == ["Active", "Closing", "Closed", "CloseFailed"],
+        "Runtime states changed",
+    )
     expected_close_order = [
         "enter Closing and reject admission",
-        "cancel root operation tree",
-        "close controller resources and neutralize",
-        "wait for ordinary supervised task cleanup",
-        "finish remaining non-terminal operations",
-        "join the internal deadline worker",
-        "assert task and resource registries are empty",
+        "publish RuntimeClosing and cancel the root tree",
+        "close resources in Runtime ID order while isolating each failure",
+        "wait for owner cleanup and join ordinary supervised tasks",
+        "finish non-terminal operations only after their owners exit",
+        "join internal workers and every retained task handle",
+        "verify operation, resource, active-task, and join registries are empty",
         "publish RuntimeClosed and close producers",
-        "enter Closed",
+        "save the Closed outcome, enter Closed, and notify close waiters",
     ]
     require(behavior["runtime"]["close_order"] == expected_close_order,
             "Runtime close order changed")
@@ -346,7 +363,14 @@ def validate_conformance():
     require(conformance.get("schema_version") == 1, "conformance schema_version must be 1")
     require(conformance.get("license") == "GPL-3.0-only", "conformance license changed")
     scenario_ids = [scenario["id"] for scenario in conformance["scenarios"]]
-    required = ["vertical-slice", "timeout-separation", "transport-faults", "event-overflow"]
+    required = [
+        "vertical-slice",
+        "runtime-stabilization",
+        "operation-terminal-transaction",
+        "timeout-separation",
+        "transport-faults",
+        "event-overflow",
+    ]
     require(scenario_ids == required, "conformance scenarios changed or were reordered")
     for scenario in conformance["scenarios"]:
         require(scenario["steps"], "{} has no steps".format(scenario["id"]))
@@ -360,7 +384,7 @@ def main():
     validate_controller_fixture()
     validate_traces()
     validate_conformance()
-    print("validated 4 schemas, 1 behavior spec, 2 controller fixtures, and 4 conformance scenarios")
+    print("validated 4 schemas, 1 behavior spec, 2 controller fixtures, and 6 conformance scenarios")
     return 0
 
 

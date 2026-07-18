@@ -75,8 +75,13 @@ ECS 的 ControllerPort、VisionPort、OutputPort 记录按顺序的 typed call�
 - wait timeout 与 operation deadline 分离；
 - parent cancellation tree；task supervisor 无脱管任务；
 - event filter、sequence、reserved capacity、gap 合并和 drain；
-- Runtime close 的逐步顺序、幂等和重入；
-- 用 Loom 或等价模型测试 registry/终态/queue 的关键并发状态。
+- Runtime explicit close 的逐步顺序、保存的 Closed/CloseFailed outcome、幂等和并发 waiter；
+- final owning Drop 只拒绝 admission/请求根取消，不执行 callback、join、finalizer 或最终事件；
+- supervised spawn 自动 owner binding、完成通知、join/unregister，以及 task 内 close 的 pre-state rejection；
+- operation terminal transaction 在 cleanup/event/registry 故障下仍注销并通知全部 waiter；
+- cancellation hook panic 逐个隔离，poisoned synchronization state 可恢复；
+- 用 Loom 模型覆盖 parent terminal/child admission、hook panic/child propagation、supervised task
+  self-wait 和 terminal commit/registry unlink/waiter notify。模型命令是 Phase 1 正式门禁。
 
 ### `easycon-controller`
 
@@ -244,7 +249,7 @@ Python/Lua Runner、字节码/固件、远端控制、配置/推送、UI/键鼠�
 
 | 层 | 故障 | 必须观察到 |
 | --- | --- | --- |
-| Runtime | executor admission failure、queue full、shutdown race | stable error/gap，无脱管 task |
+| Runtime | executor admission failure、queue full、close/Drop race、resource/task panic | 保存的 CloseFailed 或 stable error/gap，无脱管 task、无伪造 operation 终态 |
 | Serial | access denied、partial write、read timeout、hot unplug | operation Failed/Cancelled，Controller 明确状态 |
 | Protocol | wrong hello、busy、late/duplicate ACK | 不串请求，重试有界，正确 error |
 | Scheduler | cancel 与 deadline 同 tick、clock jump fake | 单一终态、单调规则不破坏 |
@@ -253,7 +258,7 @@ Python/Lua Runner、字节码/固件、远端控制、配置/推送、UI/键鼠�
 | Vision | invalid ROI、huge image、missing OCR model、native exception | 参数/模型/native 错误，无空成功 |
 | Events | 消费者停读、容量 1、terminal burst | gap + 可查询终态，生产者不阻塞 |
 | ABI | bad size/version/type/runtime、panic | 明确错误，无越界/unwind |
-| Binding | event pump 退出、GC/finalizer、process shutdown | Task 不永久悬挂，兜底关闭可诊断 |
+| Binding | event pump 退出、GC/finalizer、process shutdown | Task 不永久悬挂，遗漏显式 close 可诊断且 release 不伪造关闭 |
 
 故障点使用命名 failpoint，release binary 默认移除或关闭；测试不能依赖随机睡眠制造竞态。
 

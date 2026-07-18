@@ -82,6 +82,9 @@ ABI 声明使用 incomplete struct pointer。内部 wrapper header 含 ABI/type 
 - create/take-result 成功时通过 `T** out` 交付一个独立 owning wrapper。
 - `*_clone_handle(source, T** out)` 在需要共享时创建另一个 owning wrapper；不是返回同一个 raw pointer。
 - `*_release(NULL)` 成功且无操作；release 消耗该 wrapper。
+- 主动 Runtime wrapper 的 release 前置条件是显式 close 已返回保存的 Closed 或调用方已处理
+  CloseFailed；release 本身不执行 resource callback、不等待 task、不启动 finalizer，也不产生
+  `RuntimeClosed`。
 - 同一非 NULL raw pointer 只能 release 一次。释放后使用或二次释放属于 C 调用方未定义行为，binding 必须把字段原子置 NULL。
 - 有效但类型错误、ABI magic 错误或跨 Runtime 的 handle 返回稳定错误；不能靠 C cast 绕过。
 - 关闭 Runtime 会使主动子资源停止，但 immutable Frame/Image/Program/Event/Error/Buffer 可读到其各自最后引用释放；它们不能再启动新 operation。

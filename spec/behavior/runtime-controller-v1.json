@@ -20,23 +20,37 @@
       "protocol_timeout": "fails the operation in the controller error domain after a bounded handshake or ACK exchange",
       "transport_write_timeout": "bounds partial report and command writes independently from protocol replies"
     },
-    "terminal_commit": "exactly once; immutable result and error are mutually exclusive"
+    "terminal_commit": "exactly once; immutable result and error are mutually exclusive",
+    "terminal_transaction": {
+      "child_admission": "the parent cancellation node is sealed before owner cleanup; admission linearized after sealing is rejected and previously admitted children are cancelled",
+      "order": [
+        "seal child admission",
+        "close and cancel the admitted cancellation subtree",
+        "complete owner cleanup",
+        "commit one immutable terminal state and terminal event",
+        "unlink the operation registry entry",
+        "notify every waiter unconditionally"
+      ],
+      "failure_isolation": "cancellation hook panic is isolated per hook and never truncates sibling hooks or child propagation; event, registry, hook, or poisoned-lock faults never skip registry unlink or waiter notification"
+    }
   },
   "runtime": {
-    "states": ["Active", "Closing", "Closed"],
+    "states": ["Active", "Closing", "Closed", "CloseFailed"],
     "close_is_idempotent": true,
-    "final_handle_drop": "synchronously enters Closing and rejects admission, then delegates the remaining close sequence to a dedicated finalizer without waiting or invoking resource callbacks on the dropping thread; explicit close synchronously observes Closed only from outside bound supervised tasks, while a bound task caller is rejected before Runtime state changes",
-    "close_panic": "a ManagedResource close panic is isolated while healthy resources continue closing, but its resource and task registrations remain supervised and Runtime does not claim Closed; every unexpected internal close panic commits Cancelled with ParentClose for each still-accessible non-terminal operation, leaves Runtime in Closing, terminates events with runtime.close_panicked when possible, and wakes close waiters so operation and close waits do not block forever",
+    "explicit_close": "the only deterministic shutdown path; an external caller owns the Active to Closing transition and every concurrent or later caller receives the same saved Closed or Failed CloseOutcome",
+    "final_handle_drop": "synchronously rejects admission and requests root cancellation only; it never waits, invokes resource close callbacks, joins tasks, spawns a finalizer thread, closes event production, or promises RuntimeClosed",
+    "supervised_tasks": "tasks are created only through Runtime supervised spawn; Runtime registers before body execution, binds owner automatically, retains completion and JoinHandle, joins and unregisters, and rejects same-Runtime synchronous close from the task before state changes",
+    "close_failure": "resource, task, event, or registry failure commits CloseFailed with one saved diagnostic CloseReport, publishes runtime.close_failed as the final event, closes producers, and wakes all close waiters; operations whose owner cleanup or owner task has not finished remain non-terminal",
     "close_order": [
       "enter Closing and reject admission",
-      "cancel root operation tree",
-      "close controller resources and neutralize",
-      "wait for ordinary supervised task cleanup",
-      "finish remaining non-terminal operations",
-      "join the internal deadline worker",
-      "assert task and resource registries are empty",
+      "publish RuntimeClosing and cancel the root tree",
+      "close resources in Runtime ID order while isolating each failure",
+      "wait for owner cleanup and join ordinary supervised tasks",
+      "finish non-terminal operations only after their owners exit",
+      "join internal workers and every retained task handle",
+      "verify operation, resource, active-task, and join registries are empty",
       "publish RuntimeClosed and close producers",
-      "enter Closed"
+      "save the Closed outcome, enter Closed, and notify close waiters"
     ],
     "closed_counts": { "active_tasks": 0, "active_resources": 0, "active_operations": 0 }
   },
@@ -44,7 +58,7 @@
     "delivery": "per-subscriber bounded pull queue",
     "sequence": "strictly increasing across one Runtime",
     "overflow": "oldest ordinary events are summarized by EventGap; authoritative state remains queryable",
-    "close": "RuntimeClosed bypasses subscriber severity and log filters, is the final delivered event after successful close, leaves subscriptions drainable, and rejects later publish attempts; an unexpected internal close panic uses runtime.close_panicked as the final event when event production is still open"
+    "close": "RuntimeClosed bypasses subscriber severity and log filters and is emitted only after successful cleanup, task join, and registry convergence; CloseFailed uses runtime.close_failed as the final event; either final event leaves subscriptions drainable and rejects later publish attempts; Drop alone emits neither final event"
   },
   "controller": {
     "single_writer": true,

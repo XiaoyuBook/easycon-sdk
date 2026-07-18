@@ -32,7 +32,8 @@
 - C ABI 增加 operation wait/cancel/status/result/error 和 event subscription/read/release。
 - binding 必须保留 operation handle 到终态，不能因 Future/Task 对象被丢弃就释放监管。
 - event queue 为 terminal/error/state 保留容量，日志溢出产生 gap event。
-- 主动资源需要显式 close；RAII/SafeHandle/finalizer 只是兜底。
+- 主动资源需要显式 close；RAII/SafeHandle/GC finalizer 只能报告遗漏并释放已关闭 wrapper，不能
+  执行确定性 close。详细边界由 [ADR-0006](0006-runtime-stabilization.md) 收紧。
 - 所有 capture/serial backend 必须提供可中断关闭；不能 detach 卡住的线程后宣称 Closed。
 
 ## 被否决的方案

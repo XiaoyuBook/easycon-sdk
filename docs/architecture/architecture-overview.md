@@ -76,7 +76,7 @@ flowchart TB
 ### `easycon-runtime`
 
 - Runtime 根取消令牌、任务监管器、operation registry、事件总线、单调时钟和 deadline。
-- 通用的有界队列、资源登记、关闭协调与 panic 转换。
+- 通用的有界队列、资源登记、Runtime-owned supervised spawn/join、关闭协调与 panic 转换。
 - 提供可替换 `Clock`、executor/transport fake 接口，支持确定性测试。
 - 不知道按钮、ECS 语法、OpenCV 或具体串口协议。
 
@@ -233,6 +233,10 @@ sequenceDiagram
 - 每个异步调用都有 operation ID、终态和可追踪 error/event。
 - wait timeout 不等于 operation deadline，也不隐式取消 operation。
 - 任何 cancel/close 完成之前，资源相关任务已经退出或被父 Runtime 继续监管。
+- 长期 task 只能由 Runtime 受控创建并持有 `JoinHandle`；调用方不能手工登记或绑定 task owner。
+- 只有显式 Runtime close 承诺 cleanup、join、registry 收敛和最终事件；Drop 只拒绝 admission 并请求取消。
+- Runtime 关闭失败是保存的 `CloseFailed` outcome，不借用 `Closing` 或跨 API panic 表示。
+- Operation terminal transaction 在封闭 child admission 后才 cleanup/commit，并无条件通知 waiter。
 - Automation 终态在 Controller 中立化和 lease 释放之后才可观察。
 - C++ exception、Rust panic 和语言 exception 都不能跨越各自二进制边界。
 - 事件是观测面，不是驱动状态正确性的唯一通道；即使消费者丢事件，也能查询最终状态。

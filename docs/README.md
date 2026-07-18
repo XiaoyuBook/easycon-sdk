@@ -31,6 +31,7 @@
 - [ADR-0003：Rust 核心、私有 C++ 桥接与公共 C ABI](decisions/0003-core-native-abi-boundary.md)
 - [ADR-0004：操作句柄、拉取事件与确定性关闭](decisions/0004-operations-events-shutdown.md)
 - [ADR-0005：Windows x64 首发与同源原生包](decisions/0005-v1-platform-packaging.md)
+- [ADR-0006：Runtime 所有权、终态事务与确定性关闭](decisions/0006-runtime-stabilization.md)
 
 ## v1 固定范围
 

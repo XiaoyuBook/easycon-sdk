@@ -65,8 +65,10 @@ run.wait();
 
 ### 生命周期
 
-- `Runtime`、`Controller`、`Capture` 析构时执行 no-throw close + release；显式 `close(timeout)` 可报告错误。
-- 析构不得抛。失败记录到 Runtime cleanup event；如果对象仍有后台任务，析构等待确定性关闭。
+- `Runtime`、`Controller`、`Capture` 的正常路径都是显式 close + release；`close(timeout)` 返回可报告的
+  Closed/CloseFailed outcome。
+- 析构不得抛、阻塞、调用 resource callback 或启动 finalizer thread。未显式 close 时只报告 misuse，并
+  no-throw release；它不承诺确定性关闭或 `RuntimeClosed`。
 - child wrapper 共享一个 internal Runtime control block，避免 Runtime wrapper 提前析构导致悬空。
 - `Operation<T>::get()` 抛 typed exception；`wait_for()` 只返回 ready/not-ready；`cancel()` 幂等。
 - 接受 `std::stop_token` 的 overload 注册取消请求，token 销毁不释放 native operation。
@@ -190,7 +192,8 @@ await run.result;
 - `AbortSignal` 已 aborted 时不提交 operation；提交后 abort 只调用 native cancel。
 - Promise 只在 native terminal 后 resolve/reject，竞争规则与其他语言一致。
 - 主动资源提供幂等 `dispose(): Promise<void>`、`close()` alias 和 `[Symbol.asyncDispose]()`；`[Symbol.dispose]` 仅释放已经关闭的对象，否则抛明确状态错误，避免同步阻塞 event loop。
-- addon cleanup hook 请求关闭所有 Runtime 并等待 worker 退出；这只是进程退出兜底，不替代显式 dispose。
+- addon cleanup hook 不得在 Runtime release 中隐式完成同步关闭；它只能报告未 dispose 的 Runtime 并执行
+  非阻塞 release。显式 async dispose 是唯一确定性关闭路径。
 
 ### 类型和数据
 

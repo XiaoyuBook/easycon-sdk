@@ -33,7 +33,8 @@ flowchart TD
 ### 句柄释放与资源关闭
 
 - `release(handle)` 释放调用方引用，不等同于取消仍在运行的 operation。
-- Controller、Capture 和 Runtime 是主动资源，先 `close` 再 `release`；binding 的析构兜底会执行同样顺序。
+- Controller、Capture 和 Runtime 是主动资源，先显式 `close` 并检查结果，再 `release`。binding
+  finalizer/析构只能非阻塞 release 已关闭对象或报告遗漏，不得替代 close。
 - Program、Frame、Image、Label、Event 和已终态 Operation 是被动资源，最后引用释放即销毁。
 - 若调用方提前释放活动 Operation，Runtime 继续监管到终态并发出事件；不会产生脱管任务。
 - 同一个 raw handle 与其 `release` 并发是调用方数据竞争；其他已声明线程安全的调用可并发。
@@ -43,9 +44,12 @@ flowchart TD
 ```mermaid
 stateDiagram-v2
     [*] --> Active: create succeeds
-    Active --> Closing: close requested / final release
-    Closing --> Closed: children stopped and workers joined
+    Active --> Closing: explicit close owns transition
+    Active --> Closing: final owning Drop rejects admission
+    Closing --> Closed: cleanup, joins, registries and final event succeed
+    Closing --> CloseFailed: an unrecoverable close phase fails
     Closed --> [*]: storage released
+    CloseFailed --> [*]: storage released after remaining owners exit
 ```
 
 | 状态 | 接受新资源 | 接受查询 | 事件 |
@@ -53,6 +57,11 @@ stateDiagram-v2
 | Active | 是 | 是 | 正常发布 |
 | Closing | 否，返回 `RUNTIME_CLOSING` | 只允许状态、wait、error 和 drain | 发布关闭进度及资源终态 |
 | Closed | 否 | 只允许版本化 handle 销毁 | subscription 收到 closed 后结束 |
+| CloseFailed | 否，永久拒绝 | 允许状态、保存的 close report、operation wait/query 和 drain | subscription 收到 close_failed 后结束 |
+
+`Closing` 只表示关闭事务正在执行或最后 owning handle 已请求非确定性取消，不能同时表示已经失败。
+显式 close 保存唯一 `CloseOutcome::Closed` 或 `CloseOutcome::Failed(CloseReport)`；并发和后续 close
+caller 返回同一保存结果，不重复执行副作用。最后 owning handle 的 `Drop` 没有 close outcome。
 
 Runtime 创建是同步的，只完成内存、executor、native context 和队列初始化，不扫描/打开硬件。任何初始化失败都不会返回半有效 Runtime。
 
@@ -93,6 +102,13 @@ stateDiagram-v2
 - terminal event 与终态提交在同一有序临界区完成；查询一定能看到不早于事件的状态。
 - `cancel` 幂等。对终态 operation 调用 cancel 返回成功但不改变结果。
 - 释放 observation handle 不取消 operation。
+- parent 开始终态事务时先封闭 cancellation node；在此之后 child admission 必须失败。已经在线性化点前
+  admission 的 child 会被取消并继续由自己的 owner 清理。
+- 终态事务依次封闭 child admission、取消 subtree、执行 owner cleanup、提交 immutable 终态和 terminal
+  event、注销 registry，最后无条件通知全部 waiter。event、registry 或 poisoned lock 故障不得跳过
+  注销和通知。
+- owner cleanup panic 转成可诊断 internal failure，不得留下不可观察的半终态；terminal event 仍不是
+  waiter 正确性的唯一通道。
 
 ### wait、deadline 与 timeout
 
@@ -125,6 +141,9 @@ flowchart TD
 ```
 
 父 token 取消必然传播到子 token；子 operation 取消不影响同级资源。Automation run 还持有 Controller lease，取消时按以下顺序执行：
+
+取消传播逐个隔离 hook panic。一个 hook 失败不能阻止同一 token 的其余 hook 或任一 live child 被取消；
+取消树和 Runtime registry 使用 poisoned-lock recovery 或不传播 poison 的同步原语。
 
 1. 停止解释器取得新语句。
 2. 取消当前 WAIT、Vision 调用和未提交 Controller step。
@@ -279,20 +298,33 @@ stateDiagram-v2
 
 ## 11. Runtime 确定性关闭顺序
 
-`Runtime.close` 幂等，严格执行：
+`Runtime.close` 是唯一确定性关闭路径。第一个外部 caller 取得 close ownership 后严格执行：
 
-1. 原子进入 Closing，拒绝新 resource/operation。
-2. 请求取消活动 Automation run，等待其中立化和 Controller lease 释放。
-3. 取消其余 Controller/Vision operation 和尚未开始的任务。
-4. 对每个 Controller：撤销序列、发送中立报告、关闭 transport、join command/read task。
-5. 对每个 Capture：中断 read、join capture task、释放 native capture 和 latest frame。
-6. 等待 native compute pool 已取消任务退出，释放 OCR engine pool/native context。
-7. 完成仍未终态的 operation；违反不变量者以 internal error 终结。
-8. 发布最终关闭事件，关闭事件生产端，允许 subscription drain。
-9. join executor、scheduler、分发线程；确认 task registry 为空。
-10. 进入 Closed，随后才允许释放 Runtime storage 和卸载动态库。
+1. 原子进入 Closing，永久拒绝新 resource、operation、subscription 和 task admission。
+2. 发布 closing 进度并请求根 cancellation tree 取消。
+3. 按 Runtime ID 顺序关闭 Controller/Capture 等 resource；每个 callback panic 单独捕获，健康资源继续。
+4. 等待 resource owner cleanup 完成，并等待、join 全部普通受监管 task。
+5. 只有对应 owner task 已退出后，才以 internal cancellation 兜底完成仍未终态的 operation。
+6. 停止并 join deadline/executor/scheduler 等 Runtime 内部 task，回收全部 Runtime-owned `JoinHandle`。
+7. 验证 operation、resource、active task 和待 join task registry 全部为空。
+8. 发布唯一 `RuntimeClosed`，关闭事件生产端并允许 subscription drain。
+9. 保存 `CloseOutcome::Closed`，进入 Closed，唤醒全部 close waiter；随后才允许释放 Runtime storage。
 
-显式 `close(timeout)` 的 wait timeout 可返回，但关闭继续进行，调用方可再次 wait。同步 close 只能由受监管 task 之外的调用方执行；已绑定的 task 内调用必须在改变 Runtime 状态前快速拒绝，避免等待自身 guard。Rust 核心候选接口的 `Drop` 只可作为非阻塞兜底：先同步进入 Closing 并拒绝新 admission，再把其余关闭步骤委托给独立 finalizer；正式 binding 的最终 `release` 必须先显式 close 并等待真实 Closed。binding 不得在仍有 native 线程时卸载库。所有 backend 都必须可取消，因此正常关闭不依赖无限 detach。
+任何阶段发生不可恢复故障时，不继续伪造成功路径：隔离可继续的 resource callback，保存包含阶段、
+相关 ID、稳定诊断和 registry counts 的 `CloseReport`，发布唯一 `runtime.close_failed`，关闭事件生产端，
+进入 CloseFailed 并唤醒全部 close waiter。尚未完成 owner cleanup 或 owner task 尚未退出的 operation 保持
+非终态；其真实 owner 后续仍可提交终态并唤醒 operation waiter。重复 close 返回同一个保存 outcome。
+
+所有长期 task 只能由 `Runtime::spawn_supervised` 或等价 API 创建。Runtime 在 task body 执行前登记
+task，自动绑定 owner thread、持有完成通知和 `JoinHandle`，并在退出/join 后注销；public API 不暴露
+`TaskRegistration` 或手工 `bind_to_current_thread` 协议。受监管 task 内同步 close 在改变 Runtime 状态前
+返回 caller rejection，避免 self-wait。
+
+带 caller wait timeout 的正式 `close(timeout)` 可以只结束本次等待；已经开始的关闭仍由同一个 owner
+继续，后续 caller 观察相同 outcome。最后 owning Runtime handle 的 `Drop` 只同步拒绝 admission 并请求
+根取消：不等待、不执行 resource callback、不 join、不创建 finalizer 线程、不关闭 event producer，也不
+承诺 `RuntimeClosed`。正式 binding 的 `release` 必须先显式 close 并检查真实 outcome；binding 不得在仍有
+native 线程时卸载库。所有 backend 都必须可取消，因此正常关闭不依赖无限 detach。
 
 ## 12. 故障场景的销毁结果
 
@@ -305,9 +337,11 @@ stateDiagram-v2
 | capture 热拔出 | read task 终结，Capture Faulted，latest frame 仍可由已有引用读取 |
 | event 消费者停止 | 只影响该 subscription，核心 operation 不阻塞 |
 | 调用方忘记关闭子资源 | Runtime close 从 registry 找到并按顺序关闭 |
-| resource close callback panic | 隔离该 callback 并继续关闭其他资源；保留其 registry/task 监督，最终保持 Closing、发布关闭失败且唤醒 waiter，不得虚假声称 Closed |
-| Runtime 内部关闭阶段 panic | 为仍可访问的非终态 operation 提交 `Cancelled(ParentClose)`，保持 Closing；若事件生产仍开放则以 `runtime.close_panicked` 终止，并唤醒所有 close waiter；不得虚假声称 Closed |
-| binding finalizer 迟到 | SafeHandle/RAII 只作兜底；显式 close API 仍是验收路径 |
+| resource close callback panic | 隔离该 callback 并继续关闭其他健康资源；保存失败 resource ID 与 counts，进入 CloseFailed、发布 `runtime.close_failed` 并唤醒 close waiter；owner 尚未清理时不强制 operation 终态 |
+| Runtime 内部关闭阶段 panic | 捕获到 close boundary，保存失败阶段和稳定 internal error，进入 CloseFailed、关闭事件生产并唤醒全部 close waiter；不得跨 API unwind 或虚假声称 Closed |
+| task body panic | supervisor 保存 task ID/panic 诊断并 join handle；显式 close 返回保存的 CloseFailed outcome |
+| final owning Runtime handle Drop | 只拒绝 admission 和请求根取消；不执行 callback/join/final event，也不产生后台 finalizer |
+| binding finalizer 迟到 | 只报告遗漏或非阻塞 release；显式 close API 是唯一验收路径 |
 
 ## 13. 可测试不变量
 
@@ -315,11 +349,17 @@ stateDiagram-v2
 
 - Runtime Closed 时 task/resource registry 为空。
 - Operation 终态只转换一次，result 与 error 不同时存在。
+- parent terminal 与 child admission 的线性化点唯一；terminal 开始后不存在新 child。
+- cancellation hook panic 不截断同级 hook 或 child propagation。
+- operation terminal event/registry 故障后全部 waiter 仍被通知，且 waiter 观察到 registry 已注销。
+- supervised task 内 close 在状态变化前被拒绝；外部 close join 所有 Runtime-owned handles。
+- CloseFailed outcome 对 concurrent/later caller 相同，未完成 owner cleanup 的 operation 不被强制终结。
+- final owning Drop 不执行 resource callback、不创建线程且不发布 `RuntimeClosed`。
 - Controller report 只有一个线程写，sequence 严格递增。
 - precise sequence 不早发，fake clock 下无累计漂移。
 - Automation 终态前 controller lease 已释放且 desired report 为中立状态。
 - Frame buffer 在最后借用 operation 结束前不释放。
 - queue overflow 不丢失可查询状态，也不阻塞生产者。
 - panic/exception 不跨越 ABI 边界。可恢复 operation/native 调用失败后资源计数回到基线；若 close callback
-  panic 导致真实释放无法确认，Runtime 必须保持 Closing，并保留对应 resource/task 诊断注册，直到 owner
-  实际释放，不能通过强制清零伪造 Closed。
+  panic 导致真实释放无法确认，Runtime 必须进入 CloseFailed，并保留对应 resource/task 诊断注册，直到
+  owner 实际释放，不能通过强制清零伪造 Closed。
