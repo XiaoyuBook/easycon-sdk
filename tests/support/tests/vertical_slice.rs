@@ -33,7 +33,6 @@ fn wait_for_report_acceptance(controller: &ControllerSession, count: u64) {
 // conformance: vertical.operation-transitions
 // conformance: vertical.report-trace
 // conformance: vertical.closed-counts
-// conformance: vertical.final-event-order
 #[test]
 fn runtime_controller_fake_vertical_slice_has_exact_trace_and_clean_shutdown() {
     let clock = Arc::new(VirtualClock::default());

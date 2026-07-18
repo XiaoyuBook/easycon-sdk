@@ -8,7 +8,8 @@
       "test": "tests/support/tests/vertical_slice.rs::runtime_controller_fake_vertical_slice_has_exact_trace_and_clean_shutdown",
       "tests": [
         "tests/support/tests/vertical_slice.rs::runtime_controller_fake_vertical_slice_has_exact_trace_and_clean_shutdown",
-        "tests/support/tests/controller_lane.rs::fallback_connect_partial_direct_and_close_are_exact"
+        "tests/support/tests/controller_lane.rs::fallback_connect_partial_direct_and_close_are_exact",
+        "crates/easycon-runtime/src/runtime.rs::runtime_closed_follows_task_join_and_registry_convergence"
       ],
       "steps": [
         { "id": "vertical.runtime-create", "action": "create Runtime with VirtualClock" },
@@ -46,7 +47,7 @@
         {
           "id": "vertical.final-event-order",
           "expect": "RuntimeClosed occurs after worker join and registry convergence and post-close event production is rejected",
-          "test": "tests/support/tests/vertical_slice.rs::runtime_controller_fake_vertical_slice_has_exact_trace_and_clean_shutdown"
+          "test": "crates/easycon-runtime/src/runtime.rs::runtime_closed_follows_task_join_and_registry_convergence"
         }
       ]
     },

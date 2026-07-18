@@ -107,6 +107,8 @@ pub(crate) struct OperationInner {
     deadline_ns: Option<u64>,
     state: Mutex<OperationData>,
     changed: Condvar,
+    #[cfg(test)]
+    wait_observers: Mutex<Vec<std::sync::mpsc::Sender<()>>>,
 }
 
 struct OperationData {
@@ -138,6 +140,8 @@ impl Operation {
                     terminal_in_progress: false,
                 }),
                 changed: Condvar::new(),
+                #[cfg(test)]
+                wait_observers: Mutex::new(Vec::new()),
             }),
         };
         let weak = Arc::downgrade(&operation.inner);
@@ -153,6 +157,21 @@ impl Operation {
     #[must_use]
     pub fn id(&self) -> OperationId {
         self.inner.id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_next_wait_blocked(&self, observer: std::sync::mpsc::Sender<()>) {
+        self.inner
+            .wait_observers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(observer);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn poison_state_for_test(&self) {
+        let _state = self.inner.state.lock().expect("operation state lock");
+        panic!("failpoint:operation.state.poison");
     }
 
     /// Returns the optional absolute execution deadline.
@@ -436,6 +455,15 @@ impl OperationInner {
         loop {
             if data.state.is_terminal() {
                 return WaitResult::Completed(snapshot_data(&data));
+            }
+            #[cfg(test)]
+            if let Some(observer) = self
+                .wait_observers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop()
+            {
+                let _ = observer.send(());
             }
             match wait {
                 WaitTimeout::Poll => return WaitResult::Timeout,

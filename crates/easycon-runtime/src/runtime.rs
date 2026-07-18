@@ -144,6 +144,9 @@ pub struct Runtime {
     counts_as_owner: bool,
 }
 
+#[cfg(test)]
+type FinalEventObserver = Arc<dyn Fn(RuntimeCounts) + Send + Sync>;
+
 pub(crate) struct RuntimeInner {
     id: RuntimeId,
     runtime_handles: AtomicUsize,
@@ -166,6 +169,8 @@ pub(crate) struct RuntimeInner {
     deadline_worker_panic: AtomicBool,
     #[cfg(test)]
     final_event_failure_at: AtomicUsize,
+    #[cfg(test)]
+    final_event_before_commit: Mutex<Option<FinalEventObserver>>,
     #[cfg(test)]
     operation_terminal_event_panic: AtomicBool,
     #[cfg(test)]
@@ -431,6 +436,8 @@ impl Runtime {
             deadline_worker_panic: AtomicBool::new(false),
             #[cfg(test)]
             final_event_failure_at: AtomicUsize::new(usize::MAX),
+            #[cfg(test)]
+            final_event_before_commit: Mutex::new(None),
             #[cfg(test)]
             operation_terminal_event_panic: AtomicBool::new(false),
             #[cfg(test)]
@@ -1242,6 +1249,15 @@ impl RuntimeInner {
         if fail_at.is_some_and(|index| index < live.len()) {
             return Err(());
         }
+        #[cfg(test)]
+        if let Some(observer) = self
+            .final_event_before_commit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            observer(self.counts_recover());
+        }
         let event = self.next_event(draft);
         close_subscriptions_with_final(&live, event);
         self.events_closed.store(true, Ordering::Release);
@@ -1576,6 +1592,18 @@ mod tests {
         static BLOCK_THREAD_EXIT: RefCell<Option<BlockThreadExit>> = const { RefCell::new(None) };
     }
 
+    fn spawn_blocked_operation_waiter(
+        operation: &Operation,
+    ) -> (mpsc::Receiver<()>, std::thread::JoinHandle<WaitResult>) {
+        let (blocked, observed_block) = mpsc::channel();
+        operation.observe_next_wait_blocked(blocked);
+        let waiting_operation = operation.clone();
+        let waiter = std::thread::spawn(move || {
+            waiting_operation.wait(WaitTimeout::For(Duration::from_secs(2)))
+        });
+        (observed_block, waiter)
+    }
+
     // conformance: operation.immutable-terminal
     #[test]
     fn operation_commits_terminal_state_and_event_once() {
@@ -1793,18 +1821,14 @@ mod tests {
             .operation_registry_unlink_panic
             .store(true, Ordering::Release);
 
-        let barrier = Arc::new(Barrier::new(3));
-        let waiters: Vec<_> = (0..2)
-            .map(|_| {
-                let waiting_operation = operation.clone();
-                let waiting_barrier = barrier.clone();
-                std::thread::spawn(move || {
-                    waiting_barrier.wait();
-                    waiting_operation.wait(WaitTimeout::For(Duration::from_secs(2)))
-                })
-            })
-            .collect();
-        barrier.wait();
+        let (first_blocked, first_waiter) = spawn_blocked_operation_waiter(&operation);
+        let (second_blocked, second_waiter) = spawn_blocked_operation_waiter(&operation);
+        first_blocked
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first operation waiter blocked");
+        second_blocked
+            .recv_timeout(Duration::from_secs(2))
+            .expect("second operation waiter blocked");
         let finish = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             operation.succeed(OperationValue::Unit)
         }));
@@ -1813,7 +1837,7 @@ mod tests {
             finish.expect("terminal transaction must isolate faults"),
             TransitionOutcome::Applied
         );
-        for waiter in waiters {
+        for waiter in [first_waiter, second_waiter] {
             assert!(matches!(
                 waiter.join().expect("terminal waiter"),
                 WaitResult::Completed(OperationSnapshot {
@@ -1848,6 +1872,62 @@ mod tests {
         })
         .collect();
         assert_eq!(codes, ["runtime.operation.running"]);
+
+        let operation = runtime.create_operation(None).expect("hook operation");
+        operation.start();
+        let child = operation.cancellation_token().child();
+        child.on_cancel(|| panic!("scripted terminal child hook panic"));
+        let (blocked, waiter) = spawn_blocked_operation_waiter(&operation);
+        blocked
+            .recv_timeout(Duration::from_secs(2))
+            .expect("hook-fault waiter blocked");
+        let finish = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            operation.succeed(OperationValue::Unit)
+        }));
+        assert_eq!(
+            finish.expect("hook panic must not escape terminal transaction"),
+            TransitionOutcome::Applied
+        );
+        assert!(child.is_cancelled());
+        assert!(matches!(
+            waiter.join().expect("hook-fault waiter"),
+            WaitResult::Completed(OperationSnapshot {
+                state: OperationState::Succeeded,
+                ..
+            })
+        ));
+
+        let operation = runtime.create_operation(None).expect("poison operation");
+        operation.start();
+        let poisoned_operation = operation.clone();
+        assert!(
+            std::thread::spawn(move || poisoned_operation.poison_state_for_test())
+                .join()
+                .is_err()
+        );
+        let (blocked, waiter) = spawn_blocked_operation_waiter(&operation);
+        blocked
+            .recv_timeout(Duration::from_secs(2))
+            .expect("poison-fault waiter blocked");
+        assert_eq!(
+            operation.succeed(OperationValue::Unit),
+            TransitionOutcome::Applied
+        );
+        assert!(matches!(
+            waiter.join().expect("poison-fault waiter"),
+            WaitResult::Completed(OperationSnapshot {
+                state: OperationState::Succeeded,
+                ..
+            })
+        ));
+        assert!(
+            runtime
+                .inner
+                .operations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+        );
         runtime.close().expect("Runtime close");
     }
 
@@ -3062,6 +3142,109 @@ mod tests {
             })
         ));
         assert_eq!(events.read(WaitTimeout::Poll), SubscriptionRead::Closed);
+    }
+
+    // conformance: vertical.final-event-order
+    #[test]
+    fn runtime_closed_follows_task_join_and_registry_convergence() {
+        let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+        let events = runtime
+            .subscribe(SubscriptionOptions::default())
+            .expect("events");
+        let task = runtime
+            .spawn_supervised("final-event-order", || {})
+            .expect("task");
+        assert_eq!(task.completion.wait(), SupervisedTaskOutcome::Completed);
+
+        let (unlinked, observed_unlink) = mpsc::channel();
+        let (release_unlink, unlink_release) = mpsc::channel();
+        let hook_release = Arc::new(Mutex::new(unlink_release));
+        *runtime
+            .inner
+            .task_join_after_unlink
+            .lock()
+            .expect("task join hook lock") = Some(Arc::new(move || {
+            unlinked.send(()).expect("task unlink observer");
+            hook_release
+                .lock()
+                .expect("task unlink release lock")
+                .recv()
+                .expect("task unlink release");
+        }));
+        let (final_counts, observed_final_counts) = mpsc::channel();
+        *runtime
+            .inner
+            .final_event_before_commit
+            .lock()
+            .expect("final event observer lock") = Some(Arc::new(move |counts| {
+            final_counts.send(counts).expect("final counts observer");
+        }));
+
+        let closing_runtime = runtime.clone();
+        let closer = std::thread::spawn(move || closing_runtime.close());
+        observed_unlink
+            .recv_timeout(Duration::from_secs(2))
+            .expect("close joined and unlinked ordinary task");
+        runtime
+            .inner
+            .task_join_after_unlink
+            .lock()
+            .expect("task join hook lock")
+            .take();
+
+        let mut codes = Vec::new();
+        loop {
+            match events.read(WaitTimeout::Poll) {
+                SubscriptionRead::Event(event) => codes.push(event.code),
+                SubscriptionRead::Timeout => break,
+                SubscriptionRead::Closed => {
+                    panic!("RuntimeClosed was committed before task join returned")
+                }
+            }
+        }
+        assert!(!codes.contains(&"runtime.closed"));
+
+        release_unlink.send(()).expect("release task join");
+        assert_eq!(
+            closer.join().expect("Runtime closer"),
+            Ok(CloseOutcome::Closed)
+        );
+        assert_eq!(
+            observed_final_counts
+                .recv_timeout(Duration::from_secs(2))
+                .expect("RuntimeClosed precommit counts"),
+            RuntimeCounts {
+                active_operations: 0,
+                active_resources: 0,
+                active_tasks: 0,
+            }
+        );
+        assert_eq!(task.join(), Ok(SupervisedTaskOutcome::Completed));
+        assert_eq!(
+            runtime.counts(),
+            RuntimeCounts {
+                active_operations: 0,
+                active_resources: 0,
+                active_tasks: 0,
+            }
+        );
+
+        loop {
+            match events.read(WaitTimeout::Poll) {
+                SubscriptionRead::Event(event) => codes.push(event.code),
+                SubscriptionRead::Closed => break,
+                SubscriptionRead::Timeout => panic!("closed subscription must finish draining"),
+            }
+        }
+        assert_eq!(codes.last(), Some(&"runtime.closed"));
+        let error = runtime
+            .publish(EventDraft::ordinary(
+                EventKind::Data,
+                "test.after_runtime_closed",
+                Severity::Info,
+            ))
+            .expect_err("post-close event production must be rejected");
+        assert_eq!(error.code(), ErrorCode::RuntimeClosing);
     }
 
     // conformance: runtime.final-event-failure
