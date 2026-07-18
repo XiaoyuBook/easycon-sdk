@@ -60,6 +60,7 @@ cargo fmt --all --check
 cargo check --workspace --all-targets
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
+python tools/run_runtime_models.py
 python tools/validate_specs.py
 python tools/check_markdown_links.py
 python tools/check_repository_guards.py

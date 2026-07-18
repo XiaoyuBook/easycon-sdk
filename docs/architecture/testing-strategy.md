@@ -83,6 +83,10 @@ ECS 的 ControllerPort、VisionPort、OutputPort 记录按顺序的 typed call�
 - 用 Loom 模型覆盖 parent terminal/child admission、hook panic/child propagation、supervised task
   self-wait 和 terminal commit/registry unlink/waiter notify。模型命令是 Phase 1 正式门禁。
 
+Phase 1 的正式模型入口是 `python tools/run_runtime_models.py`。它执行独立的 `loom_runtime` test
+target 并强制单 harness thread；模型内部由 Loom 枚举同步交错，不使用随机 sleep。任何 Runtime Rust、
+Cargo、behavior 或 conformance 提交都必须在普通 workspace tests 之后单独运行该入口。
+
 ### `easycon-controller`
 
 - `SwitchReport` 全零、单按钮、多按钮、八向 HAT 和摇杆边界的 7 位编码 golden；

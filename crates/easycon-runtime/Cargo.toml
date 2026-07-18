@@ -10,5 +10,8 @@ publish = false
 [dependencies]
 easycon-model = { path = "../easycon-model" }
 
+[dev-dependencies]
+loom = "0.7.2"
+
 [lints]
 workspace = true
