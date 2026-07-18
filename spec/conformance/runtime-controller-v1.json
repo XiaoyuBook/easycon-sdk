@@ -15,14 +15,26 @@
         "cancel before a future step and accept neutral report",
         "close Runtime twice",
         "drain RuntimeClosed and close subscription",
-        "attempt an event publish after RuntimeClosed"
+        "attempt an event publish after RuntimeClosed",
+        "repeat with a fresh Runtime whose supervised task owns the final handle",
+        "drop the final Runtime clone from inside that task and drain RuntimeClosed",
+        "repeat final-handle drop with a live managed resource",
+        "hold coordinator progress while dropping the final handle and attempt new admission",
+        "panic one managed resource close callback before closing a healthy resource",
+        "inject an unexpected internal close panic while concurrent close callers wait"
       ],
       "assertions": [
         "operation states and events follow the canonical transitions",
         "report bytes and virtual timestamps match tracked fixtures",
         "direct success claims transport acceptance only",
         "active operation, task, and resource counts are zero after close",
-        "post-close event production is rejected"
+        "post-close event production is rejected",
+        "final-handle drop does not wait for the task that is dropping it",
+        "the dedicated finalizer completes the normal close order after task cleanup",
+        "managed resource close callbacks do not run on the dropping thread",
+        "final-handle drop enters Closing and rejects admission before returning",
+        "a resource close panic emits an error event while healthy resources close, retains failed supervision, wakes waiters, and never claims Closed",
+        "an unexpected internal close panic wakes every close waiter without claiming Closed and terminates the event stream with a failure event when production remains open"
       ]
     },
     {
@@ -50,6 +62,7 @@
         "reject an error ACK",
         "queue an ACK behind a report that is waiting for its minimum interval",
         "cancel after direct and final sequence bytes are accepted but before write returns",
+        "close immediately after an accepted report",
         "close while a report write is blocked before acceptance",
         "disconnect during an ACK and reconnect explicitly",
         "disconnect during a sequence",
@@ -60,6 +73,7 @@
         "late ACK cannot complete the current operation",
         "ACK waits for the earlier report instead of returning resource busy",
         "accepted-byte cancellation neutralizes and reaches Cancelled exactly once",
+        "the close neutral report waits for the same minimum report interval",
         "close interrupts blocked write and joins the lane",
         "ACK disconnect resets desired state and closes transport before reconnect",
         "disconnect fails pending work and exposes neutralization warning",
@@ -74,13 +88,15 @@
         "retain an earlier critical event while a later ordinary event is dropped",
         "publish concurrently from multiple producers",
         "complete an operation",
-        "read the subscription and query the operation"
+        "read the subscription and query the operation",
+        "close Runtime with a second subscription whose severity filter excludes Info"
       ],
       "assertions": [
         "EventGap reports the dropped sequence interval",
         "concrete events and gaps are read in strictly increasing sequence order",
         "producer never blocks",
-        "authoritative terminal state remains queryable"
+        "authoritative terminal state remains queryable",
+        "RuntimeClosed bypasses the severity filter and remains the final event"
       ]
     }
   ]

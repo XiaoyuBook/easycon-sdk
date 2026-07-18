@@ -25,15 +25,17 @@
   "runtime": {
     "states": ["Active", "Closing", "Closed"],
     "close_is_idempotent": true,
+    "final_handle_drop": "synchronously enters Closing and rejects admission, then delegates the remaining close sequence to a dedicated finalizer without waiting or invoking resource callbacks on the dropping thread; explicit close synchronously observes Closed",
+    "close_panic": "a ManagedResource close panic is isolated while healthy resources continue closing, but its resource and task registrations remain supervised and Runtime does not claim Closed; every unexpected internal close panic leaves Runtime in Closing, terminates events with runtime.close_panicked when possible, and wakes close waiters so later close calls fail instead of blocking",
     "close_order": [
       "enter Closing and reject admission",
       "cancel root operation tree",
       "close controller resources and neutralize",
       "wait for ordinary supervised task cleanup",
       "finish remaining non-terminal operations",
-      "publish RuntimeClosed and close producers",
       "join the internal deadline worker",
       "assert task and resource registries are empty",
+      "publish RuntimeClosed and close producers",
       "enter Closed"
     ],
     "closed_counts": { "active_tasks": 0, "active_resources": 0, "active_operations": 0 }
@@ -42,11 +44,12 @@
     "delivery": "per-subscriber bounded pull queue",
     "sequence": "strictly increasing across one Runtime",
     "overflow": "oldest ordinary events are summarized by EventGap; authoritative state remains queryable",
-    "close": "RuntimeClosed is the final delivered event; subscriptions remain drainable and later publish attempts are rejected"
+    "close": "RuntimeClosed bypasses subscriber severity and log filters, is the final delivered event after successful close, leaves subscriptions drainable, and rejects later publish attempts; an unexpected internal close panic uses runtime.close_panicked as the final event when event production is still open"
   },
   "controller": {
     "single_writer": true,
     "default_minimum_report_interval_ns": 30000000,
+    "report_interval_scope": "every report, including cancellation and close neutralization",
     "write_timeout_ns": 1000000000,
     "direct_success_boundary": "the complete report bytes were accepted by transport",
     "hardware_execution_claimed": false,

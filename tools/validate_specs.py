@@ -248,9 +248,9 @@ def validate_behavior():
         "close controller resources and neutralize",
         "wait for ordinary supervised task cleanup",
         "finish remaining non-terminal operations",
-        "publish RuntimeClosed and close producers",
         "join the internal deadline worker",
         "assert task and resource registries are empty",
+        "publish RuntimeClosed and close producers",
         "enter Closed",
     ]
     require(behavior["runtime"]["close_order"] == expected_close_order,

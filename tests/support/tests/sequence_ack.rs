@@ -42,7 +42,7 @@ fn connected() -> (
     let fake = FakeControllerTransport::new(clock.clone());
     fake.push_handshake(115_200, HandshakeOutcome::Success { elapsed_ns: 0 });
     let controller = ControllerSession::new(
-        runtime.clone(),
+        &runtime,
         Box::new(fake.clone()),
         ControllerOptions::default(),
     )
@@ -75,6 +75,16 @@ fn wait_until(mut predicate: impl FnMut() -> bool) {
 
 fn wait_for_report_acceptance(controller: &ControllerSession, count: u64) {
     wait_until(|| controller.snapshot().accepted_report_count >= count);
+}
+
+fn close_after_minimum_interval(clock: &VirtualClock, controller: &ControllerSession) {
+    if let Some(last) = controller.snapshot().last_report_timestamp_ns {
+        let target = last.saturating_add(ControllerOptions::default().minimum_report_interval_ns);
+        if clock.now_ns() < target {
+            clock.advance_to(target);
+        }
+    }
+    controller.close();
 }
 
 fn load_sequence_trace(id: &str) -> SequenceTrace {
@@ -259,7 +269,7 @@ fn precise_sequence_matches_absolute_offset_fixture_without_drift() {
     assert_eq!(operation.snapshot().state, OperationState::Succeeded);
     assert_eq!(controller.snapshot().lease, ControllerLeaseState::Available);
 
-    controller.close();
+    close_after_minimum_interval(&clock, &controller);
     runtime.close();
 }
 
@@ -345,7 +355,7 @@ fn sequence_cancel_neutralizes_and_releases_before_terminal() {
         .expect("cancel terminal event");
     assert!(released < terminal);
 
-    controller.close();
+    close_after_minimum_interval(&clock, &controller);
     runtime.close();
 }
 
@@ -376,7 +386,7 @@ fn minimum_interval_delays_steps_without_dropping_transitions() {
         [0, 30_000_000, 60_000_000]
     );
     assert_eq!(fake.accepted_writes()[2].bytes, [0, 0, 65, 8, 4, 2, 1, 128]);
-    controller.close();
+    close_after_minimum_interval(&clock, &controller);
     runtime.close();
 }
 
@@ -412,7 +422,7 @@ fn sequence_future_state_is_not_applied_before_its_offset() {
             Default::default(),
         )
     );
-    controller.close();
+    close_after_minimum_interval(&clock, &controller);
     runtime.close();
 }
 
@@ -443,7 +453,7 @@ fn cancel_after_final_sequence_acceptance_still_neutralizes() {
         fake.accepted_writes()[1].bytes,
         SwitchReport::NEUTRAL.encode()
     );
-    controller.close();
+    close_after_minimum_interval(&clock, &controller);
     runtime.close();
 }
 
@@ -467,7 +477,7 @@ fn cancel_after_direct_acceptance_still_reaches_cancelled() {
         fake.accepted_writes()[1].bytes,
         SwitchReport::NEUTRAL.encode()
     );
-    controller.close();
+    close_after_minimum_interval(&clock, &controller);
     runtime.close();
 }
 
@@ -511,7 +521,7 @@ fn direct_cancel_rebuilds_later_reports_from_neutral() {
         )
         .encode()
     );
-    controller.close();
+    close_after_minimum_interval(&clock, &controller);
     runtime.close();
 }
 
@@ -580,7 +590,7 @@ fn failed_cancel_neutral_keeps_later_desired_report_authoritative() {
         .encode()
     );
 
-    controller.close();
+    close_after_minimum_interval(&clock, &controller);
     runtime.close();
 }
 
@@ -616,20 +626,31 @@ fn ack_waits_for_an_earlier_report_in_the_fifo_lane() {
             .collect::<Vec<_>>(),
         [WriteKind::Report, WriteKind::Report, WriteKind::Command]
     );
-    controller.close();
+    close_after_minimum_interval(&clock, &controller);
     runtime.close();
 }
 
 #[test]
 fn close_interrupts_a_blocked_report_write_and_joins() {
-    let (_clock, runtime, fake, controller) = connected();
+    let (clock, runtime, fake, controller) = connected();
     fake.block_next_write_before_acceptance();
     let operation = controller
         .direct(ControllerAction::ButtonDown(Button::A))
         .expect("direct");
     assert!(fake.wait_until_write_blocked(Duration::from_secs(2)));
 
-    controller.close();
+    let closing = controller.clone();
+    let closer = std::thread::spawn(move || closing.close());
+    wait_until(|| controller.snapshot().state == ControllerState::Disconnecting);
+    let last = controller
+        .snapshot()
+        .last_report_timestamp_ns
+        .expect("cancellation neutral report acceptance");
+    let target = last.saturating_add(ControllerOptions::default().minimum_report_interval_ns);
+    if clock.now_ns() < target {
+        clock.advance_to(target);
+    }
+    closer.join().expect("controller closer");
     wait_terminal(&operation);
 
     assert_eq!(operation.snapshot().state, OperationState::Cancelled);
@@ -664,7 +685,7 @@ fn blocked_report_write_obeys_its_io_deadline() {
         fake.accepted_writes()[0].bytes,
         SwitchReport::NEUTRAL.encode()
     );
-    controller.close();
+    close_after_minimum_interval(&clock, &controller);
     runtime.close();
 }
 
@@ -690,7 +711,7 @@ fn delayed_report_write_stops_at_its_io_deadline() {
         fake.accepted_writes()[0].bytes,
         SwitchReport::NEUTRAL.encode()
     );
-    controller.close();
+    close_after_minimum_interval(&clock, &controller);
     runtime.close();
 }
 
@@ -730,7 +751,7 @@ fn runtime_close_does_not_execute_direct_queued_behind_ack() {
 
 #[test]
 fn automation_lease_is_a_low_level_exclusive_primitive() {
-    let (_clock, runtime, fake, controller) = connected();
+    let (clock, runtime, fake, controller) = connected();
     let lease = controller.acquire_automation_lease().expect("lease");
     assert_eq!(
         controller.snapshot().lease,
@@ -769,13 +790,13 @@ fn automation_lease_is_a_low_level_exclusive_primitive() {
         .acquire_automation_lease()
         .expect("released then reacquired");
     drop(second);
-    controller.close();
+    close_after_minimum_interval(&clock, &controller);
     runtime.close();
 }
 
 #[test]
 fn ack_matcher_ignores_late_generation_and_rejects_wrong_reply() {
-    let (_clock, runtime, fake, controller) = connected();
+    let (clock, runtime, fake, controller) = connected();
     let events = runtime
         .subscribe(SubscriptionOptions::default())
         .expect("events");
@@ -827,7 +848,7 @@ fn ack_matcher_ignores_late_generation_and_rejects_wrong_reply() {
             .all(|write| write.context.kind == WriteKind::Command)
     );
 
-    controller.close();
+    close_after_minimum_interval(&clock, &controller);
     runtime.close();
 }
 
@@ -892,13 +913,13 @@ fn ack_disconnect_resets_desired_state_before_explicit_reconnect() {
         .encode()
     );
 
-    controller.close();
+    close_after_minimum_interval(&clock, &controller);
     runtime.close();
 }
 
 #[test]
 fn ack_command_write_disconnect_resets_controller_state() {
-    let (_clock, runtime, fake, controller) = connected();
+    let (clock, runtime, fake, controller) = connected();
     let events = runtime
         .subscribe(SubscriptionOptions::default())
         .expect("events");
@@ -932,13 +953,13 @@ fn ack_command_write_disconnect_resets_controller_state() {
             && event.operation_id == Some(command.id())
     }));
 
-    controller.close();
+    close_after_minimum_interval(&clock, &controller);
     runtime.close();
 }
 
 #[test]
 fn ack_command_write_cancelled_error_commits_cancelled() {
-    let (_clock, runtime, fake, controller) = connected();
+    let (clock, runtime, fake, controller) = connected();
     fake.fail_write_call(
         1,
         TransportError::new(
@@ -958,20 +979,20 @@ fn ack_command_write_cancelled_error_commits_cancelled() {
         ErrorCode::Cancelled
     );
     assert_eq!(controller.snapshot().state, ControllerState::Connected);
-    controller.close();
+    close_after_minimum_interval(&clock, &controller);
     runtime.close();
 }
 
 #[test]
 fn close_cancels_blocked_ack_and_joins_lane() {
-    let (_clock, runtime, fake, controller) = connected();
+    let (clock, runtime, fake, controller) = connected();
     fake.push_ack(AckOutcome::BlockUntilCancelled);
     let operation = controller
         .command_with_ack(Arc::<[u8]>::from([0xA5, 0x91]), 0xff, 100)
         .expect("ACK command");
     assert!(fake.wait_until_ack_blocked(Duration::from_secs(2)));
 
-    controller.close();
+    close_after_minimum_interval(&clock, &controller);
     wait_terminal(&operation);
     assert_eq!(operation.snapshot().state, OperationState::Cancelled);
     assert_eq!(controller.snapshot().state, ControllerState::Closed);
@@ -1004,7 +1025,7 @@ fn blocked_ack_obeys_its_protocol_deadline() {
         ErrorCode::ProtocolTimeout
     );
     assert_eq!(controller.snapshot().state, ControllerState::Connected);
-    controller.close();
+    close_after_minimum_interval(&clock, &controller);
     runtime.close();
 }
 
@@ -1026,7 +1047,7 @@ fn ack_protocol_timeout_starts_after_command_write_acceptance() {
     assert_eq!(operation.snapshot().state, OperationState::Succeeded);
     assert_eq!(clock.now_ns(), 110);
     assert_eq!(controller.snapshot().state, ControllerState::Connected);
-    controller.close();
+    close_after_minimum_interval(&clock, &controller);
     runtime.close();
 }
 
@@ -1061,13 +1082,13 @@ fn sequence_disconnect_releases_lease_and_exposes_neutral_warning() {
             .iter()
             .any(|event| event.code == "controller.neutralization.not_delivered")
     );
-    controller.close();
+    close_after_minimum_interval(&clock, &controller);
     runtime.close();
 }
 
 #[test]
 fn recoverable_sequence_write_failure_accepts_neutral_before_failed() {
-    let (_clock, runtime, fake, controller) = connected();
+    let (clock, runtime, fake, controller) = connected();
     fake.fail_write_call(
         1,
         TransportError::new(TransportErrorKind::Io, "scripted report failure"),
@@ -1097,7 +1118,7 @@ fn recoverable_sequence_write_failure_accepts_neutral_before_failed() {
         WriteKind::Neutralize
     );
     assert_eq!(controller.snapshot().lease, ControllerLeaseState::Available);
-    controller.close();
+    close_after_minimum_interval(&clock, &controller);
     runtime.close();
 }
 
@@ -1126,6 +1147,6 @@ fn sequence_target_overflow_uses_the_same_neutral_failure_guard() {
         SwitchReport::NEUTRAL.encode()
     );
     assert_eq!(controller.snapshot().lease, ControllerLeaseState::Available);
-    controller.close();
+    close_after_minimum_interval(&clock, &controller);
     runtime.close();
 }

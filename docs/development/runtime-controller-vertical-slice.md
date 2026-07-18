@@ -25,9 +25,10 @@
   timeout 提交 Controller failure；report/command write 使用独立的 1 s 默认 I/O deadline，ACK reply
   timeout 从完整 command write 被 transport 接受后开始。
 - 每个 subscription 有独立有界队列。普通事件溢出合并为 `EventGap`，operation/resource
-  query 始终是权威状态；并发发布和 gap 均保持严格递增 sequence。
-- 每个 Controller 只有一个 writer thread。普通 report 的默认最小间隔是 30 ms；write 必须响应
-  operation/resource cancellation 或绝对 I/O deadline。
+  query 始终是权威状态；并发发布和 gap 均保持严格递增 sequence；最终 `runtime.closed` 不受
+  subscription severity/log filter 影响。
+- 每个 Controller 只有一个 writer thread。所有 report（包括取消和关闭中立报告）的默认最小间隔是
+  30 ms；write 必须响应 operation/resource cancellation 或绝对 I/O deadline。
 - precise sequence 的 offset 相对 lane 获权时刻且始终为绝对目标；同 offset 按输入顺序合并
   成一个 report，不从上次 dispatch 累加目标。
 - sequence 取消或可恢复失败时，先让 transport 接受 neutral report，再释放 lease 并提交终态。
@@ -37,10 +38,16 @@
   report acceptance 观测。
 - ACK command 在同一 FIFO lane 中等待前序 direct report，只有独占 sequence/Automation lease 才
   返回 `RESOURCE_BUSY`；ACK 路径发现断线时重置 desired report、记录中立化 warning 并关闭 transport。
-- Runtime close 先取消根树，再关闭/中立化并 join Controller，最后发布 `runtime.closed`；关闭后
-  会等待普通受监管 task 完成取消清理，再兜底终结遗留 operation 和发布 `runtime.closed`；内部
-  deadline worker 随后 join。关闭后 operation/resource/task 计数全部为零，`runtime.closed`
-  之后的事件发布会被拒绝。
+- 显式 Runtime close 会先取消根树，再关闭/中立化并 join Controller，随后等待普通受监管 task 完成
+  取消清理并兜底终结遗留 operation，再 join 内部 deadline worker、验证 registry 为空，最后发布
+  `runtime.closed`。
+  最后一个 owning Runtime 句柄释放会先同步进入 `Closing` 并拒绝新 admission，再把其余关闭流程委托给
+  独立 finalizer，不在析构线程中等待 task 或执行 resource close callback；需要同步观察 `Closed`
+  的调用方必须显式 close。关闭完成后
+  operation/resource/task 计数全部为零，`runtime.closed` 之后的事件发布会被拒绝。
+- 单个 `ManagedResource::close` panic 会被隔离，发布 `runtime.resource.close_panicked` 后继续关闭其他健康资源，
+  但保留失败资源及其 task 的监督注册并使本次关闭失败；所有意外内部关闭 panic 都不声称 `Closed`，而是保持 `Closing`；若事件生产仍开放则用
+  `runtime.close_panicked` 终止，并唤醒 concurrent/later close caller，使其快速报告 panic 而不是永久等待。
 
 ## 本地验证
 
@@ -66,8 +73,9 @@ bytes/timestamp、lease 顺序和 registry 计数。
 
 以下差异由本里程碑边界决定，不改变冻结架构：
 
-1. `Runtime::close` 当前 Rust 内部接口同步等待真实 `Closed`；带 caller wait timeout 的版本化公共
-   形态留给正式 C ABI 阶段，核心关闭顺序和幂等语义已经实现。
+1. `Runtime::close` 当前 Rust 内部接口同步等待真实 `Closed`；Rust `Drop` 先同步拒绝 admission，再把
+   兜底关闭委托给独立 finalizer，避免在受监管 task 或 panic unwind 中自等待/二次 panic。带 caller wait timeout 的
+   版本化公共形态留给正式 C ABI 阶段，binding 最终 release 仍须先 close 并等待真实 `Closed`。
 2. 本阶段只有 FakeControllerTransport。Windows serial discovery/open/cancellable I/O 是后续系统
    leaf backend，不允许为 fake 测试引入硬件依赖。
 3. ACK 以通用内部 command primitive 验证 generation、timeout 和 close wake；Amiibo public API、

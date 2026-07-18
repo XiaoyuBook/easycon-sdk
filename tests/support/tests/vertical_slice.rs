@@ -44,7 +44,7 @@ fn runtime_controller_fake_vertical_slice_has_exact_trace_and_clean_shutdown() {
     fake.push_handshake(115_200, HandshakeOutcome::Success { elapsed_ns: 0 });
     fake.set_maximum_write_chunk(2);
     let controller = ControllerSession::new(
-        runtime.clone(),
+        &runtime,
         Box::new(fake.clone()),
         ControllerOptions::default(),
     )

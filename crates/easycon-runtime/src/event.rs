@@ -150,7 +150,7 @@ impl EventDraft {
 pub struct SubscriptionOptions {
     /// Maximum queued events, excluding one synthesized gap summary.
     pub capacity: usize,
-    /// Minimum accepted severity.
+    /// Minimum accepted severity. The final Runtime close event always bypasses this filter.
     pub minimum_severity: Severity,
     /// Whether replaceable log events are included.
     pub include_logs: bool,
@@ -244,6 +244,14 @@ impl SubscriptionInner {
             return;
         }
 
+        self.enqueue_accepted(event);
+    }
+
+    pub(crate) fn enqueue_final(&self, event: Event) {
+        self.enqueue_accepted(event);
+    }
+
+    fn enqueue_accepted(&self, event: Event) {
         let mut state = self.state.lock().expect("subscription queue lock poisoned");
         if state.closed {
             return;

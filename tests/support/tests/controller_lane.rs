@@ -32,6 +32,16 @@ fn wait_for_report_acceptance(controller: &ControllerSession, count: u64) {
     }
 }
 
+fn close_after_minimum_interval(clock: &VirtualClock, controller: &ControllerSession) {
+    if let Some(last) = controller.snapshot().last_report_timestamp_ns {
+        let target = last.saturating_add(ControllerOptions::default().minimum_report_interval_ns);
+        if clock.now_ns() < target {
+            clock.advance_to(target);
+        }
+    }
+    controller.close();
+}
+
 // Keeps the Runtime worker quiescent so the test exercises the lane's own deadline check.
 struct ControllerDeadlineClock {
     inner: Arc<VirtualClock>,
@@ -78,7 +88,7 @@ fn fallback_connect_partial_direct_and_close_are_exact() {
     fake.push_handshake(9_600, HandshakeOutcome::Success { elapsed_ns: 5 });
     fake.set_maximum_write_chunk(2);
     let controller = ControllerSession::new(
-        runtime.clone(),
+        &runtime,
         Box::new(fake.clone()),
         ControllerOptions::default(),
     )
@@ -167,7 +177,7 @@ fn fallback_connect_partial_direct_and_close_are_exact() {
             active_tasks: 2,
         }
     );
-    controller.close();
+    close_after_minimum_interval(&clock, &controller);
     assert!(fake.is_closed());
     assert_eq!(controller.snapshot().state, ControllerState::Closed);
     let writes = fake.accepted_writes();
@@ -191,7 +201,7 @@ fn report_spacing_and_snapshot_use_transport_acceptance_time() {
     let fake = FakeControllerTransport::new(clock.clone());
     fake.push_handshake(115_200, HandshakeOutcome::Success { elapsed_ns: 0 });
     let controller = ControllerSession::new(
-        runtime.clone(),
+        &runtime,
         Box::new(fake.clone()),
         ControllerOptions::default(),
     )
@@ -233,11 +243,34 @@ fn report_spacing_and_snapshot_use_transport_acceptance_time() {
         .encode()
     );
 
-    controller.close();
+    let closing = controller.clone();
+    let (closed, observed_close) = std::sync::mpsc::channel();
+    let closer = std::thread::spawn(move || {
+        closing.close();
+        closed.send(()).expect("close observer");
+    });
+    let started = Instant::now();
+    while controller.snapshot().state != ControllerState::Disconnecting {
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "close did not start"
+        );
+        std::thread::yield_now();
+    }
+    assert!(matches!(
+        observed_close.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+    assert_eq!(fake.accepted_writes().len(), 2);
+    clock.advance_to(80_000_000);
+    observed_close
+        .recv_timeout(Duration::from_secs(2))
+        .expect("close waited for the minimum report interval");
+    closer.join().expect("controller closer");
     assert_eq!(controller.snapshot().accepted_report_count, 3);
     assert_eq!(
         controller.snapshot().last_report_timestamp_ns,
-        Some(50_000_000)
+        Some(80_000_000)
     );
     runtime.close();
 }
@@ -249,7 +282,7 @@ fn hat_sticks_and_reset_all_flow_through_the_report_lane() {
     let fake = FakeControllerTransport::new(clock.clone());
     fake.push_handshake(115_200, HandshakeOutcome::Success { elapsed_ns: 1 });
     let controller = ControllerSession::new(
-        runtime.clone(),
+        &runtime,
         Box::new(fake.clone()),
         ControllerOptions::default(),
     )
@@ -303,7 +336,7 @@ fn hat_sticks_and_reset_all_flow_through_the_report_lane() {
     );
     assert_eq!(writes[3].bytes, SwitchReport::NEUTRAL.encode());
 
-    controller.close();
+    close_after_minimum_interval(&clock, &controller);
     runtime.close();
 }
 
@@ -314,12 +347,8 @@ fn handshake_protocol_timeout_is_failed_not_cancelled() {
     let fake = FakeControllerTransport::new(clock.clone());
     fake.push_handshake(115_200, HandshakeOutcome::Timeout { elapsed_ns: 10 });
     fake.push_handshake(9_600, HandshakeOutcome::Timeout { elapsed_ns: 10 });
-    let controller = ControllerSession::new(
-        runtime.clone(),
-        Box::new(fake),
-        ControllerOptions::default(),
-    )
-    .expect("controller");
+    let controller = ControllerSession::new(&runtime, Box::new(fake), ControllerOptions::default())
+        .expect("controller");
 
     let connect = controller
         .connect(ConnectOptions {
@@ -335,7 +364,7 @@ fn handshake_protocol_timeout_is_failed_not_cancelled() {
         ErrorCode::ProtocolTimeout
     );
     assert_eq!(controller.snapshot().state, ControllerState::Disconnected);
-    controller.close();
+    close_after_minimum_interval(&clock, &controller);
     runtime.close();
 }
 
@@ -346,7 +375,7 @@ fn operation_deadline_cancels_connect_before_second_baud_attempt() {
     let fake = FakeControllerTransport::new(clock);
     fake.push_handshake(115_200, HandshakeOutcome::Timeout { elapsed_ns: 100 });
     let controller = ControllerSession::new(
-        runtime.clone(),
+        &runtime,
         Box::new(fake.clone()),
         ControllerOptions::default(),
     )
@@ -380,7 +409,7 @@ fn operation_deadline_on_final_baud_is_not_a_protocol_timeout() {
     fake.push_handshake(115_200, HandshakeOutcome::Timeout { elapsed_ns: 40 });
     fake.push_handshake(9_600, HandshakeOutcome::Timeout { elapsed_ns: 100 });
     let controller = ControllerSession::new(
-        runtime.clone(),
+        &runtime,
         Box::new(fake.clone()),
         ControllerOptions::default(),
     )
@@ -424,7 +453,7 @@ fn handshake_protocol_errors_use_bounded_fallback_then_fail() {
         },
     );
     let controller = ControllerSession::new(
-        runtime.clone(),
+        &runtime,
         Box::new(fake.clone()),
         ControllerOptions::default(),
     )
@@ -450,7 +479,7 @@ fn direct_while_disconnected_fails_without_transport_write() {
     let runtime = Runtime::new(clock.clone());
     let fake = FakeControllerTransport::new(clock);
     let controller = ControllerSession::new(
-        runtime.clone(),
+        &runtime,
         Box::new(fake.clone()),
         ControllerOptions::default(),
     )
@@ -467,13 +496,48 @@ fn direct_while_disconnected_fails_without_transport_write() {
 }
 
 #[test]
+fn dropping_last_runtime_handle_eventually_closes_a_live_controller() {
+    let clock = Arc::new(VirtualClock::default());
+    let runtime = Runtime::new(clock.clone());
+    let fake = FakeControllerTransport::new(clock.clone());
+    fake.push_handshake(115_200, HandshakeOutcome::Success { elapsed_ns: 0 });
+    let controller = ControllerSession::new(
+        &runtime,
+        Box::new(fake.clone()),
+        ControllerOptions::default(),
+    )
+    .expect("controller");
+    let connect = controller
+        .connect(ConnectOptions::default())
+        .expect("connect");
+    wait_terminal(&connect);
+    let direct = controller
+        .direct(ControllerAction::ButtonDown(Button::A))
+        .expect("direct");
+    wait_terminal(&direct);
+
+    drop(runtime);
+    clock.advance_to(ControllerOptions::default().minimum_report_interval_ns);
+
+    let started = Instant::now();
+    while controller.snapshot().state != ControllerState::Closed {
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "delegated Runtime close did not close the controller"
+        );
+        std::thread::yield_now();
+    }
+    assert!(fake.is_closed());
+}
+
+#[test]
 fn concurrent_callers_still_use_one_writer_thread() {
     let clock = Arc::new(VirtualClock::default());
     let runtime = Runtime::new(clock.clone());
     let fake = FakeControllerTransport::new(clock.clone());
     fake.push_handshake(115_200, HandshakeOutcome::Success { elapsed_ns: 1 });
     let controller = ControllerSession::new(
-        runtime.clone(),
+        &runtime,
         Box::new(fake.clone()),
         ControllerOptions::default(),
     )
@@ -522,7 +586,7 @@ fn concurrent_callers_still_use_one_writer_thread() {
             .all(|pair| pair[1].context.timestamp_ns - pair[0].context.timestamp_ns >= 30_000_000)
     );
 
-    controller.close();
+    close_after_minimum_interval(&clock, &controller);
     runtime.close();
 }
 
@@ -539,7 +603,7 @@ fn controller_construction_and_runtime_close_have_no_half_admitted_state() {
         let creator = std::thread::spawn(move || {
             creator_barrier.wait();
             ControllerSession::new(
-                creator_runtime,
+                &creator_runtime,
                 Box::new(fake),
                 ControllerOptions::default(),
             )

@@ -61,10 +61,12 @@
     "runtime": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["states", "close_is_idempotent", "close_order", "closed_counts"],
+      "required": ["states", "close_is_idempotent", "final_handle_drop", "close_panic", "close_order", "closed_counts"],
       "properties": {
         "states": { "type": "array", "minItems": 3, "items": { "type": "string" }, "uniqueItems": true },
         "close_is_idempotent": { "type": "boolean" },
+        "final_handle_drop": { "type": "string" },
+        "close_panic": { "type": "string" },
         "close_order": { "type": "array", "minItems": 1, "items": { "type": "string" } },
         "closed_counts": {
           "type": "object",
@@ -95,6 +97,7 @@
       "required": [
         "single_writer",
         "default_minimum_report_interval_ns",
+        "report_interval_scope",
         "write_timeout_ns",
         "direct_success_boundary",
         "hardware_execution_claimed",
@@ -104,6 +107,7 @@
       "properties": {
         "single_writer": { "type": "boolean" },
         "default_minimum_report_interval_ns": { "type": "integer", "minimum": 1 },
+        "report_interval_scope": { "type": "string" },
         "write_timeout_ns": { "type": "integer", "minimum": 1 },
         "direct_success_boundary": { "type": "string" },
         "hardware_execution_claimed": { "type": "boolean" },

@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::JoinHandle;
@@ -47,15 +47,19 @@ pub trait ManagedResource: Send + Sync + 'static {
 }
 
 /// Cloneable root owner for operations, resources, tasks, events, and cancellation.
-#[derive(Clone)]
+/// Dropping the final owning handle delegates shutdown to a dedicated finalizer. Call
+/// [`Runtime::close`] when the caller must synchronously observe `Closed`.
 pub struct Runtime {
     pub(crate) inner: Arc<RuntimeInner>,
+    close_on_drop: bool,
 }
 
 pub(crate) struct RuntimeInner {
     id: RuntimeId,
+    runtime_handles: AtomicUsize,
     state: Mutex<RuntimeState>,
     state_changed: Condvar,
+    close_failed: AtomicBool,
     root_cancellation: CancellationToken,
     clock: Arc<dyn Clock>,
     next_id: AtomicU64,
@@ -72,7 +76,6 @@ pub(crate) struct RuntimeInner {
     clock_hook: Mutex<Option<ClockChangeRegistration>>,
 }
 
-#[derive(Clone, Copy)]
 enum DeadlineSignal {
     Wake,
     Shutdown,
@@ -168,8 +171,10 @@ impl Runtime {
         let task_id = TaskId::new(deadline_task_number);
         let inner = Arc::new(RuntimeInner {
             id: runtime_id,
+            runtime_handles: AtomicUsize::new(1),
             state: Mutex::new(RuntimeState::Active),
             state_changed: Condvar::new(),
+            close_failed: AtomicBool::new(false),
             root_cancellation: CancellationToken::root_for_runtime(runtime_id),
             clock,
             next_id,
@@ -209,7 +214,10 @@ impl Runtime {
             .lock()
             .expect("deadline worker lock poisoned") = Some(worker);
 
-        Self { inner }
+        Self {
+            inner,
+            close_on_drop: true,
+        }
     }
 
     /// Returns the process-unique Runtime identifier.
@@ -238,6 +246,16 @@ impl Runtime {
     #[must_use]
     pub fn child_cancellation_token(&self) -> CancellationToken {
         self.inner.root_cancellation.child()
+    }
+
+    /// Creates a core-internal reference that keeps storage alive without delaying final-handle close.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn clone_for_supervision(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            close_on_drop: false,
+        }
     }
 
     /// Creates and supervises a pending operation.
@@ -451,7 +469,21 @@ impl Runtime {
     }
 
     /// Idempotently closes resources, finishes operations, closes events, and enters `Closed`.
+    /// Unlike final-handle drop, this method waits for the full close sequence to finish.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an internal close phase fails unexpectedly. Concurrent and later close callers
+    /// are woken and report the same failed-close condition instead of waiting indefinitely.
     pub fn close(&self) {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.close_impl()));
+        if let Err(payload) = result {
+            self.inner.fail_close_after_panic();
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    fn close_impl(&self) {
         let owner = {
             let mut state = self
                 .inner
@@ -459,10 +491,13 @@ impl Runtime {
                 .lock()
                 .expect("Runtime state lock poisoned");
             loop {
+                if self.inner.close_failed.load(Ordering::Acquire) {
+                    break None;
+                }
                 match *state {
                     RuntimeState::Active => {
                         *state = RuntimeState::Closing;
-                        break true;
+                        break Some(true);
                     }
                     RuntimeState::Closing => {
                         state = self
@@ -471,14 +506,21 @@ impl Runtime {
                             .wait(state)
                             .expect("Runtime state lock poisoned while closing");
                     }
-                    RuntimeState::Closed => break false,
+                    RuntimeState::Closed => break Some(false),
                 }
             }
+        };
+        let Some(owner) = owner else {
+            panic!("Runtime close previously failed");
         };
         if !owner {
             return;
         }
 
+        self.finish_close();
+    }
+
+    fn finish_close(&self) {
         let _ = self.inner.try_publish_event(EventDraft::critical(
             EventKind::State,
             "runtime.closing",
@@ -523,10 +565,32 @@ impl Runtime {
             live
         };
         resources.sort_by_key(|(id, _)| *id);
-        for (_, resource) in &resources {
-            resource.close();
+        let mut resource_close_panic = None;
+        for (id, resource) in &resources {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                resource.close();
+            }));
+            if let Err(payload) = result {
+                let _ = self.inner.try_publish_event(
+                    EventDraft::critical(
+                        EventKind::Warning,
+                        "runtime.resource.close_panicked",
+                        Severity::Error,
+                    )
+                    .with_resource(*id)
+                    .with_detail(
+                        "ManagedResource::close panicked; registration remains supervised",
+                    ),
+                );
+                if resource_close_panic.is_none() {
+                    resource_close_panic = Some(payload);
+                }
+            }
         }
         drop(resources);
+        if let Some(payload) = resource_close_panic {
+            std::panic::resume_unwind(payload);
+        }
 
         self.inner.wait_for_external_tasks();
 
@@ -536,12 +600,6 @@ impl Runtime {
             }
         }
         drop(operations);
-
-        self.inner.close_events(EventDraft::critical(
-            EventKind::State,
-            "runtime.closed",
-            Severity::Info,
-        ));
 
         self.inner.stop_deadline_worker();
         self.inner.wait_for_tasks();
@@ -555,6 +613,12 @@ impl Runtime {
             "supervised work remained after deterministic close"
         );
 
+        self.inner.close_events(EventDraft::critical(
+            EventKind::State,
+            "runtime.closed",
+            Severity::Info,
+        ));
+
         let mut state = self
             .inner
             .state
@@ -563,14 +627,55 @@ impl Runtime {
         *state = RuntimeState::Closed;
         drop(state);
         self.inner.state_changed.notify_all();
-        assert_eq!(
-            self.counts(),
-            RuntimeCounts {
-                active_operations: 0,
-                active_resources: 0,
-                active_tasks: 0,
+    }
+}
+
+impl Clone for Runtime {
+    fn clone(&self) -> Self {
+        if self.close_on_drop {
+            self.inner
+                .runtime_handles
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |handles| {
+                    handles.checked_add(1)
+                })
+                .expect("Runtime handle count exhausted");
+        }
+        Self {
+            inner: Arc::clone(&self.inner),
+            close_on_drop: self.close_on_drop,
+        }
+    }
+}
+
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        if !self.close_on_drop {
+            return;
+        }
+        let Ok(previous) = self.inner.runtime_handles.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |handles| handles.checked_sub(1),
+        ) else {
+            return;
+        };
+        if previous == 1 {
+            let finalize = {
+                let mut state = match self.inner.state.lock() {
+                    Ok(state) => state,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                if *state == RuntimeState::Active {
+                    *state = RuntimeState::Closing;
+                    true
+                } else {
+                    false
+                }
+            };
+            if finalize {
+                spawn_finalizer(Arc::clone(&self.inner));
             }
-        );
+        }
     }
 }
 
@@ -610,10 +715,66 @@ impl RuntimeInner {
             return;
         }
         let event = self.next_event(draft);
-        enqueue_event(&mut subscriptions, &event);
-        for subscription in subscriptions.iter().filter_map(Weak::upgrade) {
+        subscriptions.retain(|subscription| {
+            let Some(subscription) = subscription.upgrade() else {
+                return false;
+            };
+            subscription.enqueue_final(event.clone());
             subscription.close();
+            true
+        });
+    }
+
+    fn fail_close_after_panic(&self) {
+        {
+            let mut state = match self.state.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if *state == RuntimeState::Active {
+                *state = RuntimeState::Closing;
+            }
+            self.close_failed.store(true, Ordering::Release);
         }
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.root_cancellation.cancel();
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.stop_deadline_worker();
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.close_events(EventDraft::critical(
+                EventKind::State,
+                "runtime.close_panicked",
+                Severity::Error,
+            ));
+        }));
+        self.state_changed.notify_all();
+    }
+
+    fn fail_close_without_finalizer(&self) {
+        {
+            let mut state = match self.state.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if *state == RuntimeState::Active {
+                *state = RuntimeState::Closing;
+            }
+            self.close_failed.store(true, Ordering::Release);
+        }
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.root_cancellation.cancel();
+        }));
+        let _ = self.deadline_sender.send(DeadlineSignal::Shutdown);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.close_events(EventDraft::critical(
+                EventKind::State,
+                "runtime.close_panicked",
+                Severity::Error,
+            ));
+        }));
+        self.state_changed.notify_all();
     }
 
     fn next_event(&self, draft: EventDraft) -> Event {
@@ -757,6 +918,33 @@ fn deadline_worker(
     }
 }
 
+fn close_after_final_handle_drop(inner: Arc<RuntimeInner>) {
+    let runtime = Runtime {
+        inner,
+        close_on_drop: false,
+    };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.finish_close();
+    }));
+    if result.is_err() {
+        runtime.inner.fail_close_after_panic();
+    }
+}
+
+fn spawn_finalizer(inner: Arc<RuntimeInner>) {
+    let failure_fallback = Arc::clone(&inner);
+    if std::thread::Builder::new()
+        .name(format!("easycon-finalizer-{}", inner.id.get()))
+        .spawn(move || close_after_final_handle_drop(inner))
+        .is_err()
+    {
+        failure_fallback.fail_close_without_finalizer();
+        // No thread exists that can safely own deterministic cleanup. Retaining storage is safer
+        // than running resource callbacks inline from Drop or freeing state still used by workers.
+        std::mem::forget(failure_fallback);
+    }
+}
+
 fn enqueue_event(subscriptions: &mut Vec<Weak<SubscriptionInner>>, event: &Event) {
     subscriptions.retain(|subscription| {
         let Some(subscription) = subscription.upgrade() else {
@@ -792,7 +980,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::sync::{Arc, Barrier, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use crate::{
         EventClass, EventDraft, EventGap, EventKind, OperationState, OperationValue, Severity,
@@ -1290,6 +1478,30 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct PanickingResource {
+        registration: Mutex<Option<ResourceRegistration>>,
+        task: Mutex<Option<TaskRegistration>>,
+    }
+
+    impl ManagedResource for PanickingResource {
+        fn close(&self) {
+            panic!("scripted resource close panic");
+        }
+    }
+
+    struct ThreadReportingResource {
+        registration: Mutex<Option<ResourceRegistration>>,
+        closed_on: mpsc::Sender<std::thread::ThreadId>,
+    }
+
+    impl ManagedResource for ThreadReportingResource {
+        fn close(&self) {
+            let _ = self.closed_on.send(std::thread::current().id());
+            self.registration.lock().expect("registration lock").take();
+        }
+    }
+
     struct OrderedResource {
         marker: u8,
         order: Arc<Mutex<Vec<u8>>>,
@@ -1454,6 +1666,323 @@ mod tests {
             ))
             .expect_err("event production is closed");
         assert_eq!(error.code(), ErrorCode::RuntimeClosing);
+    }
+
+    #[test]
+    fn dropping_last_runtime_handle_eventually_closes_operations_and_events() {
+        let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+        let events = runtime
+            .subscribe(SubscriptionOptions::default())
+            .expect("subscribe");
+        let operation = runtime.create_operation(None).expect("operation");
+        operation.start();
+
+        drop(runtime);
+
+        assert!(matches!(
+            operation.wait(WaitTimeout::For(Duration::from_secs(2))),
+            WaitResult::Completed(_)
+        ));
+        assert_eq!(operation.snapshot().state, OperationState::Cancelled);
+        let mut last_code = None;
+        loop {
+            match events.read(WaitTimeout::For(Duration::from_secs(2))) {
+                SubscriptionRead::Event(event) => last_code = Some(event.code),
+                SubscriptionRead::Closed => break,
+                SubscriptionRead::Timeout => panic!("last Runtime drop must close subscriptions"),
+            }
+        }
+        assert_eq!(last_code, Some("runtime.closed"));
+    }
+
+    #[test]
+    fn final_handle_drop_resource_panic_fails_without_waiting_for_its_task() {
+        let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+        let supervised = runtime.clone_for_supervision();
+        let events = runtime
+            .subscribe(SubscriptionOptions::default())
+            .expect("subscribe");
+        let panicking = Arc::new(PanickingResource::default());
+        let managed: Arc<dyn ManagedResource> = panicking.clone();
+        let (registration, task) = runtime
+            .register_resource_with_task(managed)
+            .expect("resource and task");
+        let panicking_id = registration.id();
+        *panicking.registration.lock().expect("registration lock") = Some(registration);
+        *panicking.task.lock().expect("task lock") = Some(task);
+        let healthy = Arc::new(TestResource::default());
+        let managed: Arc<dyn ManagedResource> = healthy.clone();
+        *healthy.registration.lock().expect("registration lock") =
+            Some(runtime.register_resource(managed).expect("resource"));
+
+        drop(runtime);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| supervised.close())).is_err(),
+            "resource panic must wake close callers with failure"
+        );
+
+        assert_eq!(supervised.state(), RuntimeState::Closing);
+        assert!(healthy.closed.load(Ordering::Acquire));
+        assert_eq!(
+            supervised.counts(),
+            RuntimeCounts {
+                active_operations: 0,
+                active_resources: 1,
+                active_tasks: 1,
+            }
+        );
+        let mut observed = Vec::new();
+        loop {
+            match events.read(WaitTimeout::Poll) {
+                SubscriptionRead::Event(event) => observed.push(event),
+                SubscriptionRead::Closed => break,
+                SubscriptionRead::Timeout => panic!("failed close queue must be closed"),
+            }
+        }
+        assert!(observed.iter().any(|event| {
+            event.code == "runtime.resource.close_panicked"
+                && event.resource_id == Some(panicking_id)
+                && event.severity == Severity::Error
+        }));
+        assert_eq!(
+            observed.last().map(|event| event.code),
+            Some("runtime.close_panicked")
+        );
+        assert!(!observed.iter().any(|event| event.code == "runtime.closed"));
+
+        panicking.task.lock().expect("task lock").take();
+        panicking
+            .registration
+            .lock()
+            .expect("registration lock")
+            .take();
+    }
+
+    #[test]
+    fn final_handle_drop_reports_a_deadline_worker_panic_before_success() {
+        let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+        let supervised = runtime.clone_for_supervision();
+        let events = runtime
+            .subscribe(SubscriptionOptions::default())
+            .expect("events");
+        let poisoned_runtime = Arc::clone(&runtime.inner);
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = poisoned_runtime
+                    .operations
+                    .lock()
+                    .expect("operation registry lock");
+                panic!("scripted operation registry poison");
+            })
+            .join()
+            .is_err()
+        );
+        let _ = runtime.inner.deadline_sender.send(DeadlineSignal::Wake);
+        let started = Instant::now();
+        loop {
+            let finished = runtime
+                .inner
+                .deadline_worker
+                .lock()
+                .expect("deadline worker lock")
+                .as_ref()
+                .is_some_and(JoinHandle::is_finished);
+            if finished {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "deadline worker did not observe the injected panic"
+            );
+            std::thread::yield_now();
+        }
+
+        drop(runtime);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| supervised.close())).is_err(),
+            "worker panic must wake close callers with failure"
+        );
+        assert_eq!(supervised.state(), RuntimeState::Closing);
+        let mut codes = Vec::new();
+        loop {
+            match events.read(WaitTimeout::Poll) {
+                SubscriptionRead::Event(event) => codes.push(event.code),
+                SubscriptionRead::Closed => break,
+                SubscriptionRead::Timeout => panic!("failed close queue must be closed"),
+            }
+        }
+        assert_eq!(codes.last(), Some(&"runtime.close_panicked"));
+        assert!(!codes.contains(&"runtime.closed"));
+    }
+
+    #[test]
+    fn unexpected_close_panic_wakes_concurrent_callers_and_closes_events() {
+        let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+        let events = runtime
+            .subscribe(SubscriptionOptions::default())
+            .expect("subscribe");
+        let poisoned_runtime = Arc::clone(&runtime.inner);
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = poisoned_runtime
+                    .operations
+                    .lock()
+                    .expect("operation registry lock");
+                panic!("scripted operation registry poison");
+            })
+            .join()
+            .is_err()
+        );
+        let barrier = Arc::new(Barrier::new(3));
+        let callers: Vec<_> = (0..2)
+            .map(|_| {
+                let closing = runtime.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| closing.close()))
+                        .is_err()
+                })
+            })
+            .collect();
+
+        barrier.wait();
+        assert!(
+            callers
+                .into_iter()
+                .all(|caller| caller.join().expect("close caller"))
+        );
+        assert_eq!(runtime.state(), RuntimeState::Closing);
+        let mut codes = Vec::new();
+        loop {
+            match events.read(WaitTimeout::Poll) {
+                SubscriptionRead::Event(event) => codes.push(event.code),
+                SubscriptionRead::Closed => break,
+                SubscriptionRead::Timeout => panic!("failed close queue must be closed"),
+            }
+        }
+        assert_eq!(codes.last(), Some(&"runtime.close_panicked"));
+    }
+
+    #[test]
+    fn dropping_last_runtime_handle_rejects_admission_before_returning() {
+        let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+        let supervised = runtime.clone_for_supervision();
+        let tasks = supervised.inner.tasks.lock().expect("task registry lock");
+
+        drop(runtime);
+
+        assert_eq!(supervised.state(), RuntimeState::Closing);
+        let error = match supervised.create_operation(None) {
+            Err(error) => error,
+            Ok(_) => panic!("final handle drop must reject admission synchronously"),
+        };
+        assert_eq!(error.code(), ErrorCode::RuntimeClosing);
+        drop(tasks);
+        supervised.close();
+        assert_eq!(supervised.state(), RuntimeState::Closed);
+    }
+
+    #[test]
+    fn dropping_final_runtime_handle_inside_a_supervised_task_does_not_self_deadlock() {
+        let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+        let events = runtime
+            .subscribe(SubscriptionOptions::default())
+            .expect("subscribe");
+        let task = runtime.register_task().expect("task");
+        let worker_runtime = runtime.clone();
+        let (release, released) = mpsc::channel();
+        let (finished, observed_finish) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            released.recv().expect("worker release");
+            drop(worker_runtime);
+            drop(task);
+            finished.send(()).expect("worker completion");
+        });
+
+        drop(runtime);
+        release.send(()).expect("release worker");
+
+        observed_finish
+            .recv_timeout(Duration::from_secs(2))
+            .expect("final Runtime drop must not wait for its own task");
+        worker.join().expect("supervised worker");
+        let mut last_code = None;
+        loop {
+            match events.read(WaitTimeout::For(Duration::from_secs(2))) {
+                SubscriptionRead::Event(event) => last_code = Some(event.code),
+                SubscriptionRead::Closed => break,
+                SubscriptionRead::Timeout => panic!("delegated Runtime close did not finish"),
+            }
+        }
+        assert_eq!(last_code, Some("runtime.closed"));
+    }
+
+    #[test]
+    fn dropping_last_runtime_handle_does_not_close_resources_inline() {
+        let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+        let events = runtime
+            .subscribe(SubscriptionOptions::default())
+            .expect("subscribe");
+        let (closed_on, observed_close) = mpsc::channel();
+        let resource = Arc::new(ThreadReportingResource {
+            registration: Mutex::new(None),
+            closed_on,
+        });
+        let managed: Arc<dyn ManagedResource> = resource.clone();
+        *resource.registration.lock().expect("registration lock") = Some(
+            runtime
+                .register_resource(managed)
+                .expect("resource registration"),
+        );
+        let dropping_thread = std::thread::current().id();
+
+        drop(runtime);
+
+        let close_thread = observed_close
+            .recv_timeout(Duration::from_secs(2))
+            .expect("delegated resource close");
+        assert_ne!(close_thread, dropping_thread);
+        loop {
+            match events.read(WaitTimeout::For(Duration::from_secs(2))) {
+                SubscriptionRead::Event(_) => {}
+                SubscriptionRead::Closed => break,
+                SubscriptionRead::Timeout => panic!("delegated Runtime close did not finish"),
+            }
+        }
+    }
+
+    #[test]
+    fn dropping_a_nonfinal_runtime_handle_keeps_the_runtime_active() {
+        let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+        let other = runtime.clone();
+
+        drop(other);
+
+        assert_eq!(runtime.state(), RuntimeState::Active);
+        runtime.close();
+    }
+
+    #[test]
+    fn final_runtime_event_bypasses_subscription_severity_filter() {
+        let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+        let events = runtime
+            .subscribe(SubscriptionOptions {
+                minimum_severity: Severity::Error,
+                ..SubscriptionOptions::default()
+            })
+            .expect("subscribe");
+
+        runtime.close();
+
+        assert!(matches!(
+            events.read(WaitTimeout::Poll),
+            SubscriptionRead::Event(Event {
+                code: "runtime.closed",
+                ..
+            })
+        ));
+        assert_eq!(events.read(WaitTimeout::Poll), SubscriptionRead::Closed);
     }
 
     #[test]

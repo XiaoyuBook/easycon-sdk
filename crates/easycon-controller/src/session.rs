@@ -334,7 +334,7 @@ struct ControllerLane {
 impl ControllerSession {
     /// Creates and registers a controller without opening transport or hardware.
     pub fn new(
-        runtime: Runtime,
+        runtime: &Runtime,
         transport: Box<dyn ControllerTransport>,
         options: ControllerOptions,
     ) -> Result<Self, EasyConError> {
@@ -348,8 +348,9 @@ impl ControllerSession {
         let (sender, receiver) = mpsc::channel();
         let snapshot = Arc::new(Mutex::new(ControllerSnapshot::default()));
         let resource_cancellation = runtime.child_cancellation_token();
+        let supervised_runtime = runtime.clone_for_supervision();
         let inner = Arc::new(ControllerInner {
-            runtime: runtime.clone(),
+            runtime: supervised_runtime.clone(),
             resource_id: OnceLock::new(),
             sender: sender.clone(),
             snapshot: snapshot.clone(),
@@ -388,7 +389,7 @@ impl ControllerSession {
             let _ = wake_sender.send(LaneCommand::Wake);
         }));
         let lane = ControllerLane {
-            runtime,
+            runtime: supervised_runtime,
             resource_id,
             clock,
             options,
@@ -1683,6 +1684,57 @@ impl ControllerLane {
         self.transport.close();
     }
 
+    fn collect_command_during_close(
+        command: LaneCommand,
+        operations: &mut Vec<Operation>,
+        close_waiters: &mut Vec<SyncSender<()>>,
+    ) {
+        match command {
+            LaneCommand::Connect { operation, .. }
+            | LaneCommand::Direct { operation, .. }
+            | LaneCommand::Sequence { operation, .. }
+            | LaneCommand::Ack { operation, .. } => {
+                if !operation.snapshot().state.is_terminal() {
+                    operation.request_cancel(easycon_runtime::CancellationReason::ParentClose);
+                }
+                operations.push(operation);
+            }
+            LaneCommand::AcquireAutomationLease { completed, .. } => {
+                let _ = completed.send(Err(closed_lane_error()));
+            }
+            LaneCommand::Close { completed } => close_waiters.push(completed),
+            LaneCommand::ReleaseAutomationLease { .. } | LaneCommand::Wake => {}
+        }
+    }
+
+    fn wait_for_close_target(
+        &mut self,
+        target_ns: u64,
+        operations: &mut Vec<Operation>,
+        close_waiters: &mut Vec<SyncSender<()>>,
+    ) {
+        while self.clock.now_ns() < target_ns {
+            let command = match self.clock.real_wait_duration(target_ns) {
+                Some(duration) => match self.receiver.recv_timeout(duration) {
+                    Ok(command) => Some(command),
+                    Err(RecvTimeoutError::Timeout) => None,
+                    Err(RecvTimeoutError::Disconnected) => {
+                        std::thread::sleep(duration);
+                        None
+                    }
+                },
+                None => Some(
+                    self.receiver
+                        .recv()
+                        .expect("controller clock hook keeps the close wait channel open"),
+                ),
+            };
+            if let Some(command) = command {
+                Self::collect_command_during_close(command, operations, close_waiters);
+            }
+        }
+    }
+
     fn close_lane(&mut self, completed: Option<SyncSender<()>>) {
         let was_connected = self.state() == ControllerState::Connected;
         if was_connected {
@@ -1704,17 +1756,7 @@ impl ControllerLane {
             .chain(self.receiver.try_iter())
             .collect();
         for command in queued {
-            match command {
-                LaneCommand::Connect { operation, .. }
-                | LaneCommand::Direct { operation, .. }
-                | LaneCommand::Sequence { operation, .. }
-                | LaneCommand::Ack { operation, .. } => operations.push(operation),
-                LaneCommand::AcquireAutomationLease { completed, .. } => {
-                    let _ = completed.send(Err(closed_lane_error()));
-                }
-                LaneCommand::Close { completed } => close_waiters.push(completed),
-                LaneCommand::ReleaseAutomationLease { .. } | LaneCommand::Wake => {}
-            }
+            Self::collect_command_during_close(command, &mut operations, &mut close_waiters);
         }
         if let Some(waiting) = self.waiting_sequence.take() {
             operations.push(waiting.operation);
@@ -1731,9 +1773,17 @@ impl ControllerLane {
         if was_connected {
             let bytes = SwitchReport::NEUTRAL.encode();
             let now = self.clock.now_ns();
-            match self.write_payload(None, WriteKind::Neutralize, now, &bytes) {
+            let target_ns = self.last_report_acceptance_ns.map_or(now, |last| {
+                last.saturating_add(self.options.minimum_report_interval_ns)
+                    .max(now)
+            });
+            let deadline_id = self.clock.register_deadline(target_ns);
+            self.wait_for_close_target(target_ns, &mut operations, &mut close_waiters);
+            let dispatch_ns = self.clock.now_ns();
+            match self.write_payload(None, WriteKind::Neutralize, dispatch_ns, &bytes) {
                 Ok(()) => {
                     let accepted_at_ns = self.clock.now_ns();
+                    self.clock.record_dispatch(deadline_id, dispatch_ns);
                     self.last_report_acceptance_ns = Some(accepted_at_ns);
                     self.record_report_acceptance(accepted_at_ns, None, bytes);
                 }
@@ -1751,6 +1801,8 @@ impl ControllerLane {
             }
         }
         self.set_lease_owner(None);
+        operations.sort_by_key(|operation| operation.id());
+        operations.dedup_by_key(|operation| operation.id());
         for operation in operations {
             if operation.snapshot().state == OperationState::Cancelling {
                 operation.finish_cancelled();
