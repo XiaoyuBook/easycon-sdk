@@ -426,6 +426,7 @@ fn sequence_future_state_is_not_applied_before_its_offset() {
     runtime.close();
 }
 
+// conformance: transport.accepted-cancel-terminal
 #[test]
 fn cancel_after_final_sequence_acceptance_still_neutralizes() {
     let (clock, runtime, fake, controller) = connected();
@@ -594,6 +595,7 @@ fn failed_cancel_neutral_keeps_later_desired_report_authoritative() {
     runtime.close();
 }
 
+// conformance: transport.ack-fifo
 #[test]
 fn ack_waits_for_an_earlier_report_in_the_fifo_lane() {
     let (clock, runtime, fake, controller) = connected();
@@ -630,6 +632,7 @@ fn ack_waits_for_an_earlier_report_in_the_fifo_lane() {
     runtime.close();
 }
 
+// conformance: transport.close-interrupts-write
 #[test]
 fn close_interrupts_a_blocked_report_write_and_joins() {
     let (clock, runtime, fake, controller) = connected();
@@ -663,6 +666,7 @@ fn close_interrupts_a_blocked_report_write_and_joins() {
     runtime.close();
 }
 
+// conformance: timeout.write-fails
 #[test]
 fn blocked_report_write_obeys_its_io_deadline() {
     let (clock, runtime, fake, controller) = connected();
@@ -794,6 +798,7 @@ fn automation_lease_is_a_low_level_exclusive_primitive() {
     runtime.close();
 }
 
+// conformance: transport.late-ack-isolated
 #[test]
 fn ack_matcher_ignores_late_generation_and_rejects_wrong_reply() {
     let (clock, runtime, fake, controller) = connected();
@@ -852,6 +857,7 @@ fn ack_matcher_ignores_late_generation_and_rejects_wrong_reply() {
     runtime.close();
 }
 
+// conformance: transport.ack-disconnect-reset
 #[test]
 fn ack_disconnect_resets_desired_state_before_explicit_reconnect() {
     let (clock, runtime, fake, controller) = connected();
@@ -983,6 +989,7 @@ fn ack_command_write_cancelled_error_commits_cancelled() {
     runtime.close();
 }
 
+// conformance: transport.close-wakes-ack
 #[test]
 fn close_cancels_blocked_ack_and_joins_lane() {
     let (clock, runtime, fake, controller) = connected();
@@ -1007,6 +1014,7 @@ fn close_cancels_blocked_ack_and_joins_lane() {
     runtime.close();
 }
 
+// conformance: timeout.ack-fails
 #[test]
 fn blocked_ack_obeys_its_protocol_deadline() {
     let (clock, runtime, fake, controller) = connected();
@@ -1051,6 +1059,7 @@ fn ack_protocol_timeout_starts_after_command_write_acceptance() {
     runtime.close();
 }
 
+// conformance: transport.disconnect-warning
 #[test]
 fn sequence_disconnect_releases_lease_and_exposes_neutral_warning() {
     let (clock, runtime, fake, controller) = connected();

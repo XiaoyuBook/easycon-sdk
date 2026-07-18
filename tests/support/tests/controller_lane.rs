@@ -76,6 +76,8 @@ impl Clock for ControllerDeadlineClock {
     }
 }
 
+// conformance: vertical.transport-boundary
+// conformance: transport.bytes-exact
 #[test]
 fn fallback_connect_partial_direct_and_close_are_exact() {
     let clock = Arc::new(VirtualClock::default());
@@ -194,6 +196,7 @@ fn fallback_connect_partial_direct_and_close_are_exact() {
     runtime.close();
 }
 
+// conformance: transport.close-spacing
 #[test]
 fn report_spacing_and_snapshot_use_transport_acceptance_time() {
     let clock = Arc::new(VirtualClock::default());
@@ -340,6 +343,7 @@ fn hat_sticks_and_reset_all_flow_through_the_report_lane() {
     runtime.close();
 }
 
+// conformance: timeout.protocol-fails
 #[test]
 fn handshake_protocol_timeout_is_failed_not_cancelled() {
     let clock = Arc::new(VirtualClock::default());

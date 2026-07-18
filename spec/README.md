@@ -11,7 +11,8 @@ architecture.
 - `fixtures/controller/sequence-traces-v1.json` fixes precise-sequence dispatch and cancellation
   traces in virtual monotonic nanoseconds.
 - `conformance/runtime-controller-v1.json` defines the hardware-free vertical slice and fault
-  scenarios.
+  scenarios. Every step and assertion has a stable ID; every scenario/assertion maps to a concrete
+  Rust `#[test]` through a matching `// conformance:` source marker.
 - `schemas/` contains JSON Schema Draft 2020-12 documents for every asset shape. The local validator
   applies the schema subset used here to each concrete instance rather than only parsing the schema
   documents.
@@ -19,6 +20,12 @@ architecture.
 The fixtures were transcribed from the source evidence named in each file. Controller golden-vector
 and precise-sequence tests read these tracked files directly. Tests and validation do not open,
 build, download, or otherwise depend on `EasyCon/`.
+
+`tools/validate_specs.py` compares the complete assertion and Rust marker sets. It rejects duplicate
+assertion/step IDs, missing or renamed tests, stale source markers, and mappings that disagree with
+the test carrying the marker. The Runtime stabilization and terminal-transaction scenarios use
+structured reference actions until their production APIs land; the root-cause commits replace those
+markers with production regression tests without changing assertion IDs.
 
 Run the local validator with:
 

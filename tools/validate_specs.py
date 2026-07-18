@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Validate the milestone JSON schemas and fixtures without third-party packages."""
 
+import copy
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -358,8 +360,42 @@ def validate_traces():
     require(cancel["expected_reports"][-1].get("purpose") == "neutralize", "cancel trace lacks neutralization")
 
 
-def validate_conformance():
-    conformance = load_json("conformance/runtime-controller-v1.json")
+CONFORMANCE_MARKER = re.compile(
+    r"^[ \t]*// conformance: ([a-z0-9][a-z0-9.-]*)[ \t]*$", re.MULTILINE
+)
+CONFORMANCE_TEST_BLOCK = re.compile(
+    r"(?P<markers>(?:^[ \t]*// conformance: [a-z0-9][a-z0-9.-]*[ \t]*\r?\n)+)"
+    r"^[ \t]*#\[test\][ \t]*\r?\n"
+    r"^[ \t]*fn[ \t]+(?P<test>[A-Za-z_][A-Za-z0-9_]*)[ \t]*\(",
+    re.MULTILINE,
+)
+
+
+def conformance_test_markers():
+    markers = {}
+    for source_root in (ROOT / "crates", ROOT / "tests"):
+        for path in sorted(source_root.rglob("*.rs")):
+            text = path.read_text(encoding="utf-8")
+            raw_ids = CONFORMANCE_MARKER.findall(text)
+            captured_ids = []
+            relative = path.relative_to(ROOT).as_posix()
+            for match in CONFORMANCE_TEST_BLOCK.finditer(text):
+                test_ref = "{}::{}".format(relative, match.group("test"))
+                for assertion_id in CONFORMANCE_MARKER.findall(match.group("markers")):
+                    require(
+                        assertion_id not in markers,
+                        "duplicate conformance marker: {}".format(assertion_id),
+                    )
+                    markers[assertion_id] = test_ref
+                    captured_ids.append(assertion_id)
+            require(
+                sorted(raw_ids) == sorted(captured_ids),
+                "{} has conformance markers not attached to a Rust #[test]".format(relative),
+            )
+    return markers
+
+
+def validate_conformance_document(conformance, markers):
     require(conformance.get("schema_version") == 1, "conformance schema_version must be 1")
     require(conformance.get("license") == "GPL-3.0-only", "conformance license changed")
     scenario_ids = [scenario["id"] for scenario in conformance["scenarios"]]
@@ -372,9 +408,90 @@ def validate_conformance():
         "event-overflow",
     ]
     require(scenario_ids == required, "conformance scenarios changed or were reordered")
+    require(len(scenario_ids) == len(set(scenario_ids)), "duplicate conformance scenario ID")
+    scenario_tests = [scenario["test"] for scenario in conformance["scenarios"]]
+    require(
+        len(scenario_tests) == len(set(scenario_tests)),
+        "duplicate conformance scenario test mapping",
+    )
+    known_tests = set(markers.values())
+    step_ids = set()
+    assertion_ids = set()
     for scenario in conformance["scenarios"]:
         require(scenario["steps"], "{} has no steps".format(scenario["id"]))
         require(scenario["assertions"], "{} has no assertions".format(scenario["id"]))
+        require(
+            scenario["test"] in known_tests,
+            "{} maps to a missing or unmarked Rust test: {}".format(
+                scenario["id"], scenario["test"]
+            ),
+        )
+        for step in scenario["steps"]:
+            require(step["id"], "{} has an empty step ID".format(scenario["id"]))
+            require(step["action"], "{} has an empty action".format(step["id"]))
+            require(step["id"] not in step_ids,
+                    "duplicate conformance step ID: {}".format(step["id"]))
+            step_ids.add(step["id"])
+        for assertion in scenario["assertions"]:
+            assertion_id = assertion["id"]
+            require(assertion_id, "{} has an empty assertion ID".format(scenario["id"]))
+            require(assertion["expect"], "{} has an empty expectation".format(assertion_id))
+            require(
+                assertion_id not in assertion_ids,
+                "duplicate conformance assertion ID: {}".format(assertion_id),
+            )
+            assertion_ids.add(assertion_id)
+            require(
+                markers.get(assertion_id) == assertion["test"],
+                "{} has a missing, stale, or invalid Rust test mapping: {}".format(
+                    assertion_id, assertion["test"]
+                ),
+            )
+    require(
+        assertion_ids == set(markers),
+        "conformance assertion and Rust marker sets differ: spec_only={!r}, rust_only={!r}".format(
+            sorted(assertion_ids - set(markers)), sorted(set(markers) - assertion_ids)
+        ),
+    )
+
+
+def require_conformance_rejected(conformance, markers, message):
+    try:
+        validate_conformance_document(conformance, markers)
+    except ValidationError:
+        return
+    raise ValidationError(message)
+
+
+def validate_conformance_regressions(conformance, markers):
+    duplicate = copy.deepcopy(conformance)
+    duplicate["scenarios"][0]["assertions"].append(
+        copy.deepcopy(duplicate["scenarios"][0]["assertions"][0])
+    )
+    require_conformance_rejected(
+        duplicate, markers, "duplicate conformance assertion was not rejected"
+    )
+
+    missing = copy.deepcopy(conformance)
+    missing["scenarios"][0]["assertions"][0]["test"] = (
+        "tests/support/tests/missing.rs::missing_test"
+    )
+    require_conformance_rejected(
+        missing, markers, "missing conformance test mapping was not rejected"
+    )
+
+    stale_markers = dict(markers)
+    stale_markers["stale.assertion"] = next(iter(markers.values()))
+    require_conformance_rejected(
+        conformance, stale_markers, "stale Rust conformance marker was not rejected"
+    )
+
+
+def validate_conformance():
+    conformance = load_json("conformance/runtime-controller-v1.json")
+    markers = conformance_test_markers()
+    validate_conformance_document(conformance, markers)
+    validate_conformance_regressions(conformance, markers)
 
 
 def main():

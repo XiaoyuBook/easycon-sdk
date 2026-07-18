@@ -1124,6 +1124,7 @@ mod tests {
         runtime.close();
     }
 
+    // conformance: timeout.wait-does-not-cancel
     #[test]
     fn wait_timeout_does_not_cancel_operation() {
         let runtime = Runtime::new(Arc::new(VirtualClock::default()));
@@ -1270,6 +1271,7 @@ mod tests {
         assert_eq!(operation.snapshot().state, OperationState::Succeeded);
     }
 
+    // conformance: timeout.deadline-cancels
     #[test]
     fn deadline_requests_cancel_but_cleanup_owns_terminal_commit() {
         let clock = Arc::new(VirtualClock::default());
@@ -1356,6 +1358,7 @@ mod tests {
         );
     }
 
+    // conformance: event.gap-range
     #[test]
     fn queue_overflow_reports_gap_without_blocking_or_changing_state() {
         let clock = Arc::new(VirtualClock::default());
@@ -1407,6 +1410,7 @@ mod tests {
         assert_eq!(subscription.queued_len(), 2);
     }
 
+    // conformance: event.query-authoritative
     #[test]
     fn capacity_one_preserves_latest_terminal_and_query_is_authoritative() {
         let runtime = Runtime::new(Arc::new(VirtualClock::default()));
@@ -1445,6 +1449,7 @@ mod tests {
         assert_eq!(operation.snapshot().state, OperationState::Succeeded);
     }
 
+    // conformance: event.sequence-order
     #[test]
     fn gap_remains_between_earlier_critical_and_later_event() {
         let runtime = Runtime::new(Arc::new(VirtualClock::default()));
@@ -1492,6 +1497,7 @@ mod tests {
         );
     }
 
+    // conformance: event.producer-nonblocking
     #[test]
     fn concurrent_publishers_enqueue_in_global_sequence_order() {
         let runtime = Runtime::new(Arc::new(VirtualClock::default()));
@@ -2046,6 +2052,7 @@ mod tests {
         runtime.close();
     }
 
+    // conformance: event.final-bypasses-filter
     #[test]
     fn final_runtime_event_bypasses_subscription_severity_filter() {
         let runtime = Runtime::new(Arc::new(VirtualClock::default()));
