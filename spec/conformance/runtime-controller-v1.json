@@ -99,7 +99,7 @@
     },
     {
       "id": "operation-terminal-transaction",
-      "test": "tests/support/tests/runtime_conformance.rs::operation_terminal_reference_actions_are_executable",
+      "test": "crates/easycon-runtime/src/runtime.rs::parent_terminal_seals_child_admission_before_owner_cleanup",
       "steps": [
         { "id": "operation.parent-child-race", "action": "race parent terminal start against child operation admission" },
         { "id": "operation.hook-panic", "action": "register two cancellation hooks and a child where the first hook panics" },
@@ -116,7 +116,7 @@
         {
           "id": "operation.hook-panic-isolated",
           "expect": "one cancellation hook panic does not skip later hooks or any live child",
-          "test": "tests/support/tests/runtime_conformance.rs::operation_terminal_reference_actions_are_executable"
+          "test": "crates/easycon-runtime/src/cancellation.rs::hook_panic_does_not_skip_later_hooks_or_children"
         },
         {
           "id": "operation.immutable-terminal",

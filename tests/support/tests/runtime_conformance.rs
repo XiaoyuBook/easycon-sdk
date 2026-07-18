@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs;
-use std::sync::{Arc, Barrier, Condvar, Mutex};
+use std::sync::{Arc, Barrier, Mutex};
 
 use serde_json::Value;
 
@@ -107,65 +107,6 @@ impl RuntimeContractModel {
         assert_eq!(self.state, ContractRuntimeState::CloseFailed);
         self.task_active = false;
         self.operation_terminal = true;
-    }
-}
-
-struct TerminalState {
-    parent_open: bool,
-    early_child_cancelled: bool,
-    terminal: bool,
-    value: Option<u64>,
-}
-
-struct TerminalContractModel {
-    state: Mutex<TerminalState>,
-    registry_linked: Mutex<bool>,
-    changed: Condvar,
-}
-
-impl TerminalContractModel {
-    fn new() -> Self {
-        Self {
-            state: Mutex::new(TerminalState {
-                parent_open: true,
-                early_child_cancelled: false,
-                terminal: false,
-                value: None,
-            }),
-            registry_linked: Mutex::new(true),
-            changed: Condvar::new(),
-        }
-    }
-
-    fn admit_child(&self) -> bool {
-        lock_recover(&self.state).parent_open
-    }
-
-    fn finish_with_faults(&self, value: u64) -> bool {
-        let mut state = lock_recover(&self.state);
-        if state.terminal {
-            return false;
-        }
-        state.parent_open = false;
-        state.early_child_cancelled = true;
-        state.terminal = true;
-        state.value = Some(value);
-        let _ = std::panic::catch_unwind(|| panic!("scripted terminal event failure"));
-        *lock_recover(&self.registry_linked) = false;
-        drop(state);
-        self.changed.notify_all();
-        true
-    }
-
-    fn wait_terminal_and_check_unlinked(&self) -> bool {
-        let mut state = lock_recover(&self.state);
-        while !state.terminal {
-            state = self
-                .changed
-                .wait(state)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-        }
-        !*lock_recover(&self.registry_linked)
     }
 }
 
@@ -292,67 +233,6 @@ fn runtime_stabilization_reference_actions_are_executable() {
             "runtime.saved-close-failed",
             "runtime.owner-terminal-order",
             "runtime.close-report",
-        ],
-    );
-}
-
-// conformance: operation.hook-panic-isolated
-#[test]
-fn operation_terminal_reference_actions_are_executable() {
-    let model = Arc::new(TerminalContractModel::new());
-    assert!(model.admit_child());
-
-    let later_hook_called = Arc::new(Mutex::new(false));
-    let child_cancelled = Arc::new(Mutex::new(false));
-    let hooks: Vec<Box<dyn Fn() + Send>> =
-        vec![Box::new(|| panic!("scripted cancellation hook panic")), {
-            let later_hook_called = Arc::clone(&later_hook_called);
-            Box::new(move || *lock_recover(&later_hook_called) = true)
-        }];
-    for hook in hooks {
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook));
-    }
-    *lock_recover(&child_cancelled) = true;
-    assert!(*lock_recover(&later_hook_called));
-    assert!(*lock_recover(&child_cancelled));
-
-    let poisoned_registry = Arc::clone(&model);
-    assert!(
-        std::thread::spawn(move || {
-            let _guard = poisoned_registry
-                .registry_linked
-                .lock()
-                .expect("registry lock before scripted panic");
-            panic!("scripted registry poison");
-        })
-        .join()
-        .is_err()
-    );
-    let waiter_model = Arc::clone(&model);
-    let waiter = std::thread::spawn(move || waiter_model.wait_terminal_and_check_unlinked());
-    assert!(model.finish_with_faults(41));
-    assert!(waiter.join().expect("terminal waiter"));
-    assert!(!model.admit_child());
-    assert!(!model.finish_with_faults(99));
-    let state = lock_recover(&model.state);
-    assert!(state.early_child_cancelled);
-    assert_eq!(state.value, Some(41));
-
-    verify_coverage(
-        "operation-terminal-transaction",
-        &[
-            "operation.parent-child-race",
-            "operation.hook-panic",
-            "operation.event-fault",
-            "operation.registry-fault",
-            "operation.poison-recovery",
-        ],
-        &[
-            "operation.child-admission",
-            "operation.hook-panic-isolated",
-            "operation.immutable-terminal",
-            "operation.unlink-before-wake",
-            "operation.failure-notify",
         ],
     );
 }

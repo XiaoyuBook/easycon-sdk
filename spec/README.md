@@ -23,9 +23,9 @@ build, download, or otherwise depend on `EasyCon/`.
 
 `tools/validate_specs.py` compares the complete assertion and Rust marker sets. It rejects duplicate
 assertion/step IDs, missing or renamed tests, stale source markers, and mappings that disagree with
-the test carrying the marker. The Runtime stabilization and terminal-transaction scenarios use
-structured reference actions until their production APIs land; the root-cause commits replace those
-markers with production regression tests without changing assertion IDs.
+the test carrying the marker. The Runtime stabilization scenario uses structured reference actions
+until its production API lands; the root-cause commits replace those markers with production
+regression tests without changing assertion IDs.
 
 Run the local validator with:
 

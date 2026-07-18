@@ -1,5 +1,6 @@
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use easycon_model::RuntimeId;
 
@@ -76,7 +77,7 @@ impl CancellationToken {
             .inner
             .children
             .lock()
-            .expect("cancellation child lock poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         children.retain(|existing| {
             existing
                 .upgrade()
@@ -132,7 +133,7 @@ impl CancellationToken {
             return;
         }
         if self.is_cancelled() {
-            hook();
+            invoke_hook(&hook);
             return;
         }
 
@@ -140,14 +141,14 @@ impl CancellationToken {
             .inner
             .hooks
             .lock()
-            .expect("cancellation hook lock poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         hooks.retain(CancelHookEntry::is_active);
         if !self.inner.active.load(Ordering::Acquire) {
             return;
         }
         if self.is_cancelled() {
             drop(hooks);
-            hook();
+            invoke_hook(&hook);
         } else {
             hooks.push(CancelHookEntry { lifetime, hook });
         }
@@ -166,16 +167,13 @@ fn cancel_inner(inner: &Arc<CancellationInner>) {
         return;
     }
 
-    let hooks = std::mem::take(&mut *inner.hooks.lock().expect("cancellation hook lock poisoned"));
+    let hooks = std::mem::take(&mut *lock_recover(&inner.hooks));
     for entry in hooks.into_iter().filter(CancelHookEntry::is_active) {
-        (entry.hook)();
+        invoke_hook(&entry.hook);
     }
 
     let children = {
-        let mut children = inner
-            .children
-            .lock()
-            .expect("cancellation child lock poisoned");
+        let mut children = lock_recover(&inner.children);
         let live: Vec<_> = children
             .iter()
             .filter_map(Weak::upgrade)
@@ -193,16 +191,9 @@ fn deactivate_inner(inner: &Arc<CancellationInner>) {
     if !inner.active.swap(false, Ordering::AcqRel) {
         return;
     }
-    inner
-        .hooks
-        .lock()
-        .expect("cancellation hook lock poisoned")
-        .clear();
+    lock_recover(&inner.hooks).clear();
     let children: Vec<_> = {
-        let mut children = inner
-            .children
-            .lock()
-            .expect("cancellation child lock poisoned");
+        let mut children = lock_recover(&inner.children);
         let live = children.iter().filter_map(Weak::upgrade).collect();
         children.clear();
         live
@@ -212,8 +203,19 @@ fn deactivate_inner(inner: &Arc<CancellationInner>) {
     }
 }
 
+fn invoke_hook(hook: &CancelHook) {
+    let _ = catch_unwind(AssertUnwindSafe(|| hook()));
+}
+
+fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
 
     use super::*;
@@ -327,5 +329,75 @@ mod tests {
                 .expect("cancellation children")
                 .is_empty()
         );
+    }
+
+    // conformance: operation.hook-panic-isolated
+    #[test]
+    fn hook_panic_does_not_skip_later_hooks_or_children() {
+        let root = CancellationToken::root();
+        let child = root.child();
+        let grandchild = child.child();
+        root.on_cancel(|| panic!("scripted cancellation hook panic"));
+        let later_hook_called = Arc::new(AtomicBool::new(false));
+        let observed_later_hook = Arc::clone(&later_hook_called);
+        root.on_cancel(move || {
+            observed_later_hook.store(true, Ordering::Release);
+        });
+        let child_hook_called = Arc::new(AtomicBool::new(false));
+        let observed_child_hook = Arc::clone(&child_hook_called);
+        child.on_cancel(move || {
+            observed_child_hook.store(true, Ordering::Release);
+        });
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| root.cancel()));
+
+        assert!(
+            result.is_ok(),
+            "cancellation hook panic escaped propagation"
+        );
+        assert!(later_hook_called.load(Ordering::Acquire));
+        assert!(child_hook_called.load(Ordering::Acquire));
+        assert!(child.is_cancelled());
+        assert!(grandchild.is_cancelled());
+    }
+
+    #[test]
+    fn poisoned_cancellation_locks_recover_without_losing_propagation() {
+        let root = CancellationToken::root();
+        let poisoned = Arc::clone(&root.inner);
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = poisoned.hooks.lock().expect("hooks before scripted panic");
+                panic!("scripted hook registry poison");
+            })
+            .join()
+            .is_err()
+        );
+        let hook_called = Arc::new(AtomicBool::new(false));
+        let observed_hook = Arc::clone(&hook_called);
+        let registration = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            root.on_cancel(move || observed_hook.store(true, Ordering::Release));
+        }));
+        assert!(registration.is_ok(), "poisoned hook registry escaped");
+
+        let poisoned = Arc::clone(&root.inner);
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = poisoned
+                    .children
+                    .lock()
+                    .expect("children before scripted panic");
+                panic!("scripted child registry poison");
+            })
+            .join()
+            .is_err()
+        );
+        let child = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| root.child()))
+            .expect("poisoned child registry escaped");
+
+        root.cancel();
+
+        assert!(hook_called.load(Ordering::Acquire));
+        assert!(child.is_cancelled());
     }
 }
