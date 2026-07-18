@@ -14,7 +14,7 @@ use crate::cancellation::CancellationToken;
 use crate::clock::{Clock, ClockChangeRegistration};
 use crate::event::{
     Event, EventDraft, EventKind, EventSubscription, Severity, SubscriptionInner,
-    SubscriptionOptions,
+    SubscriptionOptions, close_subscriptions_with_final,
 };
 use crate::operation::{CancellationReason, Operation, OperationInner};
 
@@ -157,6 +157,8 @@ pub(crate) struct RuntimeInner {
     task_join_after_unlink: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     deadline_worker_panic: AtomicBool,
+    #[cfg(test)]
+    final_event_failure_at: AtomicUsize,
     deadline_task_id: TaskId,
     subscriptions: Mutex<Vec<Weak<SubscriptionInner>>>,
     events_closed: AtomicBool,
@@ -339,6 +341,8 @@ impl Runtime {
             task_join_after_unlink: Mutex::new(None),
             #[cfg(test)]
             deadline_worker_panic: AtomicBool::new(false),
+            #[cfg(test)]
+            final_event_failure_at: AtomicUsize::new(usize::MAX),
             deadline_task_id: task_id,
             subscriptions: Mutex::new(Vec::new()),
             events_closed: AtomicBool::new(false),
@@ -1058,25 +1062,30 @@ impl RuntimeInner {
         if self.events_closed.load(Ordering::Acquire) {
             return Ok(());
         }
-        let event = self.next_event(draft);
-        self.events_closed.store(true, Ordering::Release);
-        let mut failed = false;
+        #[cfg(test)]
+        let fail_at = match self
+            .final_event_failure_at
+            .swap(usize::MAX, Ordering::AcqRel)
+        {
+            usize::MAX => None,
+            index => Some(index),
+        };
+        let mut live = Vec::new();
         subscriptions.retain(|subscription| {
             let Some(subscription) = subscription.upgrade() else {
                 return false;
             };
-            if catch_unwind(AssertUnwindSafe(|| {
-                subscription.enqueue_final(event.clone());
-                subscription.close();
-            }))
-            .is_err()
-            {
-                failed = true;
-                let _ = catch_unwind(AssertUnwindSafe(|| subscription.close()));
-            }
+            live.push(subscription);
             true
         });
-        if failed { Err(()) } else { Ok(()) }
+        #[cfg(test)]
+        if fail_at.is_some_and(|index| index < live.len()) {
+            return Err(());
+        }
+        let event = self.next_event(draft);
+        close_subscriptions_with_final(&live, event);
+        self.events_closed.store(true, Ordering::Release);
+        Ok(())
     }
 
     fn next_event(&self, draft: EventDraft) -> Event {
@@ -2709,6 +2718,42 @@ mod tests {
             })
         ));
         assert_eq!(events.read(WaitTimeout::Poll), SubscriptionRead::Closed);
+    }
+
+    #[test]
+    fn final_event_failure_never_exposes_runtime_closed() {
+        let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+        let first = runtime
+            .subscribe(SubscriptionOptions::default())
+            .expect("first subscription");
+        let second = runtime
+            .subscribe(SubscriptionOptions::default())
+            .expect("second subscription");
+        runtime
+            .inner
+            .final_event_failure_at
+            .store(1, Ordering::Release);
+
+        let CloseOutcome::Failed(report) = runtime.close().expect("Runtime close") else {
+            panic!("injected final event failure cannot report Closed");
+        };
+        assert_eq!(report.phase, ClosePhase::FinalEvent);
+        assert_eq!(runtime.state(), RuntimeState::CloseFailed);
+
+        for subscription in [&first, &second] {
+            let mut codes = Vec::new();
+            loop {
+                match subscription.read(WaitTimeout::Poll) {
+                    SubscriptionRead::Event(event) => codes.push(event.code),
+                    SubscriptionRead::Closed => break,
+                    SubscriptionRead::Timeout => {
+                        panic!("failed-close subscription must be closed")
+                    }
+                }
+            }
+            assert_eq!(codes.last(), Some(&"runtime.close_failed"));
+            assert!(!codes.contains(&"runtime.closed"));
+        }
     }
 
     #[test]

@@ -188,13 +188,14 @@ pub(crate) struct SubscriptionInner {
     changed: Condvar,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct QueueState {
     entries: VecDeque<QueueEntry>,
     event_count: usize,
     closed: bool,
 }
 
+#[derive(Clone)]
 enum QueueEntry {
     Event(Event),
     Gap(PendingGap),
@@ -247,50 +248,16 @@ impl SubscriptionInner {
         self.enqueue_accepted(event);
     }
 
-    pub(crate) fn enqueue_final(&self, event: Event) {
-        self.enqueue_accepted(event);
-    }
-
     fn enqueue_accepted(&self, event: Event) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.closed {
-            return;
-        }
-
-        if state.event_count >= self.options.capacity {
-            let ordinary = state
-                .entries
-                .iter()
-                .position(|queued| {
-                    matches!(queued, QueueEntry::Event(event) if event.class == EventClass::Ordinary)
-                });
-            match (event.class, ordinary) {
-                (_, Some(index)) => {
-                    drop_event_at(&mut state, index);
-                    push_event(&mut state, event);
-                }
-                (EventClass::Critical, None) => {
-                    let index = state
-                        .entries
-                        .iter()
-                        .position(|entry| matches!(entry, QueueEntry::Event(_)))
-                        .expect("a full queue contains a concrete event");
-                    drop_event_at(&mut state, index);
-                    push_event(&mut state, event);
-                }
-                (EventClass::Ordinary, None) => {
-                    let index = state.entries.len();
-                    record_gap_at(&mut state, index, &event);
-                }
-            }
-        } else {
-            push_event(&mut state, event);
-        }
+        let changed = enqueue_accepted_state(self.options, &mut state, event);
         drop(state);
-        self.changed.notify_one();
+        if changed {
+            self.changed.notify_one();
+        }
     }
 
     fn read(&self, wait: WaitTimeout) -> SubscriptionRead {
@@ -347,6 +314,35 @@ impl SubscriptionInner {
     }
 }
 
+pub(crate) fn close_subscriptions_with_final(
+    subscriptions: &[Arc<SubscriptionInner>],
+    event: Event,
+) {
+    let mut states: Vec<_> = subscriptions
+        .iter()
+        .map(|subscription| {
+            subscription
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        })
+        .collect();
+    let mut staged = Vec::with_capacity(states.len());
+    for (subscription, state) in subscriptions.iter().zip(&states) {
+        let mut next = (**state).clone();
+        let _ = enqueue_accepted_state(subscription.options, &mut next, event.clone());
+        next.closed = true;
+        staged.push(next);
+    }
+    for (state, next) in states.iter_mut().zip(staged) {
+        **state = next;
+    }
+    drop(states);
+    for subscription in subscriptions {
+        subscription.changed.notify_all();
+    }
+}
+
 impl PendingGap {
     fn from_event(dropped: &Event) -> Self {
         Self {
@@ -386,6 +382,44 @@ impl PendingGap {
 fn push_event(state: &mut QueueState, event: Event) {
     state.entries.push_back(QueueEntry::Event(event));
     state.event_count += 1;
+}
+
+fn enqueue_accepted_state(
+    options: SubscriptionOptions,
+    state: &mut QueueState,
+    event: Event,
+) -> bool {
+    if state.closed {
+        return false;
+    }
+
+    if state.event_count >= options.capacity {
+        let ordinary = state.entries.iter().position(|queued| {
+            matches!(queued, QueueEntry::Event(event) if event.class == EventClass::Ordinary)
+        });
+        match (event.class, ordinary) {
+            (_, Some(index)) => {
+                drop_event_at(state, index);
+                push_event(state, event);
+            }
+            (EventClass::Critical, None) => {
+                let index = state
+                    .entries
+                    .iter()
+                    .position(|entry| matches!(entry, QueueEntry::Event(_)))
+                    .expect("a full queue contains a concrete event");
+                drop_event_at(state, index);
+                push_event(state, event);
+            }
+            (EventClass::Ordinary, None) => {
+                let index = state.entries.len();
+                record_gap_at(state, index, &event);
+            }
+        }
+    } else {
+        push_event(state, event);
+    }
+    true
 }
 
 fn drop_event_at(state: &mut QueueState, index: usize) {
