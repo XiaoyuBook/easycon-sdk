@@ -48,7 +48,8 @@
   operation/resource/task 计数全部为零，`runtime.closed` 之后的事件发布会被拒绝。
 - 单个 `ManagedResource::close` panic 会被隔离，发布 `runtime.resource.close_panicked` 后继续关闭其他健康资源，
   但保留失败资源及其 task 的监督注册并使本次关闭失败；所有意外内部关闭 panic 都不声称 `Closed`，而是保持 `Closing`；若事件生产仍开放则用
-  `runtime.close_panicked` 终止，并唤醒 concurrent/later close caller，使其快速报告 panic 而不是永久等待。
+  `Cancelled(ParentClose)` 兜底终结仍可访问的 operation，再用 `runtime.close_panicked` 终止事件流，并唤醒
+  concurrent/later close caller，使 operation 和 close waiter 都不会永久等待。
 
 ## 本地验证
 

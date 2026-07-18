@@ -35,7 +35,7 @@
         "the dedicated finalizer completes the normal close order after task cleanup",
         "managed resource close callbacks do not run on the dropping thread",
         "final-handle drop enters Closing and rejects admission before returning",
-        "a resource close panic emits an error event while healthy resources close, retains failed supervision, wakes waiters, and never claims Closed",
+        "a resource close panic emits an error event while healthy resources close, commits remaining operations as Cancelled with ParentClose, retains failed resource supervision, wakes waiters, and never claims Closed",
         "an unexpected internal close panic wakes every close waiter without claiming Closed and terminates the event stream with a failure event when production remains open"
       ]
     },

@@ -783,6 +783,9 @@ impl RuntimeInner {
             self.root_cancellation.cancel();
         }));
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.finish_operations_after_close_failure();
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.stop_deadline_worker();
         }));
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -809,6 +812,9 @@ impl RuntimeInner {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.root_cancellation.cancel();
         }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.finish_operations_after_close_failure();
+        }));
         let _ = self.deadline_sender.send(DeadlineSignal::Shutdown);
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.close_events(EventDraft::critical(
@@ -818,6 +824,31 @@ impl RuntimeInner {
             ));
         }));
         self.state_changed.notify_all();
+    }
+
+    fn finish_operations_after_close_failure(&self) {
+        let mut operations: Vec<_> = match self.operations.lock() {
+            Ok(operations) => operations
+                .values()
+                .cloned()
+                .map(|inner| Operation { inner })
+                .collect(),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .values()
+                .cloned()
+                .map(|inner| Operation { inner })
+                .collect(),
+        };
+        operations.sort_by_key(Operation::id);
+        for operation in operations {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = operation.request_cancel(CancellationReason::ParentClose);
+            }));
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = operation.finish_cancelled();
+            }));
+        }
     }
 
     fn next_event(&self, draft: EventDraft) -> Event {
@@ -1746,6 +1777,8 @@ mod tests {
         let events = runtime
             .subscribe(SubscriptionOptions::default())
             .expect("subscribe");
+        let operation = runtime.create_operation(None).expect("operation");
+        operation.start();
         let panicking = Arc::new(PanickingResource::default());
         let managed: Arc<dyn ManagedResource> = panicking.clone();
         let (registration, task) = runtime
@@ -1767,6 +1800,11 @@ mod tests {
 
         assert_eq!(supervised.state(), RuntimeState::Closing);
         assert!(healthy.closed.load(Ordering::Acquire));
+        assert!(matches!(
+            operation.wait(WaitTimeout::Poll),
+            WaitResult::Completed(_)
+        ));
+        assert_eq!(operation.snapshot().state, OperationState::Cancelled);
         assert_eq!(
             supervised.counts(),
             RuntimeCounts {
