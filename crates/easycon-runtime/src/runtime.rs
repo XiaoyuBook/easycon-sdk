@@ -159,6 +159,10 @@ pub(crate) struct RuntimeInner {
     deadline_worker_panic: AtomicBool,
     #[cfg(test)]
     final_event_failure_at: AtomicUsize,
+    #[cfg(test)]
+    operation_terminal_event_panic: AtomicBool,
+    #[cfg(test)]
+    operation_registry_unlink_panic: AtomicBool,
     deadline_task_id: TaskId,
     subscriptions: Mutex<Vec<Weak<SubscriptionInner>>>,
     events_closed: AtomicBool,
@@ -343,6 +347,10 @@ impl Runtime {
             deadline_worker_panic: AtomicBool::new(false),
             #[cfg(test)]
             final_event_failure_at: AtomicUsize::new(usize::MAX),
+            #[cfg(test)]
+            operation_terminal_event_panic: AtomicBool::new(false),
+            #[cfg(test)]
+            operation_registry_unlink_panic: AtomicBool::new(false),
             deadline_task_id: task_id,
             subscriptions: Mutex::new(Vec::new()),
             events_closed: AtomicBool::new(false),
@@ -1041,6 +1049,28 @@ impl RuntimeInner {
             .remove(&id);
     }
 
+    #[cfg(test)]
+    pub(crate) fn take_operation_terminal_event_failpoint(&self) -> bool {
+        self.operation_terminal_event_panic
+            .swap(false, Ordering::AcqRel)
+    }
+
+    #[cfg(not(test))]
+    pub(crate) const fn take_operation_terminal_event_failpoint(&self) -> bool {
+        false
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_operation_registry_unlink_failpoint(&self) -> bool {
+        self.operation_registry_unlink_panic
+            .swap(false, Ordering::AcqRel)
+    }
+
+    #[cfg(not(test))]
+    pub(crate) const fn take_operation_registry_unlink_failpoint(&self) -> bool {
+        false
+    }
+
     pub(crate) fn try_publish_event(&self, draft: EventDraft) -> Result<Event, EasyConError> {
         let mut subscriptions = self
             .subscriptions
@@ -1530,6 +1560,7 @@ mod tests {
         runtime.close().expect("Runtime close");
     }
 
+    // conformance: operation.reentrant-hook
     #[test]
     fn terminal_child_hook_can_observe_parent_without_deadlock() {
         let runtime = Runtime::new(Arc::new(VirtualClock::default()));
@@ -1573,41 +1604,31 @@ mod tests {
     #[test]
     fn terminal_faults_still_unlink_and_wake_waiters() {
         let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+        let events = runtime
+            .subscribe(SubscriptionOptions::default())
+            .expect("events");
         let operation = runtime.create_operation(None).expect("operation");
         operation.start();
+        runtime
+            .inner
+            .operation_terminal_event_panic
+            .store(true, Ordering::Release);
+        runtime
+            .inner
+            .operation_registry_unlink_panic
+            .store(true, Ordering::Release);
 
-        let poisoned_runtime = Arc::clone(&runtime.inner);
-        assert!(
-            std::thread::spawn(move || {
-                let _guard = poisoned_runtime
-                    .subscriptions
-                    .lock()
-                    .expect("subscription registry before scripted panic");
-                panic!("scripted event registry poison");
+        let barrier = Arc::new(Barrier::new(3));
+        let waiters: Vec<_> = (0..2)
+            .map(|_| {
+                let waiting_operation = operation.clone();
+                let waiting_barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    waiting_barrier.wait();
+                    waiting_operation.wait(WaitTimeout::For(Duration::from_secs(2)))
+                })
             })
-            .join()
-            .is_err()
-        );
-        let poisoned_runtime = Arc::clone(&runtime.inner);
-        assert!(
-            std::thread::spawn(move || {
-                let _guard = poisoned_runtime
-                    .operations
-                    .lock()
-                    .expect("operation registry before scripted panic");
-                panic!("scripted operation registry poison");
-            })
-            .join()
-            .is_err()
-        );
-
-        let barrier = Arc::new(Barrier::new(2));
-        let waiting_operation = operation.clone();
-        let waiting_barrier = barrier.clone();
-        let waiter = std::thread::spawn(move || {
-            waiting_barrier.wait();
-            waiting_operation.wait(WaitTimeout::For(Duration::from_secs(2)))
-        });
+            .collect();
         barrier.wait();
         let finish = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             operation.succeed(OperationValue::Unit)
@@ -1617,13 +1638,15 @@ mod tests {
             finish.expect("terminal transaction must isolate faults"),
             TransitionOutcome::Applied
         );
-        assert!(matches!(
-            waiter.join().expect("terminal waiter"),
-            WaitResult::Completed(OperationSnapshot {
-                state: OperationState::Succeeded,
-                ..
-            })
-        ));
+        for waiter in waiters {
+            assert!(matches!(
+                waiter.join().expect("terminal waiter"),
+                WaitResult::Completed(OperationSnapshot {
+                    state: OperationState::Succeeded,
+                    ..
+                })
+            ));
+        }
         assert!(
             runtime
                 .inner
@@ -1632,9 +1655,24 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .is_empty()
         );
-
-        runtime.inner.subscriptions.clear_poison();
-        runtime.inner.operations.clear_poison();
+        assert!(
+            !runtime
+                .inner
+                .operation_terminal_event_panic
+                .load(Ordering::Acquire)
+        );
+        assert!(
+            !runtime
+                .inner
+                .operation_registry_unlink_panic
+                .load(Ordering::Acquire)
+        );
+        let codes: Vec<_> = std::iter::from_fn(|| match events.read(WaitTimeout::Poll) {
+            SubscriptionRead::Event(event) => Some(event.code),
+            SubscriptionRead::Timeout | SubscriptionRead::Closed => None,
+        })
+        .collect();
+        assert_eq!(codes, ["runtime.operation.running"]);
         runtime.close().expect("Runtime close");
     }
 
@@ -2541,6 +2579,7 @@ mod tests {
         assert!(!codes.contains(&"runtime.closed"));
     }
 
+    // conformance: operation.poison-recovery
     #[test]
     fn poisoned_operation_registry_does_not_kill_deadline_supervision() {
         let clock = Arc::new(VirtualClock::default());
@@ -2720,6 +2759,7 @@ mod tests {
         assert_eq!(events.read(WaitTimeout::Poll), SubscriptionRead::Closed);
     }
 
+    // conformance: runtime.final-event-failure
     #[test]
     fn final_event_failure_never_exposes_runtime_closed() {
         let runtime = Runtime::new(Arc::new(VirtualClock::default()));
@@ -2808,6 +2848,7 @@ mod tests {
         assert!(Arc::ptr_eq(&report, &later));
     }
 
+    // conformance: runtime.task-panic-race
     #[test]
     fn concurrent_external_join_cannot_hide_a_task_panic_from_close() {
         let runtime = Runtime::new(Arc::new(VirtualClock::default()));
@@ -2890,6 +2931,7 @@ mod tests {
         assert_eq!(runtime.counts().active_tasks, 0);
     }
 
+    // conformance: runtime.task-exit-owned
     #[test]
     fn task_exit_destructor_close_is_rejected_before_state_change() {
         let runtime = Runtime::new(Arc::new(VirtualClock::default()));
@@ -2917,6 +2959,7 @@ mod tests {
         assert_eq!(runtime.close(), Ok(CloseOutcome::Closed));
     }
 
+    // conformance: runtime.task-exit-self-join
     #[test]
     fn task_exit_destructor_cannot_join_its_own_thread() {
         let runtime = Runtime::new(Arc::new(VirtualClock::default()));

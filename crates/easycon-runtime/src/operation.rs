@@ -414,7 +414,16 @@ impl OperationInner {
 
     fn unlink_registry(&self) {
         if let Some(runtime) = self.runtime.upgrade() {
-            let _ = catch_unwind(AssertUnwindSafe(|| runtime.unregister_operation(self.id)));
+            let unlinked = catch_unwind(AssertUnwindSafe(|| {
+                assert!(
+                    !runtime.take_operation_registry_unlink_failpoint(),
+                    "failpoint:runtime.operation.registry_unlink"
+                );
+                runtime.unregister_operation(self.id);
+            }));
+            if unlinked.is_err() {
+                let _ = catch_unwind(AssertUnwindSafe(|| runtime.unregister_operation(self.id)));
+            }
         }
     }
 
@@ -476,6 +485,10 @@ impl OperationInner {
         };
         let draft = EventDraft::critical(kind, code, severity);
         let _ = catch_unwind(AssertUnwindSafe(|| {
+            assert!(
+                !(data.state.is_terminal() && runtime.take_operation_terminal_event_failpoint()),
+                "failpoint:runtime.operation.terminal_event"
+            );
             let _ = runtime.try_publish_event(draft.with_operation(self.id));
         }));
     }

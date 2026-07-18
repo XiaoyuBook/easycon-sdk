@@ -3,7 +3,10 @@
 
 import copy
 import json
+import os
 import re
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -395,6 +398,77 @@ def conformance_test_markers():
     return markers
 
 
+def cargo_executable():
+    cargo = shutil.which("cargo")
+    if cargo:
+        return cargo
+    fallback = Path.home() / ".cargo" / ("cargo.exe" if os.name == "nt" else "cargo")
+    if fallback.is_file():
+        return str(fallback)
+    raise ValidationError("cargo was not found in PATH or $HOME/.cargo/bin")
+
+
+def discovered_rust_tests():
+    command = [
+        cargo_executable(),
+        "test",
+        "--workspace",
+        "--all-features",
+        "--",
+        "--list",
+        "--format",
+        "terse",
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            cwd=str(ROOT),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except OSError as error:
+        raise ValidationError("could not list Rust tests: {}".format(error))
+    require(
+        result.returncode == 0,
+        "cargo test discovery failed: {}".format(result.stderr.strip()),
+    )
+    return {
+        line[:-len(": test")]
+        for line in result.stdout.splitlines()
+        if line.endswith(": test")
+    }
+
+
+def executable_test_name(test_ref):
+    source, function = test_ref.rsplit("::", 1)
+    if "/src/" not in source:
+        return function
+    module = source.split("/src/", 1)[1]
+    require(module.endswith(".rs"), "invalid Rust source test mapping: {}".format(test_ref))
+    module = module[:-3]
+    if module == "lib":
+        return "tests::{}".format(function)
+    if module.endswith("/mod"):
+        module = module[:-len("/mod")]
+    return "{}::tests::{}".format(module.replace("/", "::"), function)
+
+
+def validate_conformance_test_discovery(markers, discovered):
+    missing = sorted(
+        (assertion_id, test_ref, executable_test_name(test_ref))
+        for assertion_id, test_ref in markers.items()
+        if executable_test_name(test_ref) not in discovered
+    )
+    require(
+        not missing,
+        "conformance mappings are not discovered by cargo test: {!r}".format(missing),
+    )
+
+
 def validate_conformance_document(conformance, markers):
     require(conformance.get("schema_version") == 1, "conformance schema_version must be 1")
     require(conformance.get("license") == "GPL-3.0-only", "conformance license changed")
@@ -420,18 +494,35 @@ def validate_conformance_document(conformance, markers):
     for scenario in conformance["scenarios"]:
         require(scenario["steps"], "{} has no steps".format(scenario["id"]))
         require(scenario["assertions"], "{} has no assertions".format(scenario["id"]))
+        require(scenario["tests"], "{} has no executable test suite".format(scenario["id"]))
+        require(
+            len(scenario["tests"]) == len(set(scenario["tests"])),
+            "{} has duplicate executable tests".format(scenario["id"]),
+        )
         require(
             scenario["test"] in known_tests,
             "{} maps to a missing or unmarked Rust test: {}".format(
                 scenario["id"], scenario["test"]
             ),
         )
+        require(
+            scenario["test"] in scenario["tests"],
+            "{} primary test is absent from its executable suite".format(scenario["id"]),
+        )
+        for test_ref in scenario["tests"]:
+            require(
+                test_ref in known_tests,
+                "{} suite maps to a missing or unmarked Rust test: {}".format(
+                    scenario["id"], test_ref
+                ),
+            )
         for step in scenario["steps"]:
             require(step["id"], "{} has an empty step ID".format(scenario["id"]))
             require(step["action"], "{} has an empty action".format(step["id"]))
             require(step["id"] not in step_ids,
                     "duplicate conformance step ID: {}".format(step["id"]))
             step_ids.add(step["id"])
+        expected_scenario_tests = []
         for assertion in scenario["assertions"]:
             assertion_id = assertion["id"]
             require(assertion_id, "{} has an empty assertion ID".format(scenario["id"]))
@@ -447,6 +538,12 @@ def validate_conformance_document(conformance, markers):
                     assertion_id, assertion["test"]
                 ),
             )
+            if assertion["test"] not in expected_scenario_tests:
+                expected_scenario_tests.append(assertion["test"])
+        require(
+            scenario["tests"] == expected_scenario_tests,
+            "{} executable suite does not exactly cover its assertions".format(scenario["id"]),
+        )
     require(
         assertion_ids == set(markers),
         "conformance assertion and Rust marker sets differ: spec_only={!r}, rust_only={!r}".format(
@@ -486,12 +583,32 @@ def validate_conformance_regressions(conformance, markers):
         conformance, stale_markers, "stale Rust conformance marker was not rejected"
     )
 
+    incomplete_suite = copy.deepcopy(conformance)
+    incomplete_suite["scenarios"][0]["tests"].pop()
+    require_conformance_rejected(
+        incomplete_suite, markers, "incomplete conformance scenario suite was not rejected"
+    )
+
+
+def validate_conformance_discovery_regression(markers, discovered):
+    first_test = executable_test_name(next(iter(markers.values())))
+    missing = set(discovered)
+    missing.discard(first_test)
+    try:
+        validate_conformance_test_discovery(markers, missing)
+    except ValidationError:
+        return
+    raise ValidationError("undiscovered conformance test was not rejected")
+
 
 def validate_conformance():
     conformance = load_json("conformance/runtime-controller-v1.json")
     markers = conformance_test_markers()
+    discovered = discovered_rust_tests()
+    validate_conformance_test_discovery(markers, discovered)
     validate_conformance_document(conformance, markers)
     validate_conformance_regressions(conformance, markers)
+    validate_conformance_discovery_regression(markers, discovered)
 
 
 def main():

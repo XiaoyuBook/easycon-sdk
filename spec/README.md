@@ -11,8 +11,9 @@ architecture.
 - `fixtures/controller/sequence-traces-v1.json` fixes precise-sequence dispatch and cancellation
   traces in virtual monotonic nanoseconds.
 - `conformance/runtime-controller-v1.json` defines the hardware-free vertical slice and fault
-  scenarios. Every step and assertion has a stable ID; every scenario/assertion maps to a concrete
-  Rust `#[test]` through a matching `// conformance:` source marker.
+  scenarios. Every step and assertion has a stable ID. Each scenario declares the exact executable
+  Rust test suite covering its assertions, and every assertion maps through a matching
+  `// conformance:` source marker.
 - `schemas/` contains JSON Schema Draft 2020-12 documents for every asset shape. The local validator
   applies the schema subset used here to each concrete instance rather than only parsing the schema
   documents.
@@ -21,11 +22,12 @@ The fixtures were transcribed from the source evidence named in each file. Contr
 and precise-sequence tests read these tracked files directly. Tests and validation do not open,
 build, download, or otherwise depend on `EasyCon/`.
 
-`tools/validate_specs.py` compares the complete assertion and Rust marker sets. It rejects duplicate
-assertion/step IDs, missing or renamed tests, stale source markers, and mappings that disagree with
-the test carrying the marker. The Runtime stabilization scenario uses structured reference actions
-until its production API lands; the root-cause commits replace those markers with production
-regression tests without changing assertion IDs.
+`tools/validate_specs.py` compares the complete assertion and Rust marker sets, checks each scenario
+suite for exact assertion coverage, and verifies every mapped test appears in Cargo's actual test
+discovery. It rejects duplicate assertion/step IDs, missing or renamed tests, stale source markers,
+`cfg`-disabled tests, incomplete scenario suites, and mappings that disagree with the test carrying
+the marker. Runtime stabilization assertions execute production regression paths with named fault
+injection where failure behavior is part of the contract.
 
 Run the local validator with:
 

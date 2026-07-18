@@ -6,6 +6,10 @@
     {
       "id": "vertical-slice",
       "test": "tests/support/tests/vertical_slice.rs::runtime_controller_fake_vertical_slice_has_exact_trace_and_clean_shutdown",
+      "tests": [
+        "tests/support/tests/vertical_slice.rs::runtime_controller_fake_vertical_slice_has_exact_trace_and_clean_shutdown",
+        "tests/support/tests/controller_lane.rs::fallback_connect_partial_direct_and_close_are_exact"
+      ],
       "steps": [
         { "id": "vertical.runtime-create", "action": "create Runtime with VirtualClock" },
         { "id": "vertical.subscribe", "action": "subscribe to bounded events" },
@@ -49,14 +53,26 @@
     {
       "id": "runtime-stabilization",
       "test": "crates/easycon-runtime/src/runtime.rs::resource_panic_saves_one_report_without_forcing_owner_terminal",
+      "tests": [
+        "crates/easycon-runtime/src/runtime.rs::task_close_without_manual_binding_does_not_self_wait",
+        "crates/easycon-runtime/src/runtime.rs::task_exit_destructor_close_is_rejected_before_state_change",
+        "crates/easycon-runtime/src/runtime.rs::task_exit_destructor_cannot_join_its_own_thread",
+        "crates/easycon-runtime/src/runtime.rs::concurrent_external_join_cannot_hide_a_task_panic_from_close",
+        "crates/easycon-runtime/src/runtime.rs::final_owning_drop_only_rejects_admission_and_requests_cancellation",
+        "crates/easycon-runtime/src/runtime.rs::resource_panic_saves_one_report_without_forcing_owner_terminal",
+        "crates/easycon-runtime/src/runtime.rs::final_event_failure_never_exposes_runtime_closed"
+      ],
       "steps": [
         { "id": "runtime.spawn-self-close", "action": "spawn a supervised task through Runtime and call synchronous close from its task body" },
+        { "id": "runtime.task-exit-destructor", "action": "call close and self-join from task-owned TLS destructors after the body completion signal" },
+        { "id": "runtime.task-panic-race", "action": "pause an external panic-task join at registry unlink while another thread closes Runtime" },
         { "id": "runtime.external-close", "action": "close the same Runtime externally after the supervised task exits" },
         { "id": "runtime.final-drop", "action": "drop the final owning handle of a fresh Runtime with a live resource and subscription" },
         { "id": "runtime.drop-observe", "action": "observe admission rejection and root cancellation without releasing the resource owner" },
         { "id": "runtime.resource-panic", "action": "explicitly close another Runtime whose first resource callback panics and whose healthy resource can close" },
         { "id": "runtime.failed-owner-cleanup", "action": "hold the failed resource owner task in cleanup while concurrent close callers wait" },
         { "id": "runtime.finish-real-cleanup", "action": "finish the real owner cleanup after every close caller receives the saved outcome" },
+        { "id": "runtime.final-event-failure", "action": "fail final-event preflight for the second subscription before atomically committing any Runtime final event" },
         { "id": "runtime.repeat-close-failed", "action": "call close again after CloseFailed" }
       ],
       "assertions": [
@@ -69,6 +85,21 @@
           "id": "runtime.task-owned",
           "expect": "Runtime owns task completion, JoinHandle, owner binding, join, and unregister without a public task registration protocol",
           "test": "crates/easycon-runtime/src/runtime.rs::task_close_without_manual_binding_does_not_self_wait"
+        },
+        {
+          "id": "runtime.task-exit-owned",
+          "expect": "task ownership remains active through TLS destruction so synchronous close is rejected before state change",
+          "test": "crates/easycon-runtime/src/runtime.rs::task_exit_destructor_close_is_rejected_before_state_change"
+        },
+        {
+          "id": "runtime.task-exit-self-join",
+          "expect": "a task-owned TLS destructor cannot join its own Runtime-owned thread",
+          "test": "crates/easycon-runtime/src/runtime.rs::task_exit_destructor_cannot_join_its_own_thread"
+        },
+        {
+          "id": "runtime.task-panic-race",
+          "expect": "external join cannot unlink a panicked task before its diagnostic is durable to concurrent close",
+          "test": "crates/easycon-runtime/src/runtime.rs::concurrent_external_join_cannot_hide_a_task_panic_from_close"
         },
         {
           "id": "runtime.drop-limited",
@@ -94,15 +125,29 @@
           "id": "runtime.close-report",
           "expect": "CloseFailed retains diagnostic resource or task IDs and non-converged registry counts",
           "test": "crates/easycon-runtime/src/runtime.rs::resource_panic_saves_one_report_without_forcing_owner_terminal"
+        },
+        {
+          "id": "runtime.final-event-failure",
+          "expect": "a failed final-event transaction exposes only runtime.close_failed and never a partial runtime.closed",
+          "test": "crates/easycon-runtime/src/runtime.rs::final_event_failure_never_exposes_runtime_closed"
         }
       ]
     },
     {
       "id": "operation-terminal-transaction",
       "test": "crates/easycon-runtime/src/runtime.rs::parent_terminal_seals_child_admission_before_owner_cleanup",
+      "tests": [
+        "crates/easycon-runtime/src/runtime.rs::parent_terminal_seals_child_admission_before_owner_cleanup",
+        "crates/easycon-runtime/src/cancellation.rs::hook_panic_does_not_skip_later_hooks_or_children",
+        "crates/easycon-runtime/src/runtime.rs::operation_commits_terminal_state_and_event_once",
+        "crates/easycon-runtime/src/runtime.rs::terminal_faults_still_unlink_and_wake_waiters",
+        "crates/easycon-runtime/src/runtime.rs::terminal_child_hook_can_observe_parent_without_deadlock",
+        "crates/easycon-runtime/src/runtime.rs::poisoned_operation_registry_does_not_kill_deadline_supervision"
+      ],
       "steps": [
         { "id": "operation.parent-child-race", "action": "race parent terminal start against child operation admission" },
         { "id": "operation.hook-panic", "action": "register two cancellation hooks and a child where the first hook panics" },
+        { "id": "operation.hook-reentry", "action": "observe the parent operation from a child cancellation hook during terminal sealing" },
         { "id": "operation.event-fault", "action": "inject terminal event delivery failure while an operation waiter is blocked" },
         { "id": "operation.registry-fault", "action": "inject operation registry unlink failure while a second waiter is blocked" },
         { "id": "operation.poison-recovery", "action": "poison each recoverable Runtime synchronization lock before retrying its operation" }
@@ -132,12 +177,29 @@
           "id": "operation.failure-notify",
           "expect": "event, registry, hook, and poisoned-lock faults cannot suppress waiter notification",
           "test": "crates/easycon-runtime/src/runtime.rs::terminal_faults_still_unlink_and_wake_waiters"
+        },
+        {
+          "id": "operation.reentrant-hook",
+          "expect": "a child cancellation hook can observe its parent without deadlocking terminal commit, unlink, or waiter notification",
+          "test": "crates/easycon-runtime/src/runtime.rs::terminal_child_hook_can_observe_parent_without_deadlock"
+        },
+        {
+          "id": "operation.poison-recovery",
+          "expect": "a poisoned operation registry is recovered without killing deadline supervision or changing successful close",
+          "test": "crates/easycon-runtime/src/runtime.rs::poisoned_operation_registry_does_not_kill_deadline_supervision"
         }
       ]
     },
     {
       "id": "timeout-separation",
       "test": "crates/easycon-runtime/src/runtime.rs::wait_timeout_does_not_cancel_operation",
+      "tests": [
+        "crates/easycon-runtime/src/runtime.rs::wait_timeout_does_not_cancel_operation",
+        "crates/easycon-runtime/src/runtime.rs::deadline_requests_cancel_but_cleanup_owns_terminal_commit",
+        "tests/support/tests/controller_lane.rs::handshake_protocol_timeout_is_failed_not_cancelled",
+        "tests/support/tests/sequence_ack.rs::blocked_ack_obeys_its_protocol_deadline",
+        "tests/support/tests/sequence_ack.rs::blocked_report_write_obeys_its_io_deadline"
+      ],
       "steps": [
         { "id": "timeout.poll", "action": "poll a running operation with zero wait timeout" },
         { "id": "timeout.deadline", "action": "advance past an operation deadline without manually polling Runtime" },
@@ -176,6 +238,17 @@
     {
       "id": "transport-faults",
       "test": "tests/support/tests/controller_lane.rs::fallback_connect_partial_direct_and_close_are_exact",
+      "tests": [
+        "tests/support/tests/controller_lane.rs::fallback_connect_partial_direct_and_close_are_exact",
+        "tests/support/tests/sequence_ack.rs::ack_matcher_ignores_late_generation_and_rejects_wrong_reply",
+        "tests/support/tests/sequence_ack.rs::ack_waits_for_an_earlier_report_in_the_fifo_lane",
+        "tests/support/tests/sequence_ack.rs::cancel_after_final_sequence_acceptance_still_neutralizes",
+        "tests/support/tests/controller_lane.rs::report_spacing_and_snapshot_use_transport_acceptance_time",
+        "tests/support/tests/sequence_ack.rs::close_interrupts_a_blocked_report_write_and_joins",
+        "tests/support/tests/sequence_ack.rs::ack_disconnect_resets_desired_state_before_explicit_reconnect",
+        "tests/support/tests/sequence_ack.rs::sequence_disconnect_releases_lease_and_exposes_neutral_warning",
+        "tests/support/tests/sequence_ack.rs::close_cancels_blocked_ack_and_joins_lane"
+      ],
       "steps": [
         { "id": "transport.partial-write", "action": "accept a report using partial writes" },
         { "id": "transport.late-ack", "action": "ignore a late ACK from an older generation" },
@@ -239,6 +312,13 @@
     {
       "id": "event-overflow",
       "test": "crates/easycon-runtime/src/runtime.rs::queue_overflow_reports_gap_without_blocking_or_changing_state",
+      "tests": [
+        "crates/easycon-runtime/src/runtime.rs::queue_overflow_reports_gap_without_blocking_or_changing_state",
+        "crates/easycon-runtime/src/runtime.rs::gap_remains_between_earlier_critical_and_later_event",
+        "crates/easycon-runtime/src/runtime.rs::concurrent_publishers_enqueue_in_global_sequence_order",
+        "crates/easycon-runtime/src/runtime.rs::capacity_one_preserves_latest_terminal_and_query_is_authoritative",
+        "crates/easycon-runtime/src/runtime.rs::final_runtime_event_bypasses_subscription_severity_filter"
+      ],
       "steps": [
         { "id": "event.capacity-one", "action": "create a capacity-one subscription" },
         { "id": "event.overflow", "action": "publish more ordinary events than capacity" },
