@@ -151,8 +151,6 @@ fn ids<'a>(scenario: &'a Value, field: &str) -> BTreeSet<&'a str> {
         .collect()
 }
 
-// conformance: runtime.self-close-rejected
-// conformance: runtime.task-owned
 // conformance: runtime.drop-limited
 // conformance: runtime.healthy-cleanup-after-panic
 // conformance: runtime.saved-close-failed

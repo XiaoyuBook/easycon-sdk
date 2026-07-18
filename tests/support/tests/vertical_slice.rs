@@ -103,8 +103,8 @@ fn runtime_controller_fake_vertical_slice_has_exact_trace_and_clean_shutdown() {
     assert_eq!(controller.snapshot().lease, ControllerLeaseState::Available);
 
     clock.advance_to(130_000_000);
-    runtime.close();
-    runtime.close();
+    runtime.close().expect("Runtime close");
+    runtime.close().expect("Runtime close");
 
     assert_eq!(connect.snapshot().state, OperationState::Succeeded);
     assert_eq!(direct.snapshot().state, OperationState::Succeeded);

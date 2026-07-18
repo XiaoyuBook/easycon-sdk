@@ -2,15 +2,14 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::thread::JoinHandle;
 
 use easycon_model::{
     Button, EasyConError, ErrorCode, ErrorDomain, Hat, OperationId, ResourceId, StickPosition,
 };
 use easycon_runtime::{
     Clock, ClockChangeRegistration, DeadlineId, EventDraft, EventKind, ManagedResource, Operation,
-    OperationState, OperationValue, ResourceRegistration, Runtime, Severity, TaskRegistration,
-    TransitionOutcome,
+    OperationState, OperationValue, ResourceRegistration, Runtime, Severity, SupervisedTask,
+    SupervisedTaskOutcome, TransitionOutcome,
 };
 
 use crate::protocol::SwitchReport;
@@ -202,7 +201,7 @@ struct ControllerInner {
 
 enum WorkerState {
     Starting,
-    Running(JoinHandle<()>),
+    Running(SupervisedTask),
     Failed,
     Joined,
 }
@@ -318,7 +317,6 @@ struct ControllerLane {
     transport: Box<dyn ControllerTransport>,
     receiver: Receiver<LaneCommand>,
     snapshot: Arc<Mutex<ControllerSnapshot>>,
-    task: Option<TaskRegistration>,
     desired_report: SwitchReport,
     pending_reports: VecDeque<ScheduledReport>,
     deferred_commands: VecDeque<LaneCommand>,
@@ -363,8 +361,8 @@ impl ControllerSession {
             resource_cancellation: resource_cancellation.clone(),
         });
         let managed: Arc<dyn ManagedResource> = inner.clone();
-        let (registration, task) = match runtime.register_resource_with_task(managed) {
-            Ok(registrations) => registrations,
+        let registration = match runtime.register_resource(managed) {
+            Ok(registration) => registration,
             Err(error) => {
                 *inner
                     .worker
@@ -396,7 +394,6 @@ impl ControllerSession {
             transport,
             receiver,
             snapshot,
-            task: Some(task),
             desired_report: SwitchReport::NEUTRAL,
             pending_reports: VecDeque::new(),
             deferred_commands: VecDeque::new(),
@@ -408,10 +405,12 @@ impl ControllerSession {
             waiting_sequence: None,
             next_ack_generation: 1,
         };
-        let worker = std::thread::Builder::new()
-            .name(format!("easycon-controller-{}", resource_id.get()))
-            .spawn(move || lane.run())
-            .map_err(|error| {
+        let worker = match runtime.spawn_supervised(
+            format!("easycon-controller-{}", resource_id.get()),
+            move || lane.run(),
+        ) {
+            Ok(worker) => worker,
+            Err(error) => {
                 let mut state = inner
                     .worker
                     .lock()
@@ -419,12 +418,9 @@ impl ControllerSession {
                 *state = WorkerState::Failed;
                 drop(state);
                 inner.worker_ready.notify_all();
-                EasyConError::new(
-                    ErrorDomain::Runtime,
-                    ErrorCode::Internal,
-                    format!("failed to start controller lane: {error}"),
-                )
-            })?;
+                return Err(error);
+            }
+        };
         let mut state = inner
             .worker
             .lock()
@@ -661,7 +657,13 @@ impl ControllerInner {
             }
         };
         if let Some(worker) = worker {
-            worker.join().expect("controller lane must not panic");
+            assert_eq!(
+                worker
+                    .join()
+                    .expect("controller lane cannot synchronously join itself"),
+                SupervisedTaskOutcome::Completed,
+                "controller lane must not panic"
+            );
         }
         self.registration
             .lock()
@@ -684,10 +686,6 @@ impl Drop for ControllerInner {
 
 impl ControllerLane {
     fn run(mut self) {
-        self.task
-            .as_ref()
-            .expect("controller task registration exists while lane runs")
-            .bind_to_current_thread();
         loop {
             self.observe_cancellation();
             self.dispatch_due_reports();
@@ -748,7 +746,6 @@ impl ControllerLane {
                 }
             }
         }
-        self.task.take();
     }
 
     fn next_command(&mut self) -> Option<LaneCommand> {

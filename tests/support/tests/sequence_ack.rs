@@ -270,7 +270,7 @@ fn precise_sequence_matches_absolute_offset_fixture_without_drift() {
     assert_eq!(controller.snapshot().lease, ControllerLeaseState::Available);
 
     close_after_minimum_interval(&clock, &controller);
-    runtime.close();
+    runtime.close().expect("Runtime close");
 }
 
 #[test]
@@ -356,7 +356,7 @@ fn sequence_cancel_neutralizes_and_releases_before_terminal() {
     assert!(released < terminal);
 
     close_after_minimum_interval(&clock, &controller);
-    runtime.close();
+    runtime.close().expect("Runtime close");
 }
 
 #[test]
@@ -387,7 +387,7 @@ fn minimum_interval_delays_steps_without_dropping_transitions() {
     );
     assert_eq!(fake.accepted_writes()[2].bytes, [0, 0, 65, 8, 4, 2, 1, 128]);
     close_after_minimum_interval(&clock, &controller);
-    runtime.close();
+    runtime.close().expect("Runtime close");
 }
 
 #[test]
@@ -423,7 +423,7 @@ fn sequence_future_state_is_not_applied_before_its_offset() {
         )
     );
     close_after_minimum_interval(&clock, &controller);
-    runtime.close();
+    runtime.close().expect("Runtime close");
 }
 
 // conformance: transport.accepted-cancel-terminal
@@ -455,7 +455,7 @@ fn cancel_after_final_sequence_acceptance_still_neutralizes() {
         SwitchReport::NEUTRAL.encode()
     );
     close_after_minimum_interval(&clock, &controller);
-    runtime.close();
+    runtime.close().expect("Runtime close");
 }
 
 #[test]
@@ -479,7 +479,7 @@ fn cancel_after_direct_acceptance_still_reaches_cancelled() {
         SwitchReport::NEUTRAL.encode()
     );
     close_after_minimum_interval(&clock, &controller);
-    runtime.close();
+    runtime.close().expect("Runtime close");
 }
 
 #[test]
@@ -523,7 +523,7 @@ fn direct_cancel_rebuilds_later_reports_from_neutral() {
         .encode()
     );
     close_after_minimum_interval(&clock, &controller);
-    runtime.close();
+    runtime.close().expect("Runtime close");
 }
 
 #[test]
@@ -592,7 +592,7 @@ fn failed_cancel_neutral_keeps_later_desired_report_authoritative() {
     );
 
     close_after_minimum_interval(&clock, &controller);
-    runtime.close();
+    runtime.close().expect("Runtime close");
 }
 
 // conformance: transport.ack-fifo
@@ -629,7 +629,7 @@ fn ack_waits_for_an_earlier_report_in_the_fifo_lane() {
         [WriteKind::Report, WriteKind::Report, WriteKind::Command]
     );
     close_after_minimum_interval(&clock, &controller);
-    runtime.close();
+    runtime.close().expect("Runtime close");
 }
 
 // conformance: transport.close-interrupts-write
@@ -663,7 +663,7 @@ fn close_interrupts_a_blocked_report_write_and_joins() {
             .iter()
             .all(|write| write.bytes == SwitchReport::NEUTRAL.encode())
     );
-    runtime.close();
+    runtime.close().expect("Runtime close");
 }
 
 // conformance: timeout.write-fails
@@ -690,7 +690,7 @@ fn blocked_report_write_obeys_its_io_deadline() {
         SwitchReport::NEUTRAL.encode()
     );
     close_after_minimum_interval(&clock, &controller);
-    runtime.close();
+    runtime.close().expect("Runtime close");
 }
 
 #[test]
@@ -716,7 +716,7 @@ fn delayed_report_write_stops_at_its_io_deadline() {
         SwitchReport::NEUTRAL.encode()
     );
     close_after_minimum_interval(&clock, &controller);
-    runtime.close();
+    runtime.close().expect("Runtime close");
 }
 
 #[test]
@@ -731,7 +731,7 @@ fn runtime_close_does_not_execute_direct_queued_behind_ack() {
         .direct(ControllerAction::ButtonDown(Button::A))
         .expect("queued direct");
 
-    runtime.close();
+    runtime.close().expect("Runtime close");
 
     wait_terminal(&ack);
     wait_terminal(&direct);
@@ -795,7 +795,7 @@ fn automation_lease_is_a_low_level_exclusive_primitive() {
         .expect("released then reacquired");
     drop(second);
     close_after_minimum_interval(&clock, &controller);
-    runtime.close();
+    runtime.close().expect("Runtime close");
 }
 
 // conformance: transport.late-ack-isolated
@@ -854,7 +854,7 @@ fn ack_matcher_ignores_late_generation_and_rejects_wrong_reply() {
     );
 
     close_after_minimum_interval(&clock, &controller);
-    runtime.close();
+    runtime.close().expect("Runtime close");
 }
 
 // conformance: transport.ack-disconnect-reset
@@ -920,7 +920,7 @@ fn ack_disconnect_resets_desired_state_before_explicit_reconnect() {
     );
 
     close_after_minimum_interval(&clock, &controller);
-    runtime.close();
+    runtime.close().expect("Runtime close");
 }
 
 #[test]
@@ -960,7 +960,7 @@ fn ack_command_write_disconnect_resets_controller_state() {
     }));
 
     close_after_minimum_interval(&clock, &controller);
-    runtime.close();
+    runtime.close().expect("Runtime close");
 }
 
 #[test]
@@ -986,7 +986,7 @@ fn ack_command_write_cancelled_error_commits_cancelled() {
     );
     assert_eq!(controller.snapshot().state, ControllerState::Connected);
     close_after_minimum_interval(&clock, &controller);
-    runtime.close();
+    runtime.close().expect("Runtime close");
 }
 
 // conformance: transport.close-wakes-ack
@@ -1011,7 +1011,7 @@ fn close_cancels_blocked_ack_and_joins_lane() {
             active_tasks: 1,
         }
     );
-    runtime.close();
+    runtime.close().expect("Runtime close");
 }
 
 // conformance: timeout.ack-fails
@@ -1034,7 +1034,7 @@ fn blocked_ack_obeys_its_protocol_deadline() {
     );
     assert_eq!(controller.snapshot().state, ControllerState::Connected);
     close_after_minimum_interval(&clock, &controller);
-    runtime.close();
+    runtime.close().expect("Runtime close");
 }
 
 #[test]
@@ -1056,7 +1056,7 @@ fn ack_protocol_timeout_starts_after_command_write_acceptance() {
     assert_eq!(clock.now_ns(), 110);
     assert_eq!(controller.snapshot().state, ControllerState::Connected);
     close_after_minimum_interval(&clock, &controller);
-    runtime.close();
+    runtime.close().expect("Runtime close");
 }
 
 // conformance: transport.disconnect-warning
@@ -1092,7 +1092,7 @@ fn sequence_disconnect_releases_lease_and_exposes_neutral_warning() {
             .any(|event| event.code == "controller.neutralization.not_delivered")
     );
     close_after_minimum_interval(&clock, &controller);
-    runtime.close();
+    runtime.close().expect("Runtime close");
 }
 
 #[test]
@@ -1128,7 +1128,7 @@ fn recoverable_sequence_write_failure_accepts_neutral_before_failed() {
     );
     assert_eq!(controller.snapshot().lease, ControllerLeaseState::Available);
     close_after_minimum_interval(&clock, &controller);
-    runtime.close();
+    runtime.close().expect("Runtime close");
 }
 
 #[test]
@@ -1157,5 +1157,5 @@ fn sequence_target_overflow_uses_the_same_neutral_failure_guard() {
     );
     assert_eq!(controller.snapshot().lease, ControllerLeaseState::Available);
     close_after_minimum_interval(&clock, &controller);
-    runtime.close();
+    runtime.close().expect("Runtime close");
 }

@@ -63,12 +63,12 @@
         {
           "id": "runtime.self-close-rejected",
           "expect": "supervised task close is rejected before Runtime state changes and external close later succeeds",
-          "test": "tests/support/tests/runtime_conformance.rs::runtime_stabilization_reference_actions_are_executable"
+          "test": "crates/easycon-runtime/src/runtime.rs::task_close_without_manual_binding_does_not_self_wait"
         },
         {
           "id": "runtime.task-owned",
           "expect": "Runtime owns task completion, JoinHandle, owner binding, join, and unregister without a public task registration protocol",
-          "test": "tests/support/tests/runtime_conformance.rs::runtime_stabilization_reference_actions_are_executable"
+          "test": "crates/easycon-runtime/src/runtime.rs::task_close_without_manual_binding_does_not_self_wait"
         },
         {
           "id": "runtime.drop-limited",

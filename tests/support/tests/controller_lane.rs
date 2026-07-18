@@ -193,7 +193,7 @@ fn fallback_connect_partial_direct_and_close_are_exact() {
     );
     assert_eq!(runtime.counts().active_resources, 0);
     assert_eq!(runtime.counts().active_tasks, 1);
-    runtime.close();
+    runtime.close().expect("Runtime close");
 }
 
 // conformance: transport.close-spacing
@@ -275,7 +275,7 @@ fn report_spacing_and_snapshot_use_transport_acceptance_time() {
         controller.snapshot().last_report_timestamp_ns,
         Some(80_000_000)
     );
-    runtime.close();
+    runtime.close().expect("Runtime close");
 }
 
 #[test]
@@ -340,7 +340,7 @@ fn hat_sticks_and_reset_all_flow_through_the_report_lane() {
     assert_eq!(writes[3].bytes, SwitchReport::NEUTRAL.encode());
 
     close_after_minimum_interval(&clock, &controller);
-    runtime.close();
+    runtime.close().expect("Runtime close");
 }
 
 // conformance: timeout.protocol-fails
@@ -369,7 +369,7 @@ fn handshake_protocol_timeout_is_failed_not_cancelled() {
     );
     assert_eq!(controller.snapshot().state, ControllerState::Disconnected);
     close_after_minimum_interval(&clock, &controller);
-    runtime.close();
+    runtime.close().expect("Runtime close");
 }
 
 #[test]
@@ -399,7 +399,7 @@ fn operation_deadline_cancels_connect_before_second_baud_attempt() {
     );
     assert_eq!(fake.handshake_attempts().len(), 1);
     controller.close();
-    runtime.close();
+    runtime.close().expect("Runtime close");
 }
 
 #[test]
@@ -434,7 +434,7 @@ fn operation_deadline_on_final_baud_is_not_a_protocol_timeout() {
     );
     assert_eq!(fake.handshake_attempts().len(), 2);
     controller.close();
-    runtime.close();
+    runtime.close().expect("Runtime close");
 }
 
 #[test]
@@ -474,7 +474,7 @@ fn handshake_protocol_errors_use_bounded_fallback_then_fail() {
     );
     assert_eq!(fake.handshake_attempts().len(), 2);
     controller.close();
-    runtime.close();
+    runtime.close().expect("Runtime close");
 }
 
 #[test]
@@ -496,7 +496,7 @@ fn direct_while_disconnected_fails_without_transport_write() {
     assert_eq!(action.snapshot().state, OperationState::Failed);
     assert!(fake.accepted_writes().is_empty());
     controller.close();
-    runtime.close();
+    runtime.close().expect("Runtime close");
 }
 
 #[test]
@@ -591,7 +591,7 @@ fn concurrent_callers_still_use_one_writer_thread() {
     );
 
     close_after_minimum_interval(&clock, &controller);
-    runtime.close();
+    runtime.close().expect("Runtime close");
 }
 
 #[test]
@@ -616,7 +616,7 @@ fn controller_construction_and_runtime_close_have_no_half_admitted_state() {
         let closer_barrier = barrier.clone();
         let closer = std::thread::spawn(move || {
             closer_barrier.wait();
-            closer_runtime.close();
+            closer_runtime.close().expect("Runtime close");
         });
         barrier.wait();
 

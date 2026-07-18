@@ -21,7 +21,8 @@ pub use operation::{
     TransitionOutcome, WaitResult,
 };
 pub use runtime::{
-    ManagedResource, ResourceRegistration, Runtime, RuntimeCounts, RuntimeState, TaskRegistration,
+    CloseRejection, ManagedResource, ResourceRegistration, Runtime, RuntimeCounts, RuntimeState,
+    SupervisedTask, SupervisedTaskOutcome, TaskJoinError,
 };
 pub use wait::WaitTimeout;
 
