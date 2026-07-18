@@ -1,8 +1,8 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Condvar, Mutex, Weak};
-use std::thread::JoinHandle;
+use std::thread::{JoinHandle, ThreadId};
 
 use easycon_model::{
     EasyConError, ErrorCode, ErrorDomain, OperationId, ResourceId, RuntimeId, TaskId,
@@ -66,7 +66,7 @@ pub(crate) struct RuntimeInner {
     next_sequence: AtomicU64,
     operations: Mutex<HashMap<OperationId, Arc<OperationInner>>>,
     resources: Mutex<HashMap<ResourceId, Weak<dyn ManagedResource>>>,
-    tasks: Mutex<HashSet<TaskId>>,
+    tasks: Mutex<HashMap<TaskId, Option<ThreadId>>>,
     tasks_changed: Condvar,
     deadline_task_id: TaskId,
     subscriptions: Mutex<Vec<Weak<SubscriptionInner>>>,
@@ -130,6 +130,32 @@ impl TaskRegistration {
         self.id
     }
 
+    /// Binds this registration to the worker thread before it executes supervised work.
+    ///
+    /// A bound worker cannot call synchronous [`Runtime::close`], because it cannot both wait for
+    /// and unregister itself. Repeated binding on the same thread is harmless.
+    pub fn bind_to_current_thread(&self) {
+        assert!(
+            !self.released.load(Ordering::Acquire),
+            "a released task cannot be bound to a worker thread"
+        );
+        let Some(runtime) = self.runtime.upgrade() else {
+            return;
+        };
+        let current = std::thread::current().id();
+        let mut tasks = runtime.tasks.lock().expect("task registry lock poisoned");
+        let owner = tasks
+            .get_mut(&self.id)
+            .expect("active task registration is present in Runtime registry");
+        match owner {
+            Some(existing) => assert_eq!(
+                *existing, current,
+                "a task registration cannot move between worker threads"
+            ),
+            None => *owner = Some(current),
+        }
+    }
+
     /// Removes the task after its worker has really exited. Calling repeatedly is harmless.
     pub fn unregister(&self) {
         if self.released.swap(true, Ordering::AcqRel) {
@@ -141,7 +167,7 @@ impl TaskRegistration {
                 .lock()
                 .expect("task registry lock poisoned")
                 .remove(&self.id);
-            if removed {
+            if removed.is_some() {
                 runtime.tasks_changed.notify_all();
             }
         }
@@ -181,7 +207,7 @@ impl Runtime {
             next_sequence: AtomicU64::new(1),
             operations: Mutex::new(HashMap::new()),
             resources: Mutex::new(HashMap::new()),
-            tasks: Mutex::new(HashSet::from([task_id])),
+            tasks: Mutex::new(HashMap::from([(task_id, None)])),
             tasks_changed: Condvar::new(),
             deadline_task_id: task_id,
             subscriptions: Mutex::new(Vec::new()),
@@ -405,7 +431,7 @@ impl Runtime {
             .tasks
             .lock()
             .expect("task registry lock poisoned")
-            .insert(task_id);
+            .insert(task_id, None);
         drop(state);
         Ok((
             ResourceRegistration {
@@ -434,7 +460,7 @@ impl Runtime {
             .tasks
             .lock()
             .expect("task registry lock poisoned")
-            .insert(id);
+            .insert(id, None);
         drop(state);
         Ok(TaskRegistration {
             runtime: Arc::downgrade(&self.inner),
@@ -474,8 +500,14 @@ impl Runtime {
     /// # Panics
     ///
     /// Panics when an internal close phase fails unexpectedly. Concurrent and later close callers
-    /// are woken and report the same failed-close condition instead of waiting indefinitely.
+    /// are woken and report the same failed-close condition instead of waiting indefinitely. Also
+    /// panics without changing Runtime state when called from a bound supervised task; such a task
+    /// must return and let an external owner close, or rely on final-handle drop.
     pub fn close(&self) {
+        assert!(
+            !self.inner.current_thread_owns_task(),
+            "Runtime::close cannot synchronously wait for its calling supervised task"
+        );
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.close_impl()));
         if let Err(payload) = result {
             self.inner.fail_close_after_panic();
@@ -680,6 +712,17 @@ impl Drop for Runtime {
 }
 
 impl RuntimeInner {
+    fn current_thread_owns_task(&self) -> bool {
+        let current = std::thread::current().id();
+        let tasks = match self.tasks.lock() {
+            Ok(tasks) => tasks,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        tasks
+            .values()
+            .any(|owner| owner.as_ref().is_some_and(|owner| *owner == current))
+    }
+
     fn allocate_id(&self) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         assert!(id != 0, "Runtime-local ID space exhausted");
@@ -873,7 +916,7 @@ impl RuntimeInner {
 
     fn wait_for_external_tasks(&self) {
         let mut tasks = self.tasks.lock().expect("task registry lock poisoned");
-        while tasks.iter().any(|id| *id != self.deadline_task_id) {
+        while tasks.keys().any(|id| *id != self.deadline_task_id) {
             tasks = self
                 .tasks_changed
                 .wait(tasks)
@@ -891,8 +934,9 @@ impl Drop for RuntimeInner {
 fn deadline_worker(
     runtime: Weak<RuntimeInner>,
     receiver: Receiver<DeadlineSignal>,
-    _task: TaskRegistration,
+    task: TaskRegistration,
 ) {
+    task.bind_to_current_thread();
     loop {
         let Some(runtime) = runtime.upgrade() else {
             break;
@@ -1894,6 +1938,7 @@ mod tests {
         let (release, released) = mpsc::channel();
         let (finished, observed_finish) = mpsc::channel();
         let worker = std::thread::spawn(move || {
+            task.bind_to_current_thread();
             released.recv().expect("worker release");
             drop(worker_runtime);
             drop(task);
@@ -2015,6 +2060,34 @@ mod tests {
     }
 
     #[test]
+    fn explicit_close_from_a_supervised_task_is_rejected_without_deadlock() {
+        let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+        let task = runtime.register_task().expect("task");
+        let worker_runtime = runtime.clone();
+        let (finished, observed_finish) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            task.bind_to_current_thread();
+            let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                worker_runtime.close();
+            }))
+            .is_err();
+            finished.send(rejected).expect("close rejection observer");
+            drop(task);
+        });
+
+        assert!(
+            observed_finish
+                .recv_timeout(Duration::from_secs(2))
+                .expect("supervised task close must fail fast")
+        );
+        worker.join().expect("supervised worker");
+        assert_eq!(runtime.state(), RuntimeState::Active);
+
+        runtime.close();
+        assert_eq!(runtime.state(), RuntimeState::Closed);
+    }
+
+    #[test]
     fn close_waits_for_a_supervised_task_to_finish_cleanup() {
         let runtime = Runtime::new(Arc::new(VirtualClock::default()));
         let cancellation = runtime.child_cancellation_token();
@@ -2029,6 +2102,7 @@ mod tests {
         let (release_cleanup, released) = mpsc::channel();
         let cleanup_operation = operation.clone();
         let worker = std::thread::spawn(move || {
+            task.bind_to_current_thread();
             woken.recv().expect("root cancellation");
             cleanup_started.send(()).expect("cleanup observer");
             released.recv().expect("cleanup release");

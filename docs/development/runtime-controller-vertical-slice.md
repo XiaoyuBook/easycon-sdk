@@ -43,7 +43,8 @@
   `runtime.closed`。
   最后一个 owning Runtime 句柄释放会先同步进入 `Closing` 并拒绝新 admission，再把其余关闭流程委托给
   独立 finalizer，不在析构线程中等待 task 或执行 resource close callback；需要同步观察 `Closed`
-  的调用方必须显式 close。关闭完成后
+  的 task 外调用方必须显式 close。每个受监管 worker 在执行任务前绑定其 task registration；该 worker
+  内的同步 close 会在改变 Runtime 状态前快速拒绝，不能等待自身 guard。关闭完成后
   operation/resource/task 计数全部为零，`runtime.closed` 之后的事件发布会被拒绝。
 - 单个 `ManagedResource::close` panic 会被隔离，发布 `runtime.resource.close_panicked` 后继续关闭其他健康资源，
   但保留失败资源及其 task 的监督注册并使本次关闭失败；所有意外内部关闭 panic 都不声称 `Closed`，而是保持 `Closing`；若事件生产仍开放则用

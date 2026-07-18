@@ -684,6 +684,10 @@ impl Drop for ControllerInner {
 
 impl ControllerLane {
     fn run(mut self) {
+        self.task
+            .as_ref()
+            .expect("controller task registration exists while lane runs")
+            .bind_to_current_thread();
         loop {
             self.observe_cancellation();
             self.dispatch_due_reports();

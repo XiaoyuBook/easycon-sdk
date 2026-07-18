@@ -25,7 +25,7 @@
   "runtime": {
     "states": ["Active", "Closing", "Closed"],
     "close_is_idempotent": true,
-    "final_handle_drop": "synchronously enters Closing and rejects admission, then delegates the remaining close sequence to a dedicated finalizer without waiting or invoking resource callbacks on the dropping thread; explicit close synchronously observes Closed",
+    "final_handle_drop": "synchronously enters Closing and rejects admission, then delegates the remaining close sequence to a dedicated finalizer without waiting or invoking resource callbacks on the dropping thread; explicit close synchronously observes Closed only from outside bound supervised tasks, while a bound task caller is rejected before Runtime state changes",
     "close_panic": "a ManagedResource close panic is isolated while healthy resources continue closing, but its resource and task registrations remain supervised and Runtime does not claim Closed; every unexpected internal close panic leaves Runtime in Closing, terminates events with runtime.close_panicked when possible, and wakes close waiters so later close calls fail instead of blocking",
     "close_order": [
       "enter Closing and reject admission",

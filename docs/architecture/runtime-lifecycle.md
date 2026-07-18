@@ -292,7 +292,7 @@ stateDiagram-v2
 9. join executor、scheduler、分发线程；确认 task registry 为空。
 10. 进入 Closed，随后才允许释放 Runtime storage 和卸载动态库。
 
-显式 `close(timeout)` 的 wait timeout 可返回，但关闭继续进行，调用方可再次 wait。Rust 核心候选接口的 `Drop` 只可作为非阻塞兜底：先同步进入 Closing 并拒绝新 admission，再把其余关闭步骤委托给独立 finalizer，不能在受监管 task 内自等待；正式 binding 的最终 `release` 必须先显式 close 并等待真实 Closed。binding 不得在仍有 native 线程时卸载库。所有 backend 都必须可取消，因此正常关闭不依赖无限 detach。
+显式 `close(timeout)` 的 wait timeout 可返回，但关闭继续进行，调用方可再次 wait。同步 close 只能由受监管 task 之外的调用方执行；已绑定的 task 内调用必须在改变 Runtime 状态前快速拒绝，避免等待自身 guard。Rust 核心候选接口的 `Drop` 只可作为非阻塞兜底：先同步进入 Closing 并拒绝新 admission，再把其余关闭步骤委托给独立 finalizer；正式 binding 的最终 `release` 必须先显式 close 并等待真实 Closed。binding 不得在仍有 native 线程时卸载库。所有 backend 都必须可取消，因此正常关闭不依赖无限 detach。
 
 ## 12. 故障场景的销毁结果
 
