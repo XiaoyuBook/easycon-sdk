@@ -16,7 +16,10 @@
 3. wait timeout 只终止等待；operation deadline 和协议 timeout 分别建模。
 4. cancel 是幂等请求，语言异步对象只在核心清理完成并进入终态后结束。
 5. 日志、状态、错误和完成通知通过每订阅者独立的有界拉取队列提供，不调用用户 callback。
-6. Runtime 是根取消/资源 owner，按 Automation、Controller、Capture、native pool、event/executor 的顺序关闭。
+6. Runtime 是根取消/资源 owner。主动 resource callback 按 Runtime-local `ResourceId` 顺序执行，随后
+   join 受监管 task、收尾 operation、检查 registry 并发布最终事件；不得按 Automation、Controller、
+   Capture 等未来类型硬编码顺序。该关闭协议由 [ADR-0006](0006-runtime-stabilization.md) 收紧并取代
+   本 ADR 的早期类型顺序设想。
 7. Automation 任何终态之前必须中立化 Controller 并释放写 lease。
 8. Event 只用于观察；Operation/resource query 是权威状态，队列 overflow 不得破坏正确性。
 

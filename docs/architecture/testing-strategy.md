@@ -125,7 +125,8 @@ tests 之后单独运行该入口。
 - 跨域依赖检查和资源 admission；
 - 每 Runtime 单 run；Program dependency validation；
 - run success/failure/cancel 三条路径都先中立化再终态；
-- Runtime close 时 Automation→Controller→Capture→native 的顺序。
+- Runtime close 按 Runtime-local `ResourceId` 顺序执行 resource callback，再 join task、收尾 operation、
+  检查 registry 并发布最终事件；跨域中立化和 lease 释放属于各 owner 的 cleanup，不依赖硬编码类型顺序。
 
 单元覆盖门槛：共享 Rust 业务 crates 行覆盖 ≥85%、分支覆盖 ≥80%；关键状态转换和 unsafe wrapper 要求 100% 语义分支覆盖。覆盖率只是下限，不替代竞态/故障测试。
 
@@ -178,7 +179,8 @@ tests 之后单独运行该入口。
 - Operation wait/cancel/result 竞态；多个 waiter；
 - subscription 单 reader 约束、timeout、gap、closed；
 - 强制 Rust panic 和 C++ exception，验证 status/error/event 与无跨边界 unwind；普通可恢复失败资源回基线，
-  close callback 无法确认释放时则保持 Closing 和非零诊断注册，直到 owner 实际释放；
+  close callback 无法确认释放时提交保存的 `CloseFailed` outcome，并保留非零诊断注册直到 owner 实际
+  释放；close waiter 不得在 `Closing` 永久等待；
 - 调用方 buffer 不被越界写，异步 input 在提交时深拷贝；
 - Windows Application Verifier、page heap 或等价 heap 工具检查跨 allocator/双释放。
 
