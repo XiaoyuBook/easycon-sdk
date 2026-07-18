@@ -23,11 +23,13 @@ and precise-sequence tests read these tracked files directly. Tests and validati
 build, download, or otherwise depend on `EasyCon/`.
 
 `tools/validate_specs.py` compares the complete assertion and Rust marker sets, checks each scenario
-suite for exact assertion coverage, and verifies every mapped test appears in Cargo's actual test
-discovery. It rejects duplicate assertion/step IDs, missing or renamed tests, stale source markers,
-`cfg`-disabled tests, incomplete scenario suites, and mappings that disagree with the test carrying
-the marker. Runtime stabilization assertions execute production regression paths with named fault
-injection where failure behavior is part of the contract.
+suite for exact assertion coverage, resolves every mapped source through Cargo metadata to one
+workspace package and target, then executes each unique test against that exact target. A mapping is
+valid only when libtest reports exactly one passed and zero ignored tests. The validator rejects
+duplicate assertion/step IDs, missing or renamed tests, stale source markers, `cfg`-disabled or
+ignored tests, cross-target same-name collisions, incomplete scenario suites, and mappings that
+disagree with the test carrying the marker. Runtime stabilization assertions execute production
+regression paths with named fault injection where failure behavior is part of the contract.
 
 Run the local validator with:
 

@@ -372,6 +372,13 @@ CONFORMANCE_TEST_BLOCK = re.compile(
     r"^[ \t]*fn[ \t]+(?P<test>[A-Za-z_][A-Za-z0-9_]*)[ \t]*\(",
     re.MULTILINE,
 )
+TEST_RESULT = re.compile(
+    r"^test result: (?P<status>ok|FAILED)\. "
+    r"(?P<passed>[0-9]+) passed; (?P<failed>[0-9]+) failed; "
+    r"(?P<ignored>[0-9]+) ignored; (?P<measured>[0-9]+) measured; "
+    r"(?P<filtered>[0-9]+) filtered out(?:;.*)?$",
+    re.MULTILINE,
+)
 
 
 def conformance_test_markers():
@@ -408,16 +415,13 @@ def cargo_executable():
     raise ValidationError("cargo was not found in PATH or $HOME/.cargo/bin")
 
 
-def discovered_rust_tests():
+def cargo_metadata():
     command = [
         cargo_executable(),
-        "test",
-        "--workspace",
-        "--all-features",
-        "--",
-        "--list",
-        "--format",
-        "terse",
+        "metadata",
+        "--no-deps",
+        "--format-version",
+        "1",
     ]
     try:
         result = subprocess.run(
@@ -431,16 +435,17 @@ def discovered_rust_tests():
             errors="replace",
         )
     except OSError as error:
-        raise ValidationError("could not list Rust tests: {}".format(error))
+        raise ValidationError("could not read Cargo metadata: {}".format(error))
     require(
         result.returncode == 0,
-        "cargo test discovery failed: {}".format(result.stderr.strip()),
+        "cargo metadata failed: {}".format(result.stderr.strip()),
     )
-    return {
-        line[:-len(": test")]
-        for line in result.stdout.splitlines()
-        if line.endswith(": test")
-    }
+    try:
+        metadata = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise ValidationError("cargo metadata returned invalid JSON: {}".format(error))
+    require(metadata.get("version") == 1, "cargo metadata format version changed")
+    return metadata
 
 
 def executable_test_name(test_ref):
@@ -457,15 +462,208 @@ def executable_test_name(test_ref):
     return "{}::tests::{}".format(module.replace("/", "::"), function)
 
 
-def validate_conformance_test_discovery(markers, discovered):
-    missing = sorted(
-        (assertion_id, test_ref, executable_test_name(test_ref))
-        for assertion_id, test_ref in markers.items()
-        if executable_test_name(test_ref) not in discovered
+def path_relative_to(path, parent):
+    try:
+        return path.relative_to(parent)
+    except ValueError:
+        return None
+
+
+def workspace_test_targets(metadata):
+    workspace_members = set(metadata.get("workspace_members", []))
+    targets = []
+    for package in metadata.get("packages", []):
+        if package.get("id") not in workspace_members:
+            continue
+        for target in package.get("targets", []):
+            kinds = set(target.get("kind", []))
+            if "lib" in kinds:
+                target_kind = "lib"
+            elif "test" in kinds:
+                target_kind = "test"
+            else:
+                continue
+            targets.append(
+                {
+                    "package": package["name"],
+                    "target_kind": target_kind,
+                    "target_name": target["name"],
+                    "source": Path(target["src_path"]).resolve(),
+                }
+            )
+    require(targets, "cargo metadata contains no workspace Rust test targets")
+    return targets
+
+
+def target_owns_source(target, source):
+    if target["target_kind"] == "test":
+        return source == target["source"]
+    return path_relative_to(source, target["source"].parent) is not None
+
+
+def conformance_test_targets(markers, metadata):
+    cargo_targets = workspace_test_targets(metadata)
+    resolved = []
+    for test_ref in sorted(set(markers.values())):
+        source, _ = test_ref.rsplit("::", 1)
+        source_path = (ROOT / source).resolve()
+        candidates = [
+            target for target in cargo_targets
+            if target_owns_source(target, source_path)
+        ]
+        require(
+            len(candidates) == 1,
+            "{} must map to exactly one Cargo package/target, found {!r}".format(
+                test_ref,
+                [
+                    (target["package"], target["target_kind"], target["target_name"])
+                    for target in candidates
+                ],
+            ),
+        )
+        test = dict(candidates[0])
+        test["test_ref"] = test_ref
+        test["executable"] = executable_test_name(test_ref)
+        resolved.append(test)
+    return resolved
+
+
+def exact_test_command(test, cargo=None):
+    command = [
+        cargo or cargo_executable(),
+        "test",
+        "--color",
+        "never",
+        "-p",
+        test["package"],
+        "--all-features",
+    ]
+    if test["target_kind"] == "lib":
+        command.append("--lib")
+    else:
+        command.extend(["--test", test["target_name"]])
+    command.extend(
+        [test["executable"], "--", "--exact", "--format", "terse"]
     )
+    return command
+
+
+def test_identity(test):
+    return "{}/{}:{}::{}".format(
+        test["package"],
+        test["target_kind"],
+        test["target_name"],
+        test["executable"],
+    )
+
+
+def validate_exact_test_result(test, result):
+    identity = test_identity(test)
     require(
-        not missing,
-        "conformance mappings are not discovered by cargo test: {!r}".format(missing),
+        result.returncode == 0,
+        "conformance test {} failed:\n{}\n{}".format(
+            identity, result.stdout.strip(), result.stderr.strip()
+        ).rstrip(),
+    )
+    summaries = list(TEST_RESULT.finditer(result.stdout))
+    require(
+        len(summaries) == 1,
+        "conformance test {} returned no unique libtest summary: {!r}".format(
+            identity, result.stdout.strip()
+        ),
+    )
+    summary = summaries[0]
+    counts = {
+        name: int(summary.group(name))
+        for name in ("passed", "failed", "ignored", "measured")
+    }
+    require(
+        summary.group("status") == "ok"
+        and counts == {"passed": 1, "failed": 0, "ignored": 0, "measured": 0},
+        "conformance test {} must execute exactly once and pass without being ignored; "
+        "observed status={} counts={!r}".format(
+            identity, summary.group("status"), counts
+        ),
+    )
+
+
+def execute_conformance_tests(tests, cargo=None, runner=subprocess.run):
+    for test in tests:
+        command = exact_test_command(test, cargo=cargo)
+        try:
+            result = runner(
+                command,
+                cwd=str(ROOT),
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except OSError as error:
+            raise ValidationError(
+                "could not execute conformance test {}: {}".format(
+                    test_identity(test), error
+                )
+            )
+        validate_exact_test_result(test, result)
+
+
+def require_conformance_execution_rejected(tests, runner, message):
+    try:
+        execute_conformance_tests(tests, cargo="cargo", runner=runner)
+    except ValidationError:
+        return
+    raise ValidationError(message)
+
+
+def synthetic_test_result(command, passed=0, ignored=0):
+    stdout = (
+        "running {} test\n\n"
+        "test result: ok. {} passed; 0 failed; {} ignored; 0 measured; "
+        "0 filtered out; finished in 0.00s\n"
+    ).format(passed + ignored, passed, ignored)
+    return subprocess.CompletedProcess(command, 0, stdout, "")
+
+
+def validate_conformance_execution_regressions():
+    unit = {
+        "package": "package-a",
+        "target_kind": "lib",
+        "target_name": "package_a",
+        "test_ref": "package-a/src/lib.rs::same_name",
+        "executable": "tests::same_name",
+    }
+    integration = {
+        "package": "package-b",
+        "target_kind": "test",
+        "target_name": "collision",
+        "test_ref": "package-b/tests/collision.rs::same_name",
+        "executable": "tests::same_name",
+    }
+    require(
+        exact_test_command(unit, cargo="cargo")
+        != exact_test_command(integration, cargo="cargo"),
+        "same-name tests lost their Cargo package/target identity",
+    )
+
+    def collision_runner(command, **_kwargs):
+        if "--lib" in command:
+            return synthetic_test_result(command)
+        return synthetic_test_result(command, passed=1)
+
+    require_conformance_execution_rejected(
+        [unit, integration],
+        collision_runner,
+        "a same-name test in the wrong Cargo target satisfied conformance",
+    )
+
+    def ignored_runner(command, **_kwargs):
+        return synthetic_test_result(command, ignored=1)
+
+    require_conformance_execution_rejected(
+        [unit], ignored_runner, "an ignored conformance test was accepted"
     )
 
 
@@ -590,25 +788,15 @@ def validate_conformance_regressions(conformance, markers):
     )
 
 
-def validate_conformance_discovery_regression(markers, discovered):
-    first_test = executable_test_name(next(iter(markers.values())))
-    missing = set(discovered)
-    missing.discard(first_test)
-    try:
-        validate_conformance_test_discovery(markers, missing)
-    except ValidationError:
-        return
-    raise ValidationError("undiscovered conformance test was not rejected")
-
-
 def validate_conformance():
     conformance = load_json("conformance/runtime-controller-v1.json")
     markers = conformance_test_markers()
-    discovered = discovered_rust_tests()
-    validate_conformance_test_discovery(markers, discovered)
     validate_conformance_document(conformance, markers)
     validate_conformance_regressions(conformance, markers)
-    validate_conformance_discovery_regression(markers, discovered)
+    tests = conformance_test_targets(markers, cargo_metadata())
+    validate_conformance_execution_regressions()
+    execute_conformance_tests(tests)
+    return len(tests)
 
 
 def main():
@@ -617,8 +805,11 @@ def main():
     validate_behavior()
     validate_controller_fixture()
     validate_traces()
-    validate_conformance()
-    print("validated 4 schemas, 1 behavior spec, 2 controller fixtures, and 6 conformance scenarios")
+    test_count = validate_conformance()
+    print(
+        "validated 4 schemas, 1 behavior spec, 2 controller fixtures, "
+        "6 conformance scenarios, and {} exact Rust tests".format(test_count)
+    )
     return 0
 
 
