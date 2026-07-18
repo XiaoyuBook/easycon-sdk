@@ -1466,6 +1466,44 @@ mod tests {
         runtime.close().expect("Runtime close");
     }
 
+    #[test]
+    fn terminal_child_hook_can_observe_parent_without_deadlock() {
+        let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+        let operation = runtime.create_operation(None).expect("operation");
+        operation.start();
+        let child = operation.cancellation_token().child();
+        let observed_operation = operation.clone();
+        let (hook_finished, hook_observer) = mpsc::sync_channel(0);
+        child.on_cancel(move || {
+            let snapshot = observed_operation.snapshot();
+            hook_finished
+                .send(snapshot.state)
+                .expect("hook observer remains alive");
+        });
+
+        let finishing_operation = operation.clone();
+        let (finish_sent, finish_received) = mpsc::sync_channel(0);
+        let finisher = std::thread::spawn(move || {
+            let outcome = finishing_operation.succeed(OperationValue::Unit);
+            finish_sent.send(outcome).expect("finish observer");
+        });
+
+        assert_eq!(
+            hook_observer
+                .recv_timeout(Duration::from_secs(2))
+                .expect("child cancellation hook must not deadlock"),
+            OperationState::Running
+        );
+        assert_eq!(
+            finish_received
+                .recv_timeout(Duration::from_secs(2))
+                .expect("terminal transaction must complete"),
+            TransitionOutcome::Applied
+        );
+        finisher.join().expect("operation finisher");
+        runtime.close().expect("Runtime close");
+    }
+
     // conformance: operation.unlink-before-wake
     // conformance: operation.failure-notify
     #[test]

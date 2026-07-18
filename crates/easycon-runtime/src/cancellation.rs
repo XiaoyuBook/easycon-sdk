@@ -24,6 +24,18 @@ pub struct CancellationHookRegistration {
     _lifetime: Arc<()>,
 }
 
+pub(crate) struct CancellationPropagation {
+    hooks: Vec<CancelHook>,
+}
+
+impl CancellationPropagation {
+    pub(crate) fn propagate(self) {
+        for hook in self.hooks {
+            invoke_hook(&hook);
+        }
+    }
+}
+
 /// A node in the Runtime-owned cancellation tree.
 #[derive(Clone)]
 pub struct CancellationToken {
@@ -154,12 +166,20 @@ impl CancellationToken {
         }
     }
 
-    pub(crate) fn deactivate(&self) {
-        deactivate_inner(&self.inner);
+    pub(crate) fn deactivate_deferred(&self) -> CancellationPropagation {
+        let mut hooks = Vec::new();
+        seal_deactivated_inner(&self.inner, &mut hooks);
+        CancellationPropagation { hooks }
     }
 }
 
 fn cancel_inner(inner: &Arc<CancellationInner>) {
+    let mut hooks = Vec::new();
+    seal_cancelled_inner(inner, &mut hooks);
+    CancellationPropagation { hooks }.propagate();
+}
+
+fn seal_cancelled_inner(inner: &Arc<CancellationInner>, hooks: &mut Vec<CancelHook>) {
     if !inner.active.load(Ordering::Acquire) {
         return;
     }
@@ -167,10 +187,12 @@ fn cancel_inner(inner: &Arc<CancellationInner>) {
         return;
     }
 
-    let hooks = std::mem::take(&mut *lock_recover(&inner.hooks));
-    for entry in hooks.into_iter().filter(CancelHookEntry::is_active) {
-        invoke_hook(&entry.hook);
-    }
+    hooks.extend(
+        std::mem::take(&mut *lock_recover(&inner.hooks))
+            .into_iter()
+            .filter(CancelHookEntry::is_active)
+            .map(|entry| entry.hook),
+    );
 
     let children = {
         let mut children = lock_recover(&inner.children);
@@ -183,11 +205,11 @@ fn cancel_inner(inner: &Arc<CancellationInner>) {
         live
     };
     for child in children {
-        cancel_inner(&child);
+        seal_cancelled_inner(&child, hooks);
     }
 }
 
-fn deactivate_inner(inner: &Arc<CancellationInner>) {
+fn seal_deactivated_inner(inner: &Arc<CancellationInner>, hooks: &mut Vec<CancelHook>) {
     if !inner.active.swap(false, Ordering::AcqRel) {
         return;
     }
@@ -199,7 +221,7 @@ fn deactivate_inner(inner: &Arc<CancellationInner>) {
         live
     };
     for child in children {
-        cancel_inner(&child);
+        seal_cancelled_inner(&child, hooks);
     }
 }
 
@@ -317,7 +339,7 @@ mod tests {
     #[test]
     fn child_created_after_parent_deactivation_is_cancelled_without_history() {
         let root = CancellationToken::root();
-        root.deactivate();
+        root.deactivate_deferred().propagate();
 
         let child = root.child();
 

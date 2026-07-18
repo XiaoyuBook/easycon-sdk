@@ -113,6 +113,7 @@ struct OperationData {
     result: Option<OperationValue>,
     error: Option<EasyConError>,
     cancellation_reason: Option<CancellationReason>,
+    terminal_in_progress: bool,
 }
 
 struct TerminalNotification<'a> {
@@ -143,6 +144,7 @@ impl Operation {
                     result: None,
                     error: None,
                     cancellation_reason: None,
+                    terminal_in_progress: false,
                 }),
                 changed: Condvar::new(),
             }),
@@ -255,13 +257,18 @@ impl Operation {
 impl OperationInner {
     fn transition_running(&self) -> TransitionOutcome {
         let mut data = self.lock_state();
+        if data.state.is_terminal() {
+            return TransitionOutcome::AlreadyTerminal;
+        }
+        if data.terminal_in_progress {
+            return TransitionOutcome::Invalid;
+        }
         match data.state {
             OperationState::Pending => {
                 data.state = OperationState::Running;
                 self.publish(&data);
                 TransitionOutcome::Applied
             }
-            state if state.is_terminal() => TransitionOutcome::AlreadyTerminal,
             _ => TransitionOutcome::Invalid,
         }
     }
@@ -269,6 +276,16 @@ impl OperationInner {
     fn request_cancel(&self, reason: CancellationReason) -> TransitionOutcome {
         let outcome = {
             let mut data = self.lock_state();
+            if data.state.is_terminal() {
+                return TransitionOutcome::AlreadyTerminal;
+            }
+            if data.terminal_in_progress {
+                return if data.state == OperationState::Cancelling {
+                    TransitionOutcome::Unchanged
+                } else {
+                    TransitionOutcome::Invalid
+                };
+            }
             match data.state {
                 OperationState::Pending | OperationState::Running => {
                     data.state = OperationState::Cancelling;
@@ -277,7 +294,7 @@ impl OperationInner {
                     TransitionOutcome::Applied
                 }
                 OperationState::Cancelling => TransitionOutcome::Unchanged,
-                _ => TransitionOutcome::AlreadyTerminal,
+                _ => unreachable!("terminal states returned before transition dispatch"),
             }
         };
         if outcome == TransitionOutcome::Applied {
@@ -299,10 +316,17 @@ impl OperationInner {
         let mut data = self.lock_state();
         match data.state {
             OperationState::Cancelling => {
+                if data.terminal_in_progress {
+                    return TransitionOutcome::Unchanged;
+                }
+                data.terminal_in_progress = true;
                 let notification = TerminalNotification {
                     changed: &self.changed,
                 };
-                self.seal_cancellation_subtree();
+                let propagation = self.cancellation.deactivate_deferred();
+                drop(data);
+                propagation.propagate();
+                let mut data = self.lock_state();
                 let reason = data
                     .cancellation_reason
                     .unwrap_or(CancellationReason::Requested);
@@ -346,17 +370,26 @@ impl OperationInner {
         cleanup: impl FnOnce(),
     ) -> TransitionOutcome {
         let mut data = self.lock_state();
+        if data.state.is_terminal() {
+            return TransitionOutcome::AlreadyTerminal;
+        }
+        if data.terminal_in_progress {
+            return TransitionOutcome::Invalid;
+        }
         match data.state {
             OperationState::Pending if terminal == OperationState::Failed => {}
             OperationState::Running => {}
-            state if state.is_terminal() => return TransitionOutcome::AlreadyTerminal,
             _ => return TransitionOutcome::Invalid,
         }
         let notification = TerminalNotification {
             changed: &self.changed,
         };
-        self.seal_cancellation_subtree();
+        data.terminal_in_progress = true;
+        let propagation = self.cancellation.deactivate_deferred();
+        drop(data);
+        propagation.propagate();
         let cleanup_failed = catch_unwind(AssertUnwindSafe(cleanup)).is_err();
+        let mut data = self.lock_state();
         let outcome = if cleanup_failed {
             data.state = OperationState::Failed;
             data.result = None;
@@ -377,10 +410,6 @@ impl OperationInner {
         drop(data);
         drop(notification);
         outcome
-    }
-
-    fn seal_cancellation_subtree(&self) {
-        let _ = catch_unwind(AssertUnwindSafe(|| self.cancellation.deactivate()));
     }
 
     fn unlink_registry(&self) {
