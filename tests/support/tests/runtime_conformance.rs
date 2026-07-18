@@ -296,11 +296,7 @@ fn runtime_stabilization_reference_actions_are_executable() {
     );
 }
 
-// conformance: operation.child-admission
 // conformance: operation.hook-panic-isolated
-// conformance: operation.immutable-terminal
-// conformance: operation.unlink-before-wake
-// conformance: operation.failure-notify
 #[test]
 fn operation_terminal_reference_actions_are_executable() {
     let model = Arc::new(TerminalContractModel::new());

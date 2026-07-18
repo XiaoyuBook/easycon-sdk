@@ -1960,7 +1960,8 @@ fn start_or_finish_cancelled(operation: &Operation) -> bool {
         }
         TransitionOutcome::Unchanged
         | TransitionOutcome::AlreadyTerminal
-        | TransitionOutcome::Invalid => false,
+        | TransitionOutcome::Invalid
+        | TransitionOutcome::CleanupFailed => false,
     }
 }
 

@@ -1,4 +1,5 @@
-use std::sync::{Arc, Condvar, Mutex};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Instant;
 
 use easycon_model::{EasyConError, ErrorCode, ErrorDomain, OperationId};
@@ -79,6 +80,8 @@ pub enum TransitionOutcome {
     AlreadyTerminal,
     /// The requested edge is not legal from the current non-terminal state.
     Invalid,
+    /// Owner cleanup panicked and the transaction committed an internal failure instead.
+    CleanupFailed,
 }
 
 /// Result of waiting for an operation terminal state.
@@ -110,6 +113,16 @@ struct OperationData {
     result: Option<OperationValue>,
     error: Option<EasyConError>,
     cancellation_reason: Option<CancellationReason>,
+}
+
+struct TerminalNotification<'a> {
+    changed: &'a Condvar,
+}
+
+impl Drop for TerminalNotification<'_> {
+    fn drop(&mut self) {
+        self.changed.notify_all();
+    }
 }
 
 impl Operation {
@@ -188,7 +201,8 @@ impl Operation {
 
     /// Runs non-blocking owner cleanup under the transition lock, then commits success once.
     ///
-    /// The cleanup must not call back into this operation.
+    /// The cleanup must not call back into this operation. A cleanup panic is isolated and commits
+    /// an internal failure with [`TransitionOutcome::CleanupFailed`].
     pub fn succeed_after_cleanup(
         &self,
         result: OperationValue,
@@ -209,7 +223,8 @@ impl Operation {
 
     /// Runs non-blocking owner cleanup under the transition lock, then commits failure once.
     ///
-    /// The cleanup must not call back into this operation.
+    /// The cleanup must not call back into this operation. A cleanup panic is isolated and commits
+    /// an internal failure with [`TransitionOutcome::CleanupFailed`].
     pub fn fail_after_cleanup(
         &self,
         error: EasyConError,
@@ -239,7 +254,7 @@ impl Operation {
 
 impl OperationInner {
     fn transition_running(&self) -> TransitionOutcome {
-        let mut data = self.state.lock().expect("operation state lock poisoned");
+        let mut data = self.lock_state();
         match data.state {
             OperationState::Pending => {
                 data.state = OperationState::Running;
@@ -253,7 +268,7 @@ impl OperationInner {
 
     fn request_cancel(&self, reason: CancellationReason) -> TransitionOutcome {
         let outcome = {
-            let mut data = self.state.lock().expect("operation state lock poisoned");
+            let mut data = self.lock_state();
             match data.state {
                 OperationState::Pending | OperationState::Running => {
                     data.state = OperationState::Cancelling;
@@ -266,7 +281,7 @@ impl OperationInner {
             }
         };
         if outcome == TransitionOutcome::Applied {
-            self.cancellation.cancel();
+            let _ = catch_unwind(AssertUnwindSafe(|| self.cancellation.cancel()));
             self.changed.notify_all();
         }
         outcome
@@ -281,9 +296,13 @@ impl OperationInner {
     }
 
     fn finish_cancelled(&self) -> TransitionOutcome {
-        let mut data = self.state.lock().expect("operation state lock poisoned");
+        let mut data = self.lock_state();
         match data.state {
             OperationState::Cancelling => {
+                let notification = TerminalNotification {
+                    changed: &self.changed,
+                };
+                self.seal_cancellation_subtree();
                 let reason = data
                     .cancellation_reason
                     .unwrap_or(CancellationReason::Requested);
@@ -300,8 +319,9 @@ impl OperationInner {
                 data.error = Some(EasyConError::new(ErrorDomain::Runtime, code, message));
                 data.state = OperationState::Cancelled;
                 self.publish(&data);
+                self.unlink_registry();
                 drop(data);
-                self.terminal_committed();
+                drop(notification);
                 TransitionOutcome::Applied
             }
             state if state.is_terminal() => TransitionOutcome::AlreadyTerminal,
@@ -325,38 +345,63 @@ impl OperationInner {
         error: Option<EasyConError>,
         cleanup: impl FnOnce(),
     ) -> TransitionOutcome {
-        let mut data = self.state.lock().expect("operation state lock poisoned");
+        let mut data = self.lock_state();
         match data.state {
             OperationState::Pending if terminal == OperationState::Failed => {}
             OperationState::Running => {}
             state if state.is_terminal() => return TransitionOutcome::AlreadyTerminal,
             _ => return TransitionOutcome::Invalid,
         }
-        cleanup();
-        data.state = terminal;
-        data.result = result;
-        data.error = error;
+        let notification = TerminalNotification {
+            changed: &self.changed,
+        };
+        self.seal_cancellation_subtree();
+        let cleanup_failed = catch_unwind(AssertUnwindSafe(cleanup)).is_err();
+        let outcome = if cleanup_failed {
+            data.state = OperationState::Failed;
+            data.result = None;
+            data.error = Some(EasyConError::new(
+                ErrorDomain::Internal,
+                ErrorCode::Internal,
+                "operation owner cleanup panicked",
+            ));
+            TransitionOutcome::CleanupFailed
+        } else {
+            data.state = terminal;
+            data.result = result;
+            data.error = error;
+            TransitionOutcome::Applied
+        };
         self.publish(&data);
+        self.unlink_registry();
         drop(data);
-        self.terminal_committed();
-        TransitionOutcome::Applied
+        drop(notification);
+        outcome
     }
 
-    fn terminal_committed(&self) {
-        self.cancellation.deactivate();
+    fn seal_cancellation_subtree(&self) {
+        let _ = catch_unwind(AssertUnwindSafe(|| self.cancellation.deactivate()));
+    }
+
+    fn unlink_registry(&self) {
         if let Some(runtime) = self.runtime.upgrade() {
-            runtime.unregister_operation(self.id);
+            let _ = catch_unwind(AssertUnwindSafe(|| runtime.unregister_operation(self.id)));
         }
-        self.changed.notify_all();
     }
 
     fn snapshot(&self) -> OperationSnapshot {
-        snapshot_data(&self.state.lock().expect("operation state lock poisoned"))
+        snapshot_data(&self.lock_state())
+    }
+
+    fn lock_state(&self) -> MutexGuard<'_, OperationData> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn wait(&self, wait: WaitTimeout) -> WaitResult {
         let started = Instant::now();
-        let mut data = self.state.lock().expect("operation state lock poisoned");
+        let mut data = self.lock_state();
         loop {
             if data.state.is_terminal() {
                 return WaitResult::Completed(snapshot_data(&data));
@@ -367,7 +412,7 @@ impl OperationInner {
                     data = self
                         .changed
                         .wait(data)
-                        .expect("operation state lock poisoned while waiting");
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                 }
                 WaitTimeout::For(limit) => {
                     let Some(remaining) = limit.checked_sub(started.elapsed()) else {
@@ -376,7 +421,7 @@ impl OperationInner {
                     let (next, timed_out) = self
                         .changed
                         .wait_timeout(data, remaining)
-                        .expect("operation state lock poisoned while waiting");
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     data = next;
                     if timed_out.timed_out() && !data.state.is_terminal() {
                         return WaitResult::Timeout;
@@ -401,7 +446,9 @@ impl OperationInner {
             (EventKind::State, state_code(data.state), Severity::Info)
         };
         let draft = EventDraft::critical(kind, code, severity);
-        let _ = runtime.try_publish_event(draft.with_operation(self.id));
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            let _ = runtime.try_publish_event(draft.with_operation(self.id));
+        }));
     }
 }
 

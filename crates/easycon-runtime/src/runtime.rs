@@ -312,16 +312,15 @@ impl Runtime {
                 "operation cancellation parent belongs to a different Runtime",
             ));
         }
-        if !parent.is_active() {
+        let Some(cancellation) = parent.try_child() else {
             return Err(EasyConError::new(
                 ErrorDomain::Validation,
                 ErrorCode::InvalidArgument,
                 "operation cancellation parent is no longer active",
             ));
-        }
+        };
         let id = OperationId::new(self.inner.allocate_id());
-        let operation =
-            Operation::new(id, Arc::downgrade(&self.inner), parent.child(), deadline_ns);
+        let operation = Operation::new(id, Arc::downgrade(&self.inner), cancellation, deadline_ns);
         if let Some(deadline) = deadline_ns {
             self.inner.clock.register_deadline(deadline);
         }
@@ -732,7 +731,7 @@ impl RuntimeInner {
     pub(crate) fn unregister_operation(&self, id: OperationId) {
         self.operations
             .lock()
-            .expect("operation registry lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&id);
     }
 
@@ -740,7 +739,7 @@ impl RuntimeInner {
         let mut subscriptions = self
             .subscriptions
             .lock()
-            .expect("subscription registry lock poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.events_closed.load(Ordering::Acquire) {
             return Err(events_closed_error());
         }
@@ -1058,12 +1057,14 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::{
-        EventClass, EventDraft, EventGap, EventKind, OperationState, OperationValue, Severity,
-        SubscriptionRead, SystemClock, TransitionOutcome, VirtualClock, WaitResult, WaitTimeout,
+        EventClass, EventDraft, EventGap, EventKind, OperationSnapshot, OperationState,
+        OperationValue, Severity, SubscriptionRead, SystemClock, TransitionOutcome, VirtualClock,
+        WaitResult, WaitTimeout,
     };
 
     use super::*;
 
+    // conformance: operation.immutable-terminal
     #[test]
     fn operation_commits_terminal_state_and_event_once() {
         let runtime = Runtime::new(Arc::new(VirtualClock::default()));
@@ -1186,6 +1187,139 @@ mod tests {
 
         assert_eq!(error.domain(), ErrorDomain::Validation);
         assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        runtime.close();
+    }
+
+    // conformance: operation.child-admission
+    #[test]
+    fn parent_terminal_seals_child_admission_before_owner_cleanup() {
+        let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+        let parent = runtime.create_operation(None).expect("parent operation");
+        let parent_token = parent.cancellation_token();
+        parent.start();
+        let (cleanup_started, observed_cleanup) = mpsc::sync_channel(0);
+        let (release_cleanup, released) = mpsc::sync_channel(0);
+        let finishing_parent = parent.clone();
+        let finisher = std::thread::spawn(move || {
+            finishing_parent.succeed_after_cleanup(OperationValue::Unit, || {
+                cleanup_started.send(()).expect("cleanup observer");
+                released.recv().expect("cleanup release");
+            })
+        });
+
+        observed_cleanup.recv().expect("owner cleanup started");
+        let child = runtime.create_operation_with_parent(None, &parent_token);
+        release_cleanup.send(()).expect("release owner cleanup");
+        assert_eq!(
+            finisher.join().expect("parent finisher"),
+            TransitionOutcome::Applied
+        );
+
+        let error = match child {
+            Err(error) => error,
+            Ok(_) => panic!("parent terminal transaction admitted a new child"),
+        };
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        runtime.close();
+    }
+
+    // conformance: operation.unlink-before-wake
+    // conformance: operation.failure-notify
+    #[test]
+    fn terminal_faults_still_unlink_and_wake_waiters() {
+        let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+        let operation = runtime.create_operation(None).expect("operation");
+        operation.start();
+
+        let poisoned_runtime = Arc::clone(&runtime.inner);
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = poisoned_runtime
+                    .subscriptions
+                    .lock()
+                    .expect("subscription registry before scripted panic");
+                panic!("scripted event registry poison");
+            })
+            .join()
+            .is_err()
+        );
+        let poisoned_runtime = Arc::clone(&runtime.inner);
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = poisoned_runtime
+                    .operations
+                    .lock()
+                    .expect("operation registry before scripted panic");
+                panic!("scripted operation registry poison");
+            })
+            .join()
+            .is_err()
+        );
+
+        let barrier = Arc::new(Barrier::new(2));
+        let waiting_operation = operation.clone();
+        let waiting_barrier = barrier.clone();
+        let waiter = std::thread::spawn(move || {
+            waiting_barrier.wait();
+            waiting_operation.wait(WaitTimeout::For(Duration::from_secs(2)))
+        });
+        barrier.wait();
+        let finish = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            operation.succeed(OperationValue::Unit)
+        }));
+
+        assert_eq!(
+            finish.expect("terminal transaction must isolate faults"),
+            TransitionOutcome::Applied
+        );
+        assert!(matches!(
+            waiter.join().expect("terminal waiter"),
+            WaitResult::Completed(OperationSnapshot {
+                state: OperationState::Succeeded,
+                ..
+            })
+        ));
+        assert!(
+            runtime
+                .inner
+                .operations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+        );
+
+        runtime.inner.subscriptions.clear_poison();
+        runtime.inner.operations.clear_poison();
+        runtime.close();
+    }
+
+    #[test]
+    fn owner_cleanup_panic_commits_diagnostic_failure_and_notifies() {
+        let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+        let operation = runtime.create_operation(None).expect("operation");
+        operation.start();
+
+        let finish = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            operation.succeed_after_cleanup(OperationValue::Unit, || {
+                panic!("scripted owner cleanup panic");
+            })
+        }));
+
+        assert!(
+            finish.is_ok(),
+            "owner cleanup panic escaped terminal transaction"
+        );
+        let snapshot = operation.snapshot();
+        assert_eq!(snapshot.state, OperationState::Failed);
+        assert_eq!(
+            snapshot.error.expect("cleanup failure").code(),
+            ErrorCode::Internal
+        );
+        assert!(matches!(
+            operation.wait(WaitTimeout::Poll),
+            WaitResult::Completed(_)
+        ));
+        assert_eq!(runtime.counts().active_operations, 0);
         runtime.close();
     }
 

@@ -111,7 +111,7 @@
         {
           "id": "operation.child-admission",
           "expect": "child admission linearized after parent terminal sealing is rejected and an earlier child is cancelled",
-          "test": "tests/support/tests/runtime_conformance.rs::operation_terminal_reference_actions_are_executable"
+          "test": "crates/easycon-runtime/src/runtime.rs::parent_terminal_seals_child_admission_before_owner_cleanup"
         },
         {
           "id": "operation.hook-panic-isolated",
@@ -121,17 +121,17 @@
         {
           "id": "operation.immutable-terminal",
           "expect": "terminal state and payload are immutable and committed exactly once after owner cleanup",
-          "test": "tests/support/tests/runtime_conformance.rs::operation_terminal_reference_actions_are_executable"
+          "test": "crates/easycon-runtime/src/runtime.rs::operation_commits_terminal_state_and_event_once"
         },
         {
           "id": "operation.unlink-before-wake",
           "expect": "registry unlink occurs before every terminal waiter returns",
-          "test": "tests/support/tests/runtime_conformance.rs::operation_terminal_reference_actions_are_executable"
+          "test": "crates/easycon-runtime/src/runtime.rs::terminal_faults_still_unlink_and_wake_waiters"
         },
         {
           "id": "operation.failure-notify",
           "expect": "event, registry, hook, and poisoned-lock faults cannot suppress waiter notification",
-          "test": "tests/support/tests/runtime_conformance.rs::operation_terminal_reference_actions_are_executable"
+          "test": "crates/easycon-runtime/src/runtime.rs::terminal_faults_still_unlink_and_wake_waiters"
         }
       ]
     },

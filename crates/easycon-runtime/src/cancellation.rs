@@ -63,6 +63,14 @@ impl CancellationToken {
     /// Creates a child cancelled recursively by this token.
     #[must_use]
     pub fn child(&self) -> Self {
+        self.try_child().unwrap_or_else(|| {
+            let child = Self::root_with_owner(self.inner.owner);
+            child.cancel();
+            child
+        })
+    }
+
+    pub(crate) fn try_child(&self) -> Option<Self> {
         let child = Self::root_with_owner(self.inner.owner);
         let mut children = self
             .inner
@@ -75,16 +83,14 @@ impl CancellationToken {
                 .is_some_and(|child| child.active.load(Ordering::Acquire))
         });
         if !self.inner.active.load(Ordering::Acquire) || self.is_cancelled() {
-            drop(children);
-            child.cancel();
-            return child;
+            return None;
         }
         children.push(Arc::downgrade(&child.inner));
         drop(children);
         if !self.inner.active.load(Ordering::Acquire) || self.is_cancelled() {
             child.cancel();
         }
-        child
+        Some(child)
     }
 
     /// Returns whether this token has been cancelled.
@@ -95,10 +101,6 @@ impl CancellationToken {
 
     pub(crate) fn owner(&self) -> Option<RuntimeId> {
         self.inner.owner
-    }
-
-    pub(crate) fn is_active(&self) -> bool {
-        self.inner.active.load(Ordering::Acquire)
     }
 
     /// Cancels this token and every live descendant exactly once.
