@@ -2,7 +2,11 @@
 
 ## 1. 固定目标结构
 
-本阶段只固定结构，不创建其中的 Rust/C++/.NET/Python/Node 功能项目。
+本章固定 v1 的目标结构与阶段门槛；目录会随对应阶段逐步创建，不要求当前工作树一次具备全部项目。
+仓库当前已经完成 Rust Runtime 与无硬件 Controller fake vertical slice，详见
+[实现说明](../development/runtime-controller-vertical-slice.md)。这个首个可测试里程碑覆盖 Phase 1
+Runtime 基线和一段受限的 Controller slice，不表示 Phase 2 所要求的 Windows serial、Amiibo、硬件
+characterization 或 O-01/O-02 数据已经完成。
 
 ```text
 easycon sdk/

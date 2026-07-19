@@ -348,13 +348,18 @@ SLO 在专用、固定电源策略的测试机测量；O-04 可依据首轮数�
 - 物理硬件、时序、capture 和 24h soak 通过；
 - GPL source/notice/build artifact 齐全。
 
-## 13. 文档阶段验证
+## 13. 阶段适用门禁
 
-当前阶段不构建功能项目，完成门槛是：
+仓库已经包含 Runtime、Controller 和 test support 功能项目，不再处于只验证架构文档的阶段。验证范围
+以根 [AGENTS.md](../../AGENTS.md) 为准：Rust 源码、Cargo、behavior、schema、fixture 或 conformance
+变更必须执行完整 workspace、Loom 模型、规范、链接、repository guard 和 diff 门禁；当前完整命令清单见
+[Runtime + Controller fake vertical slice](../development/runtime-controller-vertical-slice.md#本地验证)。
 
-- Markdown 相对链接全部可解析；
-- `git diff --check` 无 whitespace error；
-- tracked 文件不含已清除架构的项目名、协议名或遗留目录引用；
-- `EasyCon/` 仍被根 `.gitignore` 忽略；
-- `git -C EasyCon status --short` 为空；
-- 外层 tracked 文件没有 `EasyCon/` 内容或项目依赖。
+仅修改说明性文档且确认不影响可执行行为时，至少执行：
+
+- Markdown 相对链接检查；
+- repository guard；
+- `git diff --check`。
+
+无论变更类型，都必须确认 `EasyCon/` 仍被根 `.gitignore` 忽略、第三方参考源码没有改动，且外层 tracked
+文件没有引入 `EasyCon/` 内容或项目依赖。
