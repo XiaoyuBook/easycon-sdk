@@ -1901,6 +1901,10 @@ mod tests {
         let parent = runtime.create_operation(None).expect("parent operation");
         let parent_token = parent.cancellation_token();
         parent.start();
+        let admitted_child = runtime
+            .create_operation_with_parent(None, &parent_token)
+            .expect("child admitted before parent terminal sealing");
+        admitted_child.start();
         let (cleanup_started, observed_cleanup) = mpsc::sync_channel(0);
         let (release_cleanup, released) = mpsc::sync_channel(0);
         let finishing_parent = parent.clone();
@@ -1912,14 +1916,19 @@ mod tests {
         });
 
         observed_cleanup.recv().expect("owner cleanup started");
-        let child = runtime.create_operation_with_parent(None, &parent_token);
+        assert_eq!(admitted_child.snapshot().state, OperationState::Cancelling);
+        assert_eq!(
+            admitted_child.snapshot().cancellation_reason,
+            Some(CancellationReason::ParentClose)
+        );
+        let late_child = runtime.create_operation_with_parent(None, &parent_token);
         release_cleanup.send(()).expect("release owner cleanup");
         assert_eq!(
             finisher.join().expect("parent finisher"),
             TransitionOutcome::Applied
         );
 
-        let error = match child {
+        let error = match late_child {
             Err(error) => error,
             Ok(_) => panic!("parent terminal transaction admitted a new child"),
         };
