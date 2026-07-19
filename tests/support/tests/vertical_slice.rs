@@ -146,7 +146,7 @@ fn runtime_controller_fake_vertical_slice_has_exact_trace_and_clean_shutdown() {
 
     let mut observed = Vec::new();
     loop {
-        match events.read(WaitTimeout::Poll) {
+        match events.read(WaitTimeout::Poll).expect("event read") {
             SubscriptionRead::Event(event) => observed.push(event),
             SubscriptionRead::Closed => break,
             SubscriptionRead::Timeout => panic!("closed subscription must drain then close"),

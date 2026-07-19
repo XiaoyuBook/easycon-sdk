@@ -57,6 +57,7 @@
   },
   "events": {
     "delivery": "per-subscriber bounded pull queue",
+    "single_reader": "each subscription admits one active reader; a concurrent reader fails immediately with ResourceBusy without consuming an event",
     "sequence": "strictly increasing across one Runtime",
     "overflow": "oldest ordinary events are summarized by EventGap; authoritative state remains queryable",
     "close": "RuntimeClosed bypasses subscriber severity and log filters and is emitted only after successful cleanup, task join, and registry convergence; CloseFailed uses runtime.close_failed as the final event; either final event leaves subscriptions drainable and rejects later publish attempts; Drop alone emits neither final event"

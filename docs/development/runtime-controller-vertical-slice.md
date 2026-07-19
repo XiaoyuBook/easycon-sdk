@@ -25,8 +25,9 @@
   timeout 提交 Controller failure；report/command write 使用独立的 1 s 默认 I/O deadline，ACK reply
   timeout 从完整 command write 被 transport 接受后开始。
 - 每个 subscription 有独立有界队列。普通事件溢出合并为 `EventGap`，operation/resource
-  query 始终是权威状态；并发发布和 gap 均保持严格递增 sequence；最终 `runtime.closed` 不受
-  subscription severity/log filter 影响。
+  query 始终是权威状态；同一个 subscription 只接纳一个 active reader，并发 reader 返回
+  `RESOURCE_BUSY`；并发发布和 gap 均保持严格递增 sequence；最终 `runtime.closed` 不受 subscription
+  severity/log filter 影响。
 - 每个 Controller 只有一个 writer thread。所有 report（包括取消和关闭中立报告）的默认最小间隔是
   30 ms；write 必须响应 operation/resource cancellation 或绝对 I/O deadline。
 - precise sequence 的 offset 相对 lane 获权时刻且始终为绝对目标；同 offset 按输入顺序合并

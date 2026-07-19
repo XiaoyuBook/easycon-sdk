@@ -96,9 +96,10 @@
     "events": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["delivery", "sequence", "overflow", "close"],
+      "required": ["delivery", "single_reader", "sequence", "overflow", "close"],
       "properties": {
         "delivery": { "type": "string" },
+        "single_reader": { "type": "string" },
         "sequence": { "type": "string" },
         "overflow": { "type": "string" },
         "close": { "type": "string" }

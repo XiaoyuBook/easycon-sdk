@@ -332,6 +332,7 @@
         "crates/easycon-runtime/src/runtime.rs::queue_overflow_reports_gap_without_blocking_or_changing_state",
         "crates/easycon-runtime/src/runtime.rs::gap_remains_between_earlier_critical_and_later_event",
         "crates/easycon-runtime/src/runtime.rs::concurrent_publishers_enqueue_in_global_sequence_order",
+        "crates/easycon-runtime/src/event.rs::concurrent_reader_is_rejected_with_resource_busy",
         "crates/easycon-runtime/src/runtime.rs::capacity_one_preserves_latest_terminal_and_query_is_authoritative",
         "crates/easycon-runtime/src/runtime.rs::final_runtime_event_bypasses_subscription_severity_filter"
       ],
@@ -340,6 +341,7 @@
         { "id": "event.overflow", "action": "publish more ordinary events than capacity" },
         { "id": "event.critical-retained", "action": "retain an earlier critical event while a later ordinary event is dropped" },
         { "id": "event.concurrent-publish", "action": "publish concurrently from multiple producers" },
+        { "id": "event.concurrent-reader", "action": "block one subscription reader and attempt a second read on the same subscription" },
         { "id": "event.operation-complete", "action": "complete an operation" },
         { "id": "event.read-and-query", "action": "read the subscription and query the operation" },
         { "id": "event.filtered-close", "action": "close Runtime with a second subscription whose severity filter excludes Info" }
@@ -359,6 +361,11 @@
           "id": "event.producer-nonblocking",
           "expect": "producer never blocks",
           "test": "crates/easycon-runtime/src/runtime.rs::concurrent_publishers_enqueue_in_global_sequence_order"
+        },
+        {
+          "id": "event.single-reader",
+          "expect": "a concurrent reader fails with ResourceBusy without consuming an event and later reads remain available",
+          "test": "crates/easycon-runtime/src/event.rs::concurrent_reader_is_rejected_with_resource_busy"
         },
         {
           "id": "event.query-authoritative",

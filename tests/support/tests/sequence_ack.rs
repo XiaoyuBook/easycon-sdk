@@ -210,10 +210,12 @@ fn json_u8(value: &Value) -> u8 {
 }
 
 fn drain_events(subscription: &easycon_runtime::EventSubscription) -> Vec<Event> {
-    std::iter::from_fn(|| match subscription.read(WaitTimeout::Poll) {
-        SubscriptionRead::Event(event) => Some(event),
-        SubscriptionRead::Timeout | SubscriptionRead::Closed => None,
-    })
+    std::iter::from_fn(
+        || match subscription.read(WaitTimeout::Poll).expect("event read") {
+            SubscriptionRead::Event(event) => Some(event),
+            SubscriptionRead::Timeout | SubscriptionRead::Closed => None,
+        },
+    )
     .collect()
 }
 

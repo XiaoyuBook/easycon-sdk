@@ -132,11 +132,14 @@ fn fallback_connect_partial_direct_and_close_are_exact() {
     );
     assert_eq!(writes[0].context.timestamp_ns, 15);
     assert_eq!(writes[0].partial_calls, 4);
-    let observed: Vec<_> = std::iter::from_fn(|| match events.read(WaitTimeout::Poll) {
-        SubscriptionRead::Event(event) => Some(event),
-        SubscriptionRead::Timeout | SubscriptionRead::Closed => None,
-    })
-    .collect();
+    let observed: Vec<_> =
+        std::iter::from_fn(
+            || match events.read(WaitTimeout::Poll).expect("event read") {
+                SubscriptionRead::Event(event) => Some(event),
+                SubscriptionRead::Timeout | SubscriptionRead::Closed => None,
+            },
+        )
+        .collect();
     let accepted = observed
         .iter()
         .position(|event| {

@@ -265,6 +265,7 @@ stateDiagram-v2
 ### Subscription
 
 每次 subscribe 创建独立、有界、拉取式队列。订阅 options 包含 capacity、severity/domain filter 和是否包含 log。核心不调用用户 callback。
+同一个 subscription 同时只允许一个 active reader；并发 reader 立即返回 `RESOURCE_BUSY`，不消费事件。
 
 事件公共字段：
 

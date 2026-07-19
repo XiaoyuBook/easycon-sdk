@@ -1,8 +1,9 @@
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
-use easycon_model::{OperationId, ResourceId};
+use easycon_model::{EasyConError, ErrorCode, ErrorDomain, OperationId, ResourceId};
 
 use crate::wait::WaitTimeout;
 
@@ -184,6 +185,7 @@ pub struct EventSubscription {
 
 pub(crate) struct SubscriptionInner {
     options: SubscriptionOptions,
+    reader_active: AtomicBool,
     state: Mutex<QueueState>,
     changed: Condvar,
 }
@@ -209,11 +211,37 @@ struct PendingGap {
     timestamp_ns: u64,
 }
 
+struct ReaderGuard<'a> {
+    active: &'a AtomicBool,
+}
+
+impl ReaderGuard<'_> {
+    fn acquire(active: &AtomicBool) -> Result<ReaderGuard<'_>, EasyConError> {
+        active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| {
+                EasyConError::new(
+                    ErrorDomain::Runtime,
+                    ErrorCode::ResourceBusy,
+                    "event subscription already has an active reader",
+                )
+            })?;
+        Ok(ReaderGuard { active })
+    }
+}
+
+impl Drop for ReaderGuard<'_> {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
+    }
+}
+
 impl EventSubscription {
     pub(crate) fn new(options: SubscriptionOptions) -> Self {
         Self {
             inner: Arc::new(SubscriptionInner {
                 options,
+                reader_active: AtomicBool::new(false),
                 state: Mutex::new(QueueState::default()),
                 changed: Condvar::new(),
             }),
@@ -221,9 +249,14 @@ impl EventSubscription {
     }
 
     /// Pulls one event without invoking user code from a core thread.
-    #[must_use]
-    pub fn read(&self, wait: WaitTimeout) -> SubscriptionRead {
-        self.inner.read(wait)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::ResourceBusy`] when another reader is already blocked in or executing
+    /// a read on this subscription.
+    pub fn read(&self, wait: WaitTimeout) -> Result<SubscriptionRead, EasyConError> {
+        let _reader = ReaderGuard::acquire(&self.inner.reader_active)?;
+        Ok(self.inner.read(wait))
     }
 
     /// Returns the number of queued concrete events, excluding a pending gap summary.
@@ -454,4 +487,57 @@ fn record_gap_at(state: &mut QueueState, mut index: usize, dropped: &Event) {
         gap.merge(next);
     }
     state.entries.insert(index, QueueEntry::Gap(gap));
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use easycon_model::ErrorCode;
+
+    use super::*;
+
+    // conformance: event.single-reader
+    #[test]
+    fn concurrent_reader_is_rejected_with_resource_busy() {
+        let subscription = Arc::new(EventSubscription::new(SubscriptionOptions::default()));
+        let reading = Arc::clone(&subscription);
+        let reader = std::thread::spawn(move || reading.read(WaitTimeout::Infinite));
+        let started = Instant::now();
+        while !subscription.inner.reader_active.load(Ordering::Acquire) {
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "first subscription reader did not acquire ownership"
+            );
+            std::thread::yield_now();
+        }
+
+        let error = subscription
+            .read(WaitTimeout::Poll)
+            .expect_err("a concurrent subscription reader must be rejected");
+        assert_eq!(error.code(), ErrorCode::ResourceBusy);
+
+        let event = Event {
+            sequence: 1,
+            timestamp_ns: 0,
+            class: EventClass::Ordinary,
+            kind: EventKind::Data,
+            code: "test.reader_release",
+            severity: Severity::Info,
+            operation_id: None,
+            resource_id: None,
+            detail: None,
+        };
+        subscription.inner.enqueue(event.clone());
+        assert_eq!(
+            reader.join().expect("first subscription reader"),
+            Ok(SubscriptionRead::Event(event))
+        );
+        assert_eq!(
+            subscription.read(WaitTimeout::Poll),
+            Ok(SubscriptionRead::Timeout)
+        );
+        subscription.inner.close();
+    }
 }

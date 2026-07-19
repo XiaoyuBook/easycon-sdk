@@ -1791,11 +1791,14 @@ mod tests {
         assert!(snapshot.error.is_none());
         assert_eq!(runtime.counts().active_operations, 0);
 
-        let codes: Vec<_> = std::iter::from_fn(|| match events.read(WaitTimeout::Poll) {
-            SubscriptionRead::Event(event) => Some(event.code),
-            SubscriptionRead::Timeout | SubscriptionRead::Closed => None,
-        })
-        .collect();
+        let codes: Vec<_> =
+            std::iter::from_fn(
+                || match events.read(WaitTimeout::Poll).expect("event read") {
+                    SubscriptionRead::Event(event) => Some(event.code),
+                    SubscriptionRead::Timeout | SubscriptionRead::Closed => None,
+                },
+            )
+            .collect();
         assert_eq!(
             codes,
             ["runtime.operation.running", "runtime.operation.succeeded"]
@@ -2038,11 +2041,14 @@ mod tests {
                 .operation_registry_unlink_panic
                 .load(Ordering::Acquire)
         );
-        let codes: Vec<_> = std::iter::from_fn(|| match events.read(WaitTimeout::Poll) {
-            SubscriptionRead::Event(event) => Some(event.code),
-            SubscriptionRead::Timeout | SubscriptionRead::Closed => None,
-        })
-        .collect();
+        let codes: Vec<_> =
+            std::iter::from_fn(
+                || match events.read(WaitTimeout::Poll).expect("event read") {
+                    SubscriptionRead::Event(event) => Some(event.code),
+                    SubscriptionRead::Timeout | SubscriptionRead::Closed => None,
+                },
+            )
+            .collect();
         assert_eq!(codes, ["runtime.operation.running"]);
 
         let operation = runtime.create_operation(None).expect("hook operation");
@@ -2214,11 +2220,14 @@ mod tests {
         operation.cancel();
         operation.finish_cancelled();
 
-        let observed: Vec<_> = std::iter::from_fn(|| match events.read(WaitTimeout::Poll) {
-            SubscriptionRead::Event(event) => Some(event),
-            SubscriptionRead::Timeout | SubscriptionRead::Closed => None,
-        })
-        .collect();
+        let observed: Vec<_> =
+            std::iter::from_fn(
+                || match events.read(WaitTimeout::Poll).expect("event read") {
+                    SubscriptionRead::Event(event) => Some(event),
+                    SubscriptionRead::Timeout | SubscriptionRead::Closed => None,
+                },
+            )
+            .collect();
         assert!(observed.iter().any(|event| {
             event.code == "runtime.operation.cancelling" && event.kind == EventKind::State
         }));
@@ -2372,7 +2381,9 @@ mod tests {
             ))
             .expect("publish");
 
-        let SubscriptionRead::Event(gap) = subscription.read(WaitTimeout::Poll) else {
+        let SubscriptionRead::Event(gap) =
+            subscription.read(WaitTimeout::Poll).expect("event read")
+        else {
             panic!("expected gap event");
         };
         assert_eq!(
@@ -2409,14 +2420,14 @@ mod tests {
         operation.succeed(OperationValue::Unit);
 
         assert!(matches!(
-            subscription.read(WaitTimeout::Poll),
+            subscription.read(WaitTimeout::Poll).expect("event read"),
             SubscriptionRead::Event(Event {
                 kind: EventKind::Gap(_),
                 ..
             })
         ));
         assert!(matches!(
-            subscription.read(WaitTimeout::Poll),
+            subscription.read(WaitTimeout::Poll).expect("event read"),
             SubscriptionRead::Event(Event {
                 code: "runtime.operation.succeeded",
                 kind: EventKind::Terminal,
@@ -2458,9 +2469,11 @@ mod tests {
             ))
             .expect("publish");
 
-        let events: Vec<_> = std::iter::from_fn(|| match subscription.read(WaitTimeout::Poll) {
-            SubscriptionRead::Event(event) => Some(event),
-            SubscriptionRead::Timeout | SubscriptionRead::Closed => None,
+        let events: Vec<_> = std::iter::from_fn(|| {
+            match subscription.read(WaitTimeout::Poll).expect("event read") {
+                SubscriptionRead::Event(event) => Some(event),
+                SubscriptionRead::Timeout | SubscriptionRead::Closed => None,
+            }
         })
         .collect();
         assert_eq!(events.len(), 3);
@@ -2508,9 +2521,11 @@ mod tests {
             publisher.join().expect("publisher thread");
         }
 
-        let events: Vec<_> = std::iter::from_fn(|| match subscription.read(WaitTimeout::Poll) {
-            SubscriptionRead::Event(event) => Some(event),
-            SubscriptionRead::Timeout | SubscriptionRead::Closed => None,
+        let events: Vec<_> = std::iter::from_fn(|| {
+            match subscription.read(WaitTimeout::Poll).expect("event read") {
+                SubscriptionRead::Event(event) => Some(event),
+                SubscriptionRead::Timeout | SubscriptionRead::Closed => None,
+            }
         })
         .collect();
         assert_eq!(events.len(), 256);
@@ -2759,13 +2774,16 @@ mod tests {
         runtime.close().expect("Runtime close");
 
         assert_eq!(*close_order.lock().expect("close order lock"), [1, 2, 3]);
-        let terminal_ids: Vec<_> = std::iter::from_fn(|| match events.read(WaitTimeout::Poll) {
-            SubscriptionRead::Event(event) => Some(event),
-            SubscriptionRead::Closed | SubscriptionRead::Timeout => None,
-        })
-        .filter(|event| event.code == "runtime.operation.cancelled")
-        .filter_map(|event| event.operation_id)
-        .collect();
+        let terminal_ids: Vec<_> =
+            std::iter::from_fn(
+                || match events.read(WaitTimeout::Poll).expect("event read") {
+                    SubscriptionRead::Event(event) => Some(event),
+                    SubscriptionRead::Closed | SubscriptionRead::Timeout => None,
+                },
+            )
+            .filter(|event| event.code == "runtime.operation.cancelled")
+            .filter_map(|event| event.operation_id)
+            .collect();
         assert_eq!(terminal_ids, operation_ids);
         drop(resources);
     }
@@ -2826,7 +2844,7 @@ mod tests {
 
         let mut codes = Vec::new();
         loop {
-            match events.read(WaitTimeout::Poll) {
+            match events.read(WaitTimeout::Poll).expect("event read") {
                 SubscriptionRead::Event(event) => codes.push(event.code),
                 SubscriptionRead::Closed => break,
                 SubscriptionRead::Timeout => panic!("closed queue must not return timeout"),
@@ -2875,7 +2893,7 @@ mod tests {
         assert_eq!(error.code(), ErrorCode::RuntimeClosing);
         let mut codes = Vec::new();
         loop {
-            match events.read(WaitTimeout::Poll) {
+            match events.read(WaitTimeout::Poll).expect("event read") {
                 SubscriptionRead::Event(event) => codes.push(event.code),
                 SubscriptionRead::Timeout => break,
                 SubscriptionRead::Closed => panic!("Drop must not close event production"),
@@ -2999,7 +3017,7 @@ mod tests {
 
         let mut observed = Vec::new();
         loop {
-            match events.read(WaitTimeout::Poll) {
+            match events.read(WaitTimeout::Poll).expect("event read") {
                 SubscriptionRead::Event(event) => observed.push(event),
                 SubscriptionRead::Closed => break,
                 SubscriptionRead::Timeout => panic!("failed close queue must be closed"),
@@ -3075,7 +3093,7 @@ mod tests {
 
         let mut codes = Vec::new();
         loop {
-            match events.read(WaitTimeout::Poll) {
+            match events.read(WaitTimeout::Poll).expect("event read") {
                 SubscriptionRead::Event(event) => codes.push(event.code),
                 SubscriptionRead::Closed => break,
                 SubscriptionRead::Timeout => panic!("failed close queue must be closed"),
@@ -3140,7 +3158,7 @@ mod tests {
         assert_eq!(runtime.state(), RuntimeState::CloseFailed);
         let mut codes = Vec::new();
         loop {
-            match events.read(WaitTimeout::Poll) {
+            match events.read(WaitTimeout::Poll).expect("event read") {
                 SubscriptionRead::Event(event) => codes.push(event.code),
                 SubscriptionRead::Closed => break,
                 SubscriptionRead::Timeout => panic!("failed close queue must be closed"),
@@ -3223,7 +3241,7 @@ mod tests {
         assert_eq!(runtime.state(), RuntimeState::Closed);
         let mut codes = Vec::new();
         loop {
-            match events.read(WaitTimeout::Poll) {
+            match events.read(WaitTimeout::Poll).expect("event read") {
                 SubscriptionRead::Event(event) => codes.push(event.code),
                 SubscriptionRead::Closed => break,
                 SubscriptionRead::Timeout => panic!("failed close queue must be closed"),
@@ -3286,7 +3304,7 @@ mod tests {
         );
         let mut codes = Vec::new();
         loop {
-            match events.read(WaitTimeout::Poll) {
+            match events.read(WaitTimeout::Poll).expect("event read") {
                 SubscriptionRead::Event(event) => codes.push(event.code),
                 SubscriptionRead::Timeout => break,
                 SubscriptionRead::Closed => panic!("Drop must not finalize event production"),
@@ -3408,13 +3426,16 @@ mod tests {
         runtime.close().expect("Runtime close");
 
         assert!(matches!(
-            events.read(WaitTimeout::Poll),
+            events.read(WaitTimeout::Poll).expect("event read"),
             SubscriptionRead::Event(Event {
                 code: "runtime.closed",
                 ..
             })
         ));
-        assert_eq!(events.read(WaitTimeout::Poll), SubscriptionRead::Closed);
+        assert_eq!(
+            events.read(WaitTimeout::Poll).expect("event read"),
+            SubscriptionRead::Closed
+        );
     }
 
     // conformance: vertical.final-event-order
@@ -3467,7 +3488,7 @@ mod tests {
 
         let mut codes = Vec::new();
         loop {
-            match events.read(WaitTimeout::Poll) {
+            match events.read(WaitTimeout::Poll).expect("event read") {
                 SubscriptionRead::Event(event) => codes.push(event.code),
                 SubscriptionRead::Timeout => break,
                 SubscriptionRead::Closed => {
@@ -3503,7 +3524,7 @@ mod tests {
         );
 
         loop {
-            match events.read(WaitTimeout::Poll) {
+            match events.read(WaitTimeout::Poll).expect("event read") {
                 SubscriptionRead::Event(event) => codes.push(event.code),
                 SubscriptionRead::Closed => break,
                 SubscriptionRead::Timeout => panic!("closed subscription must finish draining"),
@@ -3544,7 +3565,7 @@ mod tests {
         for subscription in [&first, &second] {
             let mut codes = Vec::new();
             loop {
-                match subscription.read(WaitTimeout::Poll) {
+                match subscription.read(WaitTimeout::Poll).expect("event read") {
                     SubscriptionRead::Event(event) => codes.push(event.code),
                     SubscriptionRead::Closed => break,
                     SubscriptionRead::Timeout => {
@@ -3581,7 +3602,7 @@ mod tests {
         for subscription in [&first, &second] {
             let mut codes = Vec::new();
             loop {
-                match subscription.read(WaitTimeout::Poll) {
+                match subscription.read(WaitTimeout::Poll).expect("event read") {
                     SubscriptionRead::Event(event) => codes.push(event.code),
                     SubscriptionRead::Closed => break,
                     SubscriptionRead::Timeout => {
@@ -3619,7 +3640,7 @@ mod tests {
         for subscription in [&first, &second] {
             let mut observed = Vec::new();
             loop {
-                match subscription.read(WaitTimeout::Poll) {
+                match subscription.read(WaitTimeout::Poll).expect("event read") {
                     SubscriptionRead::Event(event) => observed.push(event),
                     SubscriptionRead::Closed => break,
                     SubscriptionRead::Timeout => {
@@ -3977,7 +3998,7 @@ mod tests {
         assert_eq!(with_logs.queued_len(), 2);
         assert_eq!(without_logs.queued_len(), 1);
         assert!(matches!(
-            without_logs.read(WaitTimeout::Poll),
+            without_logs.read(WaitTimeout::Poll).expect("event read"),
             SubscriptionRead::Event(Event {
                 code: "test.warning",
                 class: EventClass::Critical,
