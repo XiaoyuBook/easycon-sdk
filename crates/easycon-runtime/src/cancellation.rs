@@ -5,7 +5,7 @@ use easycon_model::RuntimeId;
 
 use crate::concurrency::{
     CancellationNode, admit_child_while_locked, cancellation_admission_open, claim_cancellation,
-    invoke_isolated, seal_cancelled_tree, seal_deactivated_tree,
+    drop_isolated, invoke_isolated, seal_cancelled_tree, seal_deactivated_tree,
 };
 
 type CancelHook = Arc<dyn Fn() + Send + Sync + 'static>;
@@ -33,10 +33,16 @@ pub(crate) struct CancellationPropagation {
 }
 
 impl CancellationPropagation {
-    pub(crate) fn propagate(self) {
-        for hook in self.hooks {
-            invoke_hook(&hook);
+    pub(crate) fn propagate(mut self) {
+        for hook in self.hooks.drain(..) {
+            invoke_hook(hook);
         }
+    }
+}
+
+impl Drop for CancellationPropagation {
+    fn drop(&mut self) {
+        drop_hooks(std::mem::take(&mut self.hooks));
     }
 }
 
@@ -71,15 +77,21 @@ impl CancellationNode for CancellationInner {
     }
 
     fn take_active_hooks(&self) -> Vec<Self::Hook> {
-        std::mem::take(&mut *lock_recover(&self.hooks))
-            .into_iter()
-            .filter(CancelHookEntry::is_active)
-            .map(|entry| entry.hook)
-            .collect()
+        let entries = std::mem::take(&mut *lock_recover(&self.hooks));
+        let mut active = Vec::with_capacity(entries.len());
+        for entry in entries {
+            if entry.is_active() {
+                active.push(entry.hook);
+            } else {
+                drop_hook(entry.hook);
+            }
+        }
+        active
     }
 
     fn clear_hooks(&self) {
-        lock_recover(&self.hooks).clear();
+        let entries = std::mem::take(&mut *lock_recover(&self.hooks));
+        drop_hook_entries(entries);
     }
 
     fn take_live_children(&self) -> Vec<Self::Child> {
@@ -192,10 +204,11 @@ impl CancellationToken {
 
     fn register_hook(&self, hook: CancelHook, lifetime: Option<Weak<()>>) {
         if !self.inner.active.load(Ordering::Acquire) {
+            drop_hook(hook);
             return;
         }
         if self.is_cancelled() {
-            invoke_hook(&hook);
+            invoke_hook(hook);
             return;
         }
 
@@ -204,15 +217,29 @@ impl CancellationToken {
             .hooks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        hooks.retain(CancelHookEntry::is_active);
+        let entries = std::mem::take(&mut *hooks);
+        let mut inactive = Vec::new();
+        for entry in entries {
+            if entry.is_active() {
+                hooks.push(entry);
+            } else {
+                inactive.push(entry);
+            }
+        }
         if !self.inner.active.load(Ordering::Acquire) {
+            drop(hooks);
+            drop_hook_entries(inactive);
+            drop_hook(hook);
             return;
         }
         if self.is_cancelled() {
             drop(hooks);
-            invoke_hook(&hook);
+            drop_hook_entries(inactive);
+            invoke_hook(hook);
         } else {
             hooks.push(CancelHookEntry { lifetime, hook });
+            drop(hooks);
+            drop_hook_entries(inactive);
         }
     }
 
@@ -229,8 +256,35 @@ fn cancel_inner(inner: &Arc<CancellationInner>) {
     CancellationPropagation { hooks }.propagate();
 }
 
-fn invoke_hook(hook: &CancelHook) {
+impl Drop for CancellationInner {
+    fn drop(&mut self) {
+        let hooks = self
+            .hooks
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop_hook_entries(std::mem::take(hooks));
+    }
+}
+
+fn invoke_hook(hook: CancelHook) {
     let _ = invoke_isolated(|| hook());
+    drop_hook(hook);
+}
+
+fn drop_hook(hook: CancelHook) {
+    let _ = drop_isolated(hook);
+}
+
+fn drop_hooks(hooks: Vec<CancelHook>) {
+    for hook in hooks {
+        drop_hook(hook);
+    }
+}
+
+fn drop_hook_entries(entries: Vec<CancelHookEntry>) {
+    for entry in entries {
+        drop_hook(entry.hook);
+    }
 }
 
 fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -381,6 +435,13 @@ mod tests {
                 drops: Arc::clone(&observed_payload_drops),
             });
         });
+        let closure_drops = Arc::new(AtomicUsize::new(0));
+        let closure_capture = DropPanickingPayload {
+            drops: Arc::clone(&closure_drops),
+        };
+        root.on_cancel(move || {
+            let _ = &closure_capture;
+        });
         let later_hook_called = Arc::new(AtomicBool::new(false));
         let observed_later_hook = Arc::clone(&later_hook_called);
         root.on_cancel(move || {
@@ -403,6 +464,29 @@ mod tests {
         assert!(child.is_cancelled());
         assert!(grandchild.is_cancelled());
         assert_eq!(payload_drops.load(Ordering::Acquire), 1);
+        assert_eq!(closure_drops.load(Ordering::Acquire), 1);
+
+        let root = CancellationToken::root();
+        let child = root.child();
+        let closure_drops = Arc::new(AtomicUsize::new(0));
+        let closure_capture = DropPanickingPayload {
+            drops: Arc::clone(&closure_drops),
+        };
+        let hook_called = Arc::new(AtomicBool::new(false));
+        let observed_hook = Arc::clone(&hook_called);
+        root.on_cancel(move || {
+            let _ = &closure_capture;
+            observed_hook.store(true, Ordering::Release);
+        });
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            root.deactivate_deferred().propagate();
+        }));
+
+        assert!(result.is_ok(), "hook drop escaped cancellation sealing");
+        assert!(!hook_called.load(Ordering::Acquire));
+        assert_eq!(closure_drops.load(Ordering::Acquire), 1);
+        assert!(child.is_cancelled());
     }
 
     #[test]

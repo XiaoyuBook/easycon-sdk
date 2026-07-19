@@ -73,6 +73,10 @@ pub fn catch_isolated<T>(action: impl FnOnce() -> T) -> Result<T, ()> {
     contain_panic(catch_unwind(AssertUnwindSafe(action)))
 }
 
+pub fn drop_isolated<T>(value: T) -> bool {
+    catch_isolated(|| drop(value)).is_ok()
+}
+
 pub fn invoke_isolated(action: impl FnOnce()) -> bool {
     catch_isolated(action).is_ok()
 }

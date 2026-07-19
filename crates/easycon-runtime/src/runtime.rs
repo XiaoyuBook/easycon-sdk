@@ -2060,6 +2060,36 @@ mod tests {
             })
         ));
 
+        let operation = runtime.create_operation(None).expect("hook-drop operation");
+        operation.start();
+        let closure_drops = Arc::new(AtomicUsize::new(0));
+        let closure_capture = DropPanickingPayload {
+            drops: Arc::clone(&closure_drops),
+        };
+        operation.on_cancel(move || {
+            let _ = &closure_capture;
+        });
+        let (blocked, waiter) = spawn_blocked_operation_waiter(&operation);
+        blocked
+            .recv_timeout(Duration::from_secs(2))
+            .expect("hook-drop waiter blocked");
+        let finish = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            operation.succeed(OperationValue::Unit)
+        }));
+        let waiter_result = waiter.join().expect("hook-drop waiter");
+        assert_eq!(
+            finish.expect("hook drop must not escape terminal transaction"),
+            TransitionOutcome::Applied
+        );
+        assert_eq!(closure_drops.load(Ordering::Acquire), 1);
+        assert!(matches!(
+            waiter_result,
+            WaitResult::Completed(OperationSnapshot {
+                state: OperationState::Succeeded,
+                ..
+            })
+        ));
+
         let operation = runtime.create_operation(None).expect("poison operation");
         operation.start();
         let poisoned_operation = operation.clone();
