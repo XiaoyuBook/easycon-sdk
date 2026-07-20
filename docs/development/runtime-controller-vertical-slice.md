@@ -1,15 +1,16 @@
-# Runtime + Controller/Serial Phase 2A Candidate
+# Runtime + Controller/Serial Phase 2A Frozen Candidate
 
 ## 里程碑状态
 
 本文实现中的 Phase 1 Runtime 已按
 [ADR-0007](../decisions/0007-phase-1-freeze.md) 冻结在 `4261925dc4e84b36e8491c0a97c17048d3eacd84`。
 基于 [ADR-0008](../decisions/0008-phase-2-controller-target.md)，Windows serial、ControllerTransport、
-Amiibo、故障注入、10,000-step fake 和软件热路径测量已经收敛为 Phase 2A Candidate，可提交独立 review。
+Amiibo、故障注入、10,000-step fake 和软件热路径测量已收敛，并按
+[ADR-0009](../decisions/0009-phase-2a-freeze.md) 冻结为 Phase 2A Candidate。
 
 当前状态严格为 **Hardware Unverified**。没有物理 CH32/控制板参与开发或验收；O-01、O-02、O-04
 保持开放，完整 Phase 2 仍未完成。本文不声称任何具体 VID/PID、固件、baud、Amiibo 容量、UART/USB HID/
-Switch 执行时序或物理中立化已经验证，也不创建完整 Phase 2 冻结 ADR。实现冻结由后续独立 review 完成。
+Switch 执行时序或物理中立化已经验证，也不创建完整 Phase 2 冻结 ADR。
 
 ## 交付范围
 

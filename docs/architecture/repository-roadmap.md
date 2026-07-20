@@ -112,10 +112,11 @@ easycon sdk/
 
 ### Phase 2：Controller vertical slice
 
-目标已按 [ADR-0008](../decisions/0008-phase-2-controller-target.md) 冻结。当前 Phase 2A 实现与无硬件
-验收已收敛为待独立 review 的候选；需要实物的 Phase 2B 尚未开始。
+目标已按 [ADR-0008](../decisions/0008-phase-2-controller-target.md) 冻结，Phase 2A 实现已按
+[ADR-0009](../decisions/0009-phase-2a-freeze.md) 冻结为 `Hardware Unverified` Candidate；需要实物的 Phase 2B
+尚未开始。
 
-#### Phase 2A：Controller/Serial Candidate（无硬件）
+#### Phase 2A：Controller/Serial Candidate（Frozen，Hardware Unverified）
 
 交付：
 
@@ -127,8 +128,8 @@ easycon sdk/
 退出门槛：ADR-0008 的 Phase 2A 交付和门禁全部通过，固定实现提交经独立 review 后另建实现冻结 ADR。
 结果必须标记 `Hardware Unverified`；O-01、O-02、O-04 保持开放。
 
-当前状态：实现、规范、故障测试、10,000-step fake 和本机软件路径测量已完成；独立 review 与实现冻结
-ADR 尚未完成，因此本节保持 Candidate 而不是 Frozen。
+当前状态：实现、规范、故障测试、10,000-step fake、本机软件路径测量和独立 review 已完成，冻结基线为
+`2e9743c5d4b205c7ecbd082f4265199ce1a6cc30`。Candidate 仍是无硬件候选，不等于完整 Phase 2 Frozen。
 
 #### Phase 2B：Controller Hardware Qualification（有硬件）
 

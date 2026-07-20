@@ -4,11 +4,12 @@ EasyCon SDK 是基于 EasyCon 源码进行二次开发的多语言 SDK 项目，
 
 ## 当前状态
 
-仓库已经冻结 SDK v1 架构和 [Phase 1 Runtime 基线](docs/decisions/0007-phase-1-freeze.md)，并形成可独立
-review 的 Phase 2A Controller/Serial Candidate：Windows serial 系统 backend、可注入 byte I/O、
-Controller 单写者 lane、Amiibo save/select、10,000-step fake 和软件路径 latency harness 均已实现。
+仓库已经冻结 SDK v1 架构、[Phase 1 Runtime 基线](docs/decisions/0007-phase-1-freeze.md) 和
+[Phase 2A Controller/Serial Candidate](docs/decisions/0009-phase-2a-freeze.md)。Phase 2A 包含 Windows serial
+系统 backend、可注入 byte I/O、Controller 单写者 lane、Amiibo save/select、10,000-step fake 和软件路径
+latency harness。
 
-[Phase 2 Controller/Serial 开发目标](docs/decisions/0008-phase-2-controller-target.md) 已冻结，但当前候选仍为
+[Phase 2 Controller/Serial 开发目标](docs/decisions/0008-phase-2-controller-target.md) 已冻结；Phase 2A 仍为
 `Hardware Unverified`：没有验证任何具体控制板、固件、VID/PID、Amiibo 容量或 UART/USB/Switch 时序，
 O-01、O-02、O-04 保持开放。当前也未发布稳定公共 API/ABI，不包含 Vision、ECS、语言绑定、固件或 UI；
 完整 Phase 2 必须在 CH32 可用后通过 Phase 2B 硬件资格验证。

@@ -34,6 +34,7 @@
 - [ADR-0006：Runtime 所有权、终态事务与确定性关闭](decisions/0006-runtime-stabilization.md)
 - [ADR-0007：冻结 Phase 1 Runtime 基线](decisions/0007-phase-1-freeze.md)
 - [ADR-0008：冻结 Phase 2 Controller/Serial 开发目标](decisions/0008-phase-2-controller-target.md)
+- [ADR-0009：冻结 Phase 2A Controller/Serial Candidate 基线](decisions/0009-phase-2a-freeze.md)
 
 ## v1 固定范围
 
@@ -47,14 +48,14 @@
 ## 当前实施状态
 
 Phase 1 Runtime 已按 [ADR-0007](decisions/0007-phase-1-freeze.md) 冻结在可执行基线 `4261925`。
-仓库现已形成可独立 review 的 Phase 2A Controller/Serial Candidate：Windows x64 system serial leaf、
-可注入 byte I/O、CH32 模拟器、Amiibo save/select、10,000-step VirtualClock 验收和软件热路径 latency
-harness 均已实现。详细证据和本地命令见
+Phase 2A Controller/Serial Candidate 已按 [ADR-0009](decisions/0009-phase-2a-freeze.md) 冻结：Windows x64
+system serial leaf、可注入 byte I/O、CH32 模拟器、Amiibo save/select、10,000-step VirtualClock 验收和
+软件热路径 latency harness 均已实现。详细证据和本地命令见
 [Runtime + Controller Phase 2A Candidate](development/runtime-controller-vertical-slice.md)。
 
 该候选仍明确标记 `Hardware Unverified`。它没有验证任何具体控制板、固件、VID/PID、Amiibo 容量、
-UART/USB/Switch 时序或物理中立化；O-01、O-02、O-04 保持开放，完整 Phase 2 未完成。实现冻结仍需后续
-独立 review，当前没有创建完整 Phase 2 冻结 ADR。
+UART/USB/Switch 时序或物理中立化；O-01、O-02、O-04 保持开放，完整 Phase 2 未完成，也没有创建完整
+Phase 2 冻结 ADR。
 
 ## 首发基线
 
