@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod faults;
+
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{BufWriter, Write};
@@ -876,6 +878,14 @@ fn qualification_check(name: &str, status: &str) -> Value {
     json!({"name": name, "status": status})
 }
 
+const FAULT_CLEANUP_ROLES: [(&str, &str); 4] = [
+    ("occupier", "occupier_cleanup"),
+    ("occupied_probe", "occupied_probe_cleanup"),
+    ("cancel", "cancel_cleanup"),
+    ("deadline", "deadline_cleanup"),
+];
+const FAULT_SCENARIOS: [&str; 3] = ["port_occupied", "cancel", "deadline"];
+
 fn cleanup_contract_succeeded(command: &str, result: &Value) -> bool {
     if command == "faults" && result.get("execution_error").is_some() {
         return partial_fault_cleanup_contract_succeeded(result);
@@ -883,7 +893,7 @@ fn cleanup_contract_succeeded(command: &str, result: &Value) -> bool {
 
     let expected_count = match command {
         "handshake" | "smoke" | "home-wake" | "sequence" => 1,
-        "faults" => 3,
+        "faults" => 4,
         "hotplug" => 2,
         "lifecycle" => result["records"].as_array().map_or(0, Vec::len),
         "amiibo" if result["write_performed"].as_bool() == Some(true) => 1,
@@ -899,9 +909,10 @@ fn cleanup_contract_succeeded(command: &str, result: &Value) -> bool {
     match command {
         "handshake" | "smoke" | "home-wake" | "sequence" => cleanup_succeeded(&result["cleanup"]),
         "faults" => {
-            cleanup_succeeded(&result["cleanup"])
-                && cleanup_succeeded(&result["secondary_cleanup"])
-                && cleanup_succeeded(&result["deadline_cleanup"])
+            complete_fault_projection_succeeded(result)
+                && FAULT_CLEANUP_ROLES
+                    .iter()
+                    .all(|(_, cleanup)| cleanup_succeeded(&result[*cleanup]))
         }
         "hotplug" => {
             cleanup_succeeded(&result["cleanup"])
@@ -920,29 +931,53 @@ fn cleanup_contract_succeeded(command: &str, result: &Value) -> bool {
     }
 }
 
-fn partial_fault_cleanup_contract_succeeded(result: &Value) -> bool {
-    const ROLES: [(&str, &str); 4] = [
-        ("occupier", "occupier_cleanup"),
-        ("occupied_probe", "occupied_probe_cleanup"),
-        ("cancel", "cancel_cleanup"),
-        ("deadline", "deadline_cleanup"),
-    ];
+fn complete_fault_projection_succeeded(result: &Value) -> bool {
+    let Some(resources) = result.get("resources").and_then(Value::as_object) else {
+        return false;
+    };
+    if resources.len() != FAULT_CLEANUP_ROLES.len()
+        || FAULT_CLEANUP_ROLES.iter().any(|(role, _)| {
+            resources
+                .get(*role)
+                .and_then(|resource| resource.get("created"))
+                .and_then(Value::as_bool)
+                != Some(true)
+        })
+    {
+        return false;
+    }
 
+    let Some(scenarios) = result.get("scenarios").and_then(Value::as_object) else {
+        return false;
+    };
+    scenarios.len() == FAULT_SCENARIOS.len()
+        && FAULT_SCENARIOS.iter().all(|scenario| {
+            scenarios
+                .get(*scenario)
+                .and_then(|value| value.get("status"))
+                .and_then(Value::as_str)
+                == Some("completed")
+        })
+}
+
+fn partial_fault_cleanup_contract_succeeded(result: &Value) -> bool {
     let Some(result_object) = result.as_object() else {
         return false;
     };
     let Some(resources) = result.get("resources").and_then(Value::as_object) else {
         return false;
     };
-    if resources.len() != ROLES.len()
-        || ROLES.iter().any(|(role, _)| !resources.contains_key(*role))
+    if resources.len() != FAULT_CLEANUP_ROLES.len()
+        || FAULT_CLEANUP_ROLES
+            .iter()
+            .any(|(role, _)| !resources.contains_key(*role))
     {
         return false;
     }
 
     let mut expected_cleanup_count = 0;
     let mut found_uncreated_role = false;
-    for (role, cleanup_field) in ROLES {
+    for (role, cleanup_field) in FAULT_CLEANUP_ROLES {
         let Some(created) = resources[role].get("created").and_then(Value::as_bool) else {
             return false;
         };
@@ -966,8 +1001,8 @@ fn partial_fault_cleanup_contract_succeeded(result: &Value) -> bool {
     let Some(scenarios) = result.get("scenarios").and_then(Value::as_object) else {
         return false;
     };
-    if scenarios.len() != 3
-        || ["port_occupied", "cancel", "deadline"]
+    if scenarios.len() != FAULT_SCENARIOS.len()
+        || FAULT_SCENARIOS
             .iter()
             .any(|scenario| !scenarios.contains_key(*scenario))
     {
@@ -976,6 +1011,10 @@ fn partial_fault_cleanup_contract_succeeded(result: &Value) -> bool {
     let Some(stage) = result["execution_error"]["stage"].as_str() else {
         return false;
     };
+    let cleanup_failure_stage = matches!(
+        stage,
+        "occupied_probe_close" | "occupier_close" | "cancel_close" | "deadline_close"
+    );
     let Some((failed_scenario, expected_created_roles)) = partial_fault_stage_contract(stage)
     else {
         return false;
@@ -1003,7 +1042,8 @@ fn partial_fault_cleanup_contract_succeeded(result: &Value) -> bool {
         _ => false,
     };
 
-    evidence_order_is_valid
+    !cleanup_failure_stage
+        && evidence_order_is_valid
         && cleanup_slot_count(result) == expected_cleanup_count
         && runtime_cleanup_count(result) == expected_cleanup_count
 }
@@ -1017,7 +1057,9 @@ fn partial_fault_stage_contract(stage: &str) -> Option<(&'static str, usize)> {
         | "occupied_probe_create" => Some(("port_occupied", 1)),
         "occupied_probe_connect_admit"
         | "occupied_probe_connect_wait"
-        | "occupied_probe_connect_terminal" => Some(("port_occupied", 2)),
+        | "occupied_probe_connect_terminal"
+        | "occupied_probe_close"
+        | "occupier_close" => Some(("port_occupied", 2)),
         "cancel_create" => Some(("cancel", 2)),
         "cancel_connect_admit"
         | "cancel_connect_wait"
@@ -1026,11 +1068,14 @@ fn partial_fault_stage_contract(stage: &str) -> Option<(&'static str, usize)> {
         | "cancel_sequence_admit"
         | "cancel_readiness"
         | "cancel_request"
-        | "cancel_terminal_wait" => Some(("cancel", 3)),
+        | "cancel_terminal_wait"
+        | "cancel_operation_terminal"
+        | "cancel_close" => Some(("cancel", 3)),
         "deadline_create" => Some(("deadline", 3)),
-        "deadline_connect_admit" | "deadline_terminal_wait" | "deadline_connect_terminal" => {
-            Some(("deadline", 4))
-        }
+        "deadline_connect_admit"
+        | "deadline_terminal_wait"
+        | "deadline_connect_terminal"
+        | "deadline_close" => Some(("deadline", 4)),
         _ => None,
     }
 }
@@ -1301,182 +1346,7 @@ fn run_home_wake(arguments: &[String]) -> Result<Value, String> {
 }
 
 fn run_faults(arguments: &[String]) -> Result<Value, String> {
-    let port: String = required_value(arguments, "--port")?;
-    let primary = Harness::new(&port, ControllerOptions::default())?;
-    primary.connect(ConnectOptions::default())?;
-
-    let occupied = Harness::new(&port, ControllerOptions::default())?;
-    let occupied_operation = occupied
-        .controller
-        .connect(ConnectOptions {
-            operation_deadline_ns: None,
-            protocol_timeout_ns: 300_000_000,
-        })
-        .map_err(|error| error.to_string())?;
-    wait_terminal(&occupied_operation, OPERATION_TIMEOUT)?;
-    let occupied_result = operation_json(&occupied_operation);
-    let occupied_open_attempts = occupied.native_open_attempts();
-    let occupied_cleanup = occupied.close();
-    if !cleanup_succeeded(&occupied_cleanup) {
-        let (cleanup, deadline_attempt) = close_primary_then_create_deadline(
-            &occupied_cleanup,
-            || primary.close(),
-            || Harness::new(&port, ControllerOptions::default()),
-        );
-        debug_assert!(deadline_attempt.is_none());
-        return Ok(json!({
-            "command": "faults",
-            "port_occupied": occupied_result,
-            "port_occupied_native_open_attempts": occupied_open_attempts,
-            "cancel_status": "not_run: secondary cleanup failed",
-            "deadline_status": "not_run: secondary cleanup failed",
-            "secondary_cleanup": occupied_cleanup,
-            "cleanup": cleanup,
-        }));
-    }
-
-    let mut result = json!({
-        "command": "faults",
-        "port_occupied": occupied_result,
-        "port_occupied_expected_failed": occupied_operation.snapshot().state == OperationState::Failed,
-        "port_occupied_native_open_attempts": occupied_open_attempts,
-        "cancel_status": "not_run",
-        "deadline_status": "not_run",
-        "secondary_cleanup": occupied_cleanup.clone(),
-    });
-    let cancel_baseline = primary.controller.snapshot();
-    result["cancel_baseline_snapshot"] = controller_snapshot_json(cancel_baseline);
-    let sequence = PreciseSequence::new(vec![
-        SequenceStep::new(0, ControllerAction::ButtonDown(Button::A)),
-        SequenceStep::new(60_000_000_000, ControllerAction::ButtonUp(Button::A)),
-    ])
-    .map_err(|error| error.to_string())?;
-    let cancelled = primary
-        .controller
-        .precise_sequence(sequence)
-        .map_err(|error| error.to_string())?;
-    let cancel_before_request = match wait_for_cancel_ready(
-        &primary.controller,
-        &cancelled,
-        cancel_baseline,
-        OPERATION_TIMEOUT,
-    ) {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            let observed = primary.controller.snapshot();
-            return Ok(finish_cancel_execution_error(
-                result,
-                &primary,
-                &cancelled,
-                observed,
-                "cancel_readiness",
-                error,
-            ));
-        }
-    };
-    let cancel_request_outcome = cancelled.cancel();
-    result["cancel_request_outcome"] = json!(format!("{cancel_request_outcome:?}"));
-    if let Err(error) = wait_terminal(&cancelled, OPERATION_TIMEOUT) {
-        return Ok(finish_cancel_execution_error(
-            result,
-            &primary,
-            &cancelled,
-            cancel_before_request,
-            "cancel_terminal_wait",
-            error,
-        ));
-    }
-    let cancel_result = operation_json(&cancelled);
-    let post_cancel = primary.controller.snapshot();
-    result["cancel_status"] = json!("completed");
-    result["cancel"] = cancel_result;
-    result["cancel_expected_cancelled"] =
-        json!(cancelled.snapshot().state == OperationState::Cancelled);
-    result["cancel_before_request_snapshot"] = controller_snapshot_json(cancel_before_request);
-    result["post_cancel_snapshot"] = controller_snapshot_json(post_cancel);
-    result["post_cancel_wait_snapshot"] = controller_snapshot_json(post_cancel);
-
-    let (primary_cleanup, deadline_attempt) = close_primary_then_create_deadline(
-        &occupied_cleanup,
-        || primary.close(),
-        || Harness::new(&port, ControllerOptions::default()),
-    );
-    result["cleanup"] = primary_cleanup;
-    result["post_cleanup_snapshot"] = controller_snapshot_json(primary.controller.snapshot());
-    let Some(deadline_attempt) = deadline_attempt else {
-        result["deadline_status"] = json!("not_run: primary cleanup failed");
-        return Ok(result);
-    };
-    let deadline = match deadline_attempt {
-        Ok(deadline) => deadline,
-        Err(error) => {
-            result["execution_error"] = json!({
-                "stage": "deadline_create",
-                "message": error,
-            });
-            result["deadline_status"] = json!("not_run: deadline harness creation failed");
-            return Ok(result);
-        }
-    };
-    let deadline_operation = deadline
-        .controller
-        .connect(ConnectOptions {
-            operation_deadline_ns: Some(deadline.now_ns()),
-            protocol_timeout_ns: 300_000_000,
-        })
-        .map_err(|error| error.to_string())?;
-    wait_terminal(&deadline_operation, OPERATION_TIMEOUT)?;
-    let deadline_result = operation_json(&deadline_operation);
-    let deadline_open_attempts = deadline.native_open_attempts();
-    let deadline_cleanup = deadline.close();
-    result["deadline_status"] = json!("completed");
-    result["deadline"] = deadline_result;
-    result["deadline_expected_cancelled"] =
-        json!(deadline_operation.snapshot().state == OperationState::Cancelled);
-    result["deadline_native_open_attempts"] = deadline_open_attempts;
-    result["deadline_cleanup"] = deadline_cleanup;
-    Ok(result)
-}
-
-fn close_primary_then_create_deadline<T>(
-    secondary_cleanup: &Value,
-    close_primary: impl FnOnce() -> Value,
-    create_deadline: impl FnOnce() -> Result<T, String>,
-) -> (Value, Option<Result<T, String>>) {
-    let primary_cleanup = close_primary();
-    let deadline = (cleanup_succeeded(secondary_cleanup) && cleanup_succeeded(&primary_cleanup))
-        .then(create_deadline);
-    (primary_cleanup, deadline)
-}
-
-fn finish_cancel_execution_error(
-    mut result: Value,
-    primary: &Harness,
-    operation: &Operation,
-    observed_before_request: ControllerSnapshot,
-    stage: &str,
-    message: String,
-) -> Value {
-    let recovery_cancel_outcome = operation.cancel();
-    let settle_error = wait_terminal(operation, OPERATION_TIMEOUT).err();
-    let post_cancel_wait = primary.controller.snapshot();
-    let cleanup = primary.close();
-    let post_cleanup = primary.controller.snapshot();
-    result["execution_error"] = json!({"stage": stage, "message": message});
-    result["cancel_status"] = json!("failed");
-    if result.get("cancel_request_outcome").is_none() {
-        result["cancel_request_outcome"] = Value::Null;
-    }
-    result["recovery_cancel_outcome"] = json!(format!("{recovery_cancel_outcome:?}"));
-    result["cancel_settle_error"] = json!(settle_error);
-    result["cancel"] = operation_json(operation);
-    result["cancel_before_request_snapshot"] = controller_snapshot_json(observed_before_request);
-    result["post_cancel_snapshot"] = controller_snapshot_json(post_cancel_wait);
-    result["post_cancel_wait_snapshot"] = controller_snapshot_json(post_cancel_wait);
-    result["post_cleanup_snapshot"] = controller_snapshot_json(post_cleanup);
-    result["deadline_status"] = json!("not_run: cancel scenario failed");
-    result["cleanup"] = cleanup;
-    result
+    faults::run(arguments)
 }
 
 fn run_hotplug(arguments: &[String]) -> Result<Value, String> {
@@ -1791,6 +1661,7 @@ fn wait_terminal(
     }
 }
 
+#[cfg(test)]
 fn wait_for_cancel_ready(
     controller: &ControllerSession,
     operation: &Operation,
@@ -2273,10 +2144,46 @@ mod tests {
 
     fn valid_fault_projection_with_cleanup() -> Value {
         let mut result = valid_fault_projection();
-        result["cleanup"] = successful_cleanup();
-        result["secondary_cleanup"] = successful_cleanup();
+        result["scenarios"] = json!({
+            "port_occupied": {"status": "completed"},
+            "cancel": {"status": "completed"},
+            "deadline": {"status": "completed"},
+        });
+        result["resources"] = json!({
+            "occupier": {"created": true},
+            "occupied_probe": {"created": true},
+            "cancel": {"created": true},
+            "deadline": {"created": true},
+        });
+        result["occupier_cleanup"] = successful_cleanup();
+        result["occupied_probe_cleanup"] = successful_cleanup();
+        result["cancel_cleanup"] = successful_cleanup();
         result["deadline_cleanup"] = successful_cleanup();
         result
+    }
+
+    #[test]
+    fn complete_fault_cleanup_uses_four_explicit_roles_without_legacy_aliases() {
+        let result = valid_fault_projection_with_cleanup();
+
+        assert!(cleanup_contract_succeeded("faults", &result));
+        assert!(result.get("cleanup").is_none());
+        assert!(result.get("secondary_cleanup").is_none());
+
+        let mut missing_resources = result.clone();
+        missing_resources
+            .as_object_mut()
+            .expect("fault result")
+            .remove("resources");
+        assert!(!cleanup_contract_succeeded("faults", &missing_resources));
+
+        let mut incomplete_scenario = result.clone();
+        incomplete_scenario["scenarios"]["cancel"]["status"] = json!("running");
+        assert!(!cleanup_contract_succeeded("faults", &incomplete_scenario));
+
+        let mut uncreated_role = result;
+        uncreated_role["resources"]["deadline"]["created"] = json!(false);
+        assert!(!cleanup_contract_succeeded("faults", &uncreated_role));
     }
 
     struct NoopTransport;
@@ -2347,9 +2254,20 @@ mod tests {
             "stage": "cancel_readiness",
             "message": "timed out waiting for first report",
         });
-        result["deadline_status"] = json!("not_run: cancel readiness failed");
-        result["cleanup"] = successful_cleanup();
-        result["secondary_cleanup"] = successful_cleanup();
+        result["scenarios"] = json!({
+            "port_occupied": {"status": "completed"},
+            "cancel": {"status": "failed"},
+            "deadline": {"status": "not_run"},
+        });
+        result["resources"] = json!({
+            "occupier": {"created": true},
+            "occupied_probe": {"created": true},
+            "cancel": {"created": true},
+            "deadline": {"created": false},
+        });
+        result["occupier_cleanup"] = successful_cleanup();
+        result["occupied_probe_cleanup"] = successful_cleanup();
+        result["cancel_cleanup"] = successful_cleanup();
 
         let (document, failure) = finalize_result("faults", Ok(result));
         assert_eq!(document["execution_status"], "failed");
@@ -2359,10 +2277,10 @@ mod tests {
             "cancel_readiness: timed out waiting for first report"
         );
         assert_eq!(
-            document["result"]["deadline_status"],
-            "not_run: cancel readiness failed"
+            document["result"]["scenarios"]["deadline"]["status"],
+            "not_run"
         );
-        assert_eq!(document["result"]["cleanup"]["outcome"], "Closed");
+        assert_eq!(document["result"]["cancel_cleanup"]["outcome"], "Closed");
         assert_eq!(
             failure.as_deref(),
             Some("cancel_readiness: timed out waiting for first report")
@@ -2400,66 +2318,6 @@ mod tests {
     }
 
     #[test]
-    fn primary_cleanup_gates_deadline_creation_in_order() {
-        use std::cell::RefCell;
-
-        let failed_cleanup = || {
-            let mut cleanup = successful_cleanup();
-            cleanup["succeeded"] = json!(false);
-            cleanup["outcome"] = json!("Failed");
-            cleanup
-        };
-
-        let trace = RefCell::new(vec!["secondary_close"]);
-        let (_, deadline) = close_primary_then_create_deadline(
-            &failed_cleanup(),
-            || {
-                trace.borrow_mut().push("primary_close");
-                successful_cleanup()
-            },
-            || {
-                trace.borrow_mut().push("deadline_create");
-                Ok(())
-            },
-        );
-        assert!(deadline.is_none());
-        assert_eq!(*trace.borrow(), ["secondary_close", "primary_close"]);
-
-        let trace = RefCell::new(vec!["secondary_close"]);
-        let (_, deadline) = close_primary_then_create_deadline(
-            &successful_cleanup(),
-            || {
-                trace.borrow_mut().push("primary_close");
-                failed_cleanup()
-            },
-            || {
-                trace.borrow_mut().push("deadline_create");
-                Ok(())
-            },
-        );
-        assert!(deadline.is_none());
-        assert_eq!(*trace.borrow(), ["secondary_close", "primary_close"]);
-
-        let trace = RefCell::new(vec!["secondary_close"]);
-        let (_, deadline) = close_primary_then_create_deadline(
-            &successful_cleanup(),
-            || {
-                trace.borrow_mut().push("primary_close");
-                successful_cleanup()
-            },
-            || {
-                trace.borrow_mut().push("deadline_create");
-                Ok(())
-            },
-        );
-        assert!(matches!(deadline, Some(Ok(()))));
-        assert_eq!(
-            *trace.borrow(),
-            ["secondary_close", "primary_close", "deadline_create"]
-        );
-    }
-
-    #[test]
     fn false_qualification_predicates_do_not_pass_or_exit_zero() {
         let cases = [
             (
@@ -2468,8 +2326,9 @@ mod tests {
                     "port_occupied_expected_failed": false,
                     "cancel_expected_cancelled": true,
                     "deadline_expected_cancelled": true,
-                    "cleanup": successful_cleanup(),
-                    "secondary_cleanup": successful_cleanup(),
+                    "occupier_cleanup": successful_cleanup(),
+                    "occupied_probe_cleanup": successful_cleanup(),
+                    "cancel_cleanup": successful_cleanup(),
                     "deadline_cleanup": successful_cleanup(),
                 }),
             ),
@@ -2817,56 +2676,6 @@ mod tests {
     }
 
     #[test]
-    fn cancel_execution_failure_preserves_request_recovery_and_cleanup_boundaries() {
-        let clock: Arc<dyn Clock> = Arc::new(SystemClock::default());
-        let runtime = Runtime::new(clock.clone());
-        let controller = ControllerSession::new(
-            &runtime,
-            Box::new(NoopTransport),
-            ControllerOptions::default(),
-        )
-        .expect("controller");
-        let harness = Harness {
-            runtime,
-            clock,
-            controller,
-            telemetry: Arc::new(Mutex::new(Telemetry::default())),
-            descriptor: SerialPortDescriptor::new("DEVICE\\TEST", "COM1").expect("descriptor"),
-        };
-        let operation = harness
-            .runtime
-            .create_operation(None)
-            .expect("test operation");
-        operation.start();
-        let request_outcome = operation.cancel();
-        assert_eq!(request_outcome, easycon_runtime::TransitionOutcome::Applied);
-        operation.finish_cancelled();
-
-        let observed_before_request = harness.controller.snapshot();
-        let mut partial = json!({"command": "faults"});
-        partial["cancel_request_outcome"] = json!(format!("{request_outcome:?}"));
-        let result = finish_cancel_execution_error(
-            partial,
-            &harness,
-            &operation,
-            observed_before_request,
-            "cancel_terminal_wait",
-            "injected terminal wait failure".to_owned(),
-        );
-
-        assert_eq!(result["cancel_request_outcome"], "Applied");
-        assert_eq!(result["recovery_cancel_outcome"], "AlreadyTerminal");
-        assert_eq!(result["cancel"]["state"], "Cancelled");
-        assert_eq!(result["post_cancel_wait_snapshot"]["state"], "Disconnected");
-        assert_eq!(result["post_cleanup_snapshot"]["state"], "Closed");
-        assert_eq!(result["cleanup"]["outcome"], "Closed");
-        assert_eq!(result["cleanup"]["counts"]["active_operations"], 0);
-        assert_eq!(result["cleanup"]["counts"]["active_resources"], 0);
-        assert_eq!(result["cleanup"]["counts"]["active_tasks"], 0);
-        assert_eq!(result["deadline_status"], "not_run: cancel scenario failed");
-    }
-
-    #[test]
     fn discovery_requires_nonempty_consistent_samples() {
         let empty_snapshots = json!({
             "samples": 3,
@@ -3188,6 +2997,11 @@ mod tests {
                     .as_object_mut()
                     .expect("lifecycle record")
                     .remove("cleanup");
+            } else if command == "faults" {
+                missing
+                    .as_object_mut()
+                    .expect("fault result")
+                    .remove("occupier_cleanup");
             } else {
                 missing
                     .as_object_mut()
