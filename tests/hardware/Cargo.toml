@@ -1,0 +1,23 @@
+[package]
+name = "easycon-hardware-qualification"
+description = "Non-release Phase 2B CH32 hardware qualification CLI"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+license = "GPL-3.0-only"
+publish = false
+
+[workspace]
+
+[dependencies]
+easycon-controller = { path = "../../crates/easycon-controller" }
+easycon-model = { path = "../../crates/easycon-model" }
+easycon-runtime = { path = "../../crates/easycon-runtime" }
+easycon-serial = { path = "../../crates/easycon-serial" }
+serde_json = "1.0"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
