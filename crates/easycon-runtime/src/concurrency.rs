@@ -8,28 +8,40 @@ pub trait CancellationNode: Sized {
     fn is_active(&self) -> bool;
     fn claim_cancel(&self) -> bool;
     fn claim_deactivate(&self) -> bool;
-    fn take_active_hooks(&self) -> Vec<Self::Hook>;
-    fn clear_hooks(&self);
+    fn take_active_hooks(&self, active: &mut Vec<Self::Hook>, discarded: &mut Vec<Self::Hook>);
+    fn take_discarded_hooks(&self, discarded: &mut Vec<Self::Hook>);
     fn take_live_children(&self) -> Vec<Self::Child>;
 }
 
-pub fn seal_cancelled_tree<N: CancellationNode>(node: &N, hooks: &mut Vec<N::Hook>) {
+pub fn seal_cancelled_tree<N: CancellationNode>(
+    node: &N,
+    hooks: &mut Vec<N::Hook>,
+    discarded: &mut Vec<N::Hook>,
+    retained_children: &mut Vec<N::Child>,
+) {
     if !node.is_active() || !node.claim_cancel() {
         return;
     }
-    hooks.extend(node.take_active_hooks());
+    node.take_active_hooks(hooks, discarded);
     for child in node.take_live_children() {
-        seal_cancelled_tree(&*child, hooks);
+        seal_cancelled_tree(&*child, hooks, discarded, retained_children);
+        retained_children.push(child);
     }
 }
 
-pub fn seal_deactivated_tree<N: CancellationNode>(node: &N, hooks: &mut Vec<N::Hook>) {
+pub fn seal_deactivated_tree<N: CancellationNode>(
+    node: &N,
+    hooks: &mut Vec<N::Hook>,
+    discarded: &mut Vec<N::Hook>,
+    retained_children: &mut Vec<N::Child>,
+) {
     if !node.claim_deactivate() {
         return;
     }
-    node.clear_hooks();
+    node.take_discarded_hooks(discarded);
     for child in node.take_live_children() {
-        seal_cancelled_tree(&*child, hooks);
+        seal_cancelled_tree(&*child, hooks, discarded, retained_children);
+        retained_children.push(child);
     }
 }
 

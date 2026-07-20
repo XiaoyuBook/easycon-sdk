@@ -29,6 +29,19 @@ enum ModelHook {
     Panic,
     AssertChildCancelled(Arc<ModelCancellationNode>),
     Count(Arc<AtomicUsize>),
+    ReenterStateOnDrop {
+        state: Arc<Mutex<bool>>,
+        drops: Arc<AtomicUsize>,
+    },
+}
+
+impl Drop for ModelHook {
+    fn drop(&mut self) {
+        if let Self::ReenterStateOnDrop { state, drops } = self {
+            let _state = state.lock().expect("operation state re-entry");
+            drops.fetch_add(1, Ordering::AcqRel);
+        }
+    }
 }
 
 struct ModelCancellationNode {
@@ -63,8 +76,15 @@ impl ModelCancellationNode {
             || children.push(linked_child),
             || {
                 let mut hooks = Vec::new();
-                seal_cancelled_tree(&*cancelled_child, &mut hooks);
-                propagate_model_hooks(hooks);
+                let mut discarded = Vec::new();
+                let mut retained_children = Vec::new();
+                seal_cancelled_tree(
+                    &*cancelled_child,
+                    &mut hooks,
+                    &mut discarded,
+                    &mut retained_children,
+                );
+                propagate_model_hooks(hooks, discarded, retained_children);
             },
         );
         admitted.then_some(child)
@@ -72,8 +92,10 @@ impl ModelCancellationNode {
 
     fn seal_and_cancel(&self) {
         let mut hooks = Vec::new();
-        seal_deactivated_tree(self, &mut hooks);
-        propagate_model_hooks(hooks);
+        let mut discarded = Vec::new();
+        let mut retained_children = Vec::new();
+        seal_deactivated_tree(self, &mut hooks, &mut discarded, &mut retained_children);
+        propagate_model_hooks(hooks, discarded, retained_children);
     }
 }
 
@@ -93,29 +115,31 @@ impl CancellationNode for ModelCancellationNode {
         self.active.swap(false, Ordering::AcqRel)
     }
 
-    fn take_active_hooks(&self) -> Vec<Self::Hook> {
-        std::mem::take(&mut *self.hooks.lock().expect("cancellation hooks"))
+    fn take_active_hooks(&self, active: &mut Vec<Self::Hook>, _discarded: &mut Vec<Self::Hook>) {
+        active.extend(std::mem::take(
+            &mut *self.hooks.lock().expect("cancellation hooks"),
+        ));
     }
 
-    fn clear_hooks(&self) {
-        self.hooks.lock().expect("cancellation hooks").clear();
+    fn take_discarded_hooks(&self, discarded: &mut Vec<Self::Hook>) {
+        discarded.extend(std::mem::take(
+            &mut *self.hooks.lock().expect("cancellation hooks"),
+        ));
     }
 
     fn take_live_children(&self) -> Vec<Self::Child> {
-        let mut children = self.children.lock().expect("child registry");
-        let live = children
-            .iter()
-            .filter(|child| child.is_active())
-            .cloned()
-            .collect();
-        children.clear();
-        live
+        std::mem::take(&mut *self.children.lock().expect("child registry"))
     }
 }
 
-fn propagate_model_hooks(hooks: Vec<ModelHook>) {
+fn propagate_model_hooks(
+    hooks: Vec<ModelHook>,
+    discarded: Vec<ModelHook>,
+    retained_children: Vec<Arc<ModelCancellationNode>>,
+) {
+    drop(discarded);
     for hook in hooks {
-        match hook {
+        match &hook {
             ModelHook::Panic => {
                 let _ = invoke_isolated(|| panic!("scripted cancellation hook panic"));
             }
@@ -127,8 +151,12 @@ fn propagate_model_hooks(hooks: Vec<ModelHook>) {
                     calls.fetch_add(1, Ordering::AcqRel);
                 });
             }
+            ModelHook::ReenterStateOnDrop { .. } => {
+                unreachable!("reentrant destructor hooks are discarded, not invoked");
+            }
         }
     }
+    drop(retained_children);
 }
 
 #[test]
@@ -177,8 +205,15 @@ fn cancellation_hook_panic_does_not_truncate_propagation() {
                     let root = Arc::clone(&root);
                     thread::spawn(move || {
                         let mut hooks = Vec::new();
-                        seal_cancelled_tree(&*root, &mut hooks);
-                        propagate_model_hooks(hooks);
+                        let mut discarded = Vec::new();
+                        let mut retained_children = Vec::new();
+                        seal_cancelled_tree(
+                            &*root,
+                            &mut hooks,
+                            &mut discarded,
+                            &mut retained_children,
+                        );
+                        propagate_model_hooks(hooks, discarded, retained_children);
                     })
                 })
                 .collect();
@@ -190,6 +225,45 @@ fn cancellation_hook_panic_does_not_truncate_propagation() {
             assert_eq!(later_hook_calls.load(Ordering::Acquire), 1);
             assert!(child.cancelled.load(Ordering::Acquire));
         });
+    });
+}
+
+#[test]
+fn terminal_deactivation_defers_hook_drop_until_state_unlock() {
+    loom::model(|| {
+        let state = Arc::new(Mutex::new(false));
+        let cancellation = Arc::new(ModelCancellationNode::new());
+        let drops = Arc::new(AtomicUsize::new(0));
+        cancellation.hooks.lock().expect("cancellation hooks").push(
+            ModelHook::ReenterStateOnDrop {
+                state: Arc::clone(&state),
+                drops: Arc::clone(&drops),
+            },
+        );
+
+        let terminal_state = Arc::clone(&state);
+        let terminal_cancellation = Arc::clone(&cancellation);
+        let terminal = thread::spawn(move || {
+            let mut state = terminal_state.lock().expect("operation state");
+            let mut hooks = Vec::new();
+            let mut discarded = Vec::new();
+            let mut retained_children = Vec::new();
+            seal_deactivated_tree(
+                &*terminal_cancellation,
+                &mut hooks,
+                &mut discarded,
+                &mut retained_children,
+            );
+            assert!(hooks.is_empty());
+            drop(state);
+            propagate_model_hooks(hooks, discarded, retained_children);
+            state = terminal_state.lock().expect("operation state");
+            *state = true;
+        });
+
+        terminal.join().expect("terminal transaction");
+        assert!(*state.lock().expect("operation state"));
+        assert_eq!(drops.load(Ordering::Acquire), 1);
     });
 }
 

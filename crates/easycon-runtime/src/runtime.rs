@@ -1594,6 +1594,22 @@ mod tests {
         }
     }
 
+    struct SnapshotOperationOnDrop {
+        operation: Operation,
+        entered: mpsc::Sender<()>,
+        completed: mpsc::Sender<OperationState>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for SnapshotOperationOnDrop {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::AcqRel);
+            let _ = self.entered.send(());
+            let state = self.operation.snapshot().state;
+            let _ = self.completed.send(state);
+        }
+    }
+
     fn panic_with_drop_panicking_payload(drops: Arc<AtomicUsize>) -> ! {
         std::panic::panic_any(DropPanickingPayload { drops });
     }
@@ -1803,6 +1819,105 @@ mod tests {
             codes,
             ["runtime.operation.running", "runtime.operation.succeeded"]
         );
+    }
+
+    // conformance: operation.hook-capture-drop-reentrant
+    #[test]
+    fn terminal_discards_hook_captures_outside_state_lock_for_success_and_failure() {
+        for terminal in [OperationState::Succeeded, OperationState::Failed] {
+            let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+            let operation = runtime.create_operation(None).expect("operation");
+            assert_eq!(operation.start(), TransitionOutcome::Applied);
+
+            let hook_calls = Arc::new(AtomicUsize::new(0));
+            let drops = Arc::new(AtomicUsize::new(0));
+            let (drop_entered, observed_drop_entered) = mpsc::channel();
+            let (drop_completed, observed_drop_completed) = mpsc::channel();
+            let capture = SnapshotOperationOnDrop {
+                operation: operation.clone(),
+                entered: drop_entered,
+                completed: drop_completed,
+                drops: Arc::clone(&drops),
+            };
+            let observed_hook_calls = Arc::clone(&hook_calls);
+            operation.on_cancel(move || {
+                let _ = &capture;
+                observed_hook_calls.fetch_add(1, Ordering::AcqRel);
+            });
+
+            let (wait_blocked, observed_wait_blocked) = mpsc::channel();
+            operation.observe_next_wait_blocked(wait_blocked);
+            let waiting_operation = operation.clone();
+            let (wait_finished, observed_wait_finished) = mpsc::sync_channel(1);
+            let waiter = std::thread::spawn(move || {
+                let result = waiting_operation.wait(WaitTimeout::Infinite);
+                wait_finished.send(result).expect("wait observer");
+            });
+            observed_wait_blocked
+                .recv_timeout(Duration::from_secs(2))
+                .expect("operation waiter blocked before terminal transaction");
+
+            let finishing_operation = operation.clone();
+            let (finish_completed, observed_finish_completed) = mpsc::sync_channel(1);
+            let finisher = std::thread::spawn(move || {
+                let outcome = match terminal {
+                    OperationState::Succeeded => finishing_operation.succeed(OperationValue::Unit),
+                    OperationState::Failed => finishing_operation.fail(EasyConError::new(
+                        ErrorDomain::Internal,
+                        ErrorCode::Internal,
+                        "scripted failure",
+                    )),
+                    _ => unreachable!("test covers success and failure terminal paths"),
+                };
+                finish_completed.send(outcome).expect("finish observer");
+            });
+
+            observed_drop_entered
+                .recv_timeout(Duration::from_secs(2))
+                .expect("discarded hook capture destructor entered");
+            assert_eq!(
+                observed_drop_completed
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("discarded hook capture destructor re-entered snapshot"),
+                OperationState::Running
+            );
+            assert_eq!(
+                observed_finish_completed
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("terminal transaction completed"),
+                TransitionOutcome::Applied
+            );
+
+            let snapshot = operation.snapshot();
+            assert_eq!(snapshot.state, terminal);
+            match terminal {
+                OperationState::Succeeded => {
+                    assert_eq!(snapshot.result, Some(OperationValue::Unit));
+                    assert!(snapshot.error.is_none());
+                }
+                OperationState::Failed => {
+                    assert!(snapshot.result.is_none());
+                    assert_eq!(
+                        snapshot.error.as_ref().expect("failure error").code(),
+                        ErrorCode::Internal
+                    );
+                }
+                _ => unreachable!("test covers success and failure terminal paths"),
+            }
+            assert_eq!(hook_calls.load(Ordering::Acquire), 0);
+            assert_eq!(drops.load(Ordering::Acquire), 1);
+            assert_eq!(runtime.counts().active_operations, 0);
+            assert!(matches!(
+                observed_wait_finished
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("terminal waiter notified"),
+                WaitResult::Completed(OperationSnapshot { state, .. }) if state == terminal
+            ));
+
+            finisher.join().expect("operation finisher");
+            waiter.join().expect("operation waiter");
+            runtime.close().expect("Runtime close");
+        }
     }
 
     // conformance: operation.unlink-before-wake

@@ -30,19 +30,25 @@ pub struct CancellationHookRegistration {
 
 pub(crate) struct CancellationPropagation {
     hooks: Vec<CancelHook>,
+    discarded: Vec<CancelHook>,
+    retained_children: Vec<Arc<CancellationInner>>,
 }
 
 impl CancellationPropagation {
     pub(crate) fn propagate(mut self) {
+        drop_hooks(std::mem::take(&mut self.discarded));
         for hook in self.hooks.drain(..) {
             invoke_hook(hook);
         }
+        drop_children(std::mem::take(&mut self.retained_children));
     }
 }
 
 impl Drop for CancellationPropagation {
     fn drop(&mut self) {
+        drop_hooks(std::mem::take(&mut self.discarded));
         drop_hooks(std::mem::take(&mut self.hooks));
+        drop_children(std::mem::take(&mut self.retained_children));
     }
 }
 
@@ -76,33 +82,28 @@ impl CancellationNode for CancellationInner {
         self.active.swap(false, Ordering::AcqRel)
     }
 
-    fn take_active_hooks(&self) -> Vec<Self::Hook> {
+    fn take_active_hooks(&self, active: &mut Vec<Self::Hook>, discarded: &mut Vec<Self::Hook>) {
         let entries = std::mem::take(&mut *lock_recover(&self.hooks));
-        let mut active = Vec::with_capacity(entries.len());
         for entry in entries {
             if entry.is_active() {
                 active.push(entry.hook);
             } else {
-                drop_hook(entry.hook);
+                discarded.push(entry.hook);
             }
         }
-        active
     }
 
-    fn clear_hooks(&self) {
+    fn take_discarded_hooks(&self, discarded: &mut Vec<Self::Hook>) {
         let entries = std::mem::take(&mut *lock_recover(&self.hooks));
-        drop_hook_entries(entries);
+        discarded.extend(entries.into_iter().map(|entry| entry.hook));
     }
 
     fn take_live_children(&self) -> Vec<Self::Child> {
-        let mut children = lock_recover(&self.children);
-        let live = children
-            .iter()
-            .filter_map(Weak::upgrade)
-            .filter(|child| child.is_active())
-            .collect();
-        children.clear();
-        live
+        let children = std::mem::take(&mut *lock_recover(&self.children));
+        children
+            .into_iter()
+            .filter_map(|child| child.upgrade())
+            .collect()
     }
 }
 
@@ -146,11 +147,16 @@ impl CancellationToken {
             .children
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        children.retain(|existing| {
-            existing
-                .upgrade()
-                .is_some_and(|child| child.active.load(Ordering::Acquire))
-        });
+        let existing = std::mem::take(&mut *children);
+        let mut retained_children = Vec::new();
+        for existing in existing {
+            if let Some(existing_child) = existing.upgrade() {
+                if existing_child.active.load(Ordering::Acquire) {
+                    children.push(existing);
+                }
+                retained_children.push(existing_child);
+            }
+        }
         let admitted = admit_child_while_locked(
             || {
                 cancellation_admission_open(
@@ -161,10 +167,11 @@ impl CancellationToken {
             || children.push(Arc::downgrade(&child.inner)),
             || child.cancel(),
         );
+        drop(children);
+        drop_children(retained_children);
         if !admitted {
             return None;
         }
-        drop(children);
         Some(child)
     }
 
@@ -245,15 +252,33 @@ impl CancellationToken {
 
     pub(crate) fn deactivate_deferred(&self) -> CancellationPropagation {
         let mut hooks = Vec::new();
-        seal_deactivated_tree(&*self.inner, &mut hooks);
-        CancellationPropagation { hooks }
+        let mut discarded = Vec::new();
+        let mut retained_children = Vec::new();
+        seal_deactivated_tree(
+            &*self.inner,
+            &mut hooks,
+            &mut discarded,
+            &mut retained_children,
+        );
+        CancellationPropagation {
+            hooks,
+            discarded,
+            retained_children,
+        }
     }
 }
 
 fn cancel_inner(inner: &Arc<CancellationInner>) {
     let mut hooks = Vec::new();
-    seal_cancelled_tree(&**inner, &mut hooks);
-    CancellationPropagation { hooks }.propagate();
+    let mut discarded = Vec::new();
+    let mut retained_children = Vec::new();
+    seal_cancelled_tree(&**inner, &mut hooks, &mut discarded, &mut retained_children);
+    CancellationPropagation {
+        hooks,
+        discarded,
+        retained_children,
+    }
+    .propagate();
 }
 
 impl Drop for CancellationInner {
@@ -278,6 +303,12 @@ fn drop_hook(hook: CancelHook) {
 fn drop_hooks(hooks: Vec<CancelHook>) {
     for hook in hooks {
         drop_hook(hook);
+    }
+}
+
+fn drop_children(children: Vec<Arc<CancellationInner>>) {
+    for child in children {
+        let _ = drop_isolated(child);
     }
 }
 

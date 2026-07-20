@@ -107,6 +107,9 @@ stateDiagram-v2
 - 终态事务依次封闭 child admission、取消 subtree、执行 owner cleanup、提交 immutable 终态和 terminal
   event、注销 registry，最后无条件通知全部 waiter。event、registry 或 poisoned lock 故障不得跳过
   注销和通知。
+- cancellation tree 封闭期间只转移 hook 和 child ownership；hook 调用、未触发 hook capture 析构及
+  可能执行用户析构的 ownership 释放都在 operation state、hooks 和 children 锁外逐项隔离。capture
+  析构重入同一 operation 查询不得阻断终态、registry 注销或 waiter 通知。
 - owner cleanup panic 转成可诊断 internal failure，不得留下不可观察的半终态；terminal event 仍不是
   waiter 正确性的唯一通道。
 
@@ -355,6 +358,8 @@ native 线程时卸载库。所有 backend 都必须可取消，因此正常关�
 - Operation 终态只转换一次，result 与 error 不同时存在。
 - parent terminal 与 child admission 的线性化点唯一；terminal 开始后不存在新 child。
 - cancellation hook panic 不截断同级 hook 或 child propagation。
+- 未触发 cancellation hook 的 capture 析构可重入同一 operation 查询，且 success/failure 终态仍完成、
+  registry 先注销并通知 waiter；hook body 不执行，capture 恰好析构一次。
 - operation terminal event/registry 故障后全部 waiter 仍被通知，且 waiter 观察到 registry 已注销。
 - supervised task 内 close 在状态变化前被拒绝；外部 close join 所有 Runtime-owned handles。
 - CloseFailed outcome 对 concurrent/later caller 相同，未完成 owner cleanup 的 operation 不被强制终结。

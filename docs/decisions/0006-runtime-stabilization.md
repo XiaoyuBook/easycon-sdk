@@ -69,6 +69,10 @@ binding、固件或 UI。
 
 event delivery、registry 清理或 hook 的局部故障不得跳过步骤 5 或 6。Runtime 同步路径中的 poisoned
 lock 必须恢复 guard 或使用不传播 poison 的原语，不能把先前 panic 扩大为永久等待。
+封闭 cancellation tree 的临界区只能转移 hook 与 child ownership；hook 调用、未触发 hook capture
+析构、panic payload 析构及可能释放用户捕获值的 child ownership，必须在 operation state、cancellation
+hooks 和 children 锁全部释放后逐项隔离执行。析构重入同一 operation 查询不得阻断终态提交、registry
+注销或 waiter 通知。
 
 ## 结果
 

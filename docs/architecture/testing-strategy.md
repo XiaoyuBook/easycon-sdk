@@ -80,9 +80,11 @@ ECS 的 ControllerPort、VisionPort、OutputPort 记录按顺序的 typed call�
 - supervised spawn 自动 owner binding、共享完成/JoinHandle ownership、真实 thread join/unregister，以及
   task 内 close 的 pre-state rejection；
 - operation terminal transaction 在 cleanup/event/registry 故障下仍注销并通知全部 waiter；
-- cancellation hook panic 逐个隔离，poisoned synchronization state 可恢复；
+- cancellation hook 调用、未触发 hook capture 析构和 panic payload 析构逐项隔离；capture 析构重入
+  operation 查询不持有 operation/hooks/children 锁，poisoned synchronization state 可恢复；
 - 用 Loom 模型覆盖 parent terminal/child admission、hook panic/child propagation、supervised task
-  self-wait 和 terminal commit/registry unlink/waiter notify。模型命令是 Phase 1 正式门禁。
+  self-wait、hook capture 析构重入和 terminal commit/registry unlink/waiter notify。模型命令是
+  Phase 1 正式门禁。
 
 Phase 1 的正式模型入口是 `python tools/run_runtime_models.py`。它以 test-only `runtime-model`
 feature 执行独立的 `loom_runtime` target 并强制单 harness thread。模型直接调用 production 使用的

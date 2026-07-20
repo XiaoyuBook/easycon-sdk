@@ -31,7 +31,7 @@
         "unlink the operation registry entry",
         "notify every waiter unconditionally"
       ],
-      "failure_isolation": "cancellation hook panic is isolated per hook and never truncates sibling hooks or child propagation; event, registry, hook, or poisoned-lock faults never skip registry unlink or waiter notification"
+      "failure_isolation": "cancellation tree sealing transfers hook and child ownership without invoking hooks or dropping user captures while operation state, cancellation hooks, or children locks are held; hook invocation, discarded capture destruction, child ownership release, and panic payload destruction are isolated per item, so one fault never truncates sibling hooks or child propagation; event, registry, hook, reentrant destruction, or poisoned-lock faults never skip registry unlink or waiter notification"
     }
   },
   "runtime": {

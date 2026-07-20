@@ -158,12 +158,14 @@
         "crates/easycon-runtime/src/runtime.rs::terminal_wait_observes_the_operation_already_unregistered",
         "crates/easycon-runtime/src/runtime.rs::terminal_faults_still_unlink_and_wake_waiters",
         "crates/easycon-runtime/src/runtime.rs::terminal_child_hook_can_observe_parent_without_deadlock",
+        "crates/easycon-runtime/src/runtime.rs::terminal_discards_hook_captures_outside_state_lock_for_success_and_failure",
         "crates/easycon-runtime/src/runtime.rs::poisoned_operation_registry_does_not_kill_deadline_supervision"
       ],
       "steps": [
         { "id": "operation.parent-child-race", "action": "race parent terminal start against child operation admission" },
         { "id": "operation.hook-panic", "action": "register two cancellation hooks and a child where the first hook panics" },
         { "id": "operation.hook-reentry", "action": "observe the parent operation from a child cancellation hook during terminal sealing" },
+        { "id": "operation.hook-capture-drop-reentry", "action": "finish success and failure while an uncalled hook capture destructor re-enters the same operation snapshot" },
         { "id": "operation.event-fault", "action": "inject terminal event delivery failure while an operation waiter is blocked" },
         { "id": "operation.registry-fault", "action": "inject operation registry unlink failure while a second waiter is blocked" },
         { "id": "operation.poison-recovery", "action": "poison each recoverable Runtime synchronization lock before retrying its operation" }
@@ -198,6 +200,11 @@
           "id": "operation.reentrant-hook",
           "expect": "a child cancellation hook can observe its parent without deadlocking terminal commit, unlink, or waiter notification",
           "test": "crates/easycon-runtime/src/runtime.rs::terminal_child_hook_can_observe_parent_without_deadlock"
+        },
+        {
+          "id": "operation.hook-capture-drop-reentrant",
+          "expect": "an uncalled hook body stays uncalled while its capture is destroyed exactly once outside operation and cancellation locks, may re-enter snapshot, and cannot block success or failure terminal commit, registry unlink, or waiter notification",
+          "test": "crates/easycon-runtime/src/runtime.rs::terminal_discards_hook_captures_outside_state_lock_for_success_and_failure"
         },
         {
           "id": "operation.poison-recovery",
