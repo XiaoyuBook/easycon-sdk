@@ -14,8 +14,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use easycon_controller::{
     AUTO_BAUD_RATES, AckFrame, AckRequest, AmiiboLimits, AmiiboSaveOptions, AmiiboSelectOptions,
     ConnectOptions, ControllerAction, ControllerLeaseState, ControllerOptions, ControllerSession,
-    ControllerSnapshot, ControllerTransport, HandshakeRequest, PreciseSequence, SequenceStep,
-    TransportError, WriteKind, WriteRequest,
+    ControllerSnapshot, ControllerState, ControllerTransport, HandshakeRequest, PreciseSequence,
+    SequenceStep, TransportError, WriteContext, WriteKind, WriteRequest,
 };
 use easycon_hardware_qualification::{distribution, option_value, required_value, value_or};
 use easycon_model::{Button, Hat, StickPosition};
@@ -55,12 +55,128 @@ struct NativeOpenAttempt {
     error: Option<SerialError>,
 }
 
+#[derive(Clone, Debug)]
+enum NeutralizationOutcome {
+    Pending,
+    Accepted,
+    Failed(TransportError),
+    Contradiction(String),
+}
+
+#[derive(Clone, Debug)]
+struct NeutralizationAttempt {
+    context: WriteContext,
+    first_write_entered_ns: u64,
+    accepted_bytes: usize,
+    outcome: NeutralizationOutcome,
+}
+
 #[derive(Default)]
 struct Telemetry {
     actual_baud: Option<u32>,
     handshake_attempts: Vec<HandshakeAttempt>,
     native_open_attempts: Vec<NativeOpenAttempt>,
     timings: Vec<TimingSample>,
+    neutralization_attempts: Vec<NeutralizationAttempt>,
+}
+
+impl NeutralizationAttempt {
+    fn contradict(&mut self, message: impl Into<String>) {
+        if !matches!(self.outcome, NeutralizationOutcome::Contradiction(_)) {
+            self.outcome = NeutralizationOutcome::Contradiction(message.into());
+        }
+    }
+}
+
+impl Telemetry {
+    fn begin_neutralization(&mut self, context: WriteContext, remaining: usize, entered_ns: u64) {
+        let offset = context.total_len.checked_sub(remaining);
+        if let Some(attempt) = self
+            .neutralization_attempts
+            .iter_mut()
+            .find(|attempt| attempt.context.sequence == context.sequence)
+        {
+            if attempt.context != context {
+                attempt.contradict("neutralization context changed across partial writes");
+            } else if !matches!(attempt.outcome, NeutralizationOutcome::Pending) {
+                attempt.contradict("neutralization write resumed after a terminal observation");
+            } else if offset != Some(attempt.accepted_bytes) {
+                attempt.contradict("neutralization partial-write prefix was not contiguous");
+            }
+            return;
+        }
+
+        let mut attempt = NeutralizationAttempt {
+            context,
+            first_write_entered_ns: entered_ns,
+            accepted_bytes: 0,
+            outcome: NeutralizationOutcome::Pending,
+        };
+        if offset != Some(0) {
+            attempt.contradict("neutralization write began without the full logical payload");
+        }
+        self.neutralization_attempts.push(attempt);
+    }
+
+    fn finish_neutralization(
+        &mut self,
+        context: WriteContext,
+        remaining: usize,
+        result: &Result<usize, TransportError>,
+    ) {
+        let Some(attempt) = self
+            .neutralization_attempts
+            .iter_mut()
+            .find(|attempt| attempt.context.sequence == context.sequence)
+        else {
+            self.neutralization_attempts.push(NeutralizationAttempt {
+                context,
+                first_write_entered_ns: context.timestamp_ns,
+                accepted_bytes: 0,
+                outcome: NeutralizationOutcome::Contradiction(
+                    "neutralization result had no matching intent".to_owned(),
+                ),
+            });
+            return;
+        };
+        if matches!(attempt.outcome, NeutralizationOutcome::Contradiction(_)) {
+            return;
+        }
+        let Some(offset) = context.total_len.checked_sub(remaining) else {
+            attempt.contradict("neutralization remainder exceeded the logical payload");
+            return;
+        };
+        if attempt.context != context || attempt.accepted_bytes != offset {
+            attempt.contradict("neutralization result did not match its logical prefix");
+            return;
+        }
+        if !matches!(attempt.outcome, NeutralizationOutcome::Pending) {
+            attempt.contradict("neutralization produced more than one terminal result");
+            return;
+        }
+
+        match result {
+            Ok(written) => {
+                if *written == 0 || *written > remaining {
+                    attempt.contradict("neutralization transport returned invalid write progress");
+                    return;
+                }
+                let Some(accepted) = offset.checked_add(*written) else {
+                    attempt.contradict("neutralization accepted-byte count overflowed");
+                    return;
+                };
+                if accepted > context.total_len {
+                    attempt.contradict("neutralization accepted beyond the logical payload");
+                    return;
+                }
+                attempt.accepted_bytes = accepted;
+                if accepted == context.total_len {
+                    attempt.outcome = NeutralizationOutcome::Accepted;
+                }
+            }
+            Err(error) => attempt.outcome = NeutralizationOutcome::Failed(error.clone()),
+        }
+    }
 }
 
 struct ObservedByteIoFactory {
@@ -89,7 +205,7 @@ impl ByteIoFactory for ObservedByteIoFactory {
 }
 
 struct ObservedTransport {
-    inner: SerialControllerTransport,
+    inner: Box<dyn ControllerTransport>,
     clock: Arc<dyn Clock>,
     telemetry: Arc<Mutex<Telemetry>>,
 }
@@ -117,8 +233,20 @@ impl ControllerTransport for ObservedTransport {
         let context = request.context;
         let remaining = request.bytes.len();
         let entered = self.clock.now_ns();
+        if context.kind == WriteKind::Neutralize {
+            self.telemetry
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .begin_neutralization(context, remaining, entered);
+        }
         let result = self.inner.write(request);
         let accepted_at = self.clock.now_ns();
+        if context.kind == WriteKind::Neutralize {
+            self.telemetry
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .finish_neutralization(context, remaining, &result);
+        }
         if let Ok(written) = result
             && context.kind == WriteKind::Report
             && context
@@ -291,7 +419,7 @@ impl Harness {
             Box::new(observed_factory),
         );
         let observed = ObservedTransport {
-            inner: serial,
+            inner: Box::new(serial),
             clock: clock.clone(),
             telemetry: telemetry.clone(),
         };
@@ -320,8 +448,24 @@ impl Harness {
     }
 
     fn close(&self) -> Value {
+        let pre_close = self.controller.snapshot();
+        let evidence_boundary = self
+            .telemetry
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .neutralization_attempts
+            .len();
         self.controller.close();
-        runtime_close_json(self.runtime.close(), self.runtime.counts())
+        let post_close = self.controller.snapshot();
+        let attempts = self
+            .telemetry
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .neutralization_attempts[evidence_boundary..]
+            .to_vec();
+        let controller = controller_cleanup_json(pre_close, post_close, &attempts);
+        let runtime = runtime_close_json(self.runtime.close(), self.runtime.counts());
+        harness_cleanup_json(controller, runtime)
     }
 
     fn actual_baud(&self) -> Option<u32> {
@@ -1081,12 +1225,156 @@ fn partial_fault_stage_contract(stage: &str) -> Option<(&'static str, usize)> {
 }
 
 fn cleanup_succeeded(value: &Value) -> bool {
+    if value["kind"] != "harness_cleanup" {
+        return false;
+    }
+    let succeeded = controller_cleanup_succeeded(&value["controller"])
+        && runtime_cleanup_succeeded(&value["runtime"]);
+    value["succeeded"].as_bool() == Some(succeeded) && succeeded
+}
+
+fn runtime_cleanup_succeeded(value: &Value) -> bool {
     value["kind"] == "runtime_cleanup"
         && value["succeeded"].as_bool() == Some(true)
         && value["outcome"] == "Closed"
         && value["counts"]["active_operations"].as_u64() == Some(0)
         && value["counts"]["active_resources"].as_u64() == Some(0)
         && value["counts"]["active_tasks"].as_u64() == Some(0)
+}
+
+fn controller_cleanup_succeeded(value: &Value) -> bool {
+    let succeeded = controller_cleanup_predicate(value);
+    value["succeeded"].as_bool() == Some(succeeded) && succeeded
+}
+
+fn controller_cleanup_predicate(value: &Value) -> bool {
+    if value["kind"] != "controller_cleanup" {
+        return false;
+    }
+    let Some(pre_close_state) = value["pre_close_state"].as_str() else {
+        return false;
+    };
+    if !matches!(
+        pre_close_state,
+        "Disconnected" | "Connecting" | "Connected" | "Disconnecting" | "Closed"
+    ) {
+        return false;
+    }
+    let Some(attempts) = value["attempts"].as_array() else {
+        return false;
+    };
+    let attempts_are_valid = attempts.iter().all(neutralization_attempt_is_valid)
+        && attempts.windows(2).all(|pair| {
+            pair[0]["sequence"]
+                .as_u64()
+                .zip(pair[1]["sequence"].as_u64())
+                .is_some_and(|(left, right)| left < right)
+        })
+        && attempts.first().is_none_or(|first| {
+            let resource_id = first["resource_id"].as_u64();
+            attempts
+                .iter()
+                .all(|attempt| attempt["resource_id"].as_u64() == resource_id)
+        });
+    let final_attempts: Vec<_> = attempts
+        .iter()
+        .filter(|attempt| attempt.get("operation_id") == Some(&Value::Null))
+        .collect();
+    let expected_neutralization = if pre_close_state != "Connected" {
+        if final_attempts.is_empty() {
+            "not_required"
+        } else {
+            "evidence_incomplete"
+        }
+    } else if final_attempts.len() != 1 {
+        "evidence_incomplete"
+    } else if neutralization_attempt_was_accepted(final_attempts[0]) {
+        "accepted"
+    } else if final_attempts[0]["outcome"] == "failed" {
+        "not_delivered"
+    } else {
+        "evidence_incomplete"
+    };
+    let final_attempt_rule = if pre_close_state == "Connected" {
+        final_attempts.len() == 1
+            && neutralization_attempt_was_accepted(final_attempts[0])
+            && attempts
+                .last()
+                .and_then(|attempt| attempt["sequence"].as_u64())
+                == final_attempts[0]["sequence"].as_u64()
+    } else {
+        final_attempts.is_empty()
+    };
+
+    attempts_are_valid
+        && value["neutralization"].as_str() == Some(expected_neutralization)
+        && final_attempt_rule
+        && value["post_close_state"] == "Closed"
+        && value["post_close_desired_report_neutral"].as_bool() == Some(true)
+        && value["post_close_lease"] == "Available"
+}
+
+fn neutralization_attempt_is_valid(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    let operation_id_is_valid = match object.get("operation_id") {
+        Some(Value::Null) => true,
+        Some(value) => value.as_u64().is_some_and(|id| id != 0),
+        None => false,
+    };
+    let Some(total_bytes) = value["total_bytes"].as_u64() else {
+        return false;
+    };
+    let Some(accepted_bytes) = value["accepted_bytes"].as_u64() else {
+        return false;
+    };
+    let common = value["resource_id"].as_u64().is_some_and(|id| id != 0)
+        && value["sequence"]
+            .as_u64()
+            .is_some_and(|sequence| sequence != 0)
+        && operation_id_is_valid
+        && value["dispatch_timestamp_ns"].is_u64()
+        && value["first_write_entered_ns"].is_u64()
+        && total_bytes == 8
+        && accepted_bytes <= total_bytes;
+    if !common {
+        return false;
+    }
+
+    match value["outcome"].as_str() {
+        Some("accepted") => {
+            accepted_bytes == total_bytes
+                && value["structured_error"].is_null()
+                && value["diagnostic"].is_null()
+        }
+        Some("failed") => {
+            accepted_bytes < total_bytes
+                && structured_transport_error_is_valid(&value["structured_error"])
+                && value["diagnostic"].is_null()
+        }
+        Some("pending" | "contradiction") => false,
+        Some(_) | None => false,
+    }
+}
+
+fn structured_transport_error_is_valid(value: &Value) -> bool {
+    value["kind"].as_str().is_some_and(|kind| {
+        matches!(
+            kind,
+            "Timeout" | "WriteTimeout" | "Cancelled" | "Disconnected" | "Io" | "Protocol"
+        )
+    }) && value["message"]
+        .as_str()
+        .is_some_and(|message| !message.trim().is_empty())
+}
+
+fn neutralization_attempt_was_accepted(value: &Value) -> bool {
+    value["operation_id"].is_null()
+        && value["total_bytes"].as_u64() == Some(8)
+        && value["accepted_bytes"].as_u64() == Some(8)
+        && value["outcome"] == "accepted"
+        && value["structured_error"].is_null()
 }
 
 fn cleanup_slot_count(value: &Value) -> usize {
@@ -1893,6 +2181,93 @@ fn with_cleanup(mut value: Value, cleanup: Value) -> Value {
     value
 }
 
+fn harness_cleanup_json(controller: Value, runtime: Value) -> Value {
+    let succeeded =
+        controller_cleanup_succeeded(&controller) && runtime_cleanup_succeeded(&runtime);
+    json!({
+        "kind": "harness_cleanup",
+        "succeeded": succeeded,
+        "controller": controller,
+        "runtime": runtime,
+    })
+}
+
+fn controller_cleanup_json(
+    pre_close: ControllerSnapshot,
+    post_close: ControllerSnapshot,
+    attempts: &[NeutralizationAttempt],
+) -> Value {
+    let final_attempts: Vec<_> = attempts
+        .iter()
+        .filter(|attempt| attempt.context.operation_id.is_none())
+        .collect();
+    let neutralization = if pre_close.state != ControllerState::Connected {
+        if final_attempts.is_empty() {
+            "not_required"
+        } else {
+            "evidence_incomplete"
+        }
+    } else if final_attempts.len() != 1 {
+        "evidence_incomplete"
+    } else {
+        match &final_attempts[0].outcome {
+            NeutralizationOutcome::Accepted
+                if final_attempts[0].context.total_len == 8
+                    && final_attempts[0].accepted_bytes == 8 =>
+            {
+                "accepted"
+            }
+            NeutralizationOutcome::Failed(_) => "not_delivered",
+            NeutralizationOutcome::Pending
+            | NeutralizationOutcome::Accepted
+            | NeutralizationOutcome::Contradiction(_) => "evidence_incomplete",
+        }
+    };
+    let mut value = json!({
+        "kind": "controller_cleanup",
+        "succeeded": false,
+        "pre_close_state": format!("{:?}", pre_close.state),
+        "post_close_state": format!("{:?}", post_close.state),
+        "post_close_desired_report_neutral": post_close.desired_report.is_neutral(),
+        "post_close_lease": format!("{:?}", post_close.lease),
+        "neutralization": neutralization,
+        "attempts": attempts.iter().map(neutralization_attempt_json).collect::<Vec<_>>(),
+    });
+    let succeeded = controller_cleanup_predicate(&value);
+    value["succeeded"] = json!(succeeded);
+    value
+}
+
+fn neutralization_attempt_json(attempt: &NeutralizationAttempt) -> Value {
+    let (outcome, structured_error, diagnostic) = match &attempt.outcome {
+        NeutralizationOutcome::Pending => ("pending", Value::Null, Value::Null),
+        NeutralizationOutcome::Accepted => ("accepted", Value::Null, Value::Null),
+        NeutralizationOutcome::Failed(error) => (
+            "failed",
+            json!({
+                "kind": format!("{:?}", error.kind()),
+                "message": error.message(),
+            }),
+            Value::Null,
+        ),
+        NeutralizationOutcome::Contradiction(message) => {
+            ("contradiction", Value::Null, json!(message))
+        }
+    };
+    json!({
+        "resource_id": attempt.context.resource_id.get(),
+        "operation_id": attempt.context.operation_id.map(|id| id.get()),
+        "sequence": attempt.context.sequence,
+        "dispatch_timestamp_ns": attempt.context.timestamp_ns,
+        "first_write_entered_ns": attempt.first_write_entered_ns,
+        "total_bytes": attempt.context.total_len,
+        "accepted_bytes": attempt.accepted_bytes,
+        "outcome": outcome,
+        "structured_error": structured_error,
+        "diagnostic": diagnostic,
+    })
+}
+
 fn runtime_close_json(
     outcome: Result<CloseOutcome, CloseRejection>,
     observed_counts: RuntimeCounts,
@@ -2061,7 +2436,15 @@ mod tests {
     }
 
     fn successful_cleanup() -> Value {
-        json!({
+        let controller = controller_cleanup_json(
+            ControllerSnapshot::default(),
+            ControllerSnapshot {
+                state: ControllerState::Closed,
+                ..ControllerSnapshot::default()
+            },
+            &[],
+        );
+        let runtime = json!({
             "kind": "runtime_cleanup",
             "succeeded": true,
             "outcome": "Closed",
@@ -2070,7 +2453,8 @@ mod tests {
                 "active_resources": 0,
                 "active_tasks": 0,
             },
-        })
+        });
+        harness_cleanup_json(controller, runtime)
     }
 
     fn fault_operation(id: u64, state: &str, domain: &str, code: &str, reason: Value) -> Value {
@@ -2207,6 +2591,94 @@ mod tests {
         fn close(&mut self) {}
     }
 
+    struct FinalNeutralFailureTransport;
+
+    impl ControllerTransport for FinalNeutralFailureTransport {
+        fn handshake(&mut self, _request: HandshakeRequest) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn write(&mut self, request: WriteRequest<'_>) -> Result<usize, TransportError> {
+            if request.context.kind == WriteKind::Neutralize
+                && request.context.operation_id.is_none()
+            {
+                Err(TransportError::new(
+                    TransportErrorKind::Io,
+                    "injected final neutral write failure",
+                ))
+            } else {
+                Ok(request.bytes.len())
+            }
+        }
+
+        fn wait_for_ack(&mut self, _request: AckRequest) -> Result<AckFrame, TransportError> {
+            Err(TransportError::new(
+                TransportErrorKind::Protocol,
+                "no ACK in final neutralization test",
+            ))
+        }
+
+        fn close(&mut self) {}
+    }
+
+    struct PartialFinalNeutralFailureTransport {
+        accepted_prefix: bool,
+    }
+
+    impl ControllerTransport for PartialFinalNeutralFailureTransport {
+        fn handshake(&mut self, _request: HandshakeRequest) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn write(&mut self, request: WriteRequest<'_>) -> Result<usize, TransportError> {
+            if request.context.kind != WriteKind::Neutralize
+                || request.context.operation_id.is_some()
+            {
+                return Ok(request.bytes.len());
+            }
+            if !self.accepted_prefix {
+                self.accepted_prefix = true;
+                Ok(3)
+            } else {
+                Err(TransportError::new(
+                    TransportErrorKind::Io,
+                    "injected failure after final neutral prefix",
+                ))
+            }
+        }
+
+        fn wait_for_ack(&mut self, _request: AckRequest) -> Result<AckFrame, TransportError> {
+            Err(TransportError::new(
+                TransportErrorKind::Protocol,
+                "no ACK in partial final neutralization test",
+            ))
+        }
+
+        fn close(&mut self) {}
+    }
+
+    fn observed_harness(transport: Box<dyn ControllerTransport>, label: &str) -> Harness {
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock::default());
+        let runtime = Runtime::new(clock.clone());
+        let telemetry = Arc::new(Mutex::new(Telemetry::default()));
+        let observed = ObservedTransport {
+            inner: transport,
+            clock: clock.clone(),
+            telemetry: telemetry.clone(),
+        };
+        let controller =
+            ControllerSession::new(&runtime, Box::new(observed), ControllerOptions::default())
+                .expect("controller");
+        Harness {
+            runtime,
+            clock,
+            controller,
+            telemetry,
+            descriptor: SerialPortDescriptor::new(format!("TEST\\{label}"), "COM1")
+                .expect("descriptor"),
+        }
+    }
+
     struct PanickingResource;
 
     impl ManagedResource for PanickingResource {
@@ -2280,7 +2752,10 @@ mod tests {
             document["result"]["scenarios"]["deadline"]["status"],
             "not_run"
         );
-        assert_eq!(document["result"]["cancel_cleanup"]["outcome"], "Closed");
+        assert_eq!(
+            document["result"]["cancel_cleanup"]["runtime"]["outcome"],
+            "Closed"
+        );
         assert_eq!(
             failure.as_deref(),
             Some("cancel_readiness: timed out waiting for first report")
@@ -3016,7 +3491,7 @@ mod tests {
         }
 
         let mut failed_outcome = cleanup();
-        failed_outcome["outcome"] = json!("Failed");
+        failed_outcome["runtime"]["outcome"] = json!("Failed");
         assert_cleanup_failure(
             "handshake",
             json!({
@@ -3026,7 +3501,7 @@ mod tests {
             }),
         );
         let mut nonzero_counts = cleanup();
-        nonzero_counts["counts"]["active_operations"] = json!(1);
+        nonzero_counts["runtime"]["counts"]["active_operations"] = json!(1);
         assert_cleanup_failure(
             "handshake",
             json!({
@@ -3152,10 +3627,10 @@ mod tests {
 
         let cleanup = harness.close();
         assert_eq!(cleanup["succeeded"], false);
-        assert_eq!(cleanup["outcome"], "Failed");
-        assert_eq!(cleanup["report"]["phase"], "ResourceCleanup");
+        assert_eq!(cleanup["runtime"]["outcome"], "Failed");
+        assert_eq!(cleanup["runtime"]["report"]["phase"], "ResourceCleanup");
         assert_eq!(
-            cleanup["report"]["diagnostic"],
+            cleanup["runtime"]["report"]["diagnostic"],
             "ManagedResource::close panicked"
         );
 
@@ -3164,10 +3639,205 @@ mod tests {
         assert_eq!(document["execution_status"], "failed");
         assert_eq!(document["qualification_status"], "failed");
         assert_eq!(
-            document["result"]["cleanup"]["report"]["phase"],
+            document["result"]["cleanup"]["runtime"]["report"]["phase"],
             "ResourceCleanup"
         );
         assert_eq!(document_exit_code(&document), 1);
+    }
+
+    #[test]
+    fn final_close_neutralization_failure_cannot_pass_cleanup() {
+        let harness = observed_harness(Box::new(FinalNeutralFailureTransport), "FINAL-NEUTRAL");
+        let operation = harness
+            .connect(ConnectOptions::default())
+            .expect("synthetic connect");
+
+        let cleanup = harness.close();
+
+        assert_eq!(cleanup["kind"], "harness_cleanup");
+        assert_eq!(cleanup["controller"]["neutralization"], "not_delivered");
+        assert_eq!(cleanup["controller"]["attempts"][0]["outcome"], "failed");
+        assert_eq!(cleanup["runtime"]["outcome"], "Closed");
+        assert_eq!(cleanup["runtime"]["counts"]["active_operations"], 0);
+        assert_eq!(cleanup["runtime"]["counts"]["active_resources"], 0);
+        assert_eq!(cleanup["runtime"]["counts"]["active_tasks"], 0);
+        assert_eq!(cleanup["succeeded"], false);
+
+        let (document, failure) = finalize_result(
+            "handshake",
+            Ok(json!({
+                "operation": operation,
+                "actual_baud": 115_200,
+                "cleanup": cleanup,
+            })),
+        );
+        assert!(failure.is_some());
+        assert_eq!(document["execution_status"], "failed");
+        assert_eq!(document["qualification_status"], "failed");
+        assert_eq!(document_exit_code(&document), 1);
+    }
+
+    #[test]
+    fn connected_close_requires_one_complete_final_neutral_attempt() {
+        let harness = observed_harness(Box::new(NoopTransport), "FINAL-NEUTRAL-SUCCESS");
+        harness
+            .connect(ConnectOptions::default())
+            .expect("synthetic connect");
+
+        let cleanup = harness.close();
+
+        assert!(cleanup_succeeded(&cleanup));
+        assert_eq!(cleanup["controller"]["neutralization"], "accepted");
+        assert_eq!(
+            cleanup["controller"]["attempts"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            cleanup["controller"]["attempts"][0]["operation_id"],
+            Value::Null
+        );
+        assert_eq!(cleanup["controller"]["attempts"][0]["total_bytes"], 8);
+        assert_eq!(cleanup["controller"]["attempts"][0]["accepted_bytes"], 8);
+        assert_eq!(cleanup["controller"]["attempts"][0]["outcome"], "accepted");
+    }
+
+    #[test]
+    fn disconnected_close_records_not_required_without_claiming_delivery() {
+        let harness = observed_harness(Box::new(NoopTransport), "FINAL-NEUTRAL-NOT-REQUIRED");
+
+        let cleanup = harness.close();
+
+        assert!(cleanup_succeeded(&cleanup));
+        assert_eq!(cleanup["controller"]["pre_close_state"], "Disconnected");
+        assert_eq!(cleanup["controller"]["neutralization"], "not_required");
+        assert_eq!(cleanup["controller"]["attempts"], json!([]));
+    }
+
+    #[test]
+    fn partial_final_neutral_failure_preserves_prefix_and_error() {
+        let harness = observed_harness(
+            Box::new(PartialFinalNeutralFailureTransport {
+                accepted_prefix: false,
+            }),
+            "FINAL-NEUTRAL-PARTIAL",
+        );
+        harness
+            .connect(ConnectOptions::default())
+            .expect("synthetic connect");
+
+        let cleanup = harness.close();
+
+        assert!(!cleanup_succeeded(&cleanup));
+        assert_eq!(cleanup["controller"]["neutralization"], "not_delivered");
+        assert_eq!(cleanup["controller"]["attempts"][0]["total_bytes"], 8);
+        assert_eq!(cleanup["controller"]["attempts"][0]["accepted_bytes"], 3);
+        assert_eq!(cleanup["controller"]["attempts"][0]["outcome"], "failed");
+        assert_eq!(
+            cleanup["controller"]["attempts"][0]["structured_error"]["kind"],
+            "Io"
+        );
+        assert_eq!(cleanup["runtime"]["outcome"], "Closed");
+    }
+
+    #[test]
+    fn cleanup_projection_rejects_legacy_partial_and_misbound_evidence() {
+        let harness = observed_harness(Box::new(NoopTransport), "FINAL-NEUTRAL-VALIDATOR");
+        harness
+            .connect(ConnectOptions::default())
+            .expect("synthetic connect");
+        let valid = harness.close();
+        assert!(cleanup_succeeded(&valid));
+
+        let mut invalid = vec![valid["runtime"].clone()];
+        let mut missing_controller = valid.clone();
+        missing_controller
+            .as_object_mut()
+            .expect("cleanup")
+            .remove("controller");
+        invalid.push(missing_controller);
+
+        let mut operation_bound = valid.clone();
+        operation_bound["controller"]["attempts"][0]["operation_id"] = json!(71);
+        invalid.push(operation_bound);
+
+        let mut partial = valid.clone();
+        partial["controller"]["attempts"][0]["accepted_bytes"] = json!(3);
+        invalid.push(partial);
+
+        let mut unknown_error = valid.clone();
+        let mut operation_failure = unknown_error["controller"]["attempts"][0].clone();
+        let final_sequence = operation_failure["sequence"]
+            .as_u64()
+            .expect("final sequence");
+        operation_failure["operation_id"] = json!(71);
+        operation_failure["accepted_bytes"] = json!(0);
+        operation_failure["outcome"] = json!("failed");
+        operation_failure["structured_error"] = json!({
+            "kind": "InventedError",
+            "message": "unknown stable kind",
+        });
+        unknown_error["controller"]["attempts"][0]["sequence"] =
+            json!(final_sequence.checked_add(1).expect("next sequence"));
+        unknown_error["controller"]["attempts"]
+            .as_array_mut()
+            .expect("attempts")
+            .insert(0, operation_failure);
+        let mut known_operation_error = unknown_error.clone();
+        known_operation_error["controller"]["attempts"][0]["structured_error"]["kind"] =
+            json!("Io");
+        assert!(cleanup_succeeded(&known_operation_error));
+        invalid.push(unknown_error);
+
+        let mut post_final_attempt = valid.clone();
+        let mut late_operation = post_final_attempt["controller"]["attempts"][0].clone();
+        let final_sequence = late_operation["sequence"].as_u64().expect("final sequence");
+        late_operation["sequence"] = json!(final_sequence.checked_add(1).expect("late sequence"));
+        late_operation["operation_id"] = json!(72);
+        post_final_attempt["controller"]["attempts"]
+            .as_array_mut()
+            .expect("attempts")
+            .push(late_operation);
+        invalid.push(post_final_attempt);
+
+        let mut outer_contradiction = valid;
+        outer_contradiction["succeeded"] = json!(false);
+        invalid.push(outer_contradiction);
+
+        for cleanup in invalid {
+            assert!(!cleanup_succeeded(&cleanup));
+            assert_cleanup_failure(
+                "handshake",
+                json!({
+                    "operation": {"state": "Succeeded"},
+                    "actual_baud": 115_200,
+                    "cleanup": cleanup,
+                }),
+            );
+        }
+    }
+
+    #[test]
+    fn controller_and_runtime_close_failures_are_both_preserved() {
+        let harness = observed_harness(
+            Box::new(FinalNeutralFailureTransport),
+            "FINAL-NEUTRAL-DOUBLE-FAILURE",
+        );
+        let resource: Arc<dyn ManagedResource> = Arc::new(PanickingResource);
+        let _registration = harness
+            .runtime
+            .register_resource(resource.clone())
+            .expect("resource");
+        harness
+            .connect(ConnectOptions::default())
+            .expect("synthetic connect");
+
+        let cleanup = harness.close();
+
+        assert_eq!(cleanup["succeeded"], false);
+        assert_eq!(cleanup["controller"]["neutralization"], "not_delivered");
+        assert_eq!(cleanup["controller"]["attempts"][0]["outcome"], "failed");
+        assert_eq!(cleanup["runtime"]["outcome"], "Failed");
+        assert_eq!(cleanup["runtime"]["report"]["phase"], "ResourceCleanup");
     }
 
     #[test]

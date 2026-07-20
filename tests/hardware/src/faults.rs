@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use super::{
     CancelSnapshotReadiness, Harness, OPERATION_TIMEOUT, cancel_snapshot_readiness,
     cleanup_succeeded, controller_snapshot_json, operation_failure, operation_json, required_value,
-    runtime_close_json, wait_terminal,
+    wait_terminal,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -93,7 +93,7 @@ impl FaultFailure {
 }
 
 struct FaultCloseEvidence {
-    runtime_cleanup: Value,
+    cleanup: Value,
     post_controller_snapshot: ControllerSnapshot,
     native_open_attempts: Value,
 }
@@ -233,11 +233,10 @@ impl FaultHarness for Harness {
     }
 
     fn close(self) -> FaultCloseEvidence {
-        self.controller.close();
-        let runtime_cleanup = runtime_close_json(self.runtime.close(), self.runtime.counts());
+        let cleanup = Harness::close(&self);
         let native_open_attempts = Harness::native_open_attempts(&self);
         FaultCloseEvidence {
-            runtime_cleanup,
+            cleanup,
             post_controller_snapshot: self.controller.snapshot(),
             native_open_attempts,
         }
@@ -351,8 +350,8 @@ impl<H: FaultHarness> FaultRun<H> {
             return Ok(());
         };
         let evidence = harness.close();
-        let succeeded = cleanup_succeeded(&evidence.runtime_cleanup);
-        self.result[role.cleanup_field()] = evidence.runtime_cleanup;
+        let succeeded = cleanup_succeeded(&evidence.cleanup);
+        self.result[role.cleanup_field()] = evidence.cleanup;
         self.result[role.post_close_snapshot_field()] =
             controller_snapshot_json(evidence.post_controller_snapshot);
         if let Some(field) = role.native_attempts_field() {
@@ -732,8 +731,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        Telemetry, cleanup_contract_succeeded, document_exit_code, finalize_result,
-        qualification_check,
+        ObservedTransport, Telemetry, cleanup_contract_succeeded, controller_cleanup_json,
+        document_exit_code, finalize_result, harness_cleanup_json, qualification_check,
+        runtime_close_json,
     };
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1001,14 +1001,23 @@ mod tests {
             {
                 let _ = operation.finish_cancelled();
             }
-            let mut cleanup = runtime_close_json(self.runtime.close(), self.runtime.counts());
+            let controller = controller_cleanup_json(
+                ControllerSnapshot::default(),
+                ControllerSnapshot {
+                    state: ControllerState::Closed,
+                    ..ControllerSnapshot::default()
+                },
+                &[],
+            );
+            let mut runtime = runtime_close_json(self.runtime.close(), self.runtime.counts());
             if self.script.close_fails(self.role) {
-                cleanup["succeeded"] = json!(false);
-                cleanup["outcome"] = json!("Failed");
-                cleanup["diagnostic"] = json!("injected close failure");
+                runtime["succeeded"] = json!(false);
+                runtime["outcome"] = json!("Failed");
+                runtime["diagnostic"] = json!("injected close failure");
             }
+            let cleanup = harness_cleanup_json(controller, runtime);
             FaultCloseEvidence {
-                runtime_cleanup: cleanup,
+                cleanup,
                 post_controller_snapshot: ControllerSnapshot {
                     state: ControllerState::Closed,
                     ..ControllerSnapshot::default()
@@ -1139,24 +1148,61 @@ mod tests {
         fn close(&mut self) {}
     }
 
-    #[test]
-    fn production_harness_adapter_closes_active_controller_and_runtime() {
+    struct AdapterFinalNeutralFailureTransport;
+
+    impl ControllerTransport for AdapterFinalNeutralFailureTransport {
+        fn handshake(&mut self, _request: HandshakeRequest) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn write(&mut self, request: WriteRequest<'_>) -> Result<usize, TransportError> {
+            if request.context.kind == easycon_controller::WriteKind::Neutralize
+                && request.context.operation_id.is_none()
+            {
+                Err(TransportError::new(
+                    TransportErrorKind::Io,
+                    "injected faults final neutral failure",
+                ))
+            } else {
+                Ok(request.bytes.len())
+            }
+        }
+
+        fn wait_for_ack(&mut self, _request: AckRequest) -> Result<AckFrame, TransportError> {
+            Err(TransportError::new(
+                TransportErrorKind::Protocol,
+                "no ACK in faults final neutral failure test",
+            ))
+        }
+
+        fn close(&mut self) {}
+    }
+
+    fn adapter_harness(transport: Box<dyn ControllerTransport>, label: &str) -> Harness {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock::default());
         let runtime = Runtime::new(clock.clone());
-        let controller = ControllerSession::new(
-            &runtime,
-            Box::new(AdapterNoopTransport),
-            ControllerOptions::default(),
-        )
-        .expect("controller");
-        let harness = Harness {
+        let telemetry = Arc::new(Mutex::new(Telemetry::default()));
+        let observed = ObservedTransport {
+            inner: transport,
+            clock: clock.clone(),
+            telemetry: telemetry.clone(),
+        };
+        let controller =
+            ControllerSession::new(&runtime, Box::new(observed), ControllerOptions::default())
+                .expect("controller");
+        Harness {
             runtime,
             clock,
             controller,
-            telemetry: Arc::new(Mutex::new(Telemetry::default())),
-            descriptor: SerialPortDescriptor::new("DEVICE\\FAULT-ADAPTER", "COM1")
+            telemetry,
+            descriptor: SerialPortDescriptor::new(format!("DEVICE\\{label}"), "COM1")
                 .expect("descriptor"),
-        };
+        }
+    }
+
+    #[test]
+    fn production_harness_adapter_closes_active_controller_and_runtime() {
+        let harness = adapter_harness(Box::new(AdapterNoopTransport), "FAULT-ADAPTER");
 
         let connect = harness
             .admit_connect(ConnectOptions::default())
@@ -1176,7 +1222,16 @@ mod tests {
         let evidence = <Harness as FaultHarness>::close(harness);
 
         assert_eq!(operation.snapshot().state, OperationState::Cancelled);
-        assert!(cleanup_succeeded(&evidence.runtime_cleanup));
+        assert!(cleanup_succeeded(&evidence.cleanup));
+        assert_eq!(evidence.cleanup["controller"]["neutralization"], "accepted");
+        assert_eq!(
+            evidence.cleanup["controller"]["attempts"][0]["operation_id"],
+            Value::Null
+        );
+        assert_eq!(
+            evidence.cleanup["controller"]["attempts"][0]["accepted_bytes"],
+            8
+        );
         assert_eq!(
             evidence.post_controller_snapshot.state,
             ControllerState::Closed
@@ -1192,6 +1247,33 @@ mod tests {
             ControllerLeaseState::Available
         );
         assert_eq!(evidence.native_open_attempts, json!([]));
+    }
+
+    #[test]
+    fn production_neutral_failure_maps_to_the_role_close_stage() {
+        let harness = adapter_harness(
+            Box::new(AdapterFinalNeutralFailureTransport),
+            "FAULT-ADAPTER-NEUTRAL-FAILURE",
+        );
+        let connect = harness
+            .admit_connect(ConnectOptions::default())
+            .expect("connect operation");
+        wait_terminal(&connect, OPERATION_TIMEOUT).expect("connected");
+        let mut run = FaultRun::new();
+        run.begin_scenario("port_occupied");
+        run.install(FaultRole::Occupier, harness);
+
+        let result = run.finish(Ok(()), &mut ProductionWaiter);
+
+        assert_eq!(result["execution_error"]["stage"], "occupier_close");
+        assert_eq!(result["scenarios"]["port_occupied"]["status"], "failed");
+        assert_eq!(result["occupier_cleanup"]["succeeded"], false);
+        assert_eq!(
+            result["occupier_cleanup"]["controller"]["neutralization"],
+            "not_delivered"
+        );
+        assert_eq!(result["occupier_cleanup"]["runtime"]["outcome"], "Closed");
+        assert!(!cleanup_contract_succeeded("faults", &result));
     }
 
     #[test]
