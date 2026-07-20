@@ -61,6 +61,7 @@ Switch 执行时序或物理中立化已经验证，也不创建完整 Phase 2 �
   report acceptance 观测。
 - ACK command 在同一 FIFO lane 中等待前序 direct report，只有独占 sequence/Automation lease 才
   返回 `RESOURCE_BUSY`；ACK 路径发现断线时重置 desired report、记录中立化 warning 并关闭 transport。
+  resource close 唤醒正在等待的 ACK 后，该 request operation 保持非终态，直到串口 stream 完成同步关闭。
 - Controller generation matcher 和 command 前 input purge 可隔离 fake 中的旧 generation 及已经排队的
   重复字节；CH32 wire ACK 本身没有 generation 字段，未来才到达的物理迟到 ACK 归属仍需 O-01/O-02
   实物验证，Phase 2A 不把软件 matcher 外推为硬件保证。

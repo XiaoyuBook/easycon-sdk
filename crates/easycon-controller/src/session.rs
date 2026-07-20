@@ -347,6 +347,7 @@ struct ControllerLane {
     desired_report: SwitchReport,
     pending_reports: VecDeque<ScheduledReport>,
     deferred_commands: VecDeque<LaneCommand>,
+    close_deferred_operations: Vec<Operation>,
     last_report_acceptance_ns: Option<u64>,
     next_write_sequence: u64,
     resource_cancellation: easycon_runtime::CancellationToken,
@@ -425,6 +426,7 @@ impl ControllerSession {
             desired_report: SwitchReport::NEUTRAL,
             pending_reports: VecDeque::new(),
             deferred_commands: VecDeque::new(),
+            close_deferred_operations: Vec::new(),
             last_report_acceptance_ns: None,
             next_write_sequence: 1,
             resource_cancellation,
@@ -1483,10 +1485,7 @@ impl ControllerLane {
                 }
             }
             Err(error) if error.kind() == TransportErrorKind::Cancelled => {
-                if operation.snapshot().state != OperationState::Cancelling {
-                    operation.request_cancel(easycon_runtime::CancellationReason::ParentClose);
-                }
-                operation.finish_cancelled();
+                self.finish_cancelled_request(operation);
             }
             Err(error) => {
                 if error.kind() == TransportErrorKind::Disconnected {
@@ -1536,10 +1535,7 @@ impl ControllerLane {
             {
                 self.handle_amiibo_cleanup_failure(operation.id(), &cleanup_error);
             }
-            if operation.snapshot().state != OperationState::Cancelling {
-                operation.request_cancel(easycon_runtime::CancellationReason::ParentClose);
-            }
-            operation.finish_cancelled();
+            self.finish_cancelled_request(operation);
             return;
         }
         if error.kind() == TransportErrorKind::Disconnected {
@@ -1716,6 +1712,17 @@ impl ControllerLane {
             true
         } else {
             false
+        }
+    }
+
+    fn finish_cancelled_request(&mut self, operation: Operation) {
+        if operation.snapshot().state != OperationState::Cancelling {
+            operation.request_cancel(easycon_runtime::CancellationReason::ParentClose);
+        }
+        if self.resource_cancellation.is_cancelled() {
+            self.close_deferred_operations.push(operation);
+        } else {
+            operation.finish_cancelled();
         }
     }
 
@@ -2233,6 +2240,7 @@ impl ControllerLane {
             .map(|pending| pending.operation)
             .collect();
         let mut close_waiters = Vec::new();
+        let mut close_deferred_operations = std::mem::take(&mut self.close_deferred_operations);
         let queued: Vec<_> = self
             .deferred_commands
             .drain(..)
@@ -2292,6 +2300,13 @@ impl ControllerLane {
             }
         }
         self.transport.close();
+        close_deferred_operations.sort_by_key(Operation::id);
+        close_deferred_operations.dedup_by_key(|operation| operation.id());
+        for operation in close_deferred_operations {
+            if operation.snapshot().state == OperationState::Cancelling {
+                operation.finish_cancelled();
+            }
+        }
         self.set_state(ControllerState::Closed, "controller.closed", None);
         if let Some(completed) = completed {
             let _ = completed.send(());

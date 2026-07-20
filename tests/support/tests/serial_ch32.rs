@@ -273,7 +273,13 @@ fn blocked_ack_obeys_deadline_and_controller_close_wakes_a_second_wait() {
         .command_with_ack(Arc::<[u8]>::from([0xa5, 0x21]), 0xff, 100)
         .expect("close-wake command");
     assert!(simulator.wait_until_read_blocked(Duration::from_secs(2)));
-    controller.close();
+    simulator.block_next_close();
+    let closing_controller = controller.clone();
+    let close = std::thread::spawn(move || closing_controller.close());
+    assert!(simulator.wait_until_close_blocked(Duration::from_secs(2)));
+    assert_eq!(closing.wait(WaitTimeout::Poll), WaitResult::Timeout);
+    simulator.release_close();
+    close.join().expect("Controller close thread");
     wait_terminal(&closing);
 
     assert_eq!(closing.snapshot().state, OperationState::Cancelled);

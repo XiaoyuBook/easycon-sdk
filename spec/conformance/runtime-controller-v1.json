@@ -476,7 +476,7 @@
         },
         {
           "id": "phase2a.serial.deadline-close-wake",
-          "expect": "absolute protocol deadline and Controller close both wake a blocked byte read without random sleep",
+          "expect": "absolute protocol deadline and Controller close both wake a blocked byte read without random sleep, and resource close settles the stream before exposing a cancelled ACK operation",
           "test": "tests/support/tests/serial_ch32.rs::blocked_ack_obeys_deadline_and_controller_close_wakes_a_second_wait"
         },
         {
