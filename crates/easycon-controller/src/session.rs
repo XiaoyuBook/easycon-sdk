@@ -1544,6 +1544,10 @@ impl ControllerLane {
         }
         if error.kind() == TransportErrorKind::Disconnected {
             self.handle_transport_disconnect(Some(operation.id()), &error);
+        } else if let Err(cleanup_error) =
+            self.exchange_amiibo_cleanup_reset(operation.id(), reset_timeout_ns)
+        {
+            self.handle_amiibo_cleanup_failure(operation.id(), &cleanup_error);
         }
         let mapped = map_transport_error(error);
         fail_or_finish_cancelled(

@@ -302,10 +302,11 @@ fn amiibo_ack_uses_the_existing_generation_matcher() {
 // conformance: phase2a.amiibo.partial-failure
 #[test]
 fn save_partial_failure_reports_completed_chunks_and_releases_the_lane() {
-    let (_clock, runtime, simulator, controller) = connected_ch32(1, 25);
+    let (clock, runtime, simulator, controller) = connected_ch32(1, 25);
     simulator.push_ack(Ch32AckBehavior::Reply(0xff));
     simulator.push_ack(Ch32AckBehavior::Reply(0xff));
     simulator.push_ack(Ch32AckBehavior::Reply(0x00));
+    simulator.push_ack(Ch32AckBehavior::Reply(0x80));
     let data: Vec<u8> = (0..25).collect();
 
     let save = controller
@@ -326,7 +327,8 @@ fn save_partial_failure_reports_completed_chunks_and_releases_the_lane() {
     assert_eq!(controller.snapshot().state, ControllerState::Connected);
     assert_eq!(controller.snapshot().lease, ControllerLeaseState::Available);
     let snapshot = simulator.snapshot();
-    assert_eq!(snapshot.commands.len(), 3);
+    assert_eq!(snapshot.commands.len(), 4);
+    assert_eq!(snapshot.commands[3], [0xa5, 0x81, 0xa5, 0x81, 0xa5, 0x81]);
     assert_eq!(snapshot.amiibo_chunks.len(), 1);
     let lease = controller
         .acquire_automation_lease()
@@ -340,7 +342,40 @@ fn save_partial_failure_reports_completed_chunks_and_releases_the_lane() {
         ErrorCode::ResourceBusy
     );
     lease.release();
-    close_connected(&runtime, &controller);
+
+    simulator.push_ack(Ch32AckBehavior::Reply(0x00));
+    simulator.push_ack(Ch32AckBehavior::NoReply);
+    simulator.block_next_close();
+    let cleanup_failure = controller
+        .save_amiibo(
+            0,
+            Arc::<[u8]>::from([9]),
+            AmiiboSaveOptions {
+                reset_timeout_ns: 100,
+                maximum_chunk_retries: 0,
+                ..AmiiboSaveOptions::default()
+            },
+        )
+        .expect("save with failing final cleanup");
+    assert!(simulator.wait_until_read_blocked(Duration::from_secs(2)));
+    clock.advance_to(clock.now_ns().saturating_add(100));
+    assert!(simulator.wait_until_close_blocked(Duration::from_secs(2)));
+    assert_eq!(cleanup_failure.wait(WaitTimeout::Poll), WaitResult::Timeout);
+    simulator.release_close();
+    wait_terminal(&cleanup_failure);
+
+    assert_eq!(
+        cleanup_failure
+            .snapshot()
+            .error
+            .expect("original partial failure")
+            .code(),
+        ErrorCode::ProtocolError
+    );
+    assert_eq!(controller.snapshot().state, ControllerState::Disconnected);
+    assert_eq!(simulator.snapshot().active_streams, 0);
+    controller.close();
+    runtime.close().expect("Runtime close");
 }
 
 // conformance: phase2a.amiibo.cancel-deadline-cleanup
