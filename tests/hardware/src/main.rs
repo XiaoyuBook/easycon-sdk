@@ -456,16 +456,28 @@ fn qualification_decision(command: &str, result: &Value) -> QualificationDecisio
         }
         "faults" => required_checks(&[
             (
-                "port_occupied_failed",
-                result["port_occupied_expected_failed"].as_bool() == Some(true),
+                "port_occupied_exact_error",
+                operation_matches(&result["port_occupied"], "Failed", "Io", "Transport", None),
             ),
             (
-                "cancel_reached_cancelled",
-                result["cancel_expected_cancelled"].as_bool() == Some(true),
+                "cancel_exact_reason",
+                operation_matches(
+                    &result["cancel"],
+                    "Cancelled",
+                    "Runtime",
+                    "Cancelled",
+                    Some("Requested"),
+                ),
             ),
             (
-                "deadline_reached_cancelled",
-                result["deadline_expected_cancelled"].as_bool() == Some(true),
+                "deadline_exact_reason",
+                operation_matches(
+                    &result["deadline"],
+                    "Cancelled",
+                    "Runtime",
+                    "DeadlineExceeded",
+                    Some("Deadline"),
+                ),
             ),
         ]),
         "hotplug" => required_checks(&[
@@ -545,6 +557,37 @@ fn qualification_decision(command: &str, result: &Value) -> QualificationDecisio
         },
         _ => required_checks(&[("known_qualification_command", false)]),
     }
+}
+
+fn operation_matches(
+    operation: &Value,
+    state: &str,
+    domain: &str,
+    code: &str,
+    cancellation_reason: Option<&str>,
+) -> bool {
+    let Some(operation) = operation.as_object() else {
+        return false;
+    };
+    let Some(error) = operation.get("structured_error").and_then(Value::as_object) else {
+        return false;
+    };
+    let reason_matches = match cancellation_reason {
+        Some(reason) => {
+            operation.get("cancellation_reason").and_then(Value::as_str) == Some(reason)
+        }
+        None => operation
+            .get("cancellation_reason")
+            .is_some_and(Value::is_null),
+    };
+    operation.get("state").and_then(Value::as_str) == Some(state)
+        && error.get("domain").and_then(Value::as_str) == Some(domain)
+        && error.get("code").and_then(Value::as_str) == Some(code)
+        && error
+            .get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| !message.is_empty())
+        && reason_matches
 }
 
 fn discovery_qualification(result: &Value) -> QualificationDecision {
@@ -1331,7 +1374,12 @@ fn operation_json(operation: &Operation) -> Value {
     json!({
         "id": operation.id().get(),
         "state": format!("{:?}", snapshot.state),
-        "error": snapshot.error.map(|error| error.to_string()),
+        "error": snapshot.error.as_ref().map(ToString::to_string),
+        "structured_error": snapshot.error.as_ref().map(|error| json!({
+            "domain": format!("{:?}", error.domain()),
+            "code": format!("{:?}", error.code()),
+            "message": error.message(),
+        })),
         "cancellation_reason": snapshot.cancellation_reason.map(|reason| format!("{reason:?}")),
     })
 }
@@ -1582,7 +1630,8 @@ fn print_help() {
 mod tests {
     use super::*;
     use easycon_controller::TransportErrorKind;
-    use easycon_runtime::ManagedResource;
+    use easycon_model::{EasyConError, ErrorCode, ErrorDomain};
+    use easycon_runtime::{CancellationReason, ManagedResource};
 
     struct TestDirectory(PathBuf);
 
@@ -1701,6 +1750,124 @@ mod tests {
             assert_ne!(document["status"], "passed", "{command}");
             assert!(failure.is_some(), "{command} must return a non-zero exit");
             assert_eq!(document_exit_code(&document), 1, "{command}");
+        }
+    }
+
+    #[test]
+    fn operation_json_preserves_structured_error_and_cancellation_reason() {
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock::default());
+        let runtime = Runtime::new(clock);
+
+        let failed = runtime.create_operation(None).expect("failed operation");
+        failed.start();
+        failed.fail(EasyConError::new(
+            ErrorDomain::Io,
+            ErrorCode::Transport,
+            "native serial open failed",
+        ));
+        let failed_json = operation_json(&failed);
+        assert_eq!(
+            failed_json["error"],
+            "Io/Transport: native serial open failed"
+        );
+        assert_eq!(failed_json["structured_error"]["domain"], "Io");
+        assert_eq!(failed_json["structured_error"]["code"], "Transport");
+        assert_eq!(
+            failed_json["structured_error"]["message"],
+            "native serial open failed"
+        );
+        assert_eq!(failed_json["cancellation_reason"], Value::Null);
+
+        let requested = runtime
+            .create_operation(None)
+            .expect("requested cancellation operation");
+        requested.start();
+        requested.cancel();
+        requested.finish_cancelled();
+        let requested_json = operation_json(&requested);
+        assert_eq!(requested_json["structured_error"]["domain"], "Runtime");
+        assert_eq!(requested_json["structured_error"]["code"], "Cancelled");
+        assert_eq!(requested_json["cancellation_reason"], "Requested");
+
+        let deadline = runtime
+            .create_operation(None)
+            .expect("deadline cancellation operation");
+        deadline.start();
+        deadline.request_cancel(CancellationReason::Deadline);
+        deadline.finish_cancelled();
+        let deadline_json = operation_json(&deadline);
+        assert_eq!(deadline_json["structured_error"]["domain"], "Runtime");
+        assert_eq!(
+            deadline_json["structured_error"]["code"],
+            "DeadlineExceeded"
+        );
+        assert_eq!(deadline_json["cancellation_reason"], "Deadline");
+
+        assert_eq!(runtime.close(), Ok(CloseOutcome::Closed));
+    }
+
+    #[test]
+    fn faults_require_exact_operation_causes() {
+        let operation = |state: &str, domain: &str, code: &str, reason: Value| {
+            json!({
+                "state": state,
+                "structured_error": {
+                    "domain": domain,
+                    "code": code,
+                    "message": "diagnostic only",
+                },
+                "cancellation_reason": reason,
+            })
+        };
+        let valid = json!({
+            "port_occupied": operation("Failed", "Io", "Transport", Value::Null),
+            "cancel": operation("Cancelled", "Runtime", "Cancelled", json!("Requested")),
+            "deadline": operation(
+                "Cancelled",
+                "Runtime",
+                "DeadlineExceeded",
+                json!("Deadline"),
+            ),
+            "port_occupied_expected_failed": true,
+            "cancel_expected_cancelled": true,
+            "deadline_expected_cancelled": true,
+        });
+        assert_eq!(
+            qualification_decision("faults", &valid).status,
+            QualificationStatus::Passed
+        );
+
+        let mut invalid = Vec::new();
+        let mut wrong_occupied_code = valid.clone();
+        wrong_occupied_code["port_occupied"]["structured_error"]["code"] = json!("ProtocolError");
+        invalid.push(wrong_occupied_code);
+
+        let mut missing_occupied_reason = valid.clone();
+        missing_occupied_reason["port_occupied"]
+            .as_object_mut()
+            .expect("occupied operation")
+            .remove("cancellation_reason");
+        invalid.push(missing_occupied_reason);
+
+        let mut wrong_cancel_reason = valid.clone();
+        wrong_cancel_reason["cancel"]["cancellation_reason"] = json!("Deadline");
+        invalid.push(wrong_cancel_reason);
+
+        let mut wrong_deadline_code = valid.clone();
+        wrong_deadline_code["deadline"]["structured_error"]["code"] = json!("Cancelled");
+        invalid.push(wrong_deadline_code);
+
+        let mut missing_deadline_error = valid;
+        missing_deadline_error["deadline"]
+            .as_object_mut()
+            .expect("deadline operation")
+            .remove("structured_error");
+        invalid.push(missing_deadline_error);
+
+        for result in invalid {
+            let decision = qualification_decision("faults", &result);
+            assert_eq!(decision.status, QualificationStatus::Failed);
+            assert!(decision.failure.is_some());
         }
     }
 
