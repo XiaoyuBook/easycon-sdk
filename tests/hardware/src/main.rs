@@ -17,7 +17,8 @@ use easycon_controller::{
 use easycon_hardware_qualification::{distribution, option_value, required_value, value_or};
 use easycon_model::{Button, Hat, StickPosition};
 use easycon_runtime::{
-    Clock, Operation, OperationState, Runtime, RuntimeCounts, SystemClock, WaitResult, WaitTimeout,
+    Clock, CloseOutcome, CloseRejection, Operation, OperationState, Runtime, RuntimeCounts,
+    SystemClock, WaitResult, WaitTimeout,
 };
 use easycon_serial::{
     SerialControllerTransport, SerialPortDescriptor, WindowsByteIoFactory, discover_system_ports,
@@ -278,12 +279,9 @@ impl Harness {
         Ok(operation_json(&operation))
     }
 
-    fn close(&self) -> Result<RuntimeCounts, String> {
+    fn close(&self) -> Value {
         self.controller.close();
-        self.runtime
-            .close()
-            .map_err(|error| format!("Runtime close rejected: {error:?}"))?;
-        Ok(self.runtime.counts())
+        runtime_close_json(self.runtime.close(), self.runtime.counts())
     }
 
     fn actual_baud(&self) -> Option<u32> {
@@ -299,24 +297,30 @@ impl Harness {
 }
 
 fn main() {
-    if let Err(error) = real_main() {
-        eprintln!("hardware qualification failed: {error}");
-        std::process::exit(1);
+    let exit_code = match real_main() {
+        Ok(exit_code) => exit_code,
+        Err(error) => {
+            eprintln!("hardware qualification failed: {error}");
+            1
+        }
+    };
+    if exit_code != 0 {
+        std::process::exit(exit_code);
     }
 }
 
-fn real_main() -> Result<(), String> {
+fn real_main() -> Result<i32, String> {
     if !cfg!(windows) {
         return Err("the hardware qualification CLI requires Windows".to_owned());
     }
     let arguments: Vec<String> = env::args().skip(1).collect();
     let Some(command) = arguments.first().map(String::as_str) else {
         print_help();
-        return Ok(());
+        return Ok(0);
     };
     if matches!(command, "--help" | "-h" | "help") {
         print_help();
-        return Ok(());
+        return Ok(0);
     }
     let artifact_dir = artifact_dir(&arguments)?;
     fs::create_dir_all(&artifact_dir).map_err(|error| error.to_string())?;
@@ -334,6 +338,7 @@ fn real_main() -> Result<(), String> {
         _ => Err(format!("unknown command: {command}")),
     };
     let (document, failure) = finalize_result(command, execution);
+    let exit_code = document_exit_code(&document);
     let output = reservation.commit(&document)?;
     println!(
         "{}",
@@ -343,19 +348,265 @@ fn real_main() -> Result<(), String> {
         }))
         .map_err(|error| error.to_string())?
     );
-    failure.map_or(Ok(()), Err)
+    if let Some(error) = failure {
+        eprintln!("hardware qualification failed: {error}");
+    }
+    Ok(exit_code)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QualificationStatus {
+    Passed,
+    Failed,
+    Unverified,
+    NotRun,
+}
+
+impl QualificationStatus {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+            Self::Unverified => "unverified",
+            Self::NotRun => "not_run",
+        }
+    }
+}
+
+struct QualificationDecision {
+    status: QualificationStatus,
+    checks: Vec<Value>,
+    failure: Option<String>,
 }
 
 fn finalize_result(command: &str, execution: Result<Value, String>) -> (Value, Option<String>) {
     match execution {
-        Ok(result) => (
-            json!({"command": command, "status": "passed", "result": result}),
-            None,
-        ),
+        Ok(result) if !all_cleanup_succeeded(&result) => {
+            let error = "deterministic cleanup did not complete".to_owned();
+            (
+                json!({
+                    "schema_version": 1,
+                    "command": command,
+                    "status": "failed",
+                    "execution_status": "failed",
+                    "qualification_status": "failed",
+                    "checks": [qualification_check("cleanup", "failed")],
+                    "error": error,
+                    "result": result,
+                }),
+                Some(error),
+            )
+        }
+        Ok(result) => {
+            let decision = qualification_decision(command, &result);
+            let status = decision.status.as_str();
+            (
+                json!({
+                    "schema_version": 1,
+                    "command": command,
+                    "status": status,
+                    "execution_status": "completed",
+                    "qualification_status": status,
+                    "checks": decision.checks,
+                    "result": result,
+                }),
+                decision.failure,
+            )
+        }
         Err(error) => (
-            json!({"command": command, "status": "failed", "error": error}),
+            json!({
+                "schema_version": 1,
+                "command": command,
+                "status": "failed",
+                "execution_status": "failed",
+                "qualification_status": "failed",
+                "checks": [],
+                "error": error,
+            }),
             Some(error),
         ),
+    }
+}
+
+fn qualification_decision(command: &str, result: &Value) -> QualificationDecision {
+    match command {
+        "discover" => required_checks(&[
+            (
+                "at_least_three_samples",
+                result["samples"]
+                    .as_u64()
+                    .is_some_and(|samples| samples >= 3),
+            ),
+            (
+                "stable_across_samples",
+                result["stable_across_samples"].as_bool() == Some(true),
+            ),
+        ]),
+        "handshake" => required_checks(&[
+            (
+                "operation_succeeded",
+                result["operation"]["state"] == "Succeeded",
+            ),
+            ("actual_baud_recorded", result["actual_baud"].is_u64()),
+        ]),
+        "smoke" | "home-wake" => {
+            let neutral =
+                result["final_snapshot"]["desired_report_neutral"].as_bool() == Some(true);
+            if neutral {
+                QualificationDecision {
+                    status: QualificationStatus::Unverified,
+                    checks: vec![
+                        qualification_check("final_report_neutral", "passed"),
+                        qualification_check("operator_observation", "unverified"),
+                    ],
+                    failure: None,
+                }
+            } else {
+                required_checks(&[("final_report_neutral", false)])
+            }
+        }
+        "faults" => required_checks(&[
+            (
+                "port_occupied_failed",
+                result["port_occupied_expected_failed"].as_bool() == Some(true),
+            ),
+            (
+                "cancel_reached_cancelled",
+                result["cancel_expected_cancelled"].as_bool() == Some(true),
+            ),
+            (
+                "deadline_reached_cancelled",
+                result["deadline_expected_cancelled"].as_bool() == Some(true),
+            ),
+        ]),
+        "hotplug" => required_checks(&[
+            (
+                "disconnect_detected",
+                result["disconnect_detected"].as_bool() == Some(true),
+            ),
+            (
+                "reconnect_succeeded",
+                result["reconnect_operation"]["state"] == "Succeeded",
+            ),
+            (
+                "stable_identity_preserved",
+                result["stable_id"].as_str()
+                    == result["reconnected_identity"]["stable_id"].as_str(),
+            ),
+        ]),
+        "lifecycle" => {
+            let cycles = result["cycles"].as_u64().unwrap_or_default();
+            let records = result["records"].as_array();
+            required_checks(&[
+                ("at_least_100_cycles", cycles >= 100),
+                (
+                    "record_count_matches_cycles",
+                    records.is_some_and(|records| records.len() as u64 == cycles),
+                ),
+                (
+                    "no_positive_process_growth",
+                    result["no_positive_growth"].as_bool() == Some(true),
+                ),
+                (
+                    "port_present_after_every_cycle",
+                    records.is_some_and(|records| {
+                        records.iter().all(|record| record["port_present"] == true)
+                    }),
+                ),
+            ])
+        }
+        "sequence" => {
+            let steps = result["requested_steps"].as_u64().unwrap_or_default();
+            let mut decision = required_checks(&[
+                ("exactly_10000_steps", steps == 10_000),
+                (
+                    "operation_succeeded",
+                    result["functional_success"].as_bool() == Some(true),
+                ),
+                (
+                    "accepted_report_count_matches_steps",
+                    result["accepted_report_count_before_final_reset"].as_u64() == Some(steps),
+                ),
+                (
+                    "complete_write_count_includes_final_reset",
+                    result["recorded_complete_writes"].as_u64() == steps.checked_add(1),
+                ),
+            ]);
+            if decision.status == QualificationStatus::Passed {
+                decision.status = QualificationStatus::Unverified;
+                decision.checks.push(qualification_check(
+                    "physical_order_analyzer_or_firmware_trace",
+                    "unverified",
+                ));
+            }
+            decision
+        }
+        "amiibo" if result["write_performed"].as_bool() != Some(true) => QualificationDecision {
+            status: QualificationStatus::NotRun,
+            checks: vec![qualification_check("authorized_write_performed", "not_run")],
+            failure: None,
+        },
+        "amiibo" => QualificationDecision {
+            status: QualificationStatus::Unverified,
+            checks: vec![
+                qualification_check("save_and_select_completed", "passed"),
+                qualification_check("capacity_and_payload_evidence", "unverified"),
+            ],
+            failure: None,
+        },
+        _ => required_checks(&[("known_qualification_command", false)]),
+    }
+}
+
+fn required_checks(checks: &[(&str, bool)]) -> QualificationDecision {
+    let failed: Vec<_> = checks
+        .iter()
+        .filter_map(|(name, passed)| (!passed).then_some(*name))
+        .collect();
+    QualificationDecision {
+        status: if failed.is_empty() {
+            QualificationStatus::Passed
+        } else {
+            QualificationStatus::Failed
+        },
+        checks: checks
+            .iter()
+            .map(|(name, passed)| {
+                qualification_check(name, if *passed { "passed" } else { "failed" })
+            })
+            .collect(),
+        failure: (!failed.is_empty())
+            .then(|| format!("qualification checks failed: {}", failed.join(", "))),
+    }
+}
+
+fn qualification_check(name: &str, status: &str) -> Value {
+    json!({"name": name, "status": status})
+}
+
+fn all_cleanup_succeeded(value: &Value) -> bool {
+    match value {
+        Value::Array(values) => values.iter().all(all_cleanup_succeeded),
+        Value::Object(object) => {
+            if object.get("kind").and_then(Value::as_str) == Some("runtime_cleanup")
+                && object.get("succeeded").and_then(Value::as_bool) != Some(true)
+            {
+                return false;
+            }
+            object.values().all(all_cleanup_succeeded)
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => true,
+    }
+}
+
+fn document_exit_code(document: &Value) -> i32 {
+    if document["execution_status"] == "cancelled" {
+        return 130;
+    }
+    match document["qualification_status"].as_str() {
+        Some("passed") => 0,
+        Some("unverified" | "not_run") => 2,
+        Some("failed") | None | Some(_) => 1,
     }
 }
 
@@ -393,8 +644,8 @@ fn run_handshake(arguments: &[String]) -> Result<Value, String> {
         "actual_baud": harness.actual_baud(),
         "attempts": handshake_json(&harness.telemetry),
     });
-    let counts = harness.close()?;
-    Ok(with_close_counts(result, counts))
+    let cleanup = harness.close();
+    Ok(with_cleanup(result, cleanup))
 }
 
 fn run_smoke(arguments: &[String]) -> Result<Value, String> {
@@ -517,8 +768,8 @@ fn run_smoke(arguments: &[String]) -> Result<Value, String> {
         "latency": latency_json(&harness.telemetry, harness.actual_baud()),
         "switch_observation": "requires operator confirmation",
     });
-    let counts = harness.close()?;
-    Ok(with_close_counts(result, counts))
+    let cleanup = harness.close();
+    Ok(with_cleanup(result, cleanup))
 }
 
 fn run_home_wake(arguments: &[String]) -> Result<Value, String> {
@@ -575,8 +826,8 @@ fn run_home_wake(arguments: &[String]) -> Result<Value, String> {
         "latency": latency_json(&harness.telemetry, harness.actual_baud()),
         "switch_observation": "requires operator confirmation",
     });
-    let counts = harness.close()?;
-    Ok(with_close_counts(result, counts))
+    let cleanup = harness.close();
+    Ok(with_cleanup(result, cleanup))
 }
 
 fn run_faults(arguments: &[String]) -> Result<Value, String> {
@@ -594,7 +845,7 @@ fn run_faults(arguments: &[String]) -> Result<Value, String> {
         .map_err(|error| error.to_string())?;
     wait_terminal(&occupied_operation, OPERATION_TIMEOUT)?;
     let occupied_result = operation_json(&occupied_operation);
-    let occupied_counts = occupied.close()?;
+    let occupied_cleanup = occupied.close();
 
     let sequence = PreciseSequence::new(vec![
         SequenceStep::new(0, ControllerAction::ButtonDown(Button::A)),
@@ -618,7 +869,7 @@ fn run_faults(arguments: &[String]) -> Result<Value, String> {
         .map_err(|error| error.to_string())?;
     wait_terminal(&deadline_operation, OPERATION_TIMEOUT)?;
     let deadline_result = operation_json(&deadline_operation);
-    let deadline_counts = deadline.close()?;
+    let deadline_cleanup = deadline.close();
 
     let result = json!({
         "command": "faults",
@@ -629,11 +880,11 @@ fn run_faults(arguments: &[String]) -> Result<Value, String> {
         "post_cancel_snapshot": snapshot_json(&primary.controller),
         "deadline": deadline_result,
         "deadline_expected_cancelled": deadline_operation.snapshot().state == OperationState::Cancelled,
-        "secondary_close_counts": counts_json(occupied_counts),
-        "deadline_close_counts": counts_json(deadline_counts),
+        "secondary_cleanup": occupied_cleanup,
+        "deadline_cleanup": deadline_cleanup,
     });
-    let counts = primary.close()?;
-    Ok(with_close_counts(result, counts))
+    let cleanup = primary.close();
+    Ok(with_cleanup(result, cleanup))
 }
 
 fn run_hotplug(arguments: &[String]) -> Result<Value, String> {
@@ -652,7 +903,7 @@ fn run_hotplug(arguments: &[String]) -> Result<Value, String> {
         .reset()
         .map_err(|error| error.to_string())?;
     wait_terminal(&disconnected, OPERATION_TIMEOUT)?;
-    harness.close()?;
+    let disconnect_cleanup = harness.close();
 
     println!("HOTPLUG_DISCONNECTED: reconnect the same device now");
     std::io::stdout()
@@ -666,12 +917,13 @@ fn run_hotplug(arguments: &[String]) -> Result<Value, String> {
         "stable_id": stable_id,
         "disconnect_operation": operation_json(&disconnected),
         "disconnect_detected": disconnected.snapshot().state == OperationState::Failed,
+        "disconnect_cleanup": disconnect_cleanup,
         "reconnect_operation": reconnect_operation,
         "reconnect_baud": reconnected.actual_baud(),
         "reconnected_identity": port_json(&reconnected.descriptor),
     });
-    let counts = reconnected.close()?;
-    Ok(with_close_counts(result, counts))
+    let cleanup = reconnected.close();
+    Ok(with_cleanup(result, cleanup))
 }
 
 fn run_lifecycle(arguments: &[String]) -> Result<Value, String> {
@@ -686,12 +938,12 @@ fn run_lifecycle(arguments: &[String]) -> Result<Value, String> {
         let harness = Harness::new(&port, ControllerOptions::default())?;
         harness.connect(ConnectOptions::default())?;
         let baud = harness.actual_baud();
-        let counts = harness.close()?;
+        let cleanup = harness.close();
         let metrics = process_metrics()?;
         records.push(json!({
             "cycle": cycle,
             "baud": baud,
-            "runtime_counts": counts_json(counts),
+            "cleanup": cleanup,
             "process": metrics,
             "port_present": find_port(&port).is_ok(),
         }));
@@ -774,8 +1026,8 @@ fn run_sequence(arguments: &[String], artifact_dir: &Path) -> Result<Value, Stri
         "timing_csv": csv,
         "physical_order_evidence": "open: no logic analyzer or firmware trace",
     });
-    let counts = harness.close()?;
-    Ok(with_close_counts(result, counts))
+    let cleanup = harness.close();
+    Ok(with_cleanup(result, cleanup))
 }
 
 fn run_amiibo(arguments: &[String]) -> Result<Value, String> {
@@ -835,8 +1087,8 @@ fn run_amiibo(arguments: &[String]) -> Result<Value, String> {
         "save": operation_json(&save),
         "select": operation_json(&select),
     });
-    let counts = harness.close()?;
-    Ok(with_close_counts(result, counts))
+    let cleanup = harness.close();
+    Ok(with_cleanup(result, cleanup))
 }
 
 fn exercise_action(
@@ -1070,9 +1322,51 @@ fn counts_json(counts: RuntimeCounts) -> Value {
     })
 }
 
-fn with_close_counts(mut value: Value, counts: RuntimeCounts) -> Value {
-    value["runtime_counts_after_close"] = counts_json(counts);
+fn with_cleanup(mut value: Value, cleanup: Value) -> Value {
+    value["cleanup"] = cleanup;
     value
+}
+
+fn runtime_close_json(
+    outcome: Result<CloseOutcome, CloseRejection>,
+    observed_counts: RuntimeCounts,
+) -> Value {
+    match outcome {
+        Ok(CloseOutcome::Closed) => {
+            let succeeded = counts_are_zero(observed_counts);
+            json!({
+                "kind": "runtime_cleanup",
+                "succeeded": succeeded,
+                "outcome": "Closed",
+                "counts": counts_json(observed_counts),
+                "diagnostic": (!succeeded).then_some("Runtime reported Closed with non-zero registries"),
+            })
+        }
+        Ok(CloseOutcome::Failed(report)) => json!({
+            "kind": "runtime_cleanup",
+            "succeeded": false,
+            "outcome": "Failed",
+            "counts": counts_json(observed_counts),
+            "report": {
+                "phase": format!("{:?}", report.phase),
+                "diagnostic": report.diagnostic.as_ref(),
+                "resource_id": report.resource_id.map(|id| id.get()),
+                "task_id": report.task_id.map(|id| id.get()),
+                "counts": counts_json(report.counts),
+            },
+        }),
+        Err(rejection) => json!({
+            "kind": "runtime_cleanup",
+            "succeeded": false,
+            "outcome": "Rejected",
+            "counts": counts_json(observed_counts),
+            "rejection": format!("{rejection:?}"),
+        }),
+    }
+}
+
+fn counts_are_zero(counts: RuntimeCounts) -> bool {
+    counts.active_operations == 0 && counts.active_resources == 0 && counts.active_tasks == 0
 }
 
 fn process_metrics() -> Result<Value, String> {
@@ -1170,6 +1464,8 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use easycon_controller::TransportErrorKind;
+    use easycon_runtime::ManagedResource;
 
     struct TestDirectory(PathBuf);
 
@@ -1194,6 +1490,35 @@ mod tests {
         }
     }
 
+    struct NoopTransport;
+
+    impl ControllerTransport for NoopTransport {
+        fn handshake(&mut self, _request: HandshakeRequest) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn write(&mut self, request: WriteRequest<'_>) -> Result<usize, TransportError> {
+            Ok(request.bytes.len())
+        }
+
+        fn wait_for_ack(&mut self, _request: AckRequest) -> Result<AckFrame, TransportError> {
+            Err(TransportError::new(
+                TransportErrorKind::Protocol,
+                "no ACK in close-outcome test",
+            ))
+        }
+
+        fn close(&mut self) {}
+    }
+
+    struct PanickingResource;
+
+    impl ManagedResource for PanickingResource {
+        fn close(&self) {
+            panic!("injected qualification close failure");
+        }
+    }
+
     #[test]
     fn failed_command_still_produces_an_artifact_document() {
         let (document, error) = finalize_result("handshake", Err("protocol timeout".to_owned()));
@@ -1201,6 +1526,133 @@ mod tests {
         assert_eq!(document["command"], "handshake");
         assert_eq!(document["error"], "protocol timeout");
         assert_eq!(error.as_deref(), Some("protocol timeout"));
+    }
+
+    #[test]
+    fn false_qualification_predicates_do_not_pass_or_exit_zero() {
+        let cases = [
+            (
+                "faults",
+                json!({
+                    "port_occupied_expected_failed": false,
+                    "cancel_expected_cancelled": true,
+                    "deadline_expected_cancelled": true,
+                }),
+            ),
+            ("hotplug", json!({"disconnect_detected": false})),
+            (
+                "lifecycle",
+                json!({"cycles": 100, "no_positive_growth": false, "records": []}),
+            ),
+            (
+                "sequence",
+                json!({
+                    "requested_steps": 10_000,
+                    "functional_success": false,
+                    "accepted_report_count_before_final_reset": 10_000,
+                    "recorded_complete_writes": 10_001,
+                }),
+            ),
+        ];
+
+        for (command, result) in cases {
+            let (document, failure) = finalize_result(command, Ok(result));
+            assert_ne!(document["status"], "passed", "{command}");
+            assert!(failure.is_some(), "{command} must return a non-zero exit");
+            assert_eq!(document_exit_code(&document), 1, "{command}");
+        }
+    }
+
+    #[test]
+    fn pending_observation_and_unwritten_amiibo_are_not_passed() {
+        let (smoke, _) = finalize_result(
+            "smoke",
+            Ok(json!({
+                "final_snapshot": {"desired_report_neutral": true},
+                "switch_observation": "requires operator confirmation",
+            })),
+        );
+        assert_eq!(smoke["status"], "unverified");
+        assert_eq!(document_exit_code(&smoke), 2);
+
+        let (home, _) = finalize_result(
+            "home-wake",
+            Ok(json!({
+                "final_snapshot": {"desired_report_neutral": true},
+                "switch_observation": "requires operator confirmation",
+            })),
+        );
+        assert_eq!(home["status"], "unverified");
+        assert_eq!(document_exit_code(&home), 2);
+
+        let (amiibo, _) = finalize_result(
+            "amiibo",
+            Ok(json!({"write_performed": false, "capability": "unknown"})),
+        );
+        assert_eq!(amiibo["status"], "not_run");
+        assert_eq!(document_exit_code(&amiibo), 2);
+    }
+
+    #[test]
+    fn functional_sequence_without_physical_trace_is_unverified() {
+        let (document, failure) = finalize_result(
+            "sequence",
+            Ok(json!({
+                "requested_steps": 10_000,
+                "functional_success": true,
+                "accepted_report_count_before_final_reset": 10_000,
+                "recorded_complete_writes": 10_001,
+                "physical_order_evidence": "open: no logic analyzer or firmware trace",
+            })),
+        );
+
+        assert!(failure.is_none());
+        assert_eq!(document["execution_status"], "completed");
+        assert_eq!(document["qualification_status"], "unverified");
+        assert_eq!(document_exit_code(&document), 2);
+    }
+
+    #[test]
+    fn runtime_close_failure_is_not_reported_as_clean_counts() {
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock::default());
+        let runtime = Runtime::new(clock.clone());
+        let controller = ControllerSession::new(
+            &runtime,
+            Box::new(NoopTransport),
+            ControllerOptions::default(),
+        )
+        .expect("controller");
+        let resource: Arc<dyn ManagedResource> = Arc::new(PanickingResource);
+        let _registration = runtime
+            .register_resource(resource.clone())
+            .expect("resource");
+        let harness = Harness {
+            runtime,
+            clock,
+            controller,
+            telemetry: Arc::new(Mutex::new(Telemetry::default())),
+            descriptor: SerialPortDescriptor::new("TEST\\CLOSE-FAILURE", "COM1")
+                .expect("descriptor"),
+        };
+
+        let cleanup = harness.close();
+        assert_eq!(cleanup["succeeded"], false);
+        assert_eq!(cleanup["outcome"], "Failed");
+        assert_eq!(cleanup["report"]["phase"], "ResourceCleanup");
+        assert_eq!(
+            cleanup["report"]["diagnostic"],
+            "ManagedResource::close panicked"
+        );
+
+        let (document, failure) = finalize_result("handshake", Ok(json!({"cleanup": cleanup})));
+        assert!(failure.is_some());
+        assert_eq!(document["execution_status"], "failed");
+        assert_eq!(document["qualification_status"], "failed");
+        assert_eq!(
+            document["result"]["cleanup"]["report"]["phase"],
+            "ResourceCleanup"
+        );
+        assert_eq!(document_exit_code(&document), 1);
     }
 
     #[test]
