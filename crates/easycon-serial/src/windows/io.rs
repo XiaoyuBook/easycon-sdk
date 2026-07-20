@@ -190,7 +190,13 @@ impl WindowsByteIo {
         // SAFETY: sampled immediately after ReadFile/WriteFile on the same thread.
         let start_error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
         if start_error != ERROR_IO_PENDING {
-            return Err(from_code(operation, start_error));
+            let error = from_code(operation, start_error);
+            let interruption = if start_error == ERROR_OPERATION_ABORTED {
+                request.interruption()
+            } else {
+                None
+            };
+            return Err(prefer_causal_interruption(error, interruption));
         }
 
         // `Clock` is a safe injectable trait and may panic. The kernel still owns the buffer and
@@ -396,7 +402,21 @@ fn wait_for_overlapped(
             )
         };
         match wait {
-            WAIT_OBJECT_0 => return overlapped_result(shared, overlapped, operation, false),
+            WAIT_OBJECT_0 => {
+                return overlapped_result(shared, overlapped, operation, false).map_err(|error| {
+                    let interruption = if error.os_code() == Some(ERROR_OPERATION_ABORTED) {
+                        request.interruption().or_else(|| {
+                            shared
+                                .closed
+                                .load(Ordering::Acquire)
+                                .then(|| disconnected_error("serial port closed during byte I/O"))
+                        })
+                    } else {
+                        None
+                    };
+                    prefer_causal_interruption(error, interruption)
+                });
+            }
             value if value == WAIT_OBJECT_0 + 1 => continue,
             value if value == WAIT_OBJECT_0 + 2 => {
                 return cancel_and_settle(
@@ -499,6 +519,17 @@ fn normalize_progress(transferred: u32) -> Result<usize, SerialError> {
     }
 }
 
+fn prefer_causal_interruption(
+    error: SerialError,
+    interruption: Option<SerialError>,
+) -> SerialError {
+    if error.os_code() == Some(ERROR_OPERATION_ABORTED) {
+        interruption.unwrap_or(error)
+    } else {
+        error
+    }
+}
+
 fn resume_unwind_after_cleanup(
     payload: Box<dyn std::any::Any + Send>,
     cleanup: impl FnOnce(),
@@ -560,6 +591,27 @@ mod tests {
         assert_eq!(duration_to_wait_ms(Duration::from_nanos(1)), 1);
         assert_eq!(duration_to_wait_ms(Duration::from_millis(1)), 1);
         assert_eq!(duration_to_wait_ms(Duration::MAX), INFINITE - 1);
+    }
+
+    #[test]
+    fn explicit_interruption_overrides_only_a_native_aborted_completion() {
+        let aborted = from_code("read", ERROR_OPERATION_ABORTED);
+        let cancelled = SerialError::new(SerialErrorKind::Cancelled, "operation cancelled");
+        assert_eq!(
+            prefer_causal_interruption(aborted.clone(), Some(cancelled)).kind(),
+            SerialErrorKind::Cancelled
+        );
+        assert_eq!(
+            prefer_causal_interruption(aborted, None).kind(),
+            SerialErrorKind::Disconnected
+        );
+
+        let io = SerialError::new(SerialErrorKind::Io, "unrelated failure");
+        let deadline = SerialError::new(SerialErrorKind::DeadlineExceeded, "deadline");
+        assert_eq!(
+            prefer_causal_interruption(io, Some(deadline)).kind(),
+            SerialErrorKind::Io
+        );
     }
 
     #[test]
