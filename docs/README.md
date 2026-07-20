@@ -27,6 +27,8 @@
    动态 cleanup contract 和无硬件 failpoint 测试边界。
 10. [Phase 2B Controller close 中立化证据设计](development/phase2b-controller-cleanup-evidence.md)：
     最终中立写的 transport acceptance、Controller/Runtime 组合 cleanup 和 synthetic failure 回归边界。
+11. [Phase 2B run directory ownership 设计](development/phase2b-run-directory-ownership.md)：目录级永久
+    reservation、retained staging、owned auxiliary 和 no-replace publish。
 
 ## 决策记录
 
