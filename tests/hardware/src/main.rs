@@ -558,6 +558,24 @@ fn discovery_qualification(result: &Value) -> QualificationDecision {
             .iter()
             .all(|snapshot| snapshot.as_array().is_some())
     });
+    let descriptors_are_valid = snapshots.is_some_and(|snapshots| {
+        snapshots.iter().all(|snapshot| {
+            snapshot.as_array().is_some_and(|descriptors| {
+                descriptors.iter().all(|descriptor| {
+                    descriptor.as_object().is_some_and(|descriptor| {
+                        descriptor
+                            .get("stable_id")
+                            .and_then(Value::as_str)
+                            .is_some_and(|stable_id| !stable_id.is_empty())
+                            && descriptor
+                                .get("port")
+                                .and_then(Value::as_str)
+                                .is_some_and(|port| !port.is_empty())
+                    })
+                })
+            })
+        })
+    });
     let evidence_is_stable = snapshots.is_some_and(|snapshots| {
         !snapshots.is_empty() && snapshots.windows(2).all(|pair| pair[0] == pair[1])
     });
@@ -568,6 +586,7 @@ fn discovery_qualification(result: &Value) -> QualificationDecision {
         ),
         ("sample_count_matches", sample_count_matches),
         ("snapshots_are_arrays", snapshots_are_arrays),
+        ("descriptors_are_valid", descriptors_are_valid),
         (
             "stable_across_samples",
             result["stable_across_samples"].as_bool() == Some(true) && evidence_is_stable,
@@ -1708,9 +1727,32 @@ mod tests {
                 "samples": 3,
                 "stable_across_samples": true,
                 "snapshots": [
-                    [{"stable_id": "DEVICE\\ONE"}],
-                    [{"stable_id": "DEVICE\\TWO"}],
-                    [{"stable_id": "DEVICE\\ONE"}],
+                    [{"stable_id": "DEVICE\\ONE", "port": "COM1"}],
+                    [{"stable_id": "DEVICE\\TWO", "port": "COM2"}],
+                    [{"stable_id": "DEVICE\\ONE", "port": "COM1"}],
+                ],
+            }),
+            json!({
+                "samples": 3,
+                "stable_across_samples": true,
+                "snapshots": [[null], [null], [null]],
+            }),
+            json!({
+                "samples": 3,
+                "stable_across_samples": true,
+                "snapshots": [
+                    [{"stable_id": "", "port": "COM8"}],
+                    [{"stable_id": "", "port": "COM8"}],
+                    [{"stable_id": "", "port": "COM8"}],
+                ],
+            }),
+            json!({
+                "samples": 3,
+                "stable_across_samples": true,
+                "snapshots": [
+                    [{"stable_id": "DEVICE\\EXPECTED", "port": ""}],
+                    [{"stable_id": "DEVICE\\EXPECTED", "port": ""}],
+                    [{"stable_id": "DEVICE\\EXPECTED", "port": ""}],
                 ],
             }),
         ] {
@@ -1721,7 +1763,10 @@ mod tests {
             assert_eq!(document_exit_code(&document), 1);
         }
 
-        let stable_device = json!([{"stable_id": "DEVICE\\EXPECTED"}]);
+        let stable_device = json!([{
+            "stable_id": "DEVICE\\EXPECTED",
+            "port": "COM8",
+        }]);
         let (nonempty, failure) = finalize_result(
             "discover",
             Ok(json!({
@@ -1876,9 +1921,9 @@ mod tests {
                     "samples": 3,
                     "stable_across_samples": true,
                     "snapshots": [
-                        [{"stable_id": "DEVICE\\EXPECTED"}],
-                        [{"stable_id": "DEVICE\\EXPECTED"}],
-                        [{"stable_id": "DEVICE\\EXPECTED"}],
+                        [{"stable_id": "DEVICE\\EXPECTED", "port": "COM8"}],
+                        [{"stable_id": "DEVICE\\EXPECTED", "port": "COM8"}],
+                        [{"stable_id": "DEVICE\\EXPECTED", "port": "COM8"}],
                     ],
                 }),
             ),
