@@ -1,16 +1,20 @@
 #![forbid(unsafe_code)]
 
+mod artifact;
 mod faults;
 
 use std::env;
-use std::fs::{self, OpenOptions};
-use std::io::{BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::fs;
+use std::io::Write;
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
+use artifact::RESERVATION_FILE_NAME;
+use artifact::{ArtifactReservation, AuxiliaryKind, SEQUENCE_TIMINGS_FILE_NAME};
 use easycon_controller::{
     AUTO_BAUD_RATES, AckFrame, AckRequest, AmiiboLimits, AmiiboSaveOptions, AmiiboSelectOptions,
     ConnectOptions, ControllerAction, ControllerLeaseState, ControllerOptions, ControllerSession,
@@ -292,118 +296,6 @@ struct Harness {
     descriptor: SerialPortDescriptor,
 }
 
-struct ArtifactReservation {
-    output: PathBuf,
-    marker: PathBuf,
-    temporary: PathBuf,
-}
-
-impl ArtifactReservation {
-    fn begin(command: &str, artifact_dir: &Path) -> Result<Self, String> {
-        if command.is_empty()
-            || !command
-                .bytes()
-                .all(|value| value.is_ascii_alphanumeric() || value == b'-')
-        {
-            return Err("command is not safe for an artifact file name".to_owned());
-        }
-
-        let output = artifact_dir.join(format!("{command}.json"));
-        let temporary = output.with_extension("json.tmp");
-        let marker = artifact_dir.join(format!(".{command}.in-progress.json"));
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&marker)
-            .map_err(|error| format!("cannot reserve {}: {error}", marker.display()))?;
-        let marker_document = json!({
-            "command": command,
-            "execution_status": "running",
-        });
-        file.write_all(
-            &serde_json::to_vec_pretty(&marker_document).map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| error.to_string())?;
-        file.flush().map_err(|error| error.to_string())?;
-        file.sync_all().map_err(|error| error.to_string())?;
-        drop(file);
-
-        let validation = (|| {
-            ensure_artifact_absent(&output)?;
-            ensure_artifact_absent(&temporary)?;
-            if command == "sequence" {
-                ensure_artifact_absent(&artifact_dir.join("sequence-timings.csv"))?;
-            }
-            Ok(())
-        })();
-        if let Err(error) = validation {
-            return match fs::remove_file(&marker) {
-                Ok(()) => Err(error),
-                Err(cleanup) => Err(format!(
-                    "{error}; cannot remove owned reservation {}: {cleanup}",
-                    marker.display()
-                )),
-            };
-        }
-
-        Ok(Self {
-            output,
-            marker,
-            temporary,
-        })
-    }
-
-    fn commit(self, document: &Value) -> Result<PathBuf, String> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&self.temporary)
-            .map_err(|error| format!("cannot create {}: {error}", self.temporary.display()))?;
-        let write_result = (|| {
-            file.write_all(
-                &serde_json::to_vec_pretty(document).map_err(|error| error.to_string())?,
-            )
-            .map_err(|error| error.to_string())?;
-            file.flush().map_err(|error| error.to_string())?;
-            file.sync_all().map_err(|error| error.to_string())
-        })();
-        drop(file);
-        if let Err(error) = write_result {
-            let _ = fs::remove_file(&self.temporary);
-            return Err(error);
-        }
-
-        if let Err(error) = fs::hard_link(&self.temporary, &self.output) {
-            let _ = fs::remove_file(&self.temporary);
-            return Err(format!(
-                "cannot publish {} as {} without replacement: {error}",
-                self.temporary.display(),
-                self.output.display()
-            ));
-        }
-        fs::remove_file(&self.temporary).map_err(|error| {
-            format!(
-                "cannot remove linked temporary artifact {}: {error}",
-                self.temporary.display()
-            )
-        })?;
-        fs::remove_file(&self.marker)
-            .map_err(|error| format!("cannot remove {}: {error}", self.marker.display()))?;
-        Ok(self.output)
-    }
-}
-
-fn ensure_artifact_absent(path: &Path) -> Result<(), String> {
-    if path.exists() {
-        Err(format!(
-            "refusing to overwrite existing qualification artifact {}",
-            path.display()
-        ))
-    } else {
-        Ok(())
-    }
-}
-
 impl Harness {
     fn new(port_name: &str, options: ControllerOptions) -> Result<Self, String> {
         let descriptor = find_port(port_name)?;
@@ -512,9 +404,11 @@ fn real_main() -> Result<i32, String> {
         print_help();
         return Ok(0);
     }
+    ArtifactReservation::validate_command(command)?;
     let artifact_dir = artifact_dir(&arguments)?;
     fs::create_dir_all(&artifact_dir).map_err(|error| error.to_string())?;
-    let reservation = ArtifactReservation::begin(command, &artifact_dir)?;
+    let mut reservation = ArtifactReservation::begin(command, &artifact_dir)?;
+    let mut sequence_timings = None;
     let execution = match command {
         "discover" => run_discover(&arguments),
         "handshake" => run_handshake(&arguments),
@@ -523,12 +417,18 @@ fn real_main() -> Result<i32, String> {
         "faults" => run_faults(&arguments),
         "hotplug" => run_hotplug(&arguments),
         "lifecycle" => run_lifecycle(&arguments),
-        "sequence" => run_sequence(&arguments, &artifact_dir),
+        "sequence" => run_sequence(&arguments).map(|(result, timings)| {
+            sequence_timings = Some(timings);
+            result
+        }),
         "amiibo" => run_amiibo(&arguments),
         _ => Err(format!("unknown command: {command}")),
     };
     let (document, failure) = finalize_result(command, execution);
     let exit_code = document_exit_code(&document);
+    if let Some(timings) = sequence_timings {
+        reservation.stage_auxiliary(AuxiliaryKind::SequenceTimingsCsv, timings)?;
+    }
     let output = reservation.commit(&document)?;
     println!(
         "{}",
@@ -1772,7 +1672,7 @@ fn run_lifecycle(arguments: &[String]) -> Result<Value, String> {
     }))
 }
 
-fn run_sequence(arguments: &[String], artifact_dir: &Path) -> Result<Value, String> {
+fn run_sequence(arguments: &[String]) -> Result<(Value, Vec<u8>), String> {
     let port: String = required_value(arguments, "--port")?;
     let steps = value_or(arguments, "--steps", 10_000_usize)?;
     if !(1..=10_000).contains(&steps) {
@@ -1811,9 +1711,7 @@ fn run_sequence(arguments: &[String], artifact_dir: &Path) -> Result<Value, Stri
         .reset()
         .map_err(|error| error.to_string())?;
     wait_succeeded(&reset, OPERATION_TIMEOUT)?;
-    fs::create_dir_all(artifact_dir).map_err(|error| error.to_string())?;
-    let csv = artifact_dir.join("sequence-timings.csv");
-    write_timing_csv(&csv, &harness.telemetry)?;
+    let timing_csv = timing_csv_bytes(&harness.telemetry)?;
     let timing_count = harness
         .telemetry
         .lock()
@@ -1830,11 +1728,11 @@ fn run_sequence(arguments: &[String], artifact_dir: &Path) -> Result<Value, Stri
         "elapsed_ns": ended.saturating_sub(started),
         "actual_baud": harness.actual_baud(),
         "latency": latency_json(&harness.telemetry, harness.actual_baud()),
-        "timing_csv": csv,
+        "timing_csv": SEQUENCE_TIMINGS_FILE_NAME,
         "physical_order_evidence": "open: no logic analyzer or firmware trace",
     });
     let cleanup = harness.close();
-    Ok(with_cleanup(result, cleanup))
+    Ok((with_cleanup(result, cleanup), timing_csv))
 }
 
 fn run_amiibo(arguments: &[String]) -> Result<Value, String> {
@@ -2396,13 +2294,8 @@ fn process_metrics() -> Result<Value, String> {
     Ok(json!({"handles": handles, "threads": threads}))
 }
 
-fn write_timing_csv(path: &Path, telemetry: &Arc<Mutex<Telemetry>>) -> Result<(), String> {
-    let file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|error| format!("cannot create {}: {error}", path.display()))?;
-    let mut writer = BufWriter::new(file);
+fn timing_csv_bytes(telemetry: &Arc<Mutex<Telemetry>>) -> Result<Vec<u8>, String> {
+    let mut writer = Vec::new();
     writeln!(
         writer,
         "sequence,command_admitted_ns,lane_wake_ns,dispatch_ns,write_entered_ns,transport_accepted_ns"
@@ -2429,7 +2322,7 @@ fn write_timing_csv(path: &Path, telemetry: &Arc<Mutex<Telemetry>>) -> Result<()
         )
         .map_err(|error| error.to_string())?;
     }
-    writer.flush().map_err(|error| error.to_string())
+    Ok(writer)
 }
 
 fn artifact_dir(arguments: &[String]) -> Result<PathBuf, String> {
@@ -4009,27 +3902,15 @@ mod tests {
     }
 
     #[test]
-    fn existing_timing_csv_is_rejected_without_overwrite() {
-        let path = std::env::temp_dir().join(format!(
-            "easycon-hardware-existing-timing-{}-{}.csv",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system clock after epoch")
-                .as_nanos()
-        ));
-        let sentinel = b"original timing evidence\n";
-        fs::write(&path, sentinel).expect("seed existing timing evidence");
+    fn timing_csv_is_rendered_without_writing_an_artifact_path() {
         let telemetry = Arc::new(Mutex::new(Telemetry::default()));
 
-        let result = write_timing_csv(&path, &telemetry);
+        let bytes = timing_csv_bytes(&telemetry).expect("render timing CSV");
 
-        assert!(result.is_err());
         assert_eq!(
-            fs::read(&path).expect("read original timing evidence"),
-            sentinel
+            bytes,
+            b"sequence,command_admitted_ns,lane_wake_ns,dispatch_ns,write_entered_ns,transport_accepted_ns\n"
         );
-        fs::remove_file(path).expect("remove timing test file");
     }
 
     #[test]
@@ -4043,7 +3924,7 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(fs::read(temporary).expect("preserved temporary"), sentinel);
-        assert!(!directory.0.join(".unknown.in-progress.json").exists());
+        assert!(!directory.0.join(RESERVATION_FILE_NAME).exists());
     }
 
     #[test]
@@ -4058,7 +3939,7 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(fs::read(temporary).expect("preserved raced file"), sentinel);
-        assert!(directory.0.join(".unknown.in-progress.json").exists());
+        assert!(directory.0.join(RESERVATION_FILE_NAME).exists());
         assert!(!directory.0.join("unknown.json").exists());
     }
 
@@ -4074,8 +3955,7 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(fs::read(output).expect("preserved final file"), sentinel);
-        assert!(directory.0.join(".unknown.in-progress.json").exists());
-        assert!(!directory.0.join("unknown.json.tmp").exists());
+        assert!(directory.0.join(RESERVATION_FILE_NAME).exists());
     }
 
     #[test]
@@ -4094,6 +3974,24 @@ mod tests {
             fs::read(directory.0.join("unknown.json")).expect("preserved first final"),
             original
         );
-        assert!(!directory.0.join(".unknown.in-progress.json").exists());
+        assert!(directory.0.join(RESERVATION_FILE_NAME).exists());
+        let reservation: Value = serde_json::from_slice(
+            &fs::read(directory.0.join(RESERVATION_FILE_NAME)).expect("read reservation"),
+        )
+        .expect("parse reservation");
+        let staging = reservation["primary_artifact"]["staging"]
+            .as_str()
+            .expect("primary staging");
+        assert!(directory.0.join(staging).exists());
+    }
+
+    #[test]
+    fn different_commands_cannot_share_a_run_directory() {
+        let directory = TestDirectory::new("cross-command-reservation");
+        let _first = ArtifactReservation::begin("unknown", &directory.0).expect("first reserve");
+
+        let second = ArtifactReservation::begin("amiibo", &directory.0);
+
+        assert!(second.is_err());
     }
 }

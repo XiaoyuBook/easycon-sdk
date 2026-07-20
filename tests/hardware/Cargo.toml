@@ -16,6 +16,10 @@ easycon-runtime = { path = "../../crates/easycon-runtime" }
 easycon-serial = { path = "../../crates/easycon-serial" }
 serde_json = "1.0"
 
+[target.'cfg(windows)'.dependencies]
+file-id = "0.2.3"
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
+
 [lints.rust]
 unsafe_code = "forbid"
 
