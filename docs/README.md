@@ -32,6 +32,7 @@
 - [ADR-0004：操作句柄、拉取事件与确定性关闭](decisions/0004-operations-events-shutdown.md)
 - [ADR-0005：Windows x64 首发与同源原生包](decisions/0005-v1-platform-packaging.md)
 - [ADR-0006：Runtime 所有权、终态事务与确定性关闭](decisions/0006-runtime-stabilization.md)
+- [ADR-0007：冻结 Phase 1 Runtime 基线](decisions/0007-phase-1-freeze.md)
 
 ## v1 固定范围
 
@@ -44,10 +45,10 @@
 
 ## 当前实施状态
 
-架构冻结后的首个开发里程碑已经实现 Rust Runtime + Controller fake vertical slice。它覆盖
-operation、取消、事件溢出、确定性关闭、源码精确 report、单写者调度、精确序列、底层
-Automation lease 与 generation-aware ACK；不代表正式 C ABI、系统串口 backend 或物理硬件
-支持已经完成。实现说明和本地验收命令见
+Phase 1 Runtime 已按 [ADR-0007](decisions/0007-phase-1-freeze.md) 冻结在可执行基线 `4261925`。
+仓库还实现了 Controller fake vertical slice，覆盖源码精确 report、单写者调度、精确序列、底层
+Automation lease 与 generation-aware ACK；这只是 Phase 2 的提前 slice，不代表正式 C ABI、系统串口
+backend、Amiibo 或物理硬件支持已经完成。实现说明和本地验收命令见
 [Runtime + Controller fake vertical slice](development/runtime-controller-vertical-slice.md)。
 
 ## 首发基线

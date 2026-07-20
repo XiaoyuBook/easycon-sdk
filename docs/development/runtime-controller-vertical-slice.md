@@ -1,5 +1,12 @@
 # Runtime + Controller fake vertical slice
 
+## 里程碑状态
+
+本文实现中的 Phase 1 Runtime 已按
+[ADR-0007](../decisions/0007-phase-1-freeze.md) 冻结在 `4261925dc4e84b36e8491c0a97c17048d3eacd84`。
+Controller 内容是 Phase 2 的提前无硬件 slice；Windows serial、Amiibo、10,000-step fake 和硬件
+characterization 仍未完成。
+
 ## 交付范围
 
 首个开发里程碑在冻结架构下实现且只实现以下 Rust 组件：

@@ -3,10 +3,10 @@
 ## 1. 固定目标结构
 
 本章固定 v1 的目标结构与阶段门槛；目录会随对应阶段逐步创建，不要求当前工作树一次具备全部项目。
-仓库当前已经完成 Rust Runtime 与无硬件 Controller fake vertical slice，详见
-[实现说明](../development/runtime-controller-vertical-slice.md)。这个首个可测试里程碑覆盖 Phase 1
-Runtime 基线和一段受限的 Controller slice，不表示 Phase 2 所要求的 Windows serial、Amiibo、硬件
-characterization 或 O-01/O-02 数据已经完成。
+仓库当前已经按 [ADR-0007](../decisions/0007-phase-1-freeze.md) 冻结 Phase 1 Runtime，并完成一段无硬件
+Controller fake vertical slice，详见 [实现说明](../development/runtime-controller-vertical-slice.md)。该
+Controller slice 不表示 Phase 2 所要求的 Windows serial、Amiibo、硬件 characterization 或 O-01/O-02
+数据已经完成。
 
 ```text
 easycon sdk/
@@ -97,7 +97,10 @@ easycon sdk/
 
 退出门槛：规范 schema 可机器校验；fixture 不读取 `EasyCon/`；所有公开语义有唯一来源。
 
-### Phase 1：model、runtime 与测试骨架
+### Phase 1：model、runtime 与测试骨架（Frozen）
+
+状态：已冻结。可执行实现基线为 `4261925dc4e84b36e8491c0a97c17048d3eacd84`；范围和重新打开规则见
+[ADR-0007](../decisions/0007-phase-1-freeze.md)。
 
 交付：
 
@@ -108,6 +111,8 @@ easycon sdk/
 退出门槛：runtime 单元/模型测试、Loom 关键模型、fault tests 全过；Runtime close 后活动 task/resource 为零。
 
 ### Phase 2：Controller vertical slice
+
+状态：进行中。当前只有无硬件 fake slice，尚未达到本阶段退出门槛。
 
 交付：
 
