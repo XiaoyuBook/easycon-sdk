@@ -17,6 +17,7 @@ use windows_sys::Win32::System::Registry::{
 
 use crate::{SerialDiscovery, SerialError, SerialErrorKind, SerialPortDescriptor, UsbIdentifiers};
 
+use super::MAX_COM_PORT_NAME_CHARS;
 use super::error::{from_code, last_error};
 
 const MAX_INSTANCE_ID_CHARS: u32 = 4_096;
@@ -331,9 +332,10 @@ fn validate_property_size(size: u32, property: &'static str) -> Result<(), Seria
 }
 
 fn is_com_port_name(value: &str) -> bool {
-    value
-        .get(..3)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("COM"))
+    value.len() <= MAX_COM_PORT_NAME_CHARS
+        && value
+            .get(..3)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("COM"))
         && value.get(3..).is_some_and(|suffix| {
             !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
         })
@@ -390,6 +392,7 @@ mod tests {
         assert!(!is_com_port_name("LPT1"));
         assert!(!is_com_port_name("COM"));
         assert!(!is_com_port_name("COM4 description"));
+        assert!(!is_com_port_name(&format!("COM{}", "1".repeat(62))));
     }
 
     // conformance: phase2a.serial.live-discovery

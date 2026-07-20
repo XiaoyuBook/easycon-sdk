@@ -24,6 +24,7 @@ use crate::{
     ByteIo, ByteIoFactory, ByteIoRequest, SerialError, SerialErrorKind, SerialPortDescriptor,
 };
 
+use super::MAX_COM_PORT_NAME_CHARS;
 use super::error::{from_code, last_error};
 
 /// Opens Windows COM ports with exclusive overlapped byte I/O.
@@ -544,7 +545,7 @@ fn disconnected_error(message: &'static str) -> SerialError {
 
 fn port_path(port_name: &str) -> Result<Vec<u16>, SerialError> {
     let name = port_name.strip_prefix(r"\\.\").unwrap_or(port_name);
-    let valid = name.len() <= 64
+    let valid = name.len() <= MAX_COM_PORT_NAME_CHARS
         && name
             .get(..3)
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("COM"))
