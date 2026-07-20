@@ -15,6 +15,8 @@ fn wait_terminal(operation: &Operation) {
     ));
 }
 
+// conformance: phase2a.latency.monotonic-stages
+// conformance: phase2a.latency.unfiltered-recorder
 #[test]
 fn direct_report_records_monotonic_software_path_stages_without_filtering() {
     let clock = Arc::new(SystemClock::default());

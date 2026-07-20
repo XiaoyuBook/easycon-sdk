@@ -285,6 +285,26 @@ direct report 的 p50/p95/p99/max 和固定测试环境。该 harness 验证 PC 
 回归，不代表 UART、CH32、USB HID 或 Switch 端到端延迟；普通 CI 继续使用 VirtualClock 证明确定性规则，
 不以易抖动的墙钟阈值代替 correctness。
 
+当前 Candidate 的确定性资产为：
+
+- `tests/support/tests/phase2a_sequence.rs`：10,000 个输入 step、5,000 个同 offset 合并 report，逐目标
+  推进 VirtualClock 并核对无丢失/乱序/早发/漂移、唯一终态、lease、中立化和 registry 收敛；
+- `tests/support/tests/phase2a_latency.rs`：不设墙钟阈值，只验证 admission、lane wake、dispatch、transport
+  entry、transport acceptance 五段时间戳单调且 recorder 不过滤样本；
+- `tests/support/tools/controller_latency.rs`：显式 release harness。它先执行指定 warmup，再要求至少
+  10,000 个 measured sample 全部满足 pacing eligibility；任一非单调、非 eligible 或缺失样本直接失败。
+
+固定环境测量命令：
+
+```powershell
+cargo run --release -p easycon-test-support --bin controller_latency -- --samples 10000 --warmup 1000 --minimum-report-interval-ns 1 --machine DESKTOP-IQM6HN5 --windows-build 10.0.26200.8875 --power-plan "GamePP 电源方案" --output target\phase2a-controller-latency-2026-07-20.csv
+```
+
+`1 ns` 配置使顺序提交且上一 operation 已终态的每个 direct report 都满足 pacing，而不是把 30 ms 等待计入
+`admitted -> write entered`；harness 仍逐样本验证 eligibility，不删除 outlier，也不使用永久 busy wait。
+环境、六段完整分位数、目标判断和 raw CSV 哈希见
+[Phase 2A latency fixture](../../spec/fixtures/controller/phase2a-latency-result-v1.json)。
+
 ### 矩阵登记
 
 O-01 关闭时建立 `hardware/matrix.yaml`（只记录 SDK 自有测试配置，不记录 EasyCon 源码锁）：

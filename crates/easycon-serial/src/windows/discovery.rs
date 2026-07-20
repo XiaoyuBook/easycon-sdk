@@ -356,6 +356,7 @@ fn parse_hex_component(value: &str, marker: &str) -> Option<u16> {
 mod tests {
     use super::*;
 
+    // conformance: phase2a.serial.system-properties
     #[test]
     fn usb_ids_come_only_from_explicit_hardware_id_components() {
         assert_eq!(
@@ -380,6 +381,7 @@ mod tests {
         assert!(!is_com_port_name("COM4 description"));
     }
 
+    // conformance: phase2a.serial.live-discovery
     #[test]
     fn live_discovery_is_sorted_and_has_stable_identity() {
         let ports = discover_system_ports().expect("Windows serial discovery");

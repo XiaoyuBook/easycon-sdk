@@ -65,6 +65,7 @@ fn close_connected(runtime: &Runtime, controller: &ControllerSession) {
     runtime.close().expect("Runtime close");
 }
 
+// conformance: phase2a.amiibo.explicit-limits
 #[test]
 fn amiibo_admission_requires_explicit_slot_and_length_limits() {
     let clock = Arc::new(VirtualClock::default());
@@ -152,6 +153,7 @@ fn amiibo_admission_requires_explicit_slot_and_length_limits() {
     runtime.close().expect("Runtime close");
 }
 
+// conformance: phase2a.amiibo.source-exact-chunks
 #[test]
 fn save_chunks_and_select_are_source_exact_and_wait_for_the_final_ack() {
     let (clock, runtime, simulator, controller) = connected_ch32(4, 45);
@@ -208,6 +210,7 @@ fn save_chunks_and_select_are_source_exact_and_wait_for_the_final_ack() {
     assert_eq!(simulator.snapshot().active_streams, 0);
 }
 
+// conformance: phase2a.amiibo.bounded-retry
 #[test]
 fn save_retries_the_same_chunk_after_source_exact_reset() {
     let (_clock, runtime, simulator, controller) = connected_ch32(1, 20);
@@ -246,6 +249,7 @@ fn save_retries_the_same_chunk_after_source_exact_reset() {
     close_connected(&runtime, &controller);
 }
 
+// conformance: phase2a.amiibo.generation
 #[test]
 fn amiibo_ack_uses_the_existing_generation_matcher() {
     let clock = Arc::new(VirtualClock::default());
@@ -295,6 +299,7 @@ fn amiibo_ack_uses_the_existing_generation_matcher() {
     close_connected(&runtime, &controller);
 }
 
+// conformance: phase2a.amiibo.partial-failure
 #[test]
 fn save_partial_failure_reports_completed_chunks_and_releases_the_lane() {
     let (_clock, runtime, simulator, controller) = connected_ch32(1, 25);
@@ -338,6 +343,7 @@ fn save_partial_failure_reports_completed_chunks_and_releases_the_lane() {
     close_connected(&runtime, &controller);
 }
 
+// conformance: phase2a.amiibo.cancel-deadline-cleanup
 #[test]
 fn save_cancel_and_operation_deadline_run_bounded_reset_cleanup() {
     let (clock, runtime, simulator, controller) = connected_ch32(1, 20);
@@ -386,6 +392,7 @@ fn save_cancel_and_operation_deadline_run_bounded_reset_cleanup() {
     close_connected(&runtime, &controller);
 }
 
+// conformance: phase2a.amiibo.disconnect-close
 #[test]
 fn save_disconnect_and_controller_close_have_unique_terminal_cleanup() {
     let (_clock, runtime, simulator, controller) = connected_ch32(1, 20);
@@ -433,6 +440,7 @@ fn save_disconnect_and_controller_close_have_unique_terminal_cleanup() {
     runtime.close().expect("Runtime close");
 }
 
+// conformance: phase2a.amiibo.select-cleanup
 #[test]
 fn select_cancel_deadline_and_disconnect_use_the_same_cleanup_contract() {
     let (clock, runtime, simulator, controller) = connected_ch32(2, 20);

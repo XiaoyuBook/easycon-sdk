@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://easycon.invalid/schemas/latency-result-v1.schema.json",
+  "title": "EasyCon Phase 2A Controller software latency result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "milestone",
+    "license",
+    "status",
+    "measurement_date",
+    "environment",
+    "harness",
+    "metrics",
+    "target",
+    "scope"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "milestone": { "const": "phase-2a-controller-serial-candidate-v1" },
+    "license": { "const": "GPL-3.0-only" },
+    "status": { "const": "Hardware Unverified" },
+    "measurement_date": { "type": "string" },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["machine", "cpu", "ram_bytes", "architecture", "os", "windows_build", "power_plan", "rustc", "cargo"],
+      "properties": {
+        "machine": { "type": "string" },
+        "cpu": { "type": "string" },
+        "ram_bytes": { "type": "integer", "minimum": 1 },
+        "architecture": { "const": "x86_64" },
+        "os": { "type": "string" },
+        "windows_build": { "type": "string" },
+        "power_plan": { "type": "string" },
+        "rustc": { "type": "string" },
+        "cargo": { "type": "string" }
+      }
+    },
+    "harness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "transport",
+        "warmup_samples",
+        "eligible_samples",
+        "minimum_report_interval_ns",
+        "measurement_elapsed_ms",
+        "outlier_filtering",
+        "permanent_busy_wait",
+        "raw_csv_rows",
+        "raw_csv_sha256"
+      ],
+      "properties": {
+        "transport": { "const": "non-blocking-memory" },
+        "warmup_samples": { "type": "integer", "minimum": 0 },
+        "eligible_samples": { "type": "integer", "minimum": 10000 },
+        "minimum_report_interval_ns": { "type": "integer", "minimum": 1 },
+        "measurement_elapsed_ms": { "type": "integer", "minimum": 1 },
+        "outlier_filtering": { "const": false },
+        "permanent_busy_wait": { "const": false },
+        "raw_csv_rows": { "type": "integer", "minimum": 10001 },
+        "raw_csv_sha256": { "type": "string" }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "command_admitted_to_lane_wake_ns",
+        "lane_wake_to_dispatch_ns",
+        "dispatch_to_transport_write_entered_ns",
+        "transport_write_entered_to_acceptance_ns",
+        "command_admitted_to_transport_write_entered_ns",
+        "command_admitted_to_transport_acceptance_ns"
+      ],
+      "properties": {
+        "command_admitted_to_lane_wake_ns": { "type": "object", "additionalProperties": false, "required": ["p50", "p95", "p99", "max"], "properties": { "p50": { "type": "integer", "minimum": 0 }, "p95": { "type": "integer", "minimum": 0 }, "p99": { "type": "integer", "minimum": 0 }, "max": { "type": "integer", "minimum": 0 } } },
+        "lane_wake_to_dispatch_ns": { "type": "object", "additionalProperties": false, "required": ["p50", "p95", "p99", "max"], "properties": { "p50": { "type": "integer", "minimum": 0 }, "p95": { "type": "integer", "minimum": 0 }, "p99": { "type": "integer", "minimum": 0 }, "max": { "type": "integer", "minimum": 0 } } },
+        "dispatch_to_transport_write_entered_ns": { "type": "object", "additionalProperties": false, "required": ["p50", "p95", "p99", "max"], "properties": { "p50": { "type": "integer", "minimum": 0 }, "p95": { "type": "integer", "minimum": 0 }, "p99": { "type": "integer", "minimum": 0 }, "max": { "type": "integer", "minimum": 0 } } },
+        "transport_write_entered_to_acceptance_ns": { "type": "object", "additionalProperties": false, "required": ["p50", "p95", "p99", "max"], "properties": { "p50": { "type": "integer", "minimum": 0 }, "p95": { "type": "integer", "minimum": 0 }, "p99": { "type": "integer", "minimum": 0 }, "max": { "type": "integer", "minimum": 0 } } },
+        "command_admitted_to_transport_write_entered_ns": { "type": "object", "additionalProperties": false, "required": ["p50", "p95", "p99", "max"], "properties": { "p50": { "type": "integer", "minimum": 0 }, "p95": { "type": "integer", "minimum": 0 }, "p99": { "type": "integer", "minimum": 0 }, "max": { "type": "integer", "minimum": 0 } } },
+        "command_admitted_to_transport_acceptance_ns": { "type": "object", "additionalProperties": false, "required": ["p50", "p95", "p99", "max"], "properties": { "p50": { "type": "integer", "minimum": 0 }, "p95": { "type": "integer", "minimum": 0 }, "p99": { "type": "integer", "minimum": 0 }, "max": { "type": "integer", "minimum": 0 } } }
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["metric", "p99_ns", "max_ns", "passed"],
+      "properties": {
+        "metric": { "const": "command_admitted_to_transport_write_entered_ns" },
+        "p99_ns": { "const": 1000000 },
+        "max_ns": { "const": 5000000 },
+        "passed": { "type": "boolean" }
+      }
+    },
+    "scope": { "type": "string" }
+  }
+}

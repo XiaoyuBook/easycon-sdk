@@ -1,16 +1,18 @@
 # EasyCon SDK v1 milestone specifications
 
-This directory contains the machine-checkable behavior and conformance baseline for the first
-Rust Runtime + Controller fake vertical slice. It is intentionally narrower than the complete v1
-architecture.
+This directory contains the machine-checkable behavior and conformance baseline for the Phase 1
+Runtime plus the Phase 2A Controller/Serial Candidate. Phase 2A is `Hardware Unverified` and remains
+narrower than the complete v1 architecture.
 
-- `behavior/runtime-controller-v1.json` fixes operation, timeout, event, shutdown, and controller
-  scheduling behavior.
-- `fixtures/controller/reports-v1.json` records source-exact protocol values and report bytes plus
-  corrected source behaviors that must not be preserved.
+- `behavior/runtime-controller-v1.json` fixes operation, timeout, event, shutdown, serial,
+  Controller, Amiibo, sequence, timing, and Hardware Unverified behavior.
+- `fixtures/controller/reports-v1.json` records source-exact protocol values, report bytes, and
+  Amiibo save/select/reset facts plus corrected source behaviors that must not be preserved.
 - `fixtures/controller/sequence-traces-v1.json` fixes precise-sequence dispatch and cancellation
   traces in virtual monotonic nanoseconds.
-- `conformance/runtime-controller-v1.json` defines the hardware-free vertical slice and fault
+- `fixtures/controller/phase2a-latency-result-v1.json` records the fixed-machine 10,000-sample
+  software-path distribution and its explicit non-hardware scope.
+- `conformance/runtime-controller-v1.json` defines the hardware-free Runtime and Phase 2A fault
   scenarios. Every step and assertion has a stable ID. Each scenario declares the exact executable
   Rust test suite covering its assertions, and every assertion maps through a matching
   `// conformance:` source marker.
@@ -18,9 +20,10 @@ architecture.
   applies the schema subset used here to each concrete instance rather than only parsing the schema
   documents.
 
-The fixtures were transcribed from the source evidence named in each file. Controller golden-vector
-and precise-sequence tests read these tracked files directly. Tests and validation do not open,
-build, download, or otherwise depend on `EasyCon/`.
+Protocol fixtures were transcribed from the source evidence named in each file; the latency fixture
+is a dated local measurement with an explicit software-only scope. Controller golden-vector and
+precise-sequence tests read their tracked files directly. Tests and validation do not open, build,
+download, or otherwise depend on `EasyCon/`.
 
 `tools/validate_specs.py` compares the complete assertion and Rust marker sets, checks each scenario
 suite for exact assertion coverage, resolves every mapped source through Cargo metadata to one

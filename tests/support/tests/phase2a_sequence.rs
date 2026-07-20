@@ -52,6 +52,9 @@ fn group_positions(group: usize) -> (StickPosition, StickPosition) {
     )
 }
 
+// conformance: phase2a.sequence.no-loss-order
+// conformance: phase2a.sequence.absolute-no-early
+// conformance: phase2a.sequence.terminal-convergence
 #[test]
 fn ten_thousand_step_sequence_is_exact_and_all_registries_converge() {
     let clock = Arc::new(VirtualClock::default());

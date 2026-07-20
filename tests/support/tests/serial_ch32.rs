@@ -69,6 +69,8 @@ fn close_controller(clock: &VirtualClock, runtime: &Runtime, controller: &Contro
     runtime.close().expect("Runtime close");
 }
 
+// conformance: phase2a.serial.end-to-end
+// conformance: phase2a.serial.partial-io
 #[test]
 fn serial_adapter_fallback_partial_report_and_close_are_byte_exact() {
     let clock = Arc::new(VirtualClock::default());
@@ -124,6 +126,7 @@ fn serial_adapter_fallback_partial_report_and_close_are_byte_exact() {
     assert_eq!(final_snapshot.closed_streams, 2);
 }
 
+// conformance: phase2a.serial.open-errors
 #[test]
 fn access_denied_and_port_busy_open_failures_are_bounded_and_leak_free() {
     let clock = Arc::new(VirtualClock::default());
@@ -157,6 +160,7 @@ fn access_denied_and_port_busy_open_failures_are_bounded_and_leak_free() {
     runtime.close().expect("Runtime close");
 }
 
+// conformance: phase2a.serial.ack-faults
 #[test]
 fn byte_ack_delay_duplicate_wrong_reply_and_zero_progress_are_isolated() {
     let (clock, runtime, simulator, controller) = connected();
@@ -236,6 +240,7 @@ fn blocked_byte_write_cancellation_neutralizes_before_terminal() {
     assert_eq!(simulator.snapshot().active_streams, 0);
 }
 
+// conformance: phase2a.serial.deadline-close-wake
 #[test]
 fn blocked_ack_obeys_deadline_and_controller_close_wakes_a_second_wait() {
     let (clock, runtime, simulator, controller) = connected();
@@ -264,6 +269,7 @@ fn blocked_ack_obeys_deadline_and_controller_close_wakes_a_second_wait() {
     runtime.close().expect("Runtime close");
 }
 
+// conformance: phase2a.serial.disconnect-close-order
 #[test]
 fn hot_unplug_and_mid_payload_failure_close_the_stream_without_continuation() {
     let (_clock, runtime, simulator, controller) = connected();

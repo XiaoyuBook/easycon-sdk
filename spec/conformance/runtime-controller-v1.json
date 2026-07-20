@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "milestone": "runtime-controller-fake-v1",
+  "milestone": "phase-2a-controller-serial-candidate-v1",
   "license": "GPL-3.0-only",
   "scenarios": [
     {
@@ -383,6 +383,204 @@
           "id": "event.final-bypasses-filter",
           "expect": "RuntimeClosed bypasses the severity filter and remains the final event",
           "test": "crates/easycon-runtime/src/runtime.rs::final_runtime_event_bypasses_subscription_severity_filter"
+        }
+      ]
+    },
+    {
+      "id": "phase2a-serial",
+      "test": "crates/easycon-serial/src/discovery.rs::stable_identity_is_independent_from_optional_labels_and_port_assignment",
+      "tests": [
+        "crates/easycon-serial/src/discovery.rs::stable_identity_is_independent_from_optional_labels_and_port_assignment",
+        "crates/easycon-serial/src/windows/discovery.rs::usb_ids_come_only_from_explicit_hardware_id_components",
+        "crates/easycon-serial/src/windows/discovery.rs::live_discovery_is_sorted_and_has_stable_identity",
+        "crates/easycon-serial/src/windows/io.rs::port_paths_are_canonical_and_do_not_open_arbitrary_devices",
+        "crates/easycon-serial/src/windows/io.rs::close_signal_is_idempotent_and_wakes_waiters",
+        "crates/easycon-serial/tests/byte_io_contract.rs::injectable_adapter_handles_partial_handshake_and_command_generation",
+        "tests/support/tests/serial_ch32.rs::serial_adapter_fallback_partial_report_and_close_are_byte_exact",
+        "tests/support/tests/serial_ch32.rs::access_denied_and_port_busy_open_failures_are_bounded_and_leak_free",
+        "tests/support/tests/serial_ch32.rs::byte_ack_delay_duplicate_wrong_reply_and_zero_progress_are_isolated",
+        "tests/support/tests/serial_ch32.rs::blocked_ack_obeys_deadline_and_controller_close_wakes_a_second_wait",
+        "tests/support/tests/serial_ch32.rs::hot_unplug_and_mid_payload_failure_close_the_stream_without_continuation"
+      ],
+      "steps": [
+        { "id": "phase2a.serial.discover", "action": "enumerate Windows COM interfaces into structured stable descriptors" },
+        { "id": "phase2a.serial.open", "action": "open only a canonical COM path through the Windows system leaf" },
+        { "id": "phase2a.serial.handshake", "action": "run source-exact 115200 to 9600 fallback over injectable byte I/O" },
+        { "id": "phase2a.serial.partial", "action": "split logical report and ACK traffic across partial and zero-progress calls" },
+        { "id": "phase2a.serial.fault", "action": "inject access denied, busy, wrong/late/duplicate ACK, deadline, disconnect, and hot unplug" },
+        { "id": "phase2a.serial.close", "action": "block write/read/close at controlled barriers and deterministically release every stream" }
+      ],
+      "assertions": [
+        {
+          "id": "phase2a.serial.stable-identity",
+          "expect": "stable device identity does not depend on optional labels or COM reassignment",
+          "test": "crates/easycon-serial/src/discovery.rs::stable_identity_is_independent_from_optional_labels_and_port_assignment"
+        },
+        {
+          "id": "phase2a.serial.system-properties",
+          "expect": "VID and PID are parsed only from explicit Windows hardware ID components",
+          "test": "crates/easycon-serial/src/windows/discovery.rs::usb_ids_come_only_from_explicit_hardware_id_components"
+        },
+        {
+          "id": "phase2a.serial.live-discovery",
+          "expect": "live Windows discovery is structured, sorted, and stable even when no physical target board is present",
+          "test": "crates/easycon-serial/src/windows/discovery.rs::live_discovery_is_sorted_and_has_stable_identity"
+        },
+        {
+          "id": "phase2a.serial.safe-open-path",
+          "expect": "system open canonicalizes COM names and rejects arbitrary device paths",
+          "test": "crates/easycon-serial/src/windows/io.rs::port_paths_are_canonical_and_do_not_open_arbitrary_devices"
+        },
+        {
+          "id": "phase2a.serial.win32-close-wake",
+          "expect": "the Win32 close signal is idempotent and wakes pending overlapped waits",
+          "test": "crates/easycon-serial/src/windows/io.rs::close_signal_is_idempotent_and_wakes_waiters"
+        },
+        {
+          "id": "phase2a.serial.injectable-contract",
+          "expect": "the serial transport accepts an injected byte-I/O factory and preserves partial command generations",
+          "test": "crates/easycon-serial/tests/byte_io_contract.rs::injectable_adapter_handles_partial_handshake_and_command_generation"
+        },
+        {
+          "id": "phase2a.serial.end-to-end",
+          "expect": "ControllerTransport uses the byte simulator for handshake, report acceptance, neutral close, and resource convergence",
+          "test": "tests/support/tests/serial_ch32.rs::serial_adapter_fallback_partial_report_and_close_are_byte_exact"
+        },
+        {
+          "id": "phase2a.serial.partial-io",
+          "expect": "partial report writes retain one logical context and reconstruct exact eight-byte frames",
+          "test": "tests/support/tests/serial_ch32.rs::serial_adapter_fallback_partial_report_and_close_are_byte_exact"
+        },
+        {
+          "id": "phase2a.serial.open-errors",
+          "expect": "access denied and port busy are bounded, normalized, and leak-free",
+          "test": "tests/support/tests/serial_ch32.rs::access_denied_and_port_busy_open_failures_are_bounded_and_leak_free"
+        },
+        {
+          "id": "phase2a.serial.ack-faults",
+          "expect": "zero progress and delayed, duplicate, or wrong ACK bytes do not cross request generations",
+          "test": "tests/support/tests/serial_ch32.rs::byte_ack_delay_duplicate_wrong_reply_and_zero_progress_are_isolated"
+        },
+        {
+          "id": "phase2a.serial.deadline-close-wake",
+          "expect": "absolute protocol deadline and Controller close both wake a blocked byte read without random sleep",
+          "test": "tests/support/tests/serial_ch32.rs::blocked_ack_obeys_deadline_and_controller_close_wakes_a_second_wait"
+        },
+        {
+          "id": "phase2a.serial.disconnect-close-order",
+          "expect": "hot unplug closes the active stream before the failed operation becomes terminal",
+          "test": "tests/support/tests/serial_ch32.rs::hot_unplug_and_mid_payload_failure_close_the_stream_without_continuation"
+        }
+      ]
+    },
+    {
+      "id": "phase2a-amiibo",
+      "test": "tests/support/tests/amiibo.rs::amiibo_admission_requires_explicit_slot_and_length_limits",
+      "tests": [
+        "tests/support/tests/amiibo.rs::amiibo_admission_requires_explicit_slot_and_length_limits",
+        "crates/easycon-controller/src/amiibo.rs::source_exact_save_select_and_reset_bytes_are_stable",
+        "tests/support/tests/amiibo.rs::save_chunks_and_select_are_source_exact_and_wait_for_the_final_ack",
+        "tests/support/tests/amiibo.rs::save_retries_the_same_chunk_after_source_exact_reset",
+        "tests/support/tests/amiibo.rs::amiibo_ack_uses_the_existing_generation_matcher",
+        "tests/support/tests/amiibo.rs::save_partial_failure_reports_completed_chunks_and_releases_the_lane",
+        "tests/support/tests/amiibo.rs::save_cancel_and_operation_deadline_run_bounded_reset_cleanup",
+        "tests/support/tests/amiibo.rs::save_disconnect_and_controller_close_have_unique_terminal_cleanup",
+        "tests/support/tests/amiibo.rs::select_cancel_deadline_and_disconnect_use_the_same_cleanup_contract"
+      ],
+      "steps": [
+        { "id": "phase2a.amiibo.admit", "action": "require explicit Hardware Unverified slot and data limits before operation admission" },
+        { "id": "phase2a.amiibo.save", "action": "send source-exact seven-byte save headers and 20-byte payload chunks" },
+        { "id": "phase2a.amiibo.select", "action": "send the source-exact slot selection command" },
+        { "id": "phase2a.amiibo.ack", "action": "match header and payload ACKs through the existing generation matcher" },
+        { "id": "phase2a.amiibo.retry", "action": "reset and retry the same chunk under a bounded caller policy" },
+        { "id": "phase2a.amiibo.cleanup", "action": "inject partial failure, cancel, deadline, disconnect, and Runtime close" }
+      ],
+      "assertions": [
+        {
+          "id": "phase2a.amiibo.explicit-limits",
+          "expect": "unknown physical slot count and total length are rejected until explicit limits are supplied",
+          "test": "tests/support/tests/amiibo.rs::amiibo_admission_requires_explicit_slot_and_length_limits"
+        },
+        {
+          "id": "phase2a.amiibo.fixture-exact",
+          "expect": "save/select/reset bytes and replies are read directly from the tracked source-exact fixture",
+          "test": "crates/easycon-controller/src/amiibo.rs::source_exact_save_select_and_reset_bytes_are_stable"
+        },
+        {
+          "id": "phase2a.amiibo.source-exact-chunks",
+          "expect": "save uses 20-byte chunks and select/save command bytes match the audited source",
+          "test": "tests/support/tests/amiibo.rs::save_chunks_and_select_are_source_exact_and_wait_for_the_final_ack"
+        },
+        {
+          "id": "phase2a.amiibo.bounded-retry",
+          "expect": "a failed chunk resets then retries the identical offset and payload within the configured bound",
+          "test": "tests/support/tests/amiibo.rs::save_retries_the_same_chunk_after_source_exact_reset"
+        },
+        {
+          "id": "phase2a.amiibo.generation",
+          "expect": "late or duplicate ACK generations cannot satisfy the next Amiibo exchange",
+          "test": "tests/support/tests/amiibo.rs::amiibo_ack_uses_the_existing_generation_matcher"
+        },
+        {
+          "id": "phase2a.amiibo.partial-failure",
+          "expect": "partial save failure reports completed chunks and releases lane ownership without false success",
+          "test": "tests/support/tests/amiibo.rs::save_partial_failure_reports_completed_chunks_and_releases_the_lane"
+        },
+        {
+          "id": "phase2a.amiibo.cancel-deadline-cleanup",
+          "expect": "cancel and absolute deadline each perform bounded reset cleanup before one Cancelled terminal state",
+          "test": "tests/support/tests/amiibo.rs::save_cancel_and_operation_deadline_run_bounded_reset_cleanup"
+        },
+        {
+          "id": "phase2a.amiibo.disconnect-close",
+          "expect": "disconnect closes the stream and resource close still attempts existing neutralization before joining",
+          "test": "tests/support/tests/amiibo.rs::save_disconnect_and_controller_close_have_unique_terminal_cleanup"
+        },
+        {
+          "id": "phase2a.amiibo.select-cleanup",
+          "expect": "select shares cancellation, deadline, disconnect, cleanup, and unique-terminal behavior",
+          "test": "tests/support/tests/amiibo.rs::select_cancel_deadline_and_disconnect_use_the_same_cleanup_contract"
+        }
+      ]
+    },
+    {
+      "id": "phase2a-acceptance",
+      "test": "tests/support/tests/phase2a_sequence.rs::ten_thousand_step_sequence_is_exact_and_all_registries_converge",
+      "tests": [
+        "tests/support/tests/phase2a_sequence.rs::ten_thousand_step_sequence_is_exact_and_all_registries_converge",
+        "tests/support/tests/phase2a_latency.rs::direct_report_records_monotonic_software_path_stages_without_filtering"
+      ],
+      "steps": [
+        { "id": "phase2a.acceptance.sequence", "action": "run 10,000 input steps as 5,000 same-offset groups on VirtualClock" },
+        { "id": "phase2a.acceptance.trace", "action": "compare every report byte, logical sequence, absolute target, wake, and dispatch record" },
+        { "id": "phase2a.acceptance.close", "action": "neutralize, close, and verify operation/resource/task registries converge" },
+        { "id": "phase2a.acceptance.latency", "action": "record all five monotonic direct-report software path stages without sample filtering" }
+      ],
+      "assertions": [
+        {
+          "id": "phase2a.sequence.no-loss-order",
+          "expect": "10,000 input steps produce exactly 5,000 ordered merged reports with no loss or reordering",
+          "test": "tests/support/tests/phase2a_sequence.rs::ten_thousand_step_sequence_is_exact_and_all_registries_converge"
+        },
+        {
+          "id": "phase2a.sequence.absolute-no-early",
+          "expect": "no report is emitted early and every non-uniform target remains absolute without cumulative drift",
+          "test": "tests/support/tests/phase2a_sequence.rs::ten_thousand_step_sequence_is_exact_and_all_registries_converge"
+        },
+        {
+          "id": "phase2a.sequence.terminal-convergence",
+          "expect": "the sequence has one terminal event, releases its lease, neutralizes on close, and converges every Runtime registry",
+          "test": "tests/support/tests/phase2a_sequence.rs::ten_thousand_step_sequence_is_exact_and_all_registries_converge"
+        },
+        {
+          "id": "phase2a.latency.monotonic-stages",
+          "expect": "admission, lane wake, dispatch, transport entry, and transport acceptance timestamps are monotonic",
+          "test": "tests/support/tests/phase2a_latency.rs::direct_report_records_monotonic_software_path_stages_without_filtering"
+        },
+        {
+          "id": "phase2a.latency.unfiltered-recorder",
+          "expect": "the in-memory recorder retains every direct sample and deterministic close reaches the transport",
+          "test": "tests/support/tests/phase2a_latency.rs::direct_report_records_monotonic_software_path_stages_without_filtering"
         }
       ]
     }

@@ -61,6 +61,20 @@ flowchart LR
 
 **[推导]** 原源码的壁钟调度、忙轮询、临时事件竞争、取消不等待和计时字段缺陷都不是用户语义。新实现以单调时钟、单写者命令队列和确定性关闭替代。
 
+### Phase 2A 实现状态
+
+**[已决定]** Windows 10/11 x64 serial backend 现在是 `easycon-serial` 系统叶子；结构化发现只使用
+Windows 提供的属性，稳定身份不从 COM 名称猜测。Controller 继续只依赖 `ControllerTransport`，不感知
+Win32 或具体串口实现。
+
+**[已决定]** Amiibo v1 save/select 已按上述源码事实实现 20 字节分包、`0xff` ACK、generation matcher
+和有界 reset/retry。源码没有给出可信的槽位数和总长度，因此默认 capability 为空；显式 limit 只允许
+无硬件测试和调用方保守接入，不能关闭 O-02 或形成设备支持声明。
+
+**[待确认]** Phase 2A 状态为 `Hardware Unverified`。O-01 的控制板/固件/VID/PID/baud 支持矩阵、O-02 的
+Amiibo 物理容量以及 O-04 的 UART/USB/Switch 时序必须在 Phase 2B 用实物关闭；软件 fake 和内存
+transport 结果不得替代这些证据。
+
 ## 4. Automation 映射
 
 | 源码组件与证据 | 已验证行为 | v1 归属 | 动作与约束 |

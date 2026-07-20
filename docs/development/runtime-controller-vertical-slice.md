@@ -1,13 +1,15 @@
-# Runtime + Controller fake vertical slice
+# Runtime + Controller/Serial Phase 2A Candidate
 
 ## 里程碑状态
 
 本文实现中的 Phase 1 Runtime 已按
 [ADR-0007](../decisions/0007-phase-1-freeze.md) 冻结在 `4261925dc4e84b36e8491c0a97c17048d3eacd84`。
-Controller 内容是 Phase 2 的提前无硬件 slice；Windows serial、Amiibo、10,000-step fake 和硬件
-characterization 仍未完成。后续范围和低延迟验收已按
-[ADR-0008](../decisions/0008-phase-2-controller-target.md) 固定为 Phase 2A 无硬件 Candidate 与 Phase 2B
-硬件资格验证；当前 slice 不构成任一阶段的完成声明。
+基于 [ADR-0008](../decisions/0008-phase-2-controller-target.md)，Windows serial、ControllerTransport、
+Amiibo、故障注入、10,000-step fake 和软件热路径测量已经收敛为 Phase 2A Candidate，可提交独立 review。
+
+当前状态严格为 **Hardware Unverified**。没有物理 CH32/控制板参与开发或验收；O-01、O-02、O-04
+保持开放，完整 Phase 2 仍未完成。本文不声称任何具体 VID/PID、固件、baud、Amiibo 容量、UART/USB HID/
+Switch 执行时序或物理中立化已经验证，也不创建完整 Phase 2 冻结 ADR。实现冻结由后续独立 review 完成。
 
 ## 交付范围
 
@@ -16,9 +18,12 @@ characterization 仍未完成。后续范围和低延迟验收已按
 - `easycon-model`：Runtime/operation/resource/task ID、稳定错误域、按钮、HAT 和摇杆值。
 - `easycon-runtime`：operation 状态机、取消树、deadline coordinator、VirtualClock、严格有序事件
   subscription、registry 和幂等确定性关闭。
-- `easycon-controller`：源码精确 Switch report、ControllerTransport、连接状态机、单写者
-  command lane、direct/reset、精确序列、Automation lease 原语和 ACK generation matcher。
-- `easycon-test-support`：只供测试使用的 FakeControllerTransport 与 vertical slice harness。
+- `easycon-controller`：源码精确 Switch report、ControllerTransport、连接状态机、单写者 command lane、
+  direct/reset、精确序列、Automation lease、ACK generation matcher，以及 Amiibo save/select operation。
+- `easycon-serial`：Windows 10/11 x64 结构化发现、稳定端口身份、Win32 overlapped byte I/O 和
+  `SerialControllerTransport`。所有串口系统调用、HANDLE/event/SetupAPI/registry RAII 都封装在此系统叶子。
+- `easycon-test-support`：只供测试使用的 FakeControllerTransport、可注入 byte I/O、字节级 CH32 模拟器、
+  close barrier、latency recorder 和 release measurement harness；不进入发布 feature。
 
 所有 fake 和验收测试都不读取、构建或下载 `EasyCon/`，也不需要物理硬件、C++ 或 OpenCV。
 完整行为资产位于 [spec/README.md](../../spec/README.md)。
@@ -39,6 +44,11 @@ characterization 仍未完成。后续范围和低延迟验收已按
   severity/log filter 影响。
 - 每个 Controller 只有一个 writer thread。所有 report（包括取消和关闭中立报告）的默认最小间隔是
   30 ms；write 必须响应 operation/resource cancellation 或绝对 I/O deadline。
+- Windows discovery 返回系统提供的稳定 device-instance identity 与可选属性；COM 名称只用于打开端口，
+  不用于猜测 VID/PID 或支持设备。Win32 open/read/write/close 只存在于 `easycon-serial`。
+- serial partial write 使用同一个 logical `WriteContext` 连续推进；半帧错误或两次 partial call 间取消会
+  关闭流，禁止后续 command 拼接到损坏帧。零进展、busy/access denied、deadline、close wake 和热拔插
+  归一化为稳定错误。
 - precise sequence 的 offset 相对 lane 获权时刻且始终为绝对目标；同 offset 按输入顺序合并
   成一个 report，不从上次 dispatch 累加目标。
 - sequence 取消或可恢复失败时，先让 transport 接受 neutral report，再释放 lease 并提交终态。
@@ -48,6 +58,13 @@ characterization 仍未完成。后续范围和低延迟验收已按
   report acceptance 观测。
 - ACK command 在同一 FIFO lane 中等待前序 direct report，只有独占 sequence/Automation lease 才
   返回 `RESOURCE_BUSY`；ACK 路径发现断线时重置 desired report、记录中立化 warning 并关闭 transport。
+- Amiibo save 使用 `A5 off_lo off_hi len_lo len_hi slot 90` header 和最多 20 字节 payload，两段分别等待
+  generation-matched `FF` ACK；select 使用 `A5 slot 91`。失败重试前发送三次 `A5 81` 并等待 `80`。
+  retry 有界；部分完成数、取消、绝对 deadline、断线和 cleanup 都进入 operation 终态契约。
+- Controller 默认没有 Amiibo slot/总长度 capability。只有显式 `AmiiboLimits` 才接纳请求；该 limit 本身
+  不构成硬件支持证据，O-02 仍开放。
+- direct report 的 `WriteContext` 记录 command admission 和 lane wake，原有 `timestamp_ns` 记录 dispatch；
+  非阻塞内存 transport 在 trait entry 和完整 acceptance 记录后两段时间戳。五段使用同一单调 Runtime clock。
 - 显式 Runtime close 会先取消根树，再关闭/中立化 Controller，等待 owner cleanup，join 全部
   Runtime-owned supervised task，兜底终结 owner 已退出后的遗留 operation，join deadline worker 并验证
   registry 为空，最后发布 `runtime.closed`、保存 Closed outcome。`runtime.closed` 之后拒绝 event publish。
@@ -81,17 +98,55 @@ git diff --check
 direct action -> precise sequence -> cancel/neutralize -> Runtime close，并核对 event/operation、report
 bytes/timestamp、lease 顺序和 registry 计数。
 
+Phase 2A 专项测试还包括：
+
+- `tests/support/tests/serial_ch32.rs`：Windows-independent byte chain、partial/zero/block、ACK fault、deadline、
+  cancel、close、hot unplug、半帧失败和 stream 计数；
+- `tests/support/tests/amiibo.rs`：8 条 save/select success/failure/cancel/deadline/disconnect/cleanup 路径；
+- `tests/support/tests/phase2a_sequence.rs`：10,000 input steps、5,000 same-offset merged reports，逐个绝对
+  target 验证无丢失、乱序、早发和漂移，并在 close 后验证三个 registry 为零；
+- `tests/support/tests/phase2a_latency.rs`：五段时间戳单调性与不丢样本的确定性 contract。
+
+当前完整 workspace 为 152 个非文档测试通过；Runtime Loom 模型 6/6；规范校验执行 5 schemas、1 behavior、
+3 controller fixtures、9 scenarios 和 61 个 exact Rust tests。最终提交前仍以实际完整门禁输出为准。
+
+## 软件路径延迟结果
+
+正式命令和方法见[测试策略](../architecture/testing-strategy.md#phase-2a-无硬件延迟证据)，结构化结果见
+[latency fixture](../../spec/fixtures/controller/phase2a-latency-result-v1.json)。环境为：
+
+- `DESKTOP-IQM6HN5`，Intel Core i7-11800H，16,964,685,824 bytes RAM，x86_64；
+- Microsoft Windows 11 Home China 25H2，build `10.0.26200.8875`；
+- `GamePP 电源方案`；Rust/Cargo 1.97.1，`x86_64-pc-windows-msvc`；
+- release build，1,000 warmup，10,000/10,000 eligible measured samples，1 ns measurement-only pacing，
+  non-blocking memory transport；未过滤 outlier，未永久 busy wait。
+
+| 单调时间段 | p50 | p95 | p99 | max |
+| --- | ---: | ---: | ---: | ---: |
+| admitted -> lane wake | 800 ns | 1,000 ns | 4,800 ns | 147,200 ns |
+| lane wake -> dispatch | 700 ns | 800 ns | 1,000 ns | 8,500 ns |
+| dispatch -> transport write entered | 200 ns | 300 ns | 400 ns | 6,000 ns |
+| write entered -> transport accepted | 100 ns | 100 ns | 100 ns | 3,000 ns |
+| admitted -> transport write entered | 1,600 ns | 1,900 ns | 5,800 ns | 148,500 ns |
+| admitted -> transport accepted | 1,700 ns | 2,000 ns | 5,900 ns | 148,600 ns |
+
+ADR-0008 的软件路径目标为主指标 p99 <= 1,000,000 ns、max <= 5,000,000 ns，本次结果通过。raw CSV
+为 10,001 行（含 header），SHA-256 为
+`8A7C803777E70D30F92898C23E3DF3821973C49D691DE4481E22066D45A0DCA6`。这些数值只代表本机进程内
+软件路径，不得外推为 UART、CH32、USB HID、Switch 总线、固件或游戏画面延迟。
+
 ## 有意保留的差异
 
 以下差异由本里程碑边界决定，不改变冻结架构：
 
 1. `Runtime::close` 当前 Rust 内部接口同步等待保存的 Closed/CloseFailed outcome。带 caller wait timeout 的
    版本化公共形态留给正式 C ABI 阶段；binding 最终 release 必须先显式 close 并检查真实 outcome。
-2. 本阶段只有 FakeControllerTransport。Windows serial discovery/open/cancellable I/O 是后续系统
-   leaf backend，不允许为 fake 测试引入硬件依赖。
-3. ACK 以通用内部 command primitive 验证 generation、timeout 和 close wake；Amiibo public API、
-   分包能力上限和物理设备数据留待相应产品/硬件里程碑。
+2. Windows system serial backend 已实现并在 Windows x64 编译/测试，但没有目标控制板；真实 VID/PID、
+   固件、115200/9600 能力和热拔插行为留给 O-01/Phase 2B。
+3. Amiibo public Rust API 和源码精确分包已实现；物理 slot 数、总长度和设备恢复行为留给 O-02/Phase 2B。
 4. Automation 只实现独占 lease 的 acquire/authorized write/release，不包含 ECS 编译器、evaluator
    或跨域运行逻辑。
-5. 没有正式 C ABI、C++ bridge、语言绑定或发布包；当前 Rust public items 仍是实现候选，不构成
+5. 软件延迟 harness 只覆盖进程内 memory transport；UART/CH32/USB/Switch 时序和连续节拍留给
+   O-04/Phase 2B。
+6. 没有正式 C ABI、C++ bridge、语言绑定或发布包；当前 Rust public items 仍是实现候选，不构成
    v1 ABI 承诺。

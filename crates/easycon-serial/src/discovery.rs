@@ -116,6 +116,7 @@ pub trait SerialDiscovery: Send + Sync + 'static {
 mod tests {
     use super::*;
 
+    // conformance: phase2a.serial.stable-identity
     #[test]
     fn stable_identity_is_independent_from_optional_labels_and_port_assignment() {
         let first = SerialPortDescriptor::new("USB\\VID_1234&PID_ABCD\\SERIAL", "COM3")

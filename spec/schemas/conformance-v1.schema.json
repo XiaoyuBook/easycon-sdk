@@ -7,7 +7,7 @@
   "required": ["schema_version", "milestone", "license", "scenarios"],
   "properties": {
     "schema_version": { "const": 1 },
-    "milestone": { "const": "runtime-controller-fake-v1" },
+    "milestone": { "const": "phase-2a-controller-serial-candidate-v1" },
     "license": { "const": "GPL-3.0-only" },
     "scenarios": {
       "type": "array",

@@ -13,6 +13,7 @@
     "hats",
     "sticks",
     "handshake",
+    "amiibo",
     "reports",
     "corrected_behaviors"
   ],
@@ -63,6 +64,73 @@
           "minItems": 1,
           "maxItems": 1,
           "items": { "type": "integer", "minimum": 0, "maximum": 255 }
+        }
+      }
+    },
+    "amiibo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["save", "select", "reset", "hardware_limits"],
+      "properties": {
+        "save": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["ready", "command", "chunk_size", "header_example", "ack", "ack_timeout_ms"],
+          "properties": {
+            "ready": { "const": 165 },
+            "command": { "const": 144 },
+            "chunk_size": { "const": 20 },
+            "header_example": {
+              "type": "array",
+              "minItems": 7,
+              "maxItems": 7,
+              "items": { "type": "integer", "minimum": 0, "maximum": 255 }
+            },
+            "ack": { "const": 255 },
+            "ack_timeout_ms": { "const": 1000 }
+          }
+        },
+        "select": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["ready", "command", "request_example", "ack", "ack_timeout_ms"],
+          "properties": {
+            "ready": { "const": 165 },
+            "command": { "const": 145 },
+            "request_example": {
+              "type": "array",
+              "minItems": 3,
+              "maxItems": 3,
+              "items": { "type": "integer", "minimum": 0, "maximum": 255 }
+            },
+            "ack": { "const": 255 },
+            "ack_timeout_ms": { "const": 200 }
+          }
+        },
+        "reset": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["request", "reply", "timeout_ms"],
+          "properties": {
+            "request": {
+              "type": "array",
+              "minItems": 6,
+              "maxItems": 6,
+              "items": { "type": "integer", "minimum": 0, "maximum": 255 }
+            },
+            "reply": { "const": 128 },
+            "timeout_ms": { "const": 50 }
+          }
+        },
+        "hardware_limits": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["slot_count", "maximum_data_len", "verified"],
+          "properties": {
+            "slot_count": { "type": "null" },
+            "maximum_data_len": { "type": "null" },
+            "verified": { "const": false }
+          }
         }
       }
     },

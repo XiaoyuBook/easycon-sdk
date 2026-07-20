@@ -8,6 +8,7 @@
     "schema_version",
     "milestone",
     "license",
+    "phase2a",
     "operations",
     "runtime",
     "events",
@@ -16,8 +17,25 @@
   ],
   "properties": {
     "schema_version": { "const": 1 },
-    "milestone": { "const": "runtime-controller-fake-v1" },
+    "milestone": { "const": "phase-2a-controller-serial-candidate-v1" },
     "license": { "const": "GPL-3.0-only" },
+    "phase2a": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "hardware_verified", "open_risks", "excluded_scope"],
+      "properties": {
+        "status": { "const": "Hardware Unverified" },
+        "hardware_verified": { "const": false },
+        "open_risks": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "uniqueItems": true,
+          "items": { "enum": ["O-01", "O-02", "O-04"] }
+        },
+        "excluded_scope": { "type": "string" }
+      }
+    },
     "operations": {
       "type": "object",
       "additionalProperties": false,
@@ -115,6 +133,9 @@
         "write_timeout_ns",
         "direct_success_boundary",
         "hardware_execution_claimed",
+        "serial",
+        "amiibo",
+        "timing",
         "sequence",
         "automation_lease"
       ],
@@ -125,17 +146,110 @@
         "write_timeout_ns": { "type": "integer", "minimum": 1 },
         "direct_success_boundary": { "type": "string" },
         "hardware_execution_claimed": { "type": "boolean" },
+        "serial": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "platform",
+            "system_leaf",
+            "identity",
+            "optional_properties",
+            "io",
+            "close",
+            "dependency_direction"
+          ],
+          "properties": {
+            "platform": { "const": "Windows 10/11 x64" },
+            "system_leaf": { "const": true },
+            "identity": { "type": "string" },
+            "optional_properties": { "type": "string" },
+            "io": { "type": "string" },
+            "close": { "type": "string" },
+            "dependency_direction": { "type": "string" }
+          }
+        },
+        "amiibo": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "chunk_size",
+            "save_command",
+            "select_command",
+            "ack",
+            "generation_matched",
+            "retry",
+            "limits",
+            "cleanup"
+          ],
+          "properties": {
+            "chunk_size": { "const": 20 },
+            "save_command": { "const": 144 },
+            "select_command": { "const": 145 },
+            "ack": { "const": 255 },
+            "generation_matched": { "const": true },
+            "retry": { "type": "string" },
+            "limits": { "type": "string" },
+            "cleanup": { "type": "string" }
+          }
+        },
+        "timing": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "stages",
+            "eligible_direct_samples",
+            "target_p99_ns",
+            "target_max_ns",
+            "software_path_only",
+            "outlier_filtering",
+            "permanent_busy_wait"
+          ],
+          "properties": {
+            "stages": {
+              "type": "array",
+              "minItems": 5,
+              "maxItems": 5,
+              "uniqueItems": true,
+              "items": {
+                "enum": [
+                  "command_admitted",
+                  "lane_wake",
+                  "lane_dispatch",
+                  "transport_write_entered",
+                  "transport_accepted"
+                ]
+              }
+            },
+            "eligible_direct_samples": { "const": 10000 },
+            "target_p99_ns": { "const": 1000000 },
+            "target_max_ns": { "const": 5000000 },
+            "software_path_only": { "const": true },
+            "outlier_filtering": { "const": false },
+            "permanent_busy_wait": { "const": false }
+          }
+        },
         "sequence": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["origin", "offsets", "same_offset", "early_dispatch", "drift", "cancel_or_failure"],
+          "required": [
+            "origin",
+            "offsets",
+            "same_offset",
+            "early_dispatch",
+            "drift",
+            "cancel_or_failure",
+            "maximum_steps",
+            "phase2a_acceptance"
+          ],
           "properties": {
             "origin": { "type": "string" },
             "offsets": { "type": "string" },
             "same_offset": { "type": "string" },
             "early_dispatch": { "type": "boolean" },
             "drift": { "type": "string" },
-            "cancel_or_failure": { "type": "string" }
+            "cancel_or_failure": { "type": "string" },
+            "maximum_steps": { "const": 10000 },
+            "phase2a_acceptance": { "type": "string" }
           }
         },
         "automation_lease": { "type": "string" }

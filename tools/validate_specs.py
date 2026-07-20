@@ -181,6 +181,7 @@ def validate_schemas():
         ("schemas/controller-fixture-v1.schema.json", "fixtures/controller/reports-v1.json"),
         ("schemas/conformance-v1.schema.json", "conformance/runtime-controller-v1.json"),
         ("schemas/sequence-trace-v1.schema.json", "fixtures/controller/sequence-traces-v1.json"),
+        ("schemas/latency-result-v1.schema.json", "fixtures/controller/phase2a-latency-result-v1.json"),
     ]
     for schema_name, instance_name in mappings:
         schema = load_json(schema_name)
@@ -226,6 +227,20 @@ def validate_behavior():
     expected_states = ["Pending", "Running", "Cancelling", "Succeeded", "Failed", "Cancelled"]
     require(behavior.get("schema_version") == 1, "behavior schema_version must be 1")
     require(behavior.get("license") == "GPL-3.0-only", "behavior license must remain GPL-3.0-only")
+    require(
+        behavior.get("milestone") == "phase-2a-controller-serial-candidate-v1",
+        "behavior milestone must identify the Phase 2A candidate",
+    )
+    require(
+        behavior["phase2a"]
+        == {
+            "status": "Hardware Unverified",
+            "hardware_verified": False,
+            "open_risks": ["O-01", "O-02", "O-04"],
+            "excluded_scope": behavior["phase2a"]["excluded_scope"],
+        },
+        "Phase 2A status or open hardware risks changed",
+    )
     require(behavior["operations"]["states"] == expected_states, "operation states changed")
     require(
         behavior["operations"]["terminal_states"] == ["Succeeded", "Failed", "Cancelled"],
@@ -285,6 +300,51 @@ def validate_behavior():
         behavior["controller"]["write_timeout_ns"] == 1_000_000_000,
         "controller write timeout must remain 1 s",
     )
+    require(
+        behavior["controller"]["serial"]["system_leaf"] is True,
+        "serial must remain a system leaf",
+    )
+    amiibo = behavior["controller"]["amiibo"]
+    require(
+        {
+            "chunk_size": amiibo["chunk_size"],
+            "save_command": amiibo["save_command"],
+            "select_command": amiibo["select_command"],
+            "ack": amiibo["ack"],
+            "generation_matched": amiibo["generation_matched"],
+        }
+        == {
+            "chunk_size": 20,
+            "save_command": 0x90,
+            "select_command": 0x91,
+            "ack": 0xFF,
+            "generation_matched": True,
+        },
+        "Amiibo source-exact values or matcher contract changed",
+    )
+    require(
+        behavior["controller"]["timing"]["stages"]
+        == [
+            "command_admitted",
+            "lane_wake",
+            "lane_dispatch",
+            "transport_write_entered",
+            "transport_accepted",
+        ],
+        "Controller timing stages changed",
+    )
+    require(
+        behavior["controller"]["timing"]["eligible_direct_samples"] == 10_000
+        and behavior["controller"]["timing"]["target_p99_ns"] == 1_000_000
+        and behavior["controller"]["timing"]["target_max_ns"] == 5_000_000
+        and behavior["controller"]["timing"]["outlier_filtering"] is False
+        and behavior["controller"]["timing"]["permanent_busy_wait"] is False,
+        "Phase 2A latency acceptance changed",
+    )
+    require(
+        behavior["controller"]["sequence"]["maximum_steps"] == 10_000,
+        "Controller sequence step ceiling changed",
+    )
     classes = {item["classification"] for item in behavior["classifications"]}
     require(classes == {"source-exact", "corrected"}, "behavior classifications are incomplete")
 
@@ -326,6 +386,37 @@ def validate_controller_fixture():
     require(fixture["handshake"]["auto_baud_order"] == [115200, 9600], "baud fallback order changed")
     require(fixture["handshake"]["request"] == [165, 165, 129], "handshake request changed")
     require(fixture["handshake"]["success_reply"] == [128], "handshake reply changed")
+    require(
+        fixture["amiibo"]
+        == {
+            "save": {
+                "ready": 0xA5,
+                "command": 0x90,
+                "chunk_size": 20,
+                "header_example": [0xA5, 12, 1, 7, 0, 3, 0x90],
+                "ack": 0xFF,
+                "ack_timeout_ms": 1000,
+            },
+            "select": {
+                "ready": 0xA5,
+                "command": 0x91,
+                "request_example": [0xA5, 3, 0x91],
+                "ack": 0xFF,
+                "ack_timeout_ms": 200,
+            },
+            "reset": {
+                "request": [0xA5, 0x81, 0xA5, 0x81, 0xA5, 0x81],
+                "reply": 0x80,
+                "timeout_ms": 50,
+            },
+            "hardware_limits": {
+                "slot_count": None,
+                "maximum_data_len": None,
+                "verified": False,
+            },
+        },
+        "source-exact Amiibo fixture changed",
+    )
     names = set()
     for report in fixture["reports"]:
         require(report["name"] not in names, "duplicate report name: {}".format(report["name"]))
@@ -361,6 +452,34 @@ def validate_traces():
     cancel = next(item for item in trace_file["traces"] if item["id"] == "cancel-before-future-step-neutralizes")
     require(cancel["operation_states"][-2:] == ["Cancelling", "Cancelled"], "cancel trace commits too early")
     require(cancel["expected_reports"][-1].get("purpose") == "neutralize", "cancel trace lacks neutralization")
+
+
+def validate_latency_result():
+    result = load_json("fixtures/controller/phase2a-latency-result-v1.json")
+    require(result["status"] == "Hardware Unverified", "latency result lost Hardware Unverified status")
+    harness = result["harness"]
+    require(harness["eligible_samples"] >= 10_000, "latency sample population is too small")
+    require(
+        harness["raw_csv_rows"] == harness["eligible_samples"] + 1,
+        "latency CSV row count must include one header and every eligible sample",
+    )
+    require(
+        re.fullmatch(r"[0-9A-F]{64}", harness["raw_csv_sha256"]) is not None,
+        "latency CSV SHA-256 is malformed",
+    )
+    for name, metric in result["metrics"].items():
+        require(
+            metric["p50"] <= metric["p95"] <= metric["p99"] <= metric["max"],
+            "{} percentiles are not monotonic".format(name),
+        )
+    target = result["target"]
+    measured = result["metrics"][target["metric"]]
+    computed_pass = measured["p99"] <= target["p99_ns"] and measured["max"] <= target["max_ns"]
+    require(target["passed"] is computed_pass, "latency pass result does not match measured values")
+    require(
+        "not UART" in result["scope"] and "Switch" in result["scope"],
+        "latency result must retain its software-only scope",
+    )
 
 
 CONFORMANCE_MARKER = re.compile(
@@ -678,6 +797,9 @@ def validate_conformance_document(conformance, markers):
         "timeout-separation",
         "transport-faults",
         "event-overflow",
+        "phase2a-serial",
+        "phase2a-amiibo",
+        "phase2a-acceptance",
     ]
     require(scenario_ids == required, "conformance scenarios changed or were reordered")
     require(len(scenario_ids) == len(set(scenario_ids)), "duplicate conformance scenario ID")
@@ -805,10 +927,11 @@ def main():
     validate_behavior()
     validate_controller_fixture()
     validate_traces()
+    validate_latency_result()
     test_count = validate_conformance()
     print(
-        "validated 4 schemas, 1 behavior spec, 2 controller fixtures, "
-        "6 conformance scenarios, and {} exact Rust tests".format(test_count)
+        "validated 5 schemas, 1 behavior spec, 3 controller fixtures, "
+        "9 conformance scenarios, and {} exact Rust tests".format(test_count)
     )
     return 0
 

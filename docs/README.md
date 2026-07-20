@@ -47,13 +47,14 @@
 ## 当前实施状态
 
 Phase 1 Runtime 已按 [ADR-0007](decisions/0007-phase-1-freeze.md) 冻结在可执行基线 `4261925`。
-仓库还实现了 Controller fake vertical slice，覆盖源码精确 report、单写者调度、精确序列、底层
-Automation lease 与 generation-aware ACK；这只是 Phase 2 的提前 slice，不代表正式 C ABI、系统串口
-backend、Amiibo 或物理硬件支持已经完成。实现说明和本地验收命令见
-[Runtime + Controller fake vertical slice](development/runtime-controller-vertical-slice.md)。
-Phase 2 已按 [ADR-0008](decisions/0008-phase-2-controller-target.md) 拆为无硬件可完成的 Phase 2A
-Controller/Serial Candidate 和必须使用实物的 Phase 2B Hardware Qualification；当前冻结的是开发目标，
-不是 Phase 2 实现或硬件支持声明。
+仓库现已形成可独立 review 的 Phase 2A Controller/Serial Candidate：Windows x64 system serial leaf、
+可注入 byte I/O、CH32 模拟器、Amiibo save/select、10,000-step VirtualClock 验收和软件热路径 latency
+harness 均已实现。详细证据和本地命令见
+[Runtime + Controller Phase 2A Candidate](development/runtime-controller-vertical-slice.md)。
+
+该候选仍明确标记 `Hardware Unverified`。它没有验证任何具体控制板、固件、VID/PID、Amiibo 容量、
+UART/USB/Switch 时序或物理中立化；O-01、O-02、O-04 保持开放，完整 Phase 2 未完成。实现冻结仍需后续
+独立 review，当前没有创建完整 Phase 2 冻结 ADR。
 
 ## 首发基线
 
@@ -69,7 +70,7 @@ Controller/Serial Candidate 和必须使用实物的 Phase 2B Hardware Qualifica
 | 编号 | 事项 | 当前默认 | 最迟门槛 |
 | --- | --- | --- | --- |
 | O-01 | 首批受支持的控制板、固件版本和 USB/串口标识 | 以现有 115200/9600 握手协议实现，支持表为空 | Controller 硬件 Beta 前 |
-| O-02 | Amiibo 槽位数量与允许的数据长度 | ECS 暴露 0..9；底层按字节缓冲并依据已验证设备能力拒绝 | C ABI 冻结前 |
+| O-02 | Amiibo 槽位数量与允许的数据长度 | Controller 默认没有该 capability；只有调用方显式提供 Hardware Unverified limit 后才接纳 save/select | C ABI 冻结前 |
 | O-03 | 官方包内置的 OCR 语言数据 | 默认接口语言为 `chi_sim`，模型只有在来源和许可证核验后才随包发布 | 首个发布候选版前 |
 | O-04 | 物理硬件动作时序 SLO | 采用 ADR-0008 的分段暂定目标，以逻辑分析仪、firmware trace 和 Switch 可观察结果校准 | Controller 硬件 Beta 前 |
 | O-05 | v1.1 是否增加 Linux x64 或 macOS arm64 | 不承诺 | v1.0 发布后规划 |

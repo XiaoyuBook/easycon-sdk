@@ -8,7 +8,9 @@
       "EasyCon/src/EasyCon.Device/Utils/SwitchCommand.cs::SwitchButton",
       "EasyCon/src/EasyCon.Device/Utils/SwitchCommand.cs::SwitchHAT",
       "EasyCon/src/EasyCon.Device/Utils/SwitchReport.cs::GetBytes",
-      "EasyCon/src/EasyCon.Device/Connection/TTLSerialClient.cs::Loop"
+      "EasyCon/src/EasyCon.Device/Connection/TTLSerialClient.cs::Loop",
+      "EasyCon/src/EasyCon.Device/NintendoSwitchCmd.cs::SaveAmiibo/ChangeAmiiboIndex/ResetControl",
+      "EasyCon/src/EasyCon.Device/Utils/CommandCode.cs::EzDvCommand/Reply"
     ]
   },
   "buttons": {
@@ -43,6 +45,33 @@
     "auto_baud_order": [115200, 9600],
     "request": [165, 165, 129],
     "success_reply": [128]
+  },
+  "amiibo": {
+    "save": {
+      "ready": 165,
+      "command": 144,
+      "chunk_size": 20,
+      "header_example": [165, 12, 1, 7, 0, 3, 144],
+      "ack": 255,
+      "ack_timeout_ms": 1000
+    },
+    "select": {
+      "ready": 165,
+      "command": 145,
+      "request_example": [165, 3, 145],
+      "ack": 255,
+      "ack_timeout_ms": 200
+    },
+    "reset": {
+      "request": [165, 129, 165, 129, 165, 129],
+      "reply": 128,
+      "timeout_ms": 50
+    },
+    "hardware_limits": {
+      "slot_count": null,
+      "maximum_data_len": null,
+      "verified": false
+    }
   },
   "reports": [
     {

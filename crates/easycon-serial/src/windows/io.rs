@@ -507,6 +507,7 @@ mod tests {
     use super::*;
     use crate::ByteIoOperation;
 
+    // conformance: phase2a.serial.safe-open-path
     #[test]
     fn port_paths_are_canonical_and_do_not_open_arbitrary_devices() {
         assert_eq!(
@@ -551,6 +552,7 @@ mod tests {
         assert_eq!(error.os_code(), None);
     }
 
+    // conformance: phase2a.serial.win32-close-wake
     #[test]
     fn close_signal_is_idempotent_and_wakes_waiters() {
         let shared = SharedPort {

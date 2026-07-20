@@ -146,14 +146,42 @@ fn validation_error(message: &'static str) -> EasyConError {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
+    use serde_json::Value;
+
     use super::*;
 
+    // conformance: phase2a.amiibo.fixture-exact
     #[test]
     fn source_exact_save_select_and_reset_bytes_are_stable() {
-        assert_eq!(save_header(3, 0, 20), [0xa5, 0, 0, 20, 0, 3, 0x90]);
-        assert_eq!(save_header(3, 140, 7), [0xa5, 12, 1, 7, 0, 3, 0x90]);
-        assert_eq!(select_command(3), [0xa5, 3, 0x91]);
-        assert_eq!(reset_command(), [0xa5, 0x81, 0xa5, 0x81, 0xa5, 0x81]);
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../spec/fixtures/controller/reports-v1.json"
+        );
+        let document: Value =
+            serde_json::from_str(&fs::read_to_string(path).expect("fixture read"))
+                .expect("fixture JSON");
+        let amiibo = &document["amiibo"];
+        let save_header_fixture: [u8; 7] = json_bytes(&amiibo["save"]["header_example"])
+            .try_into()
+            .expect("seven-byte save header");
+        let select_fixture: [u8; 3] = json_bytes(&amiibo["select"]["request_example"])
+            .try_into()
+            .expect("three-byte select command");
+        let reset_fixture: [u8; 6] = json_bytes(&amiibo["reset"]["request"])
+            .try_into()
+            .expect("six-byte reset command");
+
+        assert_eq!(save_header(3, 140, 7), save_header_fixture);
+        assert_eq!(select_command(3), select_fixture);
+        assert_eq!(reset_command(), reset_fixture);
+        assert_eq!(amiibo["save"]["chunk_size"].as_u64(), Some(20));
+        assert_eq!(amiibo["save"]["ack"].as_u64(), Some(u64::from(AMIIBO_ACK)));
+        assert_eq!(
+            amiibo["reset"]["reply"].as_u64(),
+            Some(u64::from(AMIIBO_RESET_REPLY))
+        );
     }
 
     #[test]
@@ -164,5 +192,14 @@ mod tests {
         assert!(AmiiboLimits::new(257, 1).is_err());
         assert!(AmiiboLimits::new(1, 0).is_err());
         assert!(AmiiboLimits::new(1, AMIIBO_PROTOCOL_MAX_BYTES + 1).is_err());
+    }
+
+    fn json_bytes(value: &Value) -> Vec<u8> {
+        value
+            .as_array()
+            .expect("fixture byte array")
+            .iter()
+            .map(|byte| u8::try_from(byte.as_u64().expect("fixture byte")).expect("u8 byte"))
+            .collect()
     }
 }

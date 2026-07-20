@@ -105,6 +105,7 @@ fn easycon_model_id(value: u64) -> easycon_model::OperationId {
     easycon_model::OperationId::new(value)
 }
 
+// conformance: phase2a.serial.injectable-contract
 #[test]
 fn injectable_adapter_handles_partial_handshake_and_command_generation() {
     let clock = Arc::new(VirtualClock::new(10));
