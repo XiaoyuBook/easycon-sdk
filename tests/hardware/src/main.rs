@@ -566,11 +566,11 @@ fn discovery_qualification(result: &Value) -> QualificationDecision {
                         descriptor
                             .get("stable_id")
                             .and_then(Value::as_str)
-                            .is_some_and(|stable_id| !stable_id.is_empty())
+                            .is_some_and(|stable_id| !stable_id.trim().is_empty())
                             && descriptor
                                 .get("port")
                                 .and_then(Value::as_str)
-                                .is_some_and(|port| !port.is_empty())
+                                .is_some_and(|port| !port.trim().is_empty())
                     })
                 })
             })
@@ -1753,6 +1753,24 @@ mod tests {
                     [{"stable_id": "DEVICE\\EXPECTED", "port": ""}],
                     [{"stable_id": "DEVICE\\EXPECTED", "port": ""}],
                     [{"stable_id": "DEVICE\\EXPECTED", "port": ""}],
+                ],
+            }),
+            json!({
+                "samples": 3,
+                "stable_across_samples": true,
+                "snapshots": [
+                    [{"stable_id": "   ", "port": "COM8"}],
+                    [{"stable_id": "   ", "port": "COM8"}],
+                    [{"stable_id": "   ", "port": "COM8"}],
+                ],
+            }),
+            json!({
+                "samples": 3,
+                "stable_across_samples": true,
+                "snapshots": [
+                    [{"stable_id": "DEVICE\\EXPECTED", "port": "   "}],
+                    [{"stable_id": "DEVICE\\EXPECTED", "port": "   "}],
+                    [{"stable_id": "DEVICE\\EXPECTED", "port": "   "}],
                 ],
             }),
         ] {
