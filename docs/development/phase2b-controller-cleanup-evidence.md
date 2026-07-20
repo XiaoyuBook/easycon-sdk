@@ -80,10 +80,11 @@ cleanup 证据必须 fail closed。
 唯一顺序固定为：
 
 1. 保存 close 前 Controller snapshot 和当前中立写证据边界；
-2. 同步调用 `ControllerSession::close()`；
-3. 保存 close 后 snapshot，并固定本次 close 新增的中立写尝试；
-4. 调用 `Runtime::close()`，再读取最终 counts；
-5. 组合 Controller 与 Runtime 子证据，最后计算 outer cleanup 结果。
+2. 保存当前 `ControllerSession::id()`，作为所有 attempt 的 Runtime-local resource anchor；
+3. 同步调用 `ControllerSession::close()`；
+4. 保存 close 后 snapshot，并固定本次 close 新增的中立写尝试；
+5. 调用 `Runtime::close()`，再读取最终 counts；
+6. 组合 Controller 与 Runtime 子证据，最后计算 outer cleanup 结果。
 
 faults runner 的 consuming close 继续在同一步骤之后刷新 native open attempts 和 active operation 终态。
 cleanup failure 进入现有 role-specific close stage；若已有更早 execution failure，只追加到
@@ -122,6 +123,7 @@ close 前状态不是 `Connected` 时，中立化标记为 `not_required`，原�
   "controller": {
     "kind": "controller_cleanup",
     "succeeded": true,
+    "controller_resource_id": 17,
     "pre_close_state": "Connected",
     "post_close_state": "Closed",
     "post_close_desired_report_neutral": true,
@@ -129,6 +131,7 @@ close 前状态不是 `Connected` 时，中立化标记为 `not_required`，原�
     "neutralization": "accepted",
     "attempts": [
       {
+        "resource_id": 17,
         "sequence": 9,
         "operation_id": null,
         "total_bytes": 8,
@@ -157,6 +160,14 @@ close 前状态不是 `Connected` 时，中立化标记为 `not_required`，原�
 outer `succeeded` 只在两个子 validator 都通过时为 true。`cleanup_succeeded` 必须从 nested evidence
 重新计算并核对 outer 值，不能信任单独布尔值。缺字段、旧版扁平 `runtime_cleanup`、多余/缺失 attempt、
 错误 operation binding、partial prefix、observer contradiction、Runtime 非 `Closed` 或非零 counts 均失败。
+`controller_resource_id` 必须存在、非零，并与每个 attempt 的 `resource_id` 精确相等；只要求 attempts 彼此
+相同不足以证明它们属于当前 Harness。
+
+JSON validator 对本版本 projection 使用 exact branch schema。声明为 nullable 的 `structured_error`、
+`diagnostic` 等字段必须实际存在；缺失 key 不能利用 Serde 索引返回的隐式 `Null` 冒充显式 `null`。Runtime
+`Closed` 成功分支只允许显式 null diagnostic，不能同时出现 `report` 或 `rejection`；`Failed` 和 `Rejected`
+分支的互斥结构同理。outer、Controller、attempt、structured error、Runtime 和 counts 对象都拒绝缺失或
+分支矛盾字段。
 
 cleanup failure 仍产生 `execution_status = failed`、`qualification_status = failed` 和退出码 1。完整结构化
 attempt 与 Runtime report 保留在结果中；机器判据不解析诊断 message。
@@ -208,7 +219,8 @@ partial-then-failure 作为紧邻的第二个 case 覆盖 accepted prefix，不�
 5. post-close state、lease 或 desired snapshot 矛盾时 fail closed；
 6. Runtime `CloseOutcome::Failed` 与 Controller failure 同时保留；
 7. faults 四角色 success/failpoint projection 迁移后，cleanup slot 与 nested Runtime count 仍精确；
-8. malformed/legacy cleanup JSON、outer/inner succeeded 矛盾、attempt 数量或 operation ID 畸形均非零退出；
+8. malformed/legacy cleanup JSON、缺失 nullable key、互斥 Runtime 分支、outer/inner succeeded 矛盾、
+   attempt 数量、operation ID 或 foreign resource ID 畸形均非零退出；
 9. production Harness adapter 证明 active operation 被 cancel、最终 close neutral 被接受、lease 释放、Controller
    `Closed`、Runtime counts 归零；
 10. 测试只使用 synthetic transport，不枚举或打开当前机器串口。
