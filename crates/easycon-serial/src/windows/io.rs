@@ -593,6 +593,7 @@ mod tests {
         assert_eq!(duration_to_wait_ms(Duration::MAX), INFINITE - 1);
     }
 
+    // conformance: phase2a.serial.abort-causality
     #[test]
     fn explicit_interruption_overrides_only_a_native_aborted_completion() {
         let aborted = from_code("read", ERROR_OPERATION_ABORTED);
@@ -614,6 +615,7 @@ mod tests {
         );
     }
 
+    // conformance: phase2a.serial.unwind-settle
     #[test]
     fn unwind_cleanup_runs_before_the_original_panic_is_resumed() {
         let cleanup_ran = std::cell::Cell::new(false);

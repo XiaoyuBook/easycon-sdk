@@ -395,6 +395,8 @@
         "crates/easycon-serial/src/windows/discovery.rs::live_discovery_is_sorted_and_has_stable_identity",
         "crates/easycon-serial/src/windows/io.rs::port_paths_are_canonical_and_do_not_open_arbitrary_devices",
         "crates/easycon-serial/src/windows/io.rs::close_signal_is_idempotent_and_wakes_waiters",
+        "crates/easycon-serial/src/windows/io.rs::explicit_interruption_overrides_only_a_native_aborted_completion",
+        "crates/easycon-serial/src/windows/io.rs::unwind_cleanup_runs_before_the_original_panic_is_resumed",
         "crates/easycon-serial/tests/byte_io_contract.rs::injectable_adapter_handles_partial_handshake_and_command_generation",
         "tests/support/tests/serial_ch32.rs::serial_adapter_fallback_partial_report_and_close_are_byte_exact",
         "tests/support/tests/serial_ch32.rs::access_denied_and_port_busy_open_failures_are_bounded_and_leak_free",
@@ -435,6 +437,16 @@
           "id": "phase2a.serial.win32-close-wake",
           "expect": "the Win32 close signal is idempotent and wakes pending overlapped waits",
           "test": "crates/easycon-serial/src/windows/io.rs::close_signal_is_idempotent_and_wakes_waiters"
+        },
+        {
+          "id": "phase2a.serial.abort-causality",
+          "expect": "native operation-aborted defaults to disconnect, while an observed operation or resource interruption retains its causal cancellation or deadline",
+          "test": "crates/easycon-serial/src/windows/io.rs::explicit_interruption_overrides_only_a_native_aborted_completion"
+        },
+        {
+          "id": "phase2a.serial.unwind-settle",
+          "expect": "a Rust panic in the pending overlapped wait runs synchronous cleanup before the original panic resumes",
+          "test": "crates/easycon-serial/src/windows/io.rs::unwind_cleanup_runs_before_the_original_panic_is_resumed"
         },
         {
           "id": "phase2a.serial.injectable-contract",

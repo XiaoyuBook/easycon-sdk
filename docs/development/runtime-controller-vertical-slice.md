@@ -115,7 +115,7 @@ Phase 2A 专项测试还包括：
 - `tests/support/tests/phase2a_latency.rs`：五段时间戳单调性与不丢样本的确定性 contract。
 
 当前完整 workspace 为 154 个非文档测试通过；Runtime Loom 模型 6/6；规范校验执行 5 schemas、1 behavior、
-3 controller fixtures、9 scenarios 和 61 个 exact Rust tests。最终提交前仍以实际完整门禁输出为准。
+3 controller fixtures、9 scenarios 和 63 个 exact Rust tests。最终提交前仍以实际完整门禁输出为准。
 
 ## 软件路径延迟结果
 
