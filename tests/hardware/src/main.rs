@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use easycon_controller::{
     AckFrame, AckRequest, AmiiboLimits, AmiiboSaveOptions, AmiiboSelectOptions, ConnectOptions,
@@ -212,6 +212,7 @@ fn real_main() -> Result<(), String> {
         "discover" => run_discover(&arguments),
         "handshake" => run_handshake(&arguments),
         "smoke" => run_smoke(&arguments),
+        "home-wake" => run_home_wake(&arguments),
         "faults" => run_faults(&arguments),
         "hotplug" => run_hotplug(&arguments),
         "lifecycle" => run_lifecycle(&arguments),
@@ -395,6 +396,60 @@ fn run_smoke(arguments: &[String]) -> Result<Value, String> {
         "port": port_json(&harness.descriptor),
         "actual_baud": harness.actual_baud(),
         "actions": actions,
+        "final_snapshot": snapshot_json(&harness.controller),
+        "latency": latency_json(&harness.telemetry, harness.actual_baud()),
+        "switch_observation": "requires operator confirmation",
+    });
+    let counts = harness.close()?;
+    Ok(with_close_counts(result, counts))
+}
+
+fn run_home_wake(arguments: &[String]) -> Result<Value, String> {
+    let port: String = required_value(arguments, "--port")?;
+    let attempts = value_or(arguments, "--attempts", 20_usize)?;
+    let interval_seconds = value_or(arguments, "--interval-seconds", 3_u64)?;
+    validate_home_wake(attempts, interval_seconds)?;
+    let harness = Harness::new(&port, ControllerOptions::default())?;
+    harness.connect(ConnectOptions::default())?;
+    let started = Instant::now();
+    let mut records = Vec::with_capacity(attempts);
+    for attempt in 0..attempts {
+        let target = Duration::from_secs(
+            u64::try_from(attempt)
+                .expect("bounded attempt index fits u64")
+                .saturating_mul(interval_seconds),
+        );
+        if let Some(remaining) = target.checked_sub(started.elapsed()) {
+            thread::sleep(remaining);
+        }
+        let attempt_started_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let mut actions = Vec::with_capacity(3);
+        exercise_action(
+            &harness,
+            "button.Home.down",
+            ControllerAction::ButtonDown(Button::Home),
+            &mut actions,
+        )?;
+        exercise_action(
+            &harness,
+            "button.Home.up",
+            ControllerAction::ButtonUp(Button::Home),
+            &mut actions,
+        )?;
+        exercise_action(&harness, "neutral", ControllerAction::Reset, &mut actions)?;
+        records.push(json!({
+            "attempt": attempt + 1,
+            "started_after_ms": attempt_started_ms,
+            "actions": actions,
+        }));
+    }
+    let result = json!({
+        "command": "home-wake",
+        "attempts": attempts,
+        "interval_seconds": interval_seconds,
+        "actual_baud": harness.actual_baud(),
+        "port": port_json(&harness.descriptor),
+        "records": records,
         "final_snapshot": snapshot_json(&harness.controller),
         "latency": latency_json(&harness.telemetry, harness.actual_baud()),
         "switch_observation": "requires operator confirmation",
@@ -704,6 +759,16 @@ fn left_stick_wake_actions() -> [(&'static str, ControllerAction); 4] {
     ]
 }
 
+fn validate_home_wake(attempts: usize, interval_seconds: u64) -> Result<(), String> {
+    if !(1..=100).contains(&attempts) {
+        return Err("--attempts must be in 1..=100".to_owned());
+    }
+    if !(1..=60).contains(&interval_seconds) {
+        return Err("--interval-seconds must be in 1..=60".to_owned());
+    }
+    Ok(())
+}
+
 fn find_port(port_name: &str) -> Result<SerialPortDescriptor, String> {
     discover_system_ports()
         .map_err(|error| error.to_string())?
@@ -954,6 +1019,7 @@ fn print_help() {
         "Usage:\n  easycon-hardware-qualification discover [--samples N]\n  \
          easycon-hardware-qualification handshake --port COMx\n  \
          easycon-hardware-qualification smoke --port COMx [--full] [--wake-left-stick] [--hold-ms N]\n  \
+         easycon-hardware-qualification home-wake --port COMx [--attempts 20] [--interval-seconds 3]\n  \
          easycon-hardware-qualification faults --port COMx\n  \
          easycon-hardware-qualification hotplug --port COMx [--timeout-seconds N]\n  \
          easycon-hardware-qualification lifecycle --port COMx [--cycles 100]\n  \
@@ -996,5 +1062,14 @@ mod tests {
                 ControllerAction::Reset,
             ]
         );
+    }
+
+    #[test]
+    fn home_wake_loop_is_bounded() {
+        assert!(validate_home_wake(20, 3).is_ok());
+        assert!(validate_home_wake(0, 3).is_err());
+        assert!(validate_home_wake(101, 3).is_err());
+        assert!(validate_home_wake(20, 0).is_err());
+        assert!(validate_home_wake(20, 61).is_err());
     }
 }
