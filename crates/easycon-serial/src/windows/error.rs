@@ -1,6 +1,7 @@
 use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_DEVICE_NOT_CONNECTED, ERROR_FILE_NOT_FOUND, ERROR_GEN_FAILURE,
-    ERROR_INVALID_HANDLE, ERROR_OPERATION_ABORTED, ERROR_PATH_NOT_FOUND, ERROR_SEM_TIMEOUT,
+    ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE, ERROR_DEV_NOT_EXIST, ERROR_DEVICE_NOT_CONNECTED,
+    ERROR_DEVICE_REMOVED, ERROR_FILE_NOT_FOUND, ERROR_GEN_FAILURE, ERROR_INVALID_HANDLE,
+    ERROR_NO_SUCH_DEVICE, ERROR_OPERATION_ABORTED, ERROR_PATH_NOT_FOUND, ERROR_SEM_TIMEOUT,
     ERROR_SHARING_VIOLATION,
 };
 
@@ -18,9 +19,13 @@ pub(super) fn from_code(operation: &'static str, code: u32) -> SerialError {
         ERROR_ACCESS_DENIED => SerialErrorKind::AccessDenied,
         ERROR_SHARING_VIOLATION => SerialErrorKind::PortBusy,
         ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => SerialErrorKind::NotFound,
-        ERROR_DEVICE_NOT_CONNECTED
+        ERROR_BROKEN_PIPE
+        | ERROR_DEVICE_NOT_CONNECTED
+        | ERROR_DEVICE_REMOVED
+        | ERROR_DEV_NOT_EXIST
         | ERROR_GEN_FAILURE
         | ERROR_INVALID_HANDLE
+        | ERROR_NO_SUCH_DEVICE
         | ERROR_OPERATION_ABORTED => SerialErrorKind::Disconnected,
         ERROR_SEM_TIMEOUT => SerialErrorKind::DeadlineExceeded,
         _ => SerialErrorKind::Io,
@@ -50,5 +55,17 @@ mod tests {
             from_code("read", ERROR_OPERATION_ABORTED).kind(),
             SerialErrorKind::Disconnected
         );
+        for code in [
+            windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE,
+            windows_sys::Win32::Foundation::ERROR_DEVICE_REMOVED,
+            windows_sys::Win32::Foundation::ERROR_DEV_NOT_EXIST,
+            windows_sys::Win32::Foundation::ERROR_NO_SUCH_DEVICE,
+        ] {
+            assert_eq!(
+                from_code("read", code).kind(),
+                SerialErrorKind::Disconnected,
+                "native removal code {code}"
+            );
+        }
     }
 }
