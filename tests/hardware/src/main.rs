@@ -130,6 +130,7 @@ struct Harness {
 struct ArtifactReservation {
     output: PathBuf,
     marker: PathBuf,
+    temporary: PathBuf,
 }
 
 impl ArtifactReservation {
@@ -143,7 +144,9 @@ impl ArtifactReservation {
         }
 
         let output = artifact_dir.join(format!("{command}.json"));
+        let temporary = output.with_extension("json.tmp");
         ensure_artifact_absent(&output)?;
+        ensure_artifact_absent(&temporary)?;
         if command == "sequence" {
             ensure_artifact_absent(&artifact_dir.join("sequence-timings.csv"))?;
         }
@@ -165,38 +168,44 @@ impl ArtifactReservation {
         file.flush().map_err(|error| error.to_string())?;
         file.sync_all().map_err(|error| error.to_string())?;
 
-        Ok(Self { output, marker })
+        Ok(Self {
+            output,
+            marker,
+            temporary,
+        })
     }
 
     fn commit(self, document: &Value) -> Result<PathBuf, String> {
-        let temporary = self.output.with_extension("json.tmp");
-        let result = (|| {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary)
-                .map_err(|error| format!("cannot create {}: {error}", temporary.display()))?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&self.temporary)
+            .map_err(|error| format!("cannot create {}: {error}", self.temporary.display()))?;
+        let write_result = (|| {
             file.write_all(
                 &serde_json::to_vec_pretty(document).map_err(|error| error.to_string())?,
             )
             .map_err(|error| error.to_string())?;
             file.flush().map_err(|error| error.to_string())?;
-            file.sync_all().map_err(|error| error.to_string())?;
-            fs::rename(&temporary, &self.output).map_err(|error| {
-                format!(
-                    "cannot finalize {} as {}: {error}",
-                    temporary.display(),
-                    self.output.display()
-                )
-            })?;
-            fs::remove_file(&self.marker)
-                .map_err(|error| format!("cannot remove {}: {error}", self.marker.display()))?;
-            Ok(self.output)
+            file.sync_all().map_err(|error| error.to_string())
         })();
-        if result.is_err() {
-            let _ = fs::remove_file(temporary);
+        drop(file);
+        if let Err(error) = write_result {
+            let _ = fs::remove_file(&self.temporary);
+            return Err(error);
         }
-        result
+
+        if let Err(error) = fs::rename(&self.temporary, &self.output) {
+            let _ = fs::remove_file(&self.temporary);
+            return Err(format!(
+                "cannot finalize {} as {}: {error}",
+                self.temporary.display(),
+                self.output.display()
+            ));
+        }
+        fs::remove_file(&self.marker)
+            .map_err(|error| format!("cannot remove {}: {error}", self.marker.display()))?;
+        Ok(self.output)
     }
 }
 
@@ -1143,6 +1152,29 @@ fn print_help() {
 mod tests {
     use super::*;
 
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "easycon-hardware-main-{label}-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("system clock after epoch")
+                    .as_nanos()
+            ));
+            fs::create_dir(&path).expect("create unique test directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn failed_command_still_produces_an_artifact_document() {
         let (document, error) = finalize_result("handshake", Err("protocol timeout".to_owned()));
@@ -1222,5 +1254,35 @@ mod tests {
             sentinel
         );
         fs::remove_file(path).expect("remove timing test file");
+    }
+
+    #[test]
+    fn existing_temporary_result_is_rejected_before_reservation() {
+        let directory = TestDirectory::new("existing-temporary");
+        let temporary = directory.0.join("unknown.json.tmp");
+        let sentinel = b"unfinished evidence owned by another run\n";
+        fs::write(&temporary, sentinel).expect("seed existing temporary evidence");
+
+        let result = ArtifactReservation::begin("unknown", &directory.0);
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(temporary).expect("preserved temporary"), sentinel);
+        assert!(!directory.0.join(".unknown.in-progress.json").exists());
+    }
+
+    #[test]
+    fn commit_does_not_delete_a_temporary_file_it_did_not_create() {
+        let directory = TestDirectory::new("raced-temporary");
+        let reservation = ArtifactReservation::begin("unknown", &directory.0).expect("reserve run");
+        let temporary = directory.0.join("unknown.json.tmp");
+        let sentinel = b"raced evidence owned by another writer\n";
+        fs::write(&temporary, sentinel).expect("seed raced temporary evidence");
+
+        let result = reservation.commit(&json!({"status": "failed"}));
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(temporary).expect("preserved raced file"), sentinel);
+        assert!(directory.0.join(".unknown.in-progress.json").exists());
+        assert!(!directory.0.join("unknown.json").exists());
     }
 }
