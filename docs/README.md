@@ -35,6 +35,7 @@
 - [ADR-0007：冻结 Phase 1 Runtime 基线](decisions/0007-phase-1-freeze.md)
 - [ADR-0008：冻结 Phase 2 Controller/Serial 开发目标](decisions/0008-phase-2-controller-target.md)
 - [ADR-0009：冻结 Phase 2A Controller/Serial Candidate 基线](decisions/0009-phase-2a-freeze.md)
+- [ADR-0010：冻结 Phase 2B 硬件资格工具与证据目标](decisions/0010-phase-2b-qualification-evidence.md)
 
 ## v1 固定范围
 
@@ -53,9 +54,10 @@ system serial leaf、可注入 byte I/O、CH32 模拟器、Amiibo save/select、
 软件热路径 latency harness 均已实现。详细证据和本地命令见
 [Runtime + Controller Phase 2A Candidate](development/runtime-controller-vertical-slice.md)。
 
-该候选仍明确标记 `Hardware Unverified`。它没有验证任何具体控制板、固件、VID/PID、Amiibo 容量、
-UART/USB/Switch 时序或物理中立化；O-01、O-02、O-04 保持开放，完整 Phase 2 未完成，也没有创建完整
-Phase 2 冻结 ADR。
+Phase 2B 的首轮交接和资格工具审计已开始，工具修复目标见
+[ADR-0010](decisions/0010-phase-2b-qualification-evidence.md)。当前仍明确标记 `Hardware Unverified`：没有
+冻结任何具体板型/固件、Amiibo 容量、UART/USB/Switch 时序或完整物理中立化能力；O-01、O-02、O-04
+保持开放，完整 Phase 2 未完成，也没有创建完整 Phase 2 冻结 ADR。
 
 ## 首发基线
 
