@@ -131,16 +131,16 @@ Phase 2A 专项测试还包括：
 
 | 单调时间段 | p50 | p95 | p99 | max |
 | --- | ---: | ---: | ---: | ---: |
-| admitted -> lane wake | 800 ns | 1,000 ns | 4,800 ns | 147,200 ns |
-| lane wake -> dispatch | 700 ns | 800 ns | 1,000 ns | 8,500 ns |
-| dispatch -> transport write entered | 200 ns | 300 ns | 400 ns | 6,000 ns |
-| write entered -> transport accepted | 100 ns | 100 ns | 100 ns | 3,000 ns |
-| admitted -> transport write entered | 1,600 ns | 1,900 ns | 5,800 ns | 148,500 ns |
-| admitted -> transport accepted | 1,700 ns | 2,000 ns | 5,900 ns | 148,600 ns |
+| admitted -> lane wake | 700 ns | 2,000 ns | 13,000 ns | 91,800 ns |
+| lane wake -> dispatch | 700 ns | 1,000 ns | 1,600 ns | 99,200 ns |
+| dispatch -> transport write entered | 300 ns | 400 ns | 500 ns | 24,200 ns |
+| write entered -> transport accepted | 100 ns | 100 ns | 200 ns | 1,300 ns |
+| admitted -> transport write entered | 1,700 ns | 3,100 ns | 15,400 ns | 99,900 ns |
+| admitted -> transport accepted | 1,800 ns | 3,200 ns | 15,500 ns | 99,900 ns |
 
 ADR-0008 的软件路径目标为主指标 p99 <= 1,000,000 ns、max <= 5,000,000 ns，本次结果通过。raw CSV
 为 10,001 行（含 header），SHA-256 为
-`8A7C803777E70D30F92898C23E3DF3821973C49D691DE4481E22066D45A0DCA6`。这些数值只代表本机进程内
+`33F63849AC51D718118AD54388CA1D7C4D8607D2A05E86713D8A4676C6013F00`。这些数值只代表本机进程内
 软件路径，不得外推为 UART、CH32、USB HID、Switch 总线、固件或游戏画面延迟。
 
 ## 有意保留的差异

@@ -9,7 +9,7 @@
     "cpu": "11th Gen Intel(R) Core(TM) i7-11800H @ 2.30GHz",
     "ram_bytes": 16964685824,
     "architecture": "x86_64",
-    "os": "Microsoft Windows 11 Home China 25H2",
+    "os": "Microsoft Windows 11 家庭版 中文版 25H2",
     "windows_build": "10.0.26200.8875",
     "power_plan": "GamePP 电源方案",
     "rustc": "1.97.1 (8bab26f4f 2026-07-14)",
@@ -20,19 +20,19 @@
     "warmup_samples": 1000,
     "eligible_samples": 10000,
     "minimum_report_interval_ns": 1,
-    "measurement_elapsed_ms": 60,
+    "measurement_elapsed_ms": 76,
     "outlier_filtering": false,
     "permanent_busy_wait": false,
     "raw_csv_rows": 10001,
-    "raw_csv_sha256": "8A7C803777E70D30F92898C23E3DF3821973C49D691DE4481E22066D45A0DCA6"
+    "raw_csv_sha256": "33F63849AC51D718118AD54388CA1D7C4D8607D2A05E86713D8A4676C6013F00"
   },
   "metrics": {
-    "command_admitted_to_lane_wake_ns": { "p50": 800, "p95": 1000, "p99": 4800, "max": 147200 },
-    "lane_wake_to_dispatch_ns": { "p50": 700, "p95": 800, "p99": 1000, "max": 8500 },
-    "dispatch_to_transport_write_entered_ns": { "p50": 200, "p95": 300, "p99": 400, "max": 6000 },
-    "transport_write_entered_to_acceptance_ns": { "p50": 100, "p95": 100, "p99": 100, "max": 3000 },
-    "command_admitted_to_transport_write_entered_ns": { "p50": 1600, "p95": 1900, "p99": 5800, "max": 148500 },
-    "command_admitted_to_transport_acceptance_ns": { "p50": 1700, "p95": 2000, "p99": 5900, "max": 148600 }
+    "command_admitted_to_lane_wake_ns": { "p50": 700, "p95": 2000, "p99": 13000, "max": 91800 },
+    "lane_wake_to_dispatch_ns": { "p50": 700, "p95": 1000, "p99": 1600, "max": 99200 },
+    "dispatch_to_transport_write_entered_ns": { "p50": 300, "p95": 400, "p99": 500, "max": 24200 },
+    "transport_write_entered_to_acceptance_ns": { "p50": 100, "p95": 100, "p99": 200, "max": 1300 },
+    "command_admitted_to_transport_write_entered_ns": { "p50": 1700, "p95": 3100, "p99": 15400, "max": 99900 },
+    "command_admitted_to_transport_acceptance_ns": { "p50": 1800, "p95": 3200, "p99": 15500, "max": 99900 }
   },
   "target": {
     "metric": "command_admitted_to_transport_write_entered_ns",
