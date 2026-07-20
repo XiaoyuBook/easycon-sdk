@@ -495,10 +495,14 @@ fn finalize_result(command: &str, execution: Result<Value, String>) -> (Value, O
 }
 
 fn execution_error(result: &Value) -> Option<String> {
-    let error = result.get("execution_error")?.as_object()?;
-    let stage = error.get("stage")?.as_str()?;
-    let message = error.get("message")?.as_str()?;
-    (!stage.is_empty() && !message.is_empty()).then(|| format!("{stage}: {message}"))
+    let raw = result.get("execution_error")?;
+    let parsed = raw.as_object().and_then(|error| {
+        let stage = error.get("stage")?.as_str()?;
+        let message = error.get("message")?.as_str()?;
+        (!stage.trim().is_empty() && !message.trim().is_empty())
+            .then(|| format!("{stage}: {message}"))
+    });
+    Some(parsed.unwrap_or_else(|| "malformed execution_error evidence".to_owned()))
 }
 
 fn qualification_decision(command: &str, result: &Value) -> QualificationDecision {
@@ -2233,6 +2237,35 @@ mod tests {
             Some("cancel_readiness: timed out waiting for first report")
         );
         assert_eq!(document_exit_code(&document), 1);
+    }
+
+    #[test]
+    fn malformed_execution_error_evidence_fails_closed() {
+        let malformed = [
+            Value::Null,
+            json!({}),
+            json!({"stage": "", "message": "failure"}),
+            json!({"stage": "cancel", "message": ""}),
+            json!({"stage": 7, "message": "failure"}),
+            json!("cancel failed"),
+        ];
+
+        for raw_error in malformed {
+            let mut result = valid_fault_projection_with_cleanup();
+            result["execution_error"] = raw_error.clone();
+
+            let (document, failure) = finalize_result("faults", Ok(result));
+
+            assert_eq!(document["execution_status"], "failed");
+            assert_eq!(document["qualification_status"], "failed");
+            assert_eq!(document["error"], "malformed execution_error evidence");
+            assert_eq!(document["result"]["execution_error"], raw_error);
+            assert_eq!(
+                failure.as_deref(),
+                Some("malformed execution_error evidence")
+            );
+            assert_eq!(document_exit_code(&document), 1);
+        }
     }
 
     #[test]
