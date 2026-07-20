@@ -430,6 +430,10 @@ fn run_home_wake(arguments: &[String]) -> Result<Value, String> {
             ControllerAction::ButtonDown(Button::Home),
             &mut actions,
         )?;
+        println!("{}", home_attempt_marker(attempt + 1));
+        std::io::stdout()
+            .flush()
+            .map_err(|error| error.to_string())?;
         exercise_action(
             &harness,
             "button.Home.up",
@@ -769,6 +773,10 @@ fn validate_home_wake(attempts: usize, interval_seconds: u64) -> Result<(), Stri
     Ok(())
 }
 
+fn home_attempt_marker(attempt: usize) -> String {
+    attempt.to_string()
+}
+
 fn find_port(port_name: &str) -> Result<SerialPortDescriptor, String> {
     discover_system_ports()
         .map_err(|error| error.to_string())?
@@ -1071,5 +1079,11 @@ mod tests {
         assert!(validate_home_wake(101, 3).is_err());
         assert!(validate_home_wake(20, 0).is_err());
         assert!(validate_home_wake(20, 61).is_err());
+    }
+
+    #[test]
+    fn home_attempt_marker_is_the_one_based_number_only() {
+        assert_eq!(home_attempt_marker(1), "1");
+        assert_eq!(home_attempt_marker(20), "20");
     }
 }
