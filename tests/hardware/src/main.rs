@@ -291,11 +291,19 @@ fn run_handshake(arguments: &[String]) -> Result<Value, String> {
 fn run_smoke(arguments: &[String]) -> Result<Value, String> {
     let port: String = required_value(arguments, "--port")?;
     let full = arguments.iter().any(|argument| argument == "--full");
+    let wake_left_stick = arguments
+        .iter()
+        .any(|argument| argument == "--wake-left-stick");
     let hold_ms = value_or(arguments, "--hold-ms", 0_u64)?;
     validate_hold_ms(hold_ms)?;
     let harness = Harness::new(&port, ControllerOptions::default())?;
     harness.connect(ConnectOptions::default())?;
     let mut actions = Vec::new();
+    if wake_left_stick {
+        for (label, action) in left_stick_wake_actions() {
+            exercise_action(&harness, label, action, &mut actions)?;
+        }
+    }
     exercise_action(
         &harness,
         "button.A.down",
@@ -382,6 +390,7 @@ fn run_smoke(arguments: &[String]) -> Result<Value, String> {
     let result = json!({
         "command": "smoke",
         "stage": if full { "full" } else { "a_only" },
+        "wake_left_stick": wake_left_stick,
         "a_hold_ms": hold_ms,
         "port": port_json(&harness.descriptor),
         "actual_baud": harness.actual_baud(),
@@ -677,6 +686,24 @@ fn validate_hold_ms(hold_ms: u64) -> Result<(), String> {
     }
 }
 
+fn left_stick_wake_actions() -> [(&'static str, ControllerAction); 4] {
+    [
+        (
+            "wake.left_stick.right",
+            ControllerAction::LeftStick(StickPosition::new(255, 128)),
+        ),
+        (
+            "wake.left_stick.left",
+            ControllerAction::LeftStick(StickPosition::new(0, 128)),
+        ),
+        (
+            "wake.left_stick.center",
+            ControllerAction::LeftStick(StickPosition::CENTER),
+        ),
+        ("wake.neutral", ControllerAction::Reset),
+    ]
+}
+
 fn find_port(port_name: &str) -> Result<SerialPortDescriptor, String> {
     discover_system_ports()
         .map_err(|error| error.to_string())?
@@ -926,7 +953,7 @@ fn print_help() {
     println!(
         "Usage:\n  easycon-hardware-qualification discover [--samples N]\n  \
          easycon-hardware-qualification handshake --port COMx\n  \
-         easycon-hardware-qualification smoke --port COMx [--full] [--hold-ms N]\n  \
+         easycon-hardware-qualification smoke --port COMx [--full] [--wake-left-stick] [--hold-ms N]\n  \
          easycon-hardware-qualification faults --port COMx\n  \
          easycon-hardware-qualification hotplug --port COMx [--timeout-seconds N]\n  \
          easycon-hardware-qualification lifecycle --port COMx [--cycles 100]\n  \
@@ -955,5 +982,19 @@ mod tests {
         assert!(validate_hold_ms(0).is_ok());
         assert!(validate_hold_ms(5_000).is_ok());
         assert!(validate_hold_ms(5_001).is_err());
+    }
+
+    #[test]
+    fn left_stick_wake_returns_to_neutral_before_smoke() {
+        let actions = left_stick_wake_actions();
+        assert_eq!(
+            actions.map(|(_, action)| action),
+            [
+                ControllerAction::LeftStick(StickPosition::new(255, 128)),
+                ControllerAction::LeftStick(StickPosition::new(0, 128)),
+                ControllerAction::LeftStick(StickPosition::CENTER),
+                ControllerAction::Reset,
+            ]
+        );
     }
 }
