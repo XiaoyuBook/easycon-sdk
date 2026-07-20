@@ -290,6 +290,9 @@ fn decode_first_wide_string(bytes: &[u8]) -> Option<String> {
 }
 
 fn decode_wide_strings(bytes: &[u8]) -> Vec<String> {
+    if !bytes.len().is_multiple_of(2) {
+        return Vec::new();
+    }
     let units: Vec<_> = bytes
         .chunks_exact(2)
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
@@ -297,8 +300,9 @@ fn decode_wide_strings(bytes: &[u8]) -> Vec<String> {
     units
         .split(|unit| *unit == 0)
         .filter(|value| !value.is_empty())
-        .map(String::from_utf16_lossy)
-        .collect()
+        .map(|value| String::from_utf16(value).ok())
+        .collect::<Option<Vec<_>>>()
+        .unwrap_or_default()
 }
 
 fn decode_wide(units: &[u16]) -> Option<String> {
@@ -306,7 +310,9 @@ fn decode_wide(units: &[u16]) -> Option<String> {
         .iter()
         .position(|unit| *unit == 0)
         .unwrap_or(units.len());
-    (end != 0).then(|| String::from_utf16_lossy(&units[..end]))
+    (end != 0)
+        .then(|| String::from_utf16(&units[..end]).ok())
+        .flatten()
 }
 
 fn wide_nul(value: &str) -> Vec<u16> {
@@ -341,15 +347,11 @@ fn parse_usb_identifiers(value: &str) -> Option<UsbIdentifiers> {
 }
 
 fn parse_hex_component(value: &str, marker: &str) -> Option<u16> {
-    let start = value.find(marker)?.checked_add(marker.len())?;
-    let end = start.checked_add(4)?;
-    let digits = value.get(start..end)?;
-    if value.as_bytes().get(end).is_some_and(u8::is_ascii_hexdigit) {
-        return None;
-    }
-    (digits.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .then(|| u16::from_str_radix(digits, 16).ok())
-        .flatten()
+    value
+        .split(['\\', '&', '+'])
+        .find_map(|component| component.strip_prefix(marker))
+        .filter(|digits| digits.len() == 4 && digits.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .and_then(|digits| u16::from_str_radix(digits, 16).ok())
 }
 
 #[cfg(test)]
@@ -370,6 +372,15 @@ mod tests {
         assert_eq!(parse_usb_identifiers("COM3"), None);
         assert_eq!(parse_usb_identifiers("USB\\VID_ZZZZ&PID_7523"), None);
         assert_eq!(parse_usb_identifiers("USB\\VID_12345&PID_7523"), None);
+        assert_eq!(parse_usb_identifiers("USB\\XVID_1234&PID_5678"), None);
+        assert_eq!(parse_usb_identifiers("USB\\VID_1234&XPID_5678"), None);
+        assert_eq!(parse_usb_identifiers("ROOT\\NOTVID_1234&NOTPID_5678"), None);
+    }
+
+    #[test]
+    fn malformed_utf16_properties_are_not_exposed_as_system_values() {
+        assert!(decode_wide_strings(&[b'U', 0, b'S']).is_empty());
+        assert!(decode_wide_strings(&[0x00, 0xd8]).is_empty());
     }
 
     #[test]
