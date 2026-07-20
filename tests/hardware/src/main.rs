@@ -1017,9 +1017,7 @@ fn partial_fault_stage_contract(stage: &str) -> Option<(&'static str, usize)> {
         | "occupied_probe_create" => Some(("port_occupied", 1)),
         "occupied_probe_connect_admit"
         | "occupied_probe_connect_wait"
-        | "occupied_probe_connect_terminal"
-        | "occupied_probe_close"
-        | "occupier_close" => Some(("port_occupied", 2)),
+        | "occupied_probe_connect_terminal" => Some(("port_occupied", 2)),
         "cancel_create" => Some(("cancel", 2)),
         "cancel_connect_admit"
         | "cancel_connect_wait"
@@ -1028,13 +1026,11 @@ fn partial_fault_stage_contract(stage: &str) -> Option<(&'static str, usize)> {
         | "cancel_sequence_admit"
         | "cancel_readiness"
         | "cancel_request"
-        | "cancel_terminal_wait"
-        | "cancel_close" => Some(("cancel", 3)),
+        | "cancel_terminal_wait" => Some(("cancel", 3)),
         "deadline_create" => Some(("deadline", 3)),
-        "deadline_connect_admit"
-        | "deadline_terminal_wait"
-        | "deadline_connect_terminal"
-        | "deadline_close" => Some(("deadline", 4)),
+        "deadline_connect_admit" | "deadline_terminal_wait" | "deadline_connect_terminal" => {
+            Some(("deadline", 4))
+        }
         _ => None,
     }
 }
@@ -3045,6 +3041,37 @@ mod tests {
         let mut unknown_stage = partial.clone();
         unknown_stage["execution_error"]["stage"] = json!("future_fault_stage");
         invalid.push(unknown_stage);
+
+        for close_stage in ["occupied_probe_close", "occupier_close"] {
+            let mut contradictory_close = partial.clone();
+            contradictory_close["execution_error"]["stage"] = json!(close_stage);
+            contradictory_close["resources"]["occupied_probe"]["created"] = json!(true);
+            contradictory_close["occupied_probe_cleanup"] = successful_cleanup();
+            invalid.push(contradictory_close);
+        }
+
+        let mut contradictory_cancel_close = partial.clone();
+        contradictory_cancel_close["execution_error"]["stage"] = json!("cancel_close");
+        contradictory_cancel_close["scenarios"]["port_occupied"]["status"] = json!("completed");
+        contradictory_cancel_close["scenarios"]["cancel"]["status"] = json!("failed");
+        contradictory_cancel_close["resources"]["occupied_probe"]["created"] = json!(true);
+        contradictory_cancel_close["resources"]["cancel"]["created"] = json!(true);
+        contradictory_cancel_close["occupied_probe_cleanup"] = successful_cleanup();
+        contradictory_cancel_close["cancel_cleanup"] = successful_cleanup();
+        invalid.push(contradictory_cancel_close);
+
+        let mut contradictory_deadline_close = partial.clone();
+        contradictory_deadline_close["execution_error"]["stage"] = json!("deadline_close");
+        contradictory_deadline_close["scenarios"]["port_occupied"]["status"] = json!("completed");
+        contradictory_deadline_close["scenarios"]["cancel"]["status"] = json!("completed");
+        contradictory_deadline_close["scenarios"]["deadline"]["status"] = json!("failed");
+        contradictory_deadline_close["resources"]["occupied_probe"]["created"] = json!(true);
+        contradictory_deadline_close["resources"]["cancel"]["created"] = json!(true);
+        contradictory_deadline_close["resources"]["deadline"]["created"] = json!(true);
+        contradictory_deadline_close["occupied_probe_cleanup"] = successful_cleanup();
+        contradictory_deadline_close["cancel_cleanup"] = successful_cleanup();
+        contradictory_deadline_close["deadline_cleanup"] = successful_cleanup();
+        invalid.push(contradictory_deadline_close);
 
         let mut missing_scenario = partial.clone();
         missing_scenario["scenarios"]
