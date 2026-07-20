@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::env;
-use std::fs::{self, File};
+use std::fs::{self, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -127,6 +127,90 @@ struct Harness {
     descriptor: SerialPortDescriptor,
 }
 
+struct ArtifactReservation {
+    output: PathBuf,
+    marker: PathBuf,
+}
+
+impl ArtifactReservation {
+    fn begin(command: &str, artifact_dir: &Path) -> Result<Self, String> {
+        if command.is_empty()
+            || !command
+                .bytes()
+                .all(|value| value.is_ascii_alphanumeric() || value == b'-')
+        {
+            return Err("command is not safe for an artifact file name".to_owned());
+        }
+
+        let output = artifact_dir.join(format!("{command}.json"));
+        ensure_artifact_absent(&output)?;
+        if command == "sequence" {
+            ensure_artifact_absent(&artifact_dir.join("sequence-timings.csv"))?;
+        }
+
+        let marker = artifact_dir.join(format!(".{command}.in-progress.json"));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&marker)
+            .map_err(|error| format!("cannot reserve {}: {error}", marker.display()))?;
+        let marker_document = json!({
+            "command": command,
+            "execution_status": "running",
+        });
+        file.write_all(
+            &serde_json::to_vec_pretty(&marker_document).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        file.flush().map_err(|error| error.to_string())?;
+        file.sync_all().map_err(|error| error.to_string())?;
+
+        Ok(Self { output, marker })
+    }
+
+    fn commit(self, document: &Value) -> Result<PathBuf, String> {
+        let temporary = self.output.with_extension("json.tmp");
+        let result = (|| {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)
+                .map_err(|error| format!("cannot create {}: {error}", temporary.display()))?;
+            file.write_all(
+                &serde_json::to_vec_pretty(document).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+            file.flush().map_err(|error| error.to_string())?;
+            file.sync_all().map_err(|error| error.to_string())?;
+            fs::rename(&temporary, &self.output).map_err(|error| {
+                format!(
+                    "cannot finalize {} as {}: {error}",
+                    temporary.display(),
+                    self.output.display()
+                )
+            })?;
+            fs::remove_file(&self.marker)
+                .map_err(|error| format!("cannot remove {}: {error}", self.marker.display()))?;
+            Ok(self.output)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(temporary);
+        }
+        result
+    }
+}
+
+fn ensure_artifact_absent(path: &Path) -> Result<(), String> {
+    if path.exists() {
+        Err(format!(
+            "refusing to overwrite existing qualification artifact {}",
+            path.display()
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 impl Harness {
     fn new(port_name: &str, options: ControllerOptions) -> Result<Self, String> {
         let descriptor = find_port(port_name)?;
@@ -208,6 +292,7 @@ fn real_main() -> Result<(), String> {
     }
     let artifact_dir = artifact_dir(&arguments)?;
     fs::create_dir_all(&artifact_dir).map_err(|error| error.to_string())?;
+    let reservation = ArtifactReservation::begin(command, &artifact_dir)?;
     let execution = match command {
         "discover" => run_discover(&arguments),
         "handshake" => run_handshake(&arguments),
@@ -221,12 +306,7 @@ fn real_main() -> Result<(), String> {
         _ => Err(format!("unknown command: {command}")),
     };
     let (document, failure) = finalize_result(command, execution);
-    let output = artifact_dir.join(format!("{command}.json"));
-    fs::write(
-        &output,
-        serde_json::to_vec_pretty(&document).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())?;
+    let output = reservation.commit(&document)?;
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
@@ -995,7 +1075,11 @@ fn process_metrics() -> Result<Value, String> {
 }
 
 fn write_timing_csv(path: &Path, telemetry: &Arc<Mutex<Telemetry>>) -> Result<(), String> {
-    let file = File::create(path).map_err(|error| error.to_string())?;
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| format!("cannot create {}: {error}", path.display()))?;
     let mut writer = BufWriter::new(file);
     writeln!(
         writer,
@@ -1114,5 +1198,29 @@ mod tests {
     fn home_attempt_marker_is_the_one_based_number_only() {
         assert_eq!(home_attempt_marker(1), "1");
         assert_eq!(home_attempt_marker(20), "20");
+    }
+
+    #[test]
+    fn existing_timing_csv_is_rejected_without_overwrite() {
+        let path = std::env::temp_dir().join(format!(
+            "easycon-hardware-existing-timing-{}-{}.csv",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos()
+        ));
+        let sentinel = b"original timing evidence\n";
+        fs::write(&path, sentinel).expect("seed existing timing evidence");
+        let telemetry = Arc::new(Mutex::new(Telemetry::default()));
+
+        let result = write_timing_csv(&path, &telemetry);
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read(&path).expect("read original timing evidence"),
+            sentinel
+        );
+        fs::remove_file(path).expect("remove timing test file");
     }
 }
