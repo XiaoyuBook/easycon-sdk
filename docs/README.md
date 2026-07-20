@@ -29,6 +29,8 @@
     最终中立写的 transport acceptance、Controller/Runtime 组合 cleanup 和 synthetic failure 回归边界。
 11. [Phase 2B run directory ownership 设计](development/phase2b-run-directory-ownership.md)：目录级永久
     reservation、retained staging、owned auxiliary 和 no-replace publish。
+12. [Phase 2B 设备身份接纳与诊断 readiness 证据设计](development/phase2b-device-admission-readiness.md)：
+    expected stable identity、open 前后复核、hotplug 重绑定和 diagnostic prelude 的非 capability 边界。
 
 ## 决策记录
 
