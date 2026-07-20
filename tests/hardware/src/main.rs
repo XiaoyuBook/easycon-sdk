@@ -18,7 +18,7 @@ use easycon_controller::{
     SequenceStep, TransportError, WriteContext, WriteKind, WriteRequest,
 };
 use easycon_hardware_qualification::{distribution, option_value, required_value, value_or};
-use easycon_model::{Button, Hat, StickPosition};
+use easycon_model::{Button, Hat, ResourceId, StickPosition};
 use easycon_runtime::{
     Clock, CloseOutcome, CloseRejection, Operation, OperationState, Runtime, RuntimeCounts,
     SystemClock, WaitResult, WaitTimeout,
@@ -449,6 +449,7 @@ impl Harness {
 
     fn close(&self) -> Value {
         let pre_close = self.controller.snapshot();
+        let controller_resource_id = self.controller.id();
         let evidence_boundary = self
             .telemetry
             .lock()
@@ -463,7 +464,8 @@ impl Harness {
             .unwrap_or_else(|error| error.into_inner())
             .neutralization_attempts[evidence_boundary..]
             .to_vec();
-        let controller = controller_cleanup_json(pre_close, post_close, &attempts);
+        let controller =
+            controller_cleanup_json(controller_resource_id, pre_close, post_close, &attempts);
         let runtime = runtime_close_json(self.runtime.close(), self.runtime.counts());
         harness_cleanup_json(controller, runtime)
     }
@@ -1225,7 +1227,9 @@ fn partial_fault_stage_contract(stage: &str) -> Option<(&'static str, usize)> {
 }
 
 fn cleanup_succeeded(value: &Value) -> bool {
-    if value["kind"] != "harness_cleanup" {
+    if !object_has_exact_keys(value, &["kind", "succeeded", "controller", "runtime"])
+        || value["kind"] != "harness_cleanup"
+    {
         return false;
     }
     let succeeded = controller_cleanup_succeeded(&value["controller"])
@@ -1234,12 +1238,14 @@ fn cleanup_succeeded(value: &Value) -> bool {
 }
 
 fn runtime_cleanup_succeeded(value: &Value) -> bool {
-    value["kind"] == "runtime_cleanup"
+    object_has_exact_keys(
+        value,
+        &["kind", "succeeded", "outcome", "counts", "diagnostic"],
+    ) && value["kind"] == "runtime_cleanup"
         && value["succeeded"].as_bool() == Some(true)
         && value["outcome"] == "Closed"
-        && value["counts"]["active_operations"].as_u64() == Some(0)
-        && value["counts"]["active_resources"].as_u64() == Some(0)
-        && value["counts"]["active_tasks"].as_u64() == Some(0)
+        && zero_runtime_counts(&value["counts"])
+        && value.get("diagnostic") == Some(&Value::Null)
 }
 
 fn controller_cleanup_succeeded(value: &Value) -> bool {
@@ -1248,9 +1254,29 @@ fn controller_cleanup_succeeded(value: &Value) -> bool {
 }
 
 fn controller_cleanup_predicate(value: &Value) -> bool {
-    if value["kind"] != "controller_cleanup" {
+    if !object_has_exact_keys(
+        value,
+        &[
+            "kind",
+            "succeeded",
+            "controller_resource_id",
+            "pre_close_state",
+            "post_close_state",
+            "post_close_desired_report_neutral",
+            "post_close_lease",
+            "neutralization",
+            "attempts",
+        ],
+    ) || value["kind"] != "controller_cleanup"
+    {
         return false;
     }
+    let Some(controller_resource_id) = value["controller_resource_id"]
+        .as_u64()
+        .filter(|resource_id| *resource_id != 0)
+    else {
+        return false;
+    };
     let Some(pre_close_state) = value["pre_close_state"].as_str() else {
         return false;
     };
@@ -1270,12 +1296,9 @@ fn controller_cleanup_predicate(value: &Value) -> bool {
                 .zip(pair[1]["sequence"].as_u64())
                 .is_some_and(|(left, right)| left < right)
         })
-        && attempts.first().is_none_or(|first| {
-            let resource_id = first["resource_id"].as_u64();
-            attempts
-                .iter()
-                .all(|attempt| attempt["resource_id"].as_u64() == resource_id)
-        });
+        && attempts
+            .iter()
+            .all(|attempt| attempt["resource_id"].as_u64() == Some(controller_resource_id));
     let final_attempts: Vec<_> = attempts
         .iter()
         .filter(|attempt| attempt.get("operation_id") == Some(&Value::Null))
@@ -1318,6 +1341,23 @@ fn neutralization_attempt_is_valid(value: &Value) -> bool {
     let Some(object) = value.as_object() else {
         return false;
     };
+    if !object_has_exact_keys(
+        value,
+        &[
+            "resource_id",
+            "operation_id",
+            "sequence",
+            "dispatch_timestamp_ns",
+            "first_write_entered_ns",
+            "total_bytes",
+            "accepted_bytes",
+            "outcome",
+            "structured_error",
+            "diagnostic",
+        ],
+    ) {
+        return false;
+    }
     let operation_id_is_valid = match object.get("operation_id") {
         Some(Value::Null) => true,
         Some(value) => value.as_u64().is_some_and(|id| id != 0),
@@ -1345,13 +1385,13 @@ fn neutralization_attempt_is_valid(value: &Value) -> bool {
     match value["outcome"].as_str() {
         Some("accepted") => {
             accepted_bytes == total_bytes
-                && value["structured_error"].is_null()
-                && value["diagnostic"].is_null()
+                && object.get("structured_error") == Some(&Value::Null)
+                && object.get("diagnostic") == Some(&Value::Null)
         }
         Some("failed") => {
             accepted_bytes < total_bytes
                 && structured_transport_error_is_valid(&value["structured_error"])
-                && value["diagnostic"].is_null()
+                && object.get("diagnostic") == Some(&Value::Null)
         }
         Some("pending" | "contradiction") => false,
         Some(_) | None => false,
@@ -1359,14 +1399,16 @@ fn neutralization_attempt_is_valid(value: &Value) -> bool {
 }
 
 fn structured_transport_error_is_valid(value: &Value) -> bool {
-    value["kind"].as_str().is_some_and(|kind| {
-        matches!(
-            kind,
-            "Timeout" | "WriteTimeout" | "Cancelled" | "Disconnected" | "Io" | "Protocol"
-        )
-    }) && value["message"]
-        .as_str()
-        .is_some_and(|message| !message.trim().is_empty())
+    object_has_exact_keys(value, &["kind", "message"])
+        && value["kind"].as_str().is_some_and(|kind| {
+            matches!(
+                kind,
+                "Timeout" | "WriteTimeout" | "Cancelled" | "Disconnected" | "Io" | "Protocol"
+            )
+        })
+        && value["message"]
+            .as_str()
+            .is_some_and(|message| !message.trim().is_empty())
 }
 
 fn neutralization_attempt_was_accepted(value: &Value) -> bool {
@@ -1374,7 +1416,22 @@ fn neutralization_attempt_was_accepted(value: &Value) -> bool {
         && value["total_bytes"].as_u64() == Some(8)
         && value["accepted_bytes"].as_u64() == Some(8)
         && value["outcome"] == "accepted"
-        && value["structured_error"].is_null()
+        && value.get("structured_error") == Some(&Value::Null)
+}
+
+fn zero_runtime_counts(value: &Value) -> bool {
+    object_has_exact_keys(
+        value,
+        &["active_operations", "active_resources", "active_tasks"],
+    ) && value["active_operations"].as_u64() == Some(0)
+        && value["active_resources"].as_u64() == Some(0)
+        && value["active_tasks"].as_u64() == Some(0)
+}
+
+fn object_has_exact_keys(value: &Value, expected: &[&str]) -> bool {
+    value.as_object().is_some_and(|object| {
+        object.len() == expected.len() && expected.iter().all(|key| object.contains_key(*key))
+    })
 }
 
 fn cleanup_slot_count(value: &Value) -> usize {
@@ -2193,6 +2250,7 @@ fn harness_cleanup_json(controller: Value, runtime: Value) -> Value {
 }
 
 fn controller_cleanup_json(
+    controller_resource_id: ResourceId,
     pre_close: ControllerSnapshot,
     post_close: ControllerSnapshot,
     attempts: &[NeutralizationAttempt],
@@ -2226,6 +2284,7 @@ fn controller_cleanup_json(
     let mut value = json!({
         "kind": "controller_cleanup",
         "succeeded": false,
+        "controller_resource_id": controller_resource_id.get(),
         "pre_close_state": format!("{:?}", pre_close.state),
         "post_close_state": format!("{:?}", post_close.state),
         "post_close_desired_report_neutral": post_close.desired_report.is_neutral(),
@@ -2437,6 +2496,7 @@ mod tests {
 
     fn successful_cleanup() -> Value {
         let controller = controller_cleanup_json(
+            ResourceId::new(1),
             ControllerSnapshot::default(),
             ControllerSnapshot {
                 state: ControllerState::Closed,
@@ -2453,6 +2513,7 @@ mod tests {
                 "active_resources": 0,
                 "active_tasks": 0,
             },
+            "diagnostic": null,
         });
         harness_cleanup_json(controller, runtime)
     }
@@ -3689,6 +3750,10 @@ mod tests {
         assert!(cleanup_succeeded(&cleanup));
         assert_eq!(cleanup["controller"]["neutralization"], "accepted");
         assert_eq!(
+            cleanup["controller"]["controller_resource_id"],
+            cleanup["controller"]["attempts"][0]["resource_id"]
+        );
+        assert_eq!(
             cleanup["controller"]["attempts"].as_array().map(Vec::len),
             Some(1)
         );
@@ -3709,6 +3774,11 @@ mod tests {
 
         assert!(cleanup_succeeded(&cleanup));
         assert_eq!(cleanup["controller"]["pre_close_state"], "Disconnected");
+        assert!(
+            cleanup["controller"]["controller_resource_id"]
+                .as_u64()
+                .is_some_and(|resource_id| resource_id != 0)
+        );
         assert_eq!(cleanup["controller"]["neutralization"], "not_required");
         assert_eq!(cleanup["controller"]["attempts"], json!([]));
     }
@@ -3763,6 +3833,56 @@ mod tests {
         let mut partial = valid.clone();
         partial["controller"]["attempts"][0]["accepted_bytes"] = json!(3);
         invalid.push(partial);
+
+        for field in ["structured_error", "diagnostic"] {
+            let mut missing_nullable = valid.clone();
+            missing_nullable["controller"]["attempts"][0]
+                .as_object_mut()
+                .expect("attempt")
+                .remove(field);
+            invalid.push(missing_nullable);
+        }
+
+        let mut missing_runtime_diagnostic = valid.clone();
+        missing_runtime_diagnostic["runtime"]
+            .as_object_mut()
+            .expect("runtime cleanup")
+            .remove("diagnostic");
+        invalid.push(missing_runtime_diagnostic);
+
+        let mut contradictory_runtime = valid.clone();
+        contradictory_runtime["runtime"]["report"] = json!({
+            "phase": "ResourceCleanup",
+            "diagnostic": "contradicts Closed",
+        });
+        invalid.push(contradictory_runtime);
+
+        for path in ["outer", "controller", "attempt", "counts"] {
+            let mut extra_field = valid.clone();
+            match path {
+                "outer" => extra_field["unexpected"] = json!(true),
+                "controller" => extra_field["controller"]["unexpected"] = json!(true),
+                "attempt" => extra_field["controller"]["attempts"][0]["unexpected"] = json!(true),
+                "counts" => extra_field["runtime"]["counts"]["unexpected"] = json!(0),
+                _ => unreachable!("fixed mutation path"),
+            }
+            invalid.push(extra_field);
+        }
+
+        let mut missing_resource_anchor = valid.clone();
+        missing_resource_anchor["controller"]
+            .as_object_mut()
+            .expect("controller cleanup")
+            .remove("controller_resource_id");
+        invalid.push(missing_resource_anchor);
+
+        let mut foreign_resource = valid.clone();
+        let resource_id = foreign_resource["controller"]["attempts"][0]["resource_id"]
+            .as_u64()
+            .expect("resource ID");
+        foreign_resource["controller"]["attempts"][0]["resource_id"] =
+            json!(resource_id.checked_add(1).expect("foreign resource ID"));
+        invalid.push(foreign_resource);
 
         let mut unknown_error = valid.clone();
         let mut operation_failure = unknown_error["controller"]["attempts"][0].clone();

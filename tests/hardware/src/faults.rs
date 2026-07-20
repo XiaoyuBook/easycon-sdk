@@ -725,7 +725,7 @@ mod tests {
         ControllerTransport, HandshakeRequest, SwitchReport, TransportError, TransportErrorKind,
         WriteRequest,
     };
-    use easycon_model::{EasyConError, ErrorCode, ErrorDomain, Hat, StickPosition};
+    use easycon_model::{EasyConError, ErrorCode, ErrorDomain, Hat, ResourceId, StickPosition};
     use easycon_runtime::{CancellationReason, Clock, OperationValue, Runtime, SystemClock};
     use easycon_serial::SerialPortDescriptor;
 
@@ -1002,6 +1002,7 @@ mod tests {
                 let _ = operation.finish_cancelled();
             }
             let controller = controller_cleanup_json(
+                ResourceId::new(1),
                 ControllerSnapshot::default(),
                 ControllerSnapshot {
                     state: ControllerState::Closed,
