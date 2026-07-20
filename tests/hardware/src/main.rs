@@ -295,11 +295,18 @@ fn run_smoke(arguments: &[String]) -> Result<Value, String> {
     let wake_left_stick = arguments
         .iter()
         .any(|argument| argument == "--wake-left-stick");
+    let wake_home = arguments.iter().any(|argument| argument == "--wake-home");
     let hold_ms = value_or(arguments, "--hold-ms", 0_u64)?;
     validate_hold_ms(hold_ms)?;
     let harness = Harness::new(&port, ControllerOptions::default())?;
     harness.connect(ConnectOptions::default())?;
     let mut actions = Vec::new();
+    if wake_home {
+        for (label, action) in home_wake_actions() {
+            exercise_action(&harness, label, action, &mut actions)?;
+        }
+        thread::sleep(Duration::from_secs(3));
+    }
     if wake_left_stick {
         for (label, action) in left_stick_wake_actions() {
             exercise_action(&harness, label, action, &mut actions)?;
@@ -392,6 +399,8 @@ fn run_smoke(arguments: &[String]) -> Result<Value, String> {
         "command": "smoke",
         "stage": if full { "full" } else { "a_only" },
         "wake_left_stick": wake_left_stick,
+        "wake_home": wake_home,
+        "wake_home_to_a_delay_ms": wake_home.then_some(3_000),
         "a_hold_ms": hold_ms,
         "port": port_json(&harness.descriptor),
         "actual_baud": harness.actual_baud(),
@@ -763,6 +772,14 @@ fn left_stick_wake_actions() -> [(&'static str, ControllerAction); 4] {
     ]
 }
 
+fn home_wake_actions() -> [(&'static str, ControllerAction); 3] {
+    [
+        ("wake.Home.down", ControllerAction::ButtonDown(Button::Home)),
+        ("wake.Home.up", ControllerAction::ButtonUp(Button::Home)),
+        ("wake.Home.neutral", ControllerAction::Reset),
+    ]
+}
+
 fn validate_home_wake(attempts: usize, interval_seconds: u64) -> Result<(), String> {
     if !(1..=100).contains(&attempts) {
         return Err("--attempts must be in 1..=100".to_owned());
@@ -1026,7 +1043,7 @@ fn print_help() {
     println!(
         "Usage:\n  easycon-hardware-qualification discover [--samples N]\n  \
          easycon-hardware-qualification handshake --port COMx\n  \
-         easycon-hardware-qualification smoke --port COMx [--full] [--wake-left-stick] [--hold-ms N]\n  \
+         easycon-hardware-qualification smoke --port COMx [--full] [--wake-left-stick] [--wake-home] [--hold-ms N]\n  \
          easycon-hardware-qualification home-wake --port COMx [--attempts 20] [--interval-seconds 3]\n  \
          easycon-hardware-qualification faults --port COMx\n  \
          easycon-hardware-qualification hotplug --port COMx [--timeout-seconds N]\n  \
@@ -1067,6 +1084,18 @@ mod tests {
                 ControllerAction::LeftStick(StickPosition::new(255, 128)),
                 ControllerAction::LeftStick(StickPosition::new(0, 128)),
                 ControllerAction::LeftStick(StickPosition::CENTER),
+                ControllerAction::Reset,
+            ]
+        );
+    }
+
+    #[test]
+    fn home_wake_releases_and_neutralizes_before_smoke() {
+        assert_eq!(
+            home_wake_actions().map(|(_, action)| action),
+            [
+                ControllerAction::ButtonDown(Button::Home),
+                ControllerAction::ButtonUp(Button::Home),
                 ControllerAction::Reset,
             ]
         );
