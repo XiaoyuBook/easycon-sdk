@@ -112,15 +112,31 @@ easycon sdk/
 
 ### Phase 2：Controller vertical slice
 
-状态：进行中。当前只有无硬件 fake slice，尚未达到本阶段退出门槛。
+目标已按 [ADR-0008](../decisions/0008-phase-2-controller-target.md) 冻结。当前只有提前实现的无硬件 fake
+slice，尚未完成 Phase 2A，也未开始需要实物的 Phase 2B。
+
+#### Phase 2A：Controller/Serial Candidate（无硬件）
 
 交付：
 
-- report/protocol、FakeTransport、Windows serial、连接状态机。
-- direct actions、precise sequence、Amiibo、lease 和 neutralization。
-- fake end-to-end + 首批硬件 characterization。
+- Windows x64 `easycon-serial`、结构化发现、可取消/deadline byte I/O 和 `ControllerTransport` adapter。
+- 可注入 byte-I/O、CH32 协议模拟器、partial I/O/热拔插/错误 ACK 等故障注入。
+- direct actions、precise sequence、Amiibo 20 字节分包、lease 和 neutralization 的完整 fake 链路。
+- 10,000-step fake、软件热路径分段时间戳和固定环境的延迟分布记录。
 
-退出门槛：协议 golden、10,000-step fake、cancel/断线清理和 O-01/O-02 初版能力数据通过；不含固件功能。
+退出门槛：ADR-0008 的 Phase 2A 交付和门禁全部通过，固定实现提交经独立 review 后另建实现冻结 ADR。
+结果必须标记 `Hardware Unverified`；O-01、O-02、O-04 保持开放。
+
+#### Phase 2B：Controller Hardware Qualification（有硬件）
+
+交付：
+
+- 首批控制板/固件/VID/PID/baud 支持矩阵和真实发现、连接、拔插、关闭数据。
+- Amiibo 设备容量、连续报告最小节拍、中立化以及 UART/USB/Switch 端到端时序证据。
+- 100 次生命周期、物理 10,000-report/step 和固定测量环境的延迟分布。
+
+退出门槛：O-01、O-02、O-04 关闭，受支持设备通过 ADR-0008 的硬件门槛并经独立 review；不含固件功能。
+Phase 2A 完成不等于完整 Phase 2 完成。
 
 ### Phase 3：Vision 与私有 bridge
 

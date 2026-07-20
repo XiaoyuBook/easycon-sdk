@@ -9,6 +9,10 @@ Controller 协议/单写者调度、FakeControllerTransport 和无硬件 vertica
 Phase 2 的提前 slice；当前仍未发布稳定公共 API 或 ABI，也不包含物理串口 backend、Amiibo、Vision、
 ECS、语言绑定、固件或 UI。
 
+[Phase 2 Controller/Serial 开发目标](docs/decisions/0008-phase-2-controller-target.md) 已冻结：先完成不依赖
+实物的 Phase 2A Candidate，再在 CH32 可用后执行 Phase 2B 硬件资格验证。冻结目标不表示实现或硬件支持
+已经完成。
+
 此前的实验性共享运行基线已经移除，不再作为本项目的产品架构或兼容性约束。共享核心、C ABI 和各语言绑定将在架构与行为规范固定后重新实现。
 
 完整架构固定在 [docs/README.md](docs/README.md)，包括源码能力映射、Rust/C++/C ABI

@@ -5,7 +5,9 @@
 本文实现中的 Phase 1 Runtime 已按
 [ADR-0007](../decisions/0007-phase-1-freeze.md) 冻结在 `4261925dc4e84b36e8491c0a97c17048d3eacd84`。
 Controller 内容是 Phase 2 的提前无硬件 slice；Windows serial、Amiibo、10,000-step fake 和硬件
-characterization 仍未完成。
+characterization 仍未完成。后续范围和低延迟验收已按
+[ADR-0008](../decisions/0008-phase-2-controller-target.md) 固定为 Phase 2A 无硬件 Candidate 与 Phase 2B
+硬件资格验证；当前 slice 不构成任一阶段的完成声明。
 
 ## 交付范围
 

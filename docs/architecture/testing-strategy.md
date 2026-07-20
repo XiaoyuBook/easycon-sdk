@@ -277,6 +277,14 @@ Python/Lua Runner、字节码/固件、远端控制、配置/推送、UI/键鼠�
 
 ## 10. 物理硬件体系
 
+### Phase 2A 无硬件延迟证据
+
+Phase 2A 先按 [ADR-0008](../decisions/0008-phase-2-controller-target.md) 用非阻塞内存 transport 测量
+`command admitted -> transport write entered`，至少记录 10,000 次 lane 已空闲且 pacing 已满足的 eligible
+direct report 的 p50/p95/p99/max 和固定测试环境。该 harness 验证 PC 核心没有人为前置等待及明显调度
+回归，不代表 UART、CH32、USB HID 或 Switch 端到端延迟；普通 CI 继续使用 VirtualClock 证明确定性规则，
+不以易抖动的墙钟阈值代替 correctness。
+
 ### 矩阵登记
 
 O-01 关闭时建立 `hardware/matrix.yaml`（只记录 SDK 自有测试配置，不记录 EasyCon 源码锁）：
@@ -294,9 +302,12 @@ O-01 关闭时建立 `hardware/matrix.yaml`（只记录 SDK 自有测试配置�
 - 所有按钮、八向 HAT、摇杆边界和组合；
 - Amiibo slot/分包/错误恢复；
 - 逻辑分析仪或 firmware trace 验证 10,000-step sequence 顺序零错误；
-- 暂定时序 SLO：间隔 ≥30 ms 时不早发，软件 dispatch lateness p99 ≤5 ms、max ≤15 ms；cancel 后已连接设备在 100 ms 内收到中立报告。
+- 暂定调度 SLO：间隔 ≥30 ms 时不早发，软件 dispatch lateness p99 ≤5 ms、max ≤15 ms；cancel 后已连接设备在 100 ms 内收到中立报告；
+- 115200 低延迟档暂定 SLO：空闲 direct action 到 CH32 收齐报告 p95 <5 ms、p99 <10 ms，对应 USB HID report 出现在 Switch 侧总线的中位数 <10 ms，并记录 p95/p99/max；
+- 9600 只作为兼容档；低于 30 ms 的连续节拍必须在对应控制板和固件上通过 10,000-report 无丢包/乱序验证。
 
-SLO 在专用、固定电源策略的测试机测量；O-04 可依据首轮数据调整一次，调整必须记录原因，不能在失败后临时放宽。
+SLO 在专用、固定电源策略的测试机测量；O-04 依据首轮数据冻结最终测量方法和支持阈值。未达暂定目标时
+必须保留原始结果并通过 ADR 调整目标或缩小支持范围，不能在失败后静默放宽。
 
 ### Vision 硬件测试
 

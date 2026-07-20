@@ -33,6 +33,7 @@
 - [ADR-0005：Windows x64 首发与同源原生包](decisions/0005-v1-platform-packaging.md)
 - [ADR-0006：Runtime 所有权、终态事务与确定性关闭](decisions/0006-runtime-stabilization.md)
 - [ADR-0007：冻结 Phase 1 Runtime 基线](decisions/0007-phase-1-freeze.md)
+- [ADR-0008：冻结 Phase 2 Controller/Serial 开发目标](decisions/0008-phase-2-controller-target.md)
 
 ## v1 固定范围
 
@@ -50,6 +51,9 @@ Phase 1 Runtime 已按 [ADR-0007](decisions/0007-phase-1-freeze.md) 冻结在可
 Automation lease 与 generation-aware ACK；这只是 Phase 2 的提前 slice，不代表正式 C ABI、系统串口
 backend、Amiibo 或物理硬件支持已经完成。实现说明和本地验收命令见
 [Runtime + Controller fake vertical slice](development/runtime-controller-vertical-slice.md)。
+Phase 2 已按 [ADR-0008](decisions/0008-phase-2-controller-target.md) 拆为无硬件可完成的 Phase 2A
+Controller/Serial Candidate 和必须使用实物的 Phase 2B Hardware Qualification；当前冻结的是开发目标，
+不是 Phase 2 实现或硬件支持声明。
 
 ## 首发基线
 
@@ -67,5 +71,5 @@ backend、Amiibo 或物理硬件支持已经完成。实现说明和本地验收
 | O-01 | 首批受支持的控制板、固件版本和 USB/串口标识 | 以现有 115200/9600 握手协议实现，支持表为空 | Controller 硬件 Beta 前 |
 | O-02 | Amiibo 槽位数量与允许的数据长度 | ECS 暴露 0..9；底层按字节缓冲并依据已验证设备能力拒绝 | C ABI 冻结前 |
 | O-03 | 官方包内置的 OCR 语言数据 | 默认接口语言为 `chi_sim`，模型只有在来源和许可证核验后才随包发布 | 首个发布候选版前 |
-| O-04 | 物理硬件动作时序 SLO | 先采用测试策略中的暂定阈值，以逻辑分析仪结果校准 | Controller 硬件 Beta 前 |
+| O-04 | 物理硬件动作时序 SLO | 采用 ADR-0008 的分段暂定目标，以逻辑分析仪、firmware trace 和 Switch 可观察结果校准 | Controller 硬件 Beta 前 |
 | O-05 | v1.1 是否增加 Linux x64 或 macOS arm64 | 不承诺 | v1.0 发布后规划 |
