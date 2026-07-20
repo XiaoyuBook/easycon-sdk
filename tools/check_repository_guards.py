@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Enforce first-milestone ownership, dependency, license, and legacy-architecture guards."""
+"""Enforce Phase 2A ownership, dependency, license, and architecture guards."""
 
 import re
 import subprocess
@@ -12,6 +12,7 @@ EXPECTED_MEMBERS = {
     "crates/easycon-model",
     "crates/easycon-runtime",
     "crates/easycon-controller",
+    "crates/easycon-serial",
     "tests/support",
 }
 FORBIDDEN_PREFIXES = (
@@ -25,7 +26,6 @@ FORBIDDEN_PREFIXES = (
     "crates/easycon-ecs/",
     "crates/easycon-native-sys/",
     "crates/easycon-sdk/",
-    "crates/easycon-serial/",
     "crates/easycon-vision/",
 )
 FORBIDDEN_RUNTIME_PATTERNS = {
@@ -78,6 +78,11 @@ def main():
         "crates/easycon-model/Cargo.toml": set(),
         "crates/easycon-runtime/Cargo.toml": {"easycon-model"},
         "crates/easycon-controller/Cargo.toml": {"easycon-model", "easycon-runtime"},
+        "crates/easycon-serial/Cargo.toml": {
+            "easycon-controller",
+            "easycon-model",
+            "easycon-runtime",
+        },
         "tests/support/Cargo.toml": {
             "easycon-controller",
             "easycon-model",
@@ -121,7 +126,7 @@ def main():
             print("  " + failure, file=sys.stderr)
         return 1
     print(
-        "repository guards passed: scoped workspace, dependency direction, GPL license, "
+        "repository guards passed: Phase 2A workspace, dependency direction, GPL license, "
         "source boundary, Drop finalizer ban, and legacy service-process scan"
     )
     return 0

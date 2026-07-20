@@ -49,6 +49,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "easycon-serial"
+version = "0.1.0"
+dependencies = [
+ "easycon-controller",
+ "easycon-model",
+ "easycon-runtime",
+]
+
+[[package]]
 name = "easycon-test-support"
 version = "0.1.0"
 dependencies = [
