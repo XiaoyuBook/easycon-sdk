@@ -157,30 +157,35 @@ impl WindowsByteIo {
         let operation = buffer.operation_name();
         let requested = u32::try_from(buffer.len().min(u32::MAX as usize))
             .expect("transfer length was capped at u32");
-        let mut immediate = 0_u32;
         // SAFETY: the serial HANDLE was opened for overlapped I/O; buffer and OVERLAPPED remain
         // alive and immovable until completion is observed below. Only the exclusive lane borrow
-        // can initiate a transfer on this ByteIo object.
+        // can initiate a transfer on this ByteIo object. Windows 10/11 overlapped calls use a null
+        // synchronous byte-count pointer; GetOverlappedResult owns the completion count.
         let started = unsafe {
             match buffer {
                 TransferBuffer::Read(bytes) => ReadFile(
                     self.shared.handle.raw(),
                     bytes.as_mut_ptr(),
                     requested,
-                    &mut immediate,
+                    null_mut(),
                     overlapped.as_mut(),
                 ),
                 TransferBuffer::Write(bytes) => WriteFile(
                     self.shared.handle.raw(),
                     bytes.as_ptr(),
                     requested,
-                    &mut immediate,
+                    null_mut(),
                     overlapped.as_mut(),
                 ),
             }
         };
         if started != 0 {
-            return normalize_progress(immediate);
+            return normalize_progress(overlapped_result(
+                &self.shared,
+                overlapped.as_mut(),
+                operation,
+                false,
+            )?);
         }
         // SAFETY: sampled immediately after ReadFile/WriteFile on the same thread.
         let start_error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
@@ -188,14 +193,33 @@ impl WindowsByteIo {
             return Err(from_code(operation, start_error));
         }
 
-        let transferred = wait_for_overlapped(
-            &self.shared,
-            &completion_event,
-            &interrupt_event,
-            overlapped.as_mut(),
-            &request,
-            operation,
-        )?;
+        // `Clock` is a safe injectable trait and may panic. The kernel still owns the buffer and
+        // OVERLAPPED while this wait is pending, so unwind may resume only after cancellation has
+        // been settled synchronously.
+        let waited = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            wait_for_overlapped(
+                &self.shared,
+                &completion_event,
+                &interrupt_event,
+                overlapped.as_mut(),
+                &request,
+                operation,
+            )
+        }));
+        let transferred = match waited {
+            Ok(result) => result?,
+            Err(payload) => resume_unwind_after_cleanup(payload, || {
+                let _ = cancel_and_settle(
+                    &self.shared,
+                    overlapped.as_mut(),
+                    SerialError::new(
+                        SerialErrorKind::Io,
+                        "serial byte I/O wait panicked before completion",
+                    ),
+                    operation,
+                );
+            }),
+        };
         normalize_progress(transferred)
     }
 }
@@ -475,6 +499,14 @@ fn normalize_progress(transferred: u32) -> Result<usize, SerialError> {
     }
 }
 
+fn resume_unwind_after_cleanup(
+    payload: Box<dyn std::any::Any + Send>,
+    cleanup: impl FnOnce(),
+) -> ! {
+    cleanup();
+    std::panic::resume_unwind(payload)
+}
+
 fn disconnected_error(message: &'static str) -> SerialError {
     SerialError::new(SerialErrorKind::Disconnected, message)
 }
@@ -528,6 +560,19 @@ mod tests {
         assert_eq!(duration_to_wait_ms(Duration::from_nanos(1)), 1);
         assert_eq!(duration_to_wait_ms(Duration::from_millis(1)), 1);
         assert_eq!(duration_to_wait_ms(Duration::MAX), INFINITE - 1);
+    }
+
+    #[test]
+    fn unwind_cleanup_runs_before_the_original_panic_is_resumed() {
+        let cleanup_ran = std::cell::Cell::new(false);
+        let resumed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let payload =
+                std::panic::catch_unwind(|| panic!("clock panic")).expect_err("test panic payload");
+            resume_unwind_after_cleanup(payload, || cleanup_ran.set(true));
+        }));
+
+        assert!(resumed.is_err());
+        assert!(cleanup_ran.get());
     }
 
     #[test]
