@@ -170,10 +170,14 @@ impl ControllerTransport for SerialControllerTransport {
             ByteIoOperation::ControllerWrite(request.context),
         );
         if let Err(error) = check_interruption(&io_request, IoPhase::Write) {
-            return Err(self.close_after_partial_failure(offset, error));
+            return Err(self.close_after_write_failure(request.context.kind, offset, error));
         }
         if self.io.is_none() {
-            return Err(self.close_after_partial_failure(offset, disconnected()));
+            return Err(self.close_after_write_failure(
+                request.context.kind,
+                offset,
+                disconnected(),
+            ));
         }
         let io = self.io.as_mut().expect("serial stream checked above");
 
@@ -198,10 +202,9 @@ impl ControllerTransport for SerialControllerTransport {
             });
         let written = match result {
             Ok(written) => written,
-            Err(error) if offset != 0 => {
-                return Err(self.close_after_partial_failure(offset, error));
+            Err(error) => {
+                return Err(self.close_after_write_failure(request.context.kind, offset, error));
             }
-            Err(error) => return Err(error),
         };
         let accepted = offset
             .checked_add(written)
@@ -245,19 +248,22 @@ impl ControllerTransport for SerialControllerTransport {
 }
 
 impl SerialControllerTransport {
-    fn close_after_partial_failure(
+    fn close_after_write_failure(
         &mut self,
+        kind: WriteKind,
         accepted_prefix: usize,
         error: TransportError,
     ) -> TransportError {
-        if accepted_prefix == 0 {
+        if accepted_prefix == 0 && kind != WriteKind::Neutralize {
             return error;
         }
         self.close_stream();
-        TransportError::new(
-            TransportErrorKind::Disconnected,
-            format!("serial stream closed after partial-write failure: {error}"),
-        )
+        let message = if accepted_prefix == 0 {
+            format!("serial stream closed after neutralization failure: {error}")
+        } else {
+            format!("serial stream closed after partial-write failure: {error}")
+        };
+        TransportError::new(TransportErrorKind::Disconnected, message)
     }
 }
 

@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use easycon_controller::{
     ConnectOptions, ControllerAction, ControllerOptions, ControllerSession, ControllerState,
@@ -54,6 +54,18 @@ fn wait_terminal(operation: &Operation) {
         operation.wait(WaitTimeout::For(Duration::from_secs(2))),
         WaitResult::Completed(_)
     ));
+}
+
+fn wait_running(operation: &Operation) {
+    let started = Instant::now();
+    while operation.snapshot().state == OperationState::Pending {
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "operation did not start"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(operation.snapshot().state, OperationState::Running);
 }
 
 fn close_controller(clock: &VirtualClock, runtime: &Runtime, controller: &ControllerSession) {
@@ -343,6 +355,43 @@ fn cancellation_between_partial_calls_closes_the_corrupted_stream() {
     assert!(snapshot.reports.is_empty());
     assert_eq!(snapshot.active_streams, 0);
     assert_eq!(snapshot.closed_streams, 1);
+    controller.close();
+    runtime.close().expect("Runtime close");
+}
+
+// conformance: phase2a.serial.neutral-failure-close-order
+#[test]
+fn failed_cancel_neutral_closes_the_serial_stream_before_terminal() {
+    let (clock, runtime, simulator, controller) = connected();
+    let accepted = controller
+        .direct(ControllerAction::ButtonDown(Button::A))
+        .expect("accepted direct operation");
+    wait_terminal(&accepted);
+
+    let cancelled = controller
+        .direct(ControllerAction::ButtonDown(Button::B))
+        .expect("cancelled direct operation");
+    wait_running(&cancelled);
+    simulator.fail_next_write(SerialErrorKind::Io);
+    simulator.block_next_close();
+    cancelled.cancel();
+    clock.advance_by(Duration::from_millis(30));
+
+    let close_blocked = simulator.wait_until_close_blocked(Duration::from_secs(2));
+    let state_before_close = cancelled.wait(WaitTimeout::Poll);
+    simulator.release_close();
+    assert!(
+        close_blocked,
+        "failed neutralization did not close the stream"
+    );
+    assert_eq!(state_before_close, WaitResult::Timeout);
+    wait_terminal(&cancelled);
+
+    assert_eq!(cancelled.snapshot().state, OperationState::Cancelled);
+    assert_eq!(controller.snapshot().state, ControllerState::Disconnected);
+    let snapshot = simulator.snapshot();
+    assert_eq!(snapshot.active_streams, 0);
+    assert_eq!(snapshot.reports.len(), 1);
     controller.close();
     runtime.close().expect("Runtime close");
 }

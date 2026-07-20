@@ -81,7 +81,7 @@
       "identity": "stable device-instance identity is independent from optional labels and COM reassignment",
       "optional_properties": "VID, PID, manufacturer, and friendly name are present only when supplied by Windows; COM names never imply device identity",
       "io": "open, partial read/write, zero progress, absolute deadline, operation/resource cancellation, busy/access denied, timeout, and disconnect are normalized inside easycon-serial",
-      "close": "resource-close cancellation wakes pending overlapped I/O; close settles cancellation and releases every event, HANDLE, stream, and owner synchronously",
+      "close": "resource-close cancellation wakes pending overlapped I/O; close settles cancellation and releases every event, HANDLE, stream, and owner synchronously; failed serial neutralization invalidates the stream before operation terminal commit",
       "dependency_direction": "easycon-serial implements ControllerTransport as a system leaf; controller/runtime/model never depend on a concrete serial backend or Win32"
     },
     "amiibo": {

@@ -47,8 +47,8 @@ Switch 执行时序或物理中立化已经验证，也不创建完整 Phase 2 �
 - Windows discovery 返回系统提供的稳定 device-instance identity 与可选属性；COM 名称只用于打开端口，
   不用于猜测 VID/PID 或支持设备。Win32 open/read/write/close 只存在于 `easycon-serial`。
 - serial partial write 使用同一个 logical `WriteContext` 连续推进；半帧错误或两次 partial call 间取消会
-  关闭流，禁止后续 command 拼接到损坏帧。零进展、busy/access denied、deadline、close wake 和热拔插
-  归一化为稳定错误。
+  关闭流，禁止后续 command 拼接到损坏帧；serial neutralization 即使在首字节前失败也先关闭 stream，
+  再允许 operation 提交终态。零进展、busy/access denied、deadline、close wake 和热拔插归一化为稳定错误。
 - Win32 `HANDLE`、event、SetupAPI list 和 registry key 均由窄 RAII owner 释放；pending `OVERLAPPED` 和
   调用方 buffer 在 completion、cancel、wait failure 以及可注入 `Clock` panic 路径上都先经
   `CancelIoEx`/`GetOverlappedResult` 同步结算，再允许释放或继续 unwind。
@@ -114,8 +114,8 @@ Phase 2A 专项测试还包括：
   target 验证无丢失、乱序、早发和漂移，并在 close 后验证三个 registry 为零；
 - `tests/support/tests/phase2a_latency.rs`：五段时间戳单调性与不丢样本的确定性 contract。
 
-当前完整 workspace 为 155 个非文档测试通过；Runtime Loom 模型 6/6；规范校验执行 5 schemas、1 behavior、
-3 controller fixtures、9 scenarios 和 63 个 exact Rust tests。最终提交前仍以实际完整门禁输出为准。
+当前完整 workspace 为 156 个非文档测试通过；Runtime Loom 模型 6/6；规范校验执行 5 schemas、1 behavior、
+3 controller fixtures、9 scenarios 和 64 个 exact Rust tests。最终提交前仍以实际完整门禁输出为准。
 
 ## 软件路径延迟结果
 

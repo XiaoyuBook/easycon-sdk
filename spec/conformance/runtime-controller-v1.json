@@ -402,7 +402,8 @@
         "tests/support/tests/serial_ch32.rs::access_denied_and_port_busy_open_failures_are_bounded_and_leak_free",
         "tests/support/tests/serial_ch32.rs::byte_ack_delay_duplicate_wrong_reply_and_zero_progress_are_isolated",
         "tests/support/tests/serial_ch32.rs::blocked_ack_obeys_deadline_and_controller_close_wakes_a_second_wait",
-        "tests/support/tests/serial_ch32.rs::hot_unplug_and_mid_payload_failure_close_the_stream_without_continuation"
+        "tests/support/tests/serial_ch32.rs::hot_unplug_and_mid_payload_failure_close_the_stream_without_continuation",
+        "tests/support/tests/serial_ch32.rs::failed_cancel_neutral_closes_the_serial_stream_before_terminal"
       ],
       "steps": [
         { "id": "phase2a.serial.discover", "action": "enumerate Windows COM interfaces into structured stable descriptors" },
@@ -482,6 +483,11 @@
           "id": "phase2a.serial.disconnect-close-order",
           "expect": "hot unplug closes the active stream before the failed operation becomes terminal",
           "test": "tests/support/tests/serial_ch32.rs::hot_unplug_and_mid_payload_failure_close_the_stream_without_continuation"
+        },
+        {
+          "id": "phase2a.serial.neutral-failure-close-order",
+          "expect": "a failed serial neutral report invalidates and closes the stream before the cancelled operation becomes terminal",
+          "test": "tests/support/tests/serial_ch32.rs::failed_cancel_neutral_closes_the_serial_stream_before_terminal"
         }
       ]
     },
