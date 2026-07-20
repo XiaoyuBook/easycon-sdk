@@ -430,18 +430,7 @@ fn finalize_result(command: &str, execution: Result<Value, String>) -> (Value, O
 
 fn qualification_decision(command: &str, result: &Value) -> QualificationDecision {
     match command {
-        "discover" => required_checks(&[
-            (
-                "at_least_three_samples",
-                result["samples"]
-                    .as_u64()
-                    .is_some_and(|samples| samples >= 3),
-            ),
-            (
-                "stable_across_samples",
-                result["stable_across_samples"].as_bool() == Some(true),
-            ),
-        ]),
+        "discover" => discovery_qualification(result),
         "handshake" => required_checks(&[
             (
                 "operation_succeeded",
@@ -556,6 +545,56 @@ fn qualification_decision(command: &str, result: &Value) -> QualificationDecisio
         },
         _ => required_checks(&[("known_qualification_command", false)]),
     }
+}
+
+fn discovery_qualification(result: &Value) -> QualificationDecision {
+    let samples = result["samples"].as_u64();
+    let snapshots = result["snapshots"].as_array();
+    let sample_count_matches = samples
+        .zip(snapshots)
+        .is_some_and(|(samples, snapshots)| usize::try_from(samples).ok() == Some(snapshots.len()));
+    let snapshots_are_arrays = snapshots.is_some_and(|snapshots| {
+        snapshots
+            .iter()
+            .all(|snapshot| snapshot.as_array().is_some())
+    });
+    let evidence_is_stable = snapshots.is_some_and(|snapshots| {
+        !snapshots.is_empty() && snapshots.windows(2).all(|pair| pair[0] == pair[1])
+    });
+    let mut decision = required_checks(&[
+        (
+            "at_least_three_samples",
+            samples.is_some_and(|samples| samples >= 3),
+        ),
+        ("sample_count_matches", sample_count_matches),
+        ("snapshots_are_arrays", snapshots_are_arrays),
+        (
+            "stable_across_samples",
+            result["stable_across_samples"].as_bool() == Some(true) && evidence_is_stable,
+        ),
+    ]);
+    if decision.status != QualificationStatus::Passed {
+        return decision;
+    }
+
+    let devices_discovered = snapshots.is_some_and(|snapshots| {
+        snapshots.iter().all(|snapshot| {
+            snapshot
+                .as_array()
+                .is_some_and(|descriptors| !descriptors.is_empty())
+        })
+    });
+    if devices_discovered {
+        decision
+            .checks
+            .push(qualification_check("devices_discovered", "passed"));
+    } else {
+        decision.status = QualificationStatus::NotRun;
+        decision
+            .checks
+            .push(qualification_check("devices_discovered", "not_run"));
+    }
+    decision
 }
 
 fn required_checks(checks: &[(&str, bool)]) -> QualificationDecision {
@@ -1644,6 +1683,60 @@ mod tests {
             assert!(failure.is_some(), "{command} must return a non-zero exit");
             assert_eq!(document_exit_code(&document), 1, "{command}");
         }
+    }
+
+    #[test]
+    fn discovery_requires_nonempty_consistent_samples() {
+        let empty_snapshots = json!({
+            "samples": 3,
+            "stable_across_samples": true,
+            "snapshots": [[], [], []],
+        });
+        let (empty, failure) = finalize_result("discover", Ok(empty_snapshots));
+        assert!(failure.is_none());
+        assert_eq!(empty["execution_status"], "completed");
+        assert_eq!(empty["qualification_status"], "not_run");
+        assert_eq!(document_exit_code(&empty), 2);
+
+        for result in [
+            json!({
+                "samples": 3,
+                "stable_across_samples": true,
+                "snapshots": [],
+            }),
+            json!({
+                "samples": 3,
+                "stable_across_samples": true,
+                "snapshots": [
+                    [{"stable_id": "DEVICE\\ONE"}],
+                    [{"stable_id": "DEVICE\\TWO"}],
+                    [{"stable_id": "DEVICE\\ONE"}],
+                ],
+            }),
+        ] {
+            let (document, failure) = finalize_result("discover", Ok(result));
+            assert!(failure.is_some());
+            assert_eq!(document["execution_status"], "completed");
+            assert_eq!(document["qualification_status"], "failed");
+            assert_eq!(document_exit_code(&document), 1);
+        }
+
+        let stable_device = json!([{"stable_id": "DEVICE\\EXPECTED"}]);
+        let (nonempty, failure) = finalize_result(
+            "discover",
+            Ok(json!({
+                "samples": 3,
+                "stable_across_samples": true,
+                "snapshots": [
+                    stable_device.clone(),
+                    stable_device.clone(),
+                    stable_device,
+                ],
+            })),
+        );
+        assert!(failure.is_none());
+        assert_eq!(nonempty["qualification_status"], "passed");
+        assert_eq!(document_exit_code(&nonempty), 0);
     }
 
     #[test]
