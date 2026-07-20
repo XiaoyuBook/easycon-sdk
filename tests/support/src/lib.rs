@@ -5,7 +5,8 @@ mod ch32;
 mod controller;
 
 pub use ch32::{
-    Ch32AcceptedReport, Ch32AckBehavior, Ch32ByteSimulator, Ch32HandshakeBehavior, Ch32Snapshot,
+    Ch32AcceptedReport, Ch32AckBehavior, Ch32AmiiboChunk, Ch32ByteSimulator, Ch32HandshakeBehavior,
+    Ch32Snapshot,
 };
 pub use controller::{
     AcceptedWrite, AckOutcome, FakeControllerTransport, HandshakeAttemptRecord, HandshakeOutcome,

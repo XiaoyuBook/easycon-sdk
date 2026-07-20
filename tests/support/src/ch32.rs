@@ -50,6 +50,17 @@ pub struct Ch32AcceptedReport {
     pub bytes: [u8; 8],
 }
 
+/// One Amiibo chunk payload observed after its source-exact save header.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Ch32AmiiboChunk {
+    /// Zero-based slot from the save header.
+    pub slot: u8,
+    /// Byte offset decoded from the two seven-bit fields.
+    pub offset: usize,
+    /// Exact payload bytes written for this attempt.
+    pub bytes: Vec<u8>,
+}
+
 /// Immutable byte-device accounting snapshot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Ch32Snapshot {
@@ -59,6 +70,10 @@ pub struct Ch32Snapshot {
     pub reports: Vec<Ch32AcceptedReport>,
     /// Complete request/response command payloads.
     pub commands: Vec<Vec<u8>>,
+    /// Amiibo payload attempts reconstructed from save headers.
+    pub amiibo_chunks: Vec<Ch32AmiiboChunk>,
+    /// Source-exact zero-based select requests.
+    pub amiibo_selections: Vec<u8>,
     /// Bytes removed at request-generation boundaries.
     pub discarded_input_bytes: usize,
     /// Streams currently owned by a transport.
@@ -96,6 +111,9 @@ struct State {
     controller_partial: Option<ControllerPartial>,
     reports: Vec<Ch32AcceptedReport>,
     commands: Vec<Vec<u8>>,
+    amiibo_chunks: Vec<Ch32AmiiboChunk>,
+    amiibo_selections: Vec<u8>,
+    pending_amiibo: Option<PendingAmiibo>,
     incoming: VecDeque<u8>,
     scheduled: Vec<ScheduledByte>,
     next_read_error: Option<SerialErrorKind>,
@@ -118,6 +136,13 @@ struct State {
 struct ControllerPartial {
     context: WriteContext,
     bytes: Vec<u8>,
+}
+
+#[derive(Clone, Copy)]
+struct PendingAmiibo {
+    slot: u8,
+    offset: usize,
+    length: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -145,6 +170,9 @@ impl Ch32ByteSimulator {
                 controller_partial: None,
                 reports: Vec::new(),
                 commands: Vec::new(),
+                amiibo_chunks: Vec::new(),
+                amiibo_selections: Vec::new(),
+                pending_amiibo: None,
                 incoming: VecDeque::new(),
                 scheduled: Vec::new(),
                 next_read_error: None,
@@ -314,6 +342,8 @@ impl Ch32ByteSimulator {
             baud_attempts: state.baud_attempts.clone(),
             reports: state.reports.clone(),
             commands: state.commands.clone(),
+            amiibo_chunks: state.amiibo_chunks.clone(),
+            amiibo_selections: state.amiibo_selections.clone(),
             discarded_input_bytes: state.discarded_input_bytes,
             active_streams: state.active_streams,
             closed_streams: state.closed_streams,
@@ -372,6 +402,7 @@ impl ByteIoFactory for Ch32ByteSimulator {
         state.incoming.clear();
         state.scheduled.clear();
         state.next_read_error = None;
+        state.pending_amiibo = None;
         drop(state);
         Ok(Box::new(SimulatedByteIo {
             clock: self.clock.clone(),
@@ -486,6 +517,7 @@ impl ByteIo for SimulatedByteIo {
         }
         if let Some(kind) = state.fail_next_write.take() {
             state.controller_partial = None;
+            state.pending_amiibo = None;
             return Err(scripted_error(kind, "scripted CH32 write failure"));
         }
         if matches!(request.operation, ByteIoOperation::ControllerWrite(_))
@@ -600,6 +632,7 @@ impl ByteIo for SimulatedByteIo {
             state.handshake_behavior = None;
             state.handshake_bytes.clear();
             state.controller_partial = None;
+            state.pending_amiibo = None;
             state.incoming.clear();
             state.scheduled.clear();
             state.closed_streams = state
@@ -689,9 +722,64 @@ fn append_controller_bytes(
             state.reports.push(Ch32AcceptedReport { context, bytes });
         }
         WriteKind::Command => {
+            inspect_amiibo_command(state, &complete.bytes)?;
             state.commands.push(complete.bytes);
             apply_ack_script(state, now_ns)?;
         }
+    }
+    Ok(())
+}
+
+fn inspect_amiibo_command(state: &mut State, bytes: &[u8]) -> Result<(), SerialError> {
+    const RESET: [u8; 6] = [0xa5, 0x81, 0xa5, 0x81, 0xa5, 0x81];
+    if let Some(pending) = state.pending_amiibo.take() {
+        if bytes.len() != pending.length {
+            return Err(protocol_error(
+                "CH32 Amiibo payload length differs from its save header",
+            ));
+        }
+        state.amiibo_chunks.push(Ch32AmiiboChunk {
+            slot: pending.slot,
+            offset: pending.offset,
+            bytes: bytes.to_vec(),
+        });
+        return Ok(());
+    }
+    if bytes == RESET {
+        return Ok(());
+    }
+    if let [
+        0xa5,
+        offset_low,
+        offset_high,
+        length_low,
+        length_high,
+        slot,
+        0x90,
+    ] = bytes
+    {
+        if offset_low & 0x80 != 0
+            || offset_high & 0x80 != 0
+            || length_low & 0x80 != 0
+            || length_high & 0x80 != 0
+        {
+            return Err(protocol_error(
+                "CH32 Amiibo save header is not seven-bit encoded",
+            ));
+        }
+        let length = usize::from(*length_low) | (usize::from(*length_high) << 7);
+        if length == 0 || length > 20 {
+            return Err(protocol_error("CH32 Amiibo save chunk length is invalid"));
+        }
+        state.pending_amiibo = Some(PendingAmiibo {
+            slot: *slot,
+            offset: usize::from(*offset_low) | (usize::from(*offset_high) << 7),
+            length,
+        });
+        return Ok(());
+    }
+    if let [0xa5, slot, 0x91] = bytes {
+        state.amiibo_selections.push(*slot);
     }
     Ok(())
 }
@@ -701,6 +789,12 @@ fn apply_ack_script(state: &mut State, now_ns: u64) -> Result<(), SerialError> {
         .ack_scripts
         .pop_front()
         .ok_or_else(|| protocol_error("no scripted CH32 ACK behavior"))?;
+    let keeps_amiibo_payload_pending = matches!(
+        behavior,
+        Ch32AckBehavior::Reply(0xff)
+            | Ch32AckBehavior::Delayed { byte: 0xff, .. }
+            | Ch32AckBehavior::Duplicate(0xff)
+    );
     match behavior {
         Ch32AckBehavior::Reply(byte) => state.incoming.push_back(byte),
         Ch32AckBehavior::Delayed { byte, elapsed_ns } => {
@@ -716,6 +810,9 @@ fn apply_ack_script(state: &mut State, now_ns: u64) -> Result<(), SerialError> {
         Ch32AckBehavior::NoReply => {}
         Ch32AckBehavior::Error(kind) => state.next_read_error = Some(kind),
         Ch32AckBehavior::Disconnect => state.stream_connected = false,
+    }
+    if state.pending_amiibo.is_some() && !keeps_amiibo_payload_pending {
+        state.pending_amiibo = None;
     }
     Ok(())
 }

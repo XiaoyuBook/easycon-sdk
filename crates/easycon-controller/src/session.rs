@@ -12,6 +12,11 @@ use easycon_runtime::{
     SupervisedTaskOutcome, TransitionOutcome,
 };
 
+use crate::amiibo::{
+    AMIIBO_ACK, AMIIBO_CHUNK_SIZE, AMIIBO_DEFAULT_RESET_TIMEOUT_NS, AMIIBO_RESET_REPLY,
+    AmiiboLimits, AmiiboSaveOptions, AmiiboSelectOptions, MAX_AMIIBO_CHUNK_RETRIES, reset_command,
+    save_header, select_command,
+};
 use crate::protocol::SwitchReport;
 use crate::sequence::PreciseSequence;
 use crate::transport::{
@@ -79,6 +84,8 @@ pub struct ControllerOptions {
     pub minimum_report_interval_ns: u64,
     /// Maximum duration allowed for one complete logical transport write.
     pub write_timeout_ns: u64,
+    /// Explicit hardware-derived Amiibo limits; absent by default in Phase 2A.
+    pub amiibo_limits: Option<AmiiboLimits>,
 }
 
 impl Default for ControllerOptions {
@@ -86,6 +93,7 @@ impl Default for ControllerOptions {
         Self {
             minimum_report_interval_ns: 30_000_000,
             write_timeout_ns: 1_000_000_000,
+            amiibo_limits: None,
         }
     }
 }
@@ -197,6 +205,7 @@ struct ControllerInner {
     closing: AtomicBool,
     registration: Mutex<Option<ResourceRegistration>>,
     resource_cancellation: easycon_runtime::CancellationToken,
+    amiibo_limits: Option<AmiiboLimits>,
 }
 
 enum WorkerState {
@@ -226,6 +235,17 @@ enum LaneCommand {
         expected_reply: u8,
         protocol_timeout_ns: u64,
     },
+    AmiiboSave {
+        operation: Operation,
+        slot: u8,
+        data: Arc<[u8]>,
+        options: AmiiboSaveOptions,
+    },
+    AmiiboSelect {
+        operation: Operation,
+        slot: u8,
+        options: AmiiboSelectOptions,
+    },
     AcquireAutomationLease {
         lease_id: u64,
         completed: SyncSender<Result<(), EasyConError>>,
@@ -245,7 +265,9 @@ impl LaneCommand {
             Self::Connect { operation, .. }
             | Self::Direct { operation, .. }
             | Self::Sequence { operation, .. }
-            | Self::Ack { operation, .. } => Some(operation),
+            | Self::Ack { operation, .. }
+            | Self::AmiiboSave { operation, .. }
+            | Self::AmiiboSelect { operation, .. } => Some(operation),
             Self::AcquireAutomationLease { .. }
             | Self::ReleaseAutomationLease { .. }
             | Self::Wake
@@ -258,7 +280,9 @@ impl LaneCommand {
             Self::Connect { operation, .. }
             | Self::Direct { operation, .. }
             | Self::Sequence { operation, .. }
-            | Self::Ack { operation, .. } => Some(operation),
+            | Self::Ack { operation, .. }
+            | Self::AmiiboSave { operation, .. }
+            | Self::AmiiboSelect { operation, .. } => Some(operation),
             Self::AcquireAutomationLease { .. }
             | Self::ReleaseAutomationLease { .. }
             | Self::Wake
@@ -359,6 +383,7 @@ impl ControllerSession {
             closing: AtomicBool::new(false),
             registration: Mutex::new(None),
             resource_cancellation: resource_cancellation.clone(),
+            amiibo_limits: options.amiibo_limits,
         });
         let managed: Arc<dyn ManagedResource> = inner.clone();
         let registration = match runtime.register_resource(managed) {
@@ -514,6 +539,76 @@ impl ControllerSession {
             command,
             expected_reply,
             protocol_timeout_ns,
+        })
+    }
+
+    /// Returns the explicit Amiibo limits configured for this candidate session.
+    #[must_use]
+    pub fn amiibo_limits(&self) -> Option<AmiiboLimits> {
+        self.inner.amiibo_limits
+    }
+
+    /// Saves Amiibo bytes in source-exact 20-byte chunks under explicit device limits.
+    pub fn save_amiibo(
+        &self,
+        slot: u8,
+        data: impl Into<Arc<[u8]>>,
+        options: AmiiboSaveOptions,
+    ) -> Result<Operation, EasyConError> {
+        if options.ack_timeout_ns == 0
+            || options.reset_timeout_ns == 0
+            || options.maximum_chunk_retries > MAX_AMIIBO_CHUNK_RETRIES
+        {
+            return Err(EasyConError::new(
+                ErrorDomain::Validation,
+                ErrorCode::InvalidArgument,
+                "Amiibo timeouts must be non-zero and chunk retries must not exceed 8",
+            ));
+        }
+        let limits = self.require_amiibo_limits()?;
+        limits.validate_slot(slot)?;
+        let data = data.into();
+        limits.validate_data(data.len())?;
+        self.enqueue_operation(options.operation_deadline_ns, |operation| {
+            LaneCommand::AmiiboSave {
+                operation,
+                slot,
+                data,
+                options,
+            }
+        })
+    }
+
+    /// Selects one zero-based Amiibo slot under explicit device limits.
+    pub fn select_amiibo(
+        &self,
+        slot: u8,
+        options: AmiiboSelectOptions,
+    ) -> Result<Operation, EasyConError> {
+        if options.ack_timeout_ns == 0 {
+            return Err(EasyConError::new(
+                ErrorDomain::Validation,
+                ErrorCode::InvalidArgument,
+                "Amiibo selection ACK timeout must be non-zero",
+            ));
+        }
+        self.require_amiibo_limits()?.validate_slot(slot)?;
+        self.enqueue_operation(options.operation_deadline_ns, |operation| {
+            LaneCommand::AmiiboSelect {
+                operation,
+                slot,
+                options,
+            }
+        })
+    }
+
+    fn require_amiibo_limits(&self) -> Result<AmiiboLimits, EasyConError> {
+        self.inner.amiibo_limits.ok_or_else(|| {
+            EasyConError::new(
+                ErrorDomain::Controller,
+                ErrorCode::InvalidArgument,
+                "Amiibo capability is Hardware Unverified; explicit limits are required",
+            )
         })
     }
 
@@ -719,7 +814,7 @@ impl ControllerLane {
                     expected_reply,
                     protocol_timeout_ns,
                 } => {
-                    if self.should_defer_ack() {
+                    if self.should_defer_request_response() {
                         self.deferred_commands.push_front(LaneCommand::Ack {
                             operation,
                             command,
@@ -728,6 +823,39 @@ impl ControllerLane {
                         });
                     } else {
                         self.handle_ack(operation, command, expected_reply, protocol_timeout_ns);
+                    }
+                }
+                LaneCommand::AmiiboSave {
+                    operation,
+                    slot,
+                    data,
+                    options,
+                } => {
+                    if self.should_defer_request_response() {
+                        self.deferred_commands.push_front(LaneCommand::AmiiboSave {
+                            operation,
+                            slot,
+                            data,
+                            options,
+                        });
+                    } else {
+                        self.handle_amiibo_save(operation, slot, data, options);
+                    }
+                }
+                LaneCommand::AmiiboSelect {
+                    operation,
+                    slot,
+                    options,
+                } => {
+                    if self.should_defer_request_response() {
+                        self.deferred_commands
+                            .push_front(LaneCommand::AmiiboSelect {
+                                operation,
+                                slot,
+                                options,
+                            });
+                    } else {
+                        self.handle_amiibo_select(operation, slot, options);
                     }
                 }
                 LaneCommand::AcquireAutomationLease {
@@ -750,12 +878,15 @@ impl ControllerLane {
 
     fn next_command(&mut self) -> Option<LaneCommand> {
         loop {
-            let deferred_ack_blocked = self
-                .deferred_commands
-                .front()
-                .is_some_and(|command| matches!(command, LaneCommand::Ack { .. }))
-                && self.should_defer_ack();
-            if !deferred_ack_blocked && let Some(command) = self.deferred_commands.pop_front() {
+            let deferred_request_blocked = self.deferred_commands.front().is_some_and(|command| {
+                matches!(
+                    command,
+                    LaneCommand::Ack { .. }
+                        | LaneCommand::AmiiboSave { .. }
+                        | LaneCommand::AmiiboSelect { .. }
+                )
+            }) && self.should_defer_request_response();
+            if !deferred_request_blocked && let Some(command) = self.deferred_commands.pop_front() {
                 return Some(command);
             }
 
@@ -771,7 +902,7 @@ impl ControllerLane {
                 Some(command @ LaneCommand::Close { .. }) | Some(command @ LaneCommand::Wake) => {
                     return Some(command);
                 }
-                Some(command) if deferred_ack_blocked => {
+                Some(command) if deferred_request_blocked => {
                     self.deferred_commands.push_back(command);
                 }
                 command => return command,
@@ -779,7 +910,7 @@ impl ControllerLane {
         }
     }
 
-    fn should_defer_ack(&self) -> bool {
+    fn should_defer_request_response(&self) -> bool {
         self.lease_owner.is_none()
             && self.waiting_sequence.is_none()
             && !self.pending_reports.is_empty()
@@ -1097,53 +1228,183 @@ impl ControllerLane {
         expected_reply: u8,
         protocol_timeout_ns: u64,
     ) {
-        if self.finish_if_cancelled_before_start(&operation) {
+        if !self.prepare_request_operation(&operation) {
             return;
         }
-        if !start_or_finish_cancelled(&operation) {
+        let result = self.exchange_ack(
+            &operation,
+            &command,
+            expected_reply,
+            protocol_timeout_ns,
+            None,
+        );
+        self.finish_request_exchange(operation, result);
+    }
+
+    fn handle_amiibo_select(
+        &mut self,
+        operation: Operation,
+        slot: u8,
+        options: AmiiboSelectOptions,
+    ) {
+        if !self.prepare_request_operation(&operation) {
             return;
+        }
+        let result = self.exchange_ack(
+            &operation,
+            &select_command(slot),
+            AMIIBO_ACK,
+            options.ack_timeout_ns,
+            options.operation_deadline_ns,
+        );
+        self.finish_amiibo_exchange(operation, result, AMIIBO_DEFAULT_RESET_TIMEOUT_NS);
+    }
+
+    fn handle_amiibo_save(
+        &mut self,
+        operation: Operation,
+        slot: u8,
+        data: Arc<[u8]>,
+        options: AmiiboSaveOptions,
+    ) {
+        if !self.prepare_request_operation(&operation) {
+            return;
+        }
+        let mut completed_chunks = 0_usize;
+        for (chunk_index, chunk) in data.chunks(AMIIBO_CHUNK_SIZE).enumerate() {
+            let offset = chunk_index
+                .checked_mul(AMIIBO_CHUNK_SIZE)
+                .expect("validated Amiibo offset cannot overflow");
+            let header = save_header(slot, offset, chunk.len());
+            let mut retries = 0_u8;
+            loop {
+                let result = self.exchange_ack(
+                    &operation,
+                    &header,
+                    AMIIBO_ACK,
+                    options.ack_timeout_ns,
+                    options.operation_deadline_ns,
+                );
+                let result = match result {
+                    Ok(()) => self.exchange_ack(
+                        &operation,
+                        chunk,
+                        AMIIBO_ACK,
+                        options.ack_timeout_ns,
+                        options.operation_deadline_ns,
+                    ),
+                    Err(error) => Err(error),
+                };
+                match result {
+                    Ok(()) => break,
+                    Err(error)
+                        if is_retryable_amiibo_error(&error)
+                            && retries < options.maximum_chunk_retries =>
+                    {
+                        retries = retries.saturating_add(1);
+                        self.publish_amiibo_event(
+                            "controller.amiibo.save.retry",
+                            &operation,
+                            format!("slot={slot}, offset={offset}, retry={retries}, cause={error}"),
+                            true,
+                        );
+                        if let Err(reset_error) = self.exchange_ack(
+                            &operation,
+                            &reset_command(),
+                            AMIIBO_RESET_REPLY,
+                            options.reset_timeout_ns,
+                            options.operation_deadline_ns,
+                        ) {
+                            self.finish_amiibo_save_failure(
+                                operation,
+                                reset_error,
+                                completed_chunks,
+                                options.reset_timeout_ns,
+                            );
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        self.finish_amiibo_save_failure(
+                            operation,
+                            error,
+                            completed_chunks,
+                            options.reset_timeout_ns,
+                        );
+                        return;
+                    }
+                }
+            }
+            completed_chunks = completed_chunks
+                .checked_add(1)
+                .expect("validated Amiibo chunk count cannot overflow");
+            self.publish_amiibo_event(
+                "controller.amiibo.save.chunk_accepted",
+                &operation,
+                format!("slot={slot}, offset={offset}, length={}", chunk.len()),
+                false,
+            );
+        }
+        if operation.succeed(OperationValue::Unit) == TransitionOutcome::Invalid
+            && operation.snapshot().state == OperationState::Cancelling
+        {
+            operation.finish_cancelled();
+        }
+    }
+
+    fn prepare_request_operation(&mut self, operation: &Operation) -> bool {
+        if self.finish_if_cancelled_before_start(operation) {
+            return false;
+        }
+        if !start_or_finish_cancelled(operation) {
+            return false;
         }
         if self.state() != ControllerState::Connected {
             fail_or_finish_cancelled(
-                &operation,
+                operation,
                 EasyConError::new(
                     ErrorDomain::Controller,
                     ErrorCode::DeviceDisconnected,
                     "controller is not connected",
                 ),
             );
-            return;
+            return false;
         }
         if self.lease_owner.is_some() || self.waiting_sequence.is_some() {
             fail_or_finish_cancelled(
-                &operation,
+                operation,
                 resource_busy_error("controller write lease is owned"),
             );
-            return;
+            return false;
         }
+        true
+    }
 
+    fn exchange_ack(
+        &mut self,
+        operation: &Operation,
+        command: &[u8],
+        expected_reply: u8,
+        protocol_timeout_ns: u64,
+        operation_deadline_ns: Option<u64>,
+    ) -> Result<(), TransportError> {
+        if self.cancel_or_deadline(operation, operation_deadline_ns) {
+            return Err(cancelled_transport_error());
+        }
         let generation = self.next_ack_generation;
         self.next_ack_generation = self
             .next_ack_generation
             .checked_add(1)
             .expect("ACK generation exhausted");
         let now = self.clock.now_ns();
-        if let Err(error) = self.write_payload(Some(&operation), WriteKind::Command, now, &command)
-        {
-            if error.kind() == TransportErrorKind::Cancelled {
-                if operation.snapshot().state != OperationState::Cancelling {
-                    operation.request_cancel(easycon_runtime::CancellationReason::ParentClose);
-                }
-                operation.finish_cancelled();
-                return;
-            }
-            if error.kind() == TransportErrorKind::Disconnected {
-                self.handle_transport_disconnect(Some(operation.id()), &error);
-            }
-            fail_or_finish_cancelled(&operation, map_transport_error(error));
-            return;
+        self.write_payload(Some(operation), WriteKind::Command, now, command)?;
+        if self.cancel_or_deadline(operation, operation_deadline_ns) {
+            return Err(cancelled_transport_error());
         }
-        let deadline_ns = self.clock.now_ns().saturating_add(protocol_timeout_ns);
+        let protocol_deadline_ns = self.clock.now_ns().saturating_add(protocol_timeout_ns);
+        let deadline_ns = operation_deadline_ns.map_or(protocol_deadline_ns, |deadline| {
+            deadline.min(protocol_deadline_ns)
+        });
         loop {
             let request = AckRequest {
                 operation_id: operation.id(),
@@ -1166,40 +1427,223 @@ impl ControllerLane {
                     );
                 }
                 Ok(frame) if frame.generation == generation && frame.byte == expected_reply => {
-                    if operation.succeed(OperationValue::Unit) == TransitionOutcome::Invalid
-                        && operation.snapshot().state == OperationState::Cancelling
-                    {
-                        operation.finish_cancelled();
+                    if self.cancel_or_deadline(operation, operation_deadline_ns) {
+                        return Err(cancelled_transport_error());
                     }
-                    return;
+                    return Ok(());
                 }
                 Ok(_) => {
-                    fail_or_finish_cancelled(
-                        &operation,
-                        EasyConError::new(
-                            ErrorDomain::Controller,
-                            ErrorCode::ProtocolError,
-                            "ACK generation or reply byte did not match",
-                        ),
-                    );
-                    return;
-                }
-                Err(error) if error.kind() == TransportErrorKind::Cancelled => {
-                    if operation.snapshot().state != OperationState::Cancelling {
-                        operation.request_cancel(easycon_runtime::CancellationReason::ParentClose);
-                    }
-                    operation.finish_cancelled();
-                    return;
+                    return Err(TransportError::new(
+                        TransportErrorKind::Protocol,
+                        "ACK generation or reply byte did not match",
+                    ));
                 }
                 Err(error) => {
-                    if error.kind() == TransportErrorKind::Disconnected {
-                        self.handle_transport_disconnect(Some(operation.id()), &error);
+                    if self.cancel_or_deadline(operation, operation_deadline_ns) {
+                        return Err(cancelled_transport_error());
                     }
-                    fail_or_finish_cancelled(&operation, map_transport_error(error));
-                    return;
+                    return Err(error);
                 }
             }
         }
+    }
+
+    fn finish_request_exchange(
+        &mut self,
+        operation: Operation,
+        result: Result<(), TransportError>,
+    ) {
+        match result {
+            Ok(()) => {
+                if operation.succeed(OperationValue::Unit) == TransitionOutcome::Invalid
+                    && operation.snapshot().state == OperationState::Cancelling
+                {
+                    operation.finish_cancelled();
+                }
+            }
+            Err(error) if error.kind() == TransportErrorKind::Cancelled => {
+                if operation.snapshot().state != OperationState::Cancelling {
+                    operation.request_cancel(easycon_runtime::CancellationReason::ParentClose);
+                }
+                operation.finish_cancelled();
+            }
+            Err(error) => {
+                if error.kind() == TransportErrorKind::Disconnected {
+                    self.handle_transport_disconnect(Some(operation.id()), &error);
+                }
+                fail_or_finish_cancelled(&operation, map_transport_error(error));
+            }
+        }
+    }
+
+    fn finish_amiibo_exchange(
+        &mut self,
+        operation: Operation,
+        result: Result<(), TransportError>,
+        reset_timeout_ns: u64,
+    ) {
+        if let Err(error) = &result
+            && error.kind() == TransportErrorKind::Cancelled
+            && let Err(cleanup_error) =
+                self.exchange_amiibo_cleanup_reset(operation.id(), reset_timeout_ns)
+        {
+            self.handle_amiibo_cleanup_failure(operation.id(), &cleanup_error);
+        }
+        self.finish_request_exchange(operation, result);
+    }
+
+    fn finish_amiibo_save_failure(
+        &mut self,
+        operation: Operation,
+        error: TransportError,
+        completed_chunks: usize,
+        reset_timeout_ns: u64,
+    ) {
+        self.publish_amiibo_event(
+            if error.kind() == TransportErrorKind::Cancelled {
+                "controller.amiibo.save.cancelled"
+            } else {
+                "controller.amiibo.save.partial_failure"
+            },
+            &operation,
+            format!("completed_chunks={completed_chunks}, cause={error}"),
+            true,
+        );
+        if error.kind() == TransportErrorKind::Cancelled {
+            if let Err(cleanup_error) =
+                self.exchange_amiibo_cleanup_reset(operation.id(), reset_timeout_ns)
+            {
+                self.handle_amiibo_cleanup_failure(operation.id(), &cleanup_error);
+            }
+            if operation.snapshot().state != OperationState::Cancelling {
+                operation.request_cancel(easycon_runtime::CancellationReason::ParentClose);
+            }
+            operation.finish_cancelled();
+            return;
+        }
+        if error.kind() == TransportErrorKind::Disconnected {
+            self.handle_transport_disconnect(Some(operation.id()), &error);
+        }
+        let mapped = map_transport_error(error);
+        fail_or_finish_cancelled(
+            &operation,
+            EasyConError::new(
+                mapped.domain(),
+                mapped.code(),
+                format!(
+                    "Amiibo save failed after {completed_chunks} complete chunks: {}",
+                    mapped.message()
+                ),
+            ),
+        );
+    }
+
+    fn exchange_amiibo_cleanup_reset(
+        &mut self,
+        operation_id: OperationId,
+        reset_timeout_ns: u64,
+    ) -> Result<(), TransportError> {
+        if self.resource_cancellation.is_cancelled() || self.state() != ControllerState::Connected {
+            return Err(cancelled_transport_error());
+        }
+        let generation = self.next_ack_generation;
+        self.next_ack_generation = self
+            .next_ack_generation
+            .checked_add(1)
+            .expect("ACK generation exhausted");
+        let now = self.clock.now_ns();
+        self.write_payload(None, WriteKind::Command, now, &reset_command())?;
+        let deadline_ns = self.clock.now_ns().saturating_add(reset_timeout_ns);
+        loop {
+            match self.transport.wait_for_ack(AckRequest {
+                operation_id,
+                generation,
+                expected_reply: AMIIBO_RESET_REPLY,
+                deadline_ns,
+                cancellation: easycon_runtime::CancellationToken::root(),
+                resource_cancellation: self.resource_cancellation.clone(),
+            }) {
+                Ok(frame) if frame.generation < generation => {
+                    let _ = self.runtime.publish(
+                        EventDraft::ordinary(
+                            EventKind::Warning,
+                            "controller.ack.late_ignored",
+                            Severity::Warning,
+                        )
+                        .with_resource(self.resource_id)
+                        .with_operation(operation_id),
+                    );
+                }
+                Ok(frame) if frame.generation == generation && frame.byte == AMIIBO_RESET_REPLY => {
+                    return Ok(());
+                }
+                Ok(_) => {
+                    return Err(TransportError::new(
+                        TransportErrorKind::Protocol,
+                        "Amiibo cleanup reset reply did not match",
+                    ));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn invalidate_amiibo_stream(&mut self, operation_id: OperationId, error: &TransportError) {
+        self.desired_report.reset();
+        self.update_desired_snapshot();
+        self.set_state(
+            ControllerState::Disconnected,
+            "controller.disconnected",
+            None,
+        );
+        let _ = self.runtime.publish(
+            EventDraft::critical(
+                EventKind::Warning,
+                "controller.amiibo.cleanup.stream_closed",
+                Severity::Warning,
+            )
+            .with_resource(self.resource_id)
+            .with_operation(operation_id)
+            .with_detail(error.to_string()),
+        );
+        self.fail_pending_disconnected();
+    }
+
+    fn handle_amiibo_cleanup_failure(&mut self, operation_id: OperationId, error: &TransportError) {
+        if self.resource_cancellation.is_cancelled() {
+            let _ = self.runtime.publish(
+                EventDraft::critical(
+                    EventKind::Warning,
+                    "controller.amiibo.cleanup.deferred_to_close",
+                    Severity::Warning,
+                )
+                .with_resource(self.resource_id)
+                .with_operation(operation_id)
+                .with_detail(error.to_string()),
+            );
+        } else {
+            self.invalidate_amiibo_stream(operation_id, error);
+        }
+    }
+
+    fn publish_amiibo_event(
+        &self,
+        code: &'static str,
+        operation: &Operation,
+        detail: String,
+        warning: bool,
+    ) {
+        let (kind, severity) = if warning {
+            (EventKind::Warning, Severity::Warning)
+        } else {
+            (EventKind::Data, Severity::Info)
+        };
+        let _ = self.runtime.publish(
+            EventDraft::ordinary(kind, code, severity)
+                .with_resource(self.resource_id)
+                .with_operation(operation.id())
+                .with_detail(detail),
+        );
     }
 
     fn handle_transport_disconnect(
@@ -1694,7 +2138,9 @@ impl ControllerLane {
             LaneCommand::Connect { operation, .. }
             | LaneCommand::Direct { operation, .. }
             | LaneCommand::Sequence { operation, .. }
-            | LaneCommand::Ack { operation, .. } => {
+            | LaneCommand::Ack { operation, .. }
+            | LaneCommand::AmiiboSave { operation, .. }
+            | LaneCommand::AmiiboSelect { operation, .. } => {
                 if !operation.snapshot().state.is_terminal() {
                     operation.request_cancel(easycon_runtime::CancellationReason::ParentClose);
                 }
@@ -1934,6 +2380,20 @@ fn map_transport_error(error: TransportError) -> EasyConError {
         TransportErrorKind::Protocol => (ErrorDomain::Controller, ErrorCode::ProtocolError),
     };
     EasyConError::new(domain, code, error.message())
+}
+
+fn is_retryable_amiibo_error(error: &TransportError) -> bool {
+    matches!(
+        error.kind(),
+        TransportErrorKind::Timeout | TransportErrorKind::Protocol
+    )
+}
+
+fn cancelled_transport_error() -> TransportError {
+    TransportError::new(
+        TransportErrorKind::Cancelled,
+        "Controller operation cancelled during ACK exchange",
+    )
 }
 
 fn fail_closed_lane(operation: &Operation) {
