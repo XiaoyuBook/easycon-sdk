@@ -735,6 +735,7 @@ fn cancel_evidence_valid(result: &Value) -> bool {
     };
 
     baseline.get("state").and_then(Value::as_str) == Some("Connected")
+        && result["cancel_request_outcome"].as_str() == Some("Applied")
         && baseline
             .get("desired_report_neutral")
             .and_then(Value::as_bool)
@@ -1254,7 +1255,8 @@ fn run_faults(arguments: &[String]) -> Result<Value, String> {
             ));
         }
     };
-    let _ = cancelled.cancel();
+    let cancel_request_outcome = cancelled.cancel();
+    result["cancel_request_outcome"] = json!(format!("{cancel_request_outcome:?}"));
     if let Err(error) = wait_terminal(&cancelled, OPERATION_TIMEOUT) {
         return Ok(finish_cancel_execution_error(
             result,
@@ -1273,6 +1275,7 @@ fn run_faults(arguments: &[String]) -> Result<Value, String> {
         json!(cancelled.snapshot().state == OperationState::Cancelled);
     result["cancel_before_request_snapshot"] = controller_snapshot_json(cancel_before_request);
     result["post_cancel_snapshot"] = controller_snapshot_json(post_cancel);
+    result["post_cancel_wait_snapshot"] = controller_snapshot_json(post_cancel);
 
     let (primary_cleanup, deadline_attempt) = close_primary_then_create_deadline(
         &occupied_cleanup,
@@ -1280,6 +1283,7 @@ fn run_faults(arguments: &[String]) -> Result<Value, String> {
         || Harness::new(&port, ControllerOptions::default()),
     );
     result["cleanup"] = primary_cleanup;
+    result["post_cleanup_snapshot"] = controller_snapshot_json(primary.controller.snapshot());
     let Some(deadline_attempt) = deadline_attempt else {
         result["deadline_status"] = json!("not_run: primary cleanup failed");
         return Ok(result);
@@ -1334,16 +1338,23 @@ fn finish_cancel_execution_error(
     stage: &str,
     message: String,
 ) -> Value {
-    let cancel_outcome = operation.cancel();
+    let recovery_cancel_outcome = operation.cancel();
     let settle_error = wait_terminal(operation, OPERATION_TIMEOUT).err();
+    let post_cancel_wait = primary.controller.snapshot();
     let cleanup = primary.close();
+    let post_cleanup = primary.controller.snapshot();
     result["execution_error"] = json!({"stage": stage, "message": message});
     result["cancel_status"] = json!("failed");
-    result["cancel_request_outcome"] = json!(format!("{cancel_outcome:?}"));
+    if result.get("cancel_request_outcome").is_none() {
+        result["cancel_request_outcome"] = Value::Null;
+    }
+    result["recovery_cancel_outcome"] = json!(format!("{recovery_cancel_outcome:?}"));
     result["cancel_settle_error"] = json!(settle_error);
     result["cancel"] = operation_json(operation);
     result["cancel_before_request_snapshot"] = controller_snapshot_json(observed_before_request);
-    result["post_cancel_snapshot"] = controller_snapshot_json(primary.controller.snapshot());
+    result["post_cancel_snapshot"] = controller_snapshot_json(post_cancel_wait);
+    result["post_cancel_wait_snapshot"] = controller_snapshot_json(post_cancel_wait);
+    result["post_cleanup_snapshot"] = controller_snapshot_json(post_cleanup);
     result["deadline_status"] = json!("not_run: cancel scenario failed");
     result["cleanup"] = cleanup;
     result
@@ -2111,6 +2122,7 @@ mod tests {
                 "Cancelled",
                 json!("Requested"),
             ),
+            "cancel_request_outcome": "Applied",
             "cancel_baseline_snapshot": {
                 "state": "Connected",
                 "desired_report_neutral": true,
@@ -2573,6 +2585,17 @@ mod tests {
             json!(99);
         invalid.push(wrong_sequence_owner);
 
+        let mut missing_request_outcome = valid.clone();
+        missing_request_outcome
+            .as_object_mut()
+            .expect("fault result")
+            .remove("cancel_request_outcome");
+        invalid.push(missing_request_outcome);
+
+        let mut repeated_request_outcome = valid.clone();
+        repeated_request_outcome["cancel_request_outcome"] = json!("Unchanged");
+        invalid.push(repeated_request_outcome);
+
         let mut no_neutral_acceptance = valid.clone();
         no_neutral_acceptance["post_cancel_snapshot"]["accepted_report_count"] = json!(8);
         invalid.push(no_neutral_acceptance);
@@ -2672,6 +2695,56 @@ mod tests {
 
         controller.close();
         assert_eq!(runtime.close(), Ok(CloseOutcome::Closed));
+    }
+
+    #[test]
+    fn cancel_execution_failure_preserves_request_recovery_and_cleanup_boundaries() {
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock::default());
+        let runtime = Runtime::new(clock.clone());
+        let controller = ControllerSession::new(
+            &runtime,
+            Box::new(NoopTransport),
+            ControllerOptions::default(),
+        )
+        .expect("controller");
+        let harness = Harness {
+            runtime,
+            clock,
+            controller,
+            telemetry: Arc::new(Mutex::new(Telemetry::default())),
+            descriptor: SerialPortDescriptor::new("DEVICE\\TEST", "COM1").expect("descriptor"),
+        };
+        let operation = harness
+            .runtime
+            .create_operation(None)
+            .expect("test operation");
+        operation.start();
+        let request_outcome = operation.cancel();
+        assert_eq!(request_outcome, easycon_runtime::TransitionOutcome::Applied);
+        operation.finish_cancelled();
+
+        let observed_before_request = harness.controller.snapshot();
+        let mut partial = json!({"command": "faults"});
+        partial["cancel_request_outcome"] = json!(format!("{request_outcome:?}"));
+        let result = finish_cancel_execution_error(
+            partial,
+            &harness,
+            &operation,
+            observed_before_request,
+            "cancel_terminal_wait",
+            "injected terminal wait failure".to_owned(),
+        );
+
+        assert_eq!(result["cancel_request_outcome"], "Applied");
+        assert_eq!(result["recovery_cancel_outcome"], "AlreadyTerminal");
+        assert_eq!(result["cancel"]["state"], "Cancelled");
+        assert_eq!(result["post_cancel_wait_snapshot"]["state"], "Disconnected");
+        assert_eq!(result["post_cleanup_snapshot"]["state"], "Closed");
+        assert_eq!(result["cleanup"]["outcome"], "Closed");
+        assert_eq!(result["cleanup"]["counts"]["active_operations"], 0);
+        assert_eq!(result["cleanup"]["counts"]["active_resources"], 0);
+        assert_eq!(result["cleanup"]["counts"]["active_tasks"], 0);
+        assert_eq!(result["deadline_status"], "not_run: cancel scenario failed");
     }
 
     #[test]
