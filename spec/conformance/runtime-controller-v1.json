@@ -503,6 +503,7 @@
         "tests/support/tests/amiibo.rs::save_partial_failure_reports_completed_chunks_and_releases_the_lane",
         "tests/support/tests/amiibo.rs::save_cancel_and_operation_deadline_run_bounded_reset_cleanup",
         "tests/support/tests/amiibo.rs::save_disconnect_and_controller_close_have_unique_terminal_cleanup",
+        "tests/support/tests/amiibo.rs::resource_close_during_failed_save_cleanup_settles_stream_before_terminal",
         "tests/support/tests/amiibo.rs::select_cancel_deadline_and_disconnect_use_the_same_cleanup_contract"
       ],
       "steps": [
@@ -553,6 +554,11 @@
           "id": "phase2a.amiibo.disconnect-close",
           "expect": "disconnect closes the stream and resource close still attempts existing neutralization before joining",
           "test": "tests/support/tests/amiibo.rs::save_disconnect_and_controller_close_have_unique_terminal_cleanup"
+        },
+        {
+          "id": "phase2a.amiibo.cleanup-close-order",
+          "expect": "resource close that interrupts a failed save cleanup settles the stream before exposing the cancelled operation",
+          "test": "tests/support/tests/amiibo.rs::resource_close_during_failed_save_cleanup_settles_stream_before_terminal"
         },
         {
           "id": "phase2a.amiibo.select-cleanup",

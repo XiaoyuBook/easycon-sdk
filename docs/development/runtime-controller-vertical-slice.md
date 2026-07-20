@@ -110,13 +110,13 @@ Phase 2A 专项测试还包括：
 
 - `tests/support/tests/serial_ch32.rs`：Windows-independent byte chain、partial/zero/block、ACK fault、deadline、
   cancel、close、hot unplug、半帧失败和 stream 计数；
-- `tests/support/tests/amiibo.rs`：8 条 save/select success/failure/cancel/deadline/disconnect/cleanup 路径；
+- `tests/support/tests/amiibo.rs`：9 条 save/select success/failure/cancel/deadline/disconnect/cleanup 路径；
 - `tests/support/tests/phase2a_sequence.rs`：10,000 input steps、5,000 same-offset merged reports，逐个绝对
   target 验证无丢失、乱序、早发和漂移，并在 close 后验证三个 registry 为零；
 - `tests/support/tests/phase2a_latency.rs`：五段时间戳单调性与不丢样本的确定性 contract。
 
-当前完整 workspace 为 156 个非文档测试通过；Runtime Loom 模型 6/6；规范校验执行 5 schemas、1 behavior、
-3 controller fixtures、9 scenarios 和 64 个 exact Rust tests。最终提交前仍以实际完整门禁输出为准。
+当前完整 workspace 为 157 个非文档测试通过；Runtime Loom 模型 6/6；规范校验执行 5 schemas、1 behavior、
+3 controller fixtures、9 scenarios 和 65 个 exact Rust tests。最终提交前仍以实际完整门禁输出为准。
 
 ## 软件路径延迟结果
 

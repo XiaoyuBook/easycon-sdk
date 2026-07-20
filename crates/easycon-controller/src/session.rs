@@ -1491,7 +1491,7 @@ impl ControllerLane {
                 if error.kind() == TransportErrorKind::Disconnected {
                     self.handle_transport_disconnect(Some(operation.id()), &error);
                 }
-                fail_or_finish_cancelled(&operation, map_transport_error(error));
+                self.fail_request_exchange(operation, map_transport_error(error));
             }
         }
     }
@@ -1546,8 +1546,8 @@ impl ControllerLane {
             self.handle_amiibo_cleanup_failure(operation.id(), &cleanup_error);
         }
         let mapped = map_transport_error(error);
-        fail_or_finish_cancelled(
-            &operation,
+        self.fail_request_exchange(
+            operation,
             EasyConError::new(
                 mapped.domain(),
                 mapped.code(),
@@ -1719,10 +1719,33 @@ impl ControllerLane {
         if operation.snapshot().state != OperationState::Cancelling {
             operation.request_cancel(easycon_runtime::CancellationReason::ParentClose);
         }
-        if self.resource_cancellation.is_cancelled() {
+        let Some(operation) = self.defer_request_for_resource_close(operation) else {
+            return;
+        };
+        operation.finish_cancelled();
+    }
+
+    fn fail_request_exchange(&mut self, operation: Operation, error: EasyConError) {
+        let Some(operation) = self.defer_request_for_resource_close(operation) else {
+            return;
+        };
+        fail_or_finish_cancelled(&operation, error);
+    }
+
+    fn defer_request_for_resource_close(&mut self, operation: Operation) -> Option<Operation> {
+        if !self.resource_cancellation.is_cancelled() {
+            return Some(operation);
+        }
+        if !operation.snapshot().state.is_terminal()
+            && operation.snapshot().state != OperationState::Cancelling
+        {
+            operation.request_cancel(easycon_runtime::CancellationReason::ParentClose);
+        }
+        if operation.snapshot().state == OperationState::Cancelling {
             self.close_deferred_operations.push(operation);
+            None
         } else {
-            operation.finish_cancelled();
+            Some(operation)
         }
     }
 

@@ -475,6 +475,42 @@ fn save_disconnect_and_controller_close_have_unique_terminal_cleanup() {
     runtime.close().expect("Runtime close");
 }
 
+// conformance: phase2a.amiibo.cleanup-close-order
+#[test]
+fn resource_close_during_failed_save_cleanup_settles_stream_before_terminal() {
+    let (_clock, runtime, simulator, controller) = connected_ch32(1, 20);
+    simulator.push_ack(Ch32AckBehavior::Reply(0xff));
+    simulator.push_ack(Ch32AckBehavior::Reply(0x00));
+    simulator.push_ack(Ch32AckBehavior::NoReply);
+    let save = controller
+        .save_amiibo(
+            0,
+            Arc::<[u8]>::from([1, 2, 3]),
+            AmiiboSaveOptions {
+                maximum_chunk_retries: 0,
+                ..AmiiboSaveOptions::default()
+            },
+        )
+        .expect("save with blocked failure cleanup");
+    assert!(simulator.wait_until_read_blocked(Duration::from_secs(2)));
+
+    simulator.block_next_close();
+    let closing_controller = controller.clone();
+    let close = std::thread::spawn(move || closing_controller.close());
+    let close_blocked = simulator.wait_until_close_blocked(Duration::from_secs(2));
+    let state_before_close = save.wait(WaitTimeout::Poll);
+    simulator.release_close();
+    close.join().expect("Controller close thread");
+
+    assert!(close_blocked, "resource close did not reach the stream");
+    assert_eq!(state_before_close, WaitResult::Timeout);
+    wait_terminal(&save);
+    assert_eq!(save.snapshot().state, OperationState::Cancelled);
+    assert_eq!(controller.snapshot().state, ControllerState::Closed);
+    assert_eq!(simulator.snapshot().active_streams, 0);
+    runtime.close().expect("Runtime close");
+}
+
 // conformance: phase2a.amiibo.select-cleanup
 #[test]
 fn select_cancel_deadline_and_disconnect_use_the_same_cleanup_contract() {
