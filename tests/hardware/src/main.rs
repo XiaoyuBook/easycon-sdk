@@ -291,6 +291,8 @@ fn run_handshake(arguments: &[String]) -> Result<Value, String> {
 fn run_smoke(arguments: &[String]) -> Result<Value, String> {
     let port: String = required_value(arguments, "--port")?;
     let full = arguments.iter().any(|argument| argument == "--full");
+    let hold_ms = value_or(arguments, "--hold-ms", 0_u64)?;
+    validate_hold_ms(hold_ms)?;
     let harness = Harness::new(&port, ControllerOptions::default())?;
     harness.connect(ConnectOptions::default())?;
     let mut actions = Vec::new();
@@ -300,6 +302,9 @@ fn run_smoke(arguments: &[String]) -> Result<Value, String> {
         ControllerAction::ButtonDown(Button::A),
         &mut actions,
     )?;
+    if hold_ms != 0 {
+        thread::sleep(Duration::from_millis(hold_ms));
+    }
     exercise_action(
         &harness,
         "button.A.up",
@@ -377,6 +382,7 @@ fn run_smoke(arguments: &[String]) -> Result<Value, String> {
     let result = json!({
         "command": "smoke",
         "stage": if full { "full" } else { "a_only" },
+        "a_hold_ms": hold_ms,
         "port": port_json(&harness.descriptor),
         "actual_baud": harness.actual_baud(),
         "actions": actions,
@@ -663,6 +669,14 @@ fn exercise_action(
     Ok(())
 }
 
+fn validate_hold_ms(hold_ms: u64) -> Result<(), String> {
+    if hold_ms <= 5_000 {
+        Ok(())
+    } else {
+        Err("--hold-ms must not exceed 5000".to_owned())
+    }
+}
+
 fn find_port(port_name: &str) -> Result<SerialPortDescriptor, String> {
     discover_system_ports()
         .map_err(|error| error.to_string())?
@@ -912,7 +926,7 @@ fn print_help() {
     println!(
         "Usage:\n  easycon-hardware-qualification discover [--samples N]\n  \
          easycon-hardware-qualification handshake --port COMx\n  \
-         easycon-hardware-qualification smoke --port COMx [--full]\n  \
+         easycon-hardware-qualification smoke --port COMx [--full] [--hold-ms N]\n  \
          easycon-hardware-qualification faults --port COMx\n  \
          easycon-hardware-qualification hotplug --port COMx [--timeout-seconds N]\n  \
          easycon-hardware-qualification lifecycle --port COMx [--cycles 100]\n  \
@@ -934,5 +948,12 @@ mod tests {
         assert_eq!(document["command"], "handshake");
         assert_eq!(document["error"], "protocol timeout");
         assert_eq!(error.as_deref(), Some("protocol timeout"));
+    }
+
+    #[test]
+    fn diagnostic_hold_is_bounded() {
+        assert!(validate_hold_ms(0).is_ok());
+        assert!(validate_hold_ms(5_000).is_ok());
+        assert!(validate_hold_ms(5_001).is_err());
     }
 }
