@@ -65,6 +65,15 @@ pub enum WriteKind {
     Command,
 }
 
+/// Controller-side monotonic stages captured before one direct report enters transport.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DirectWriteTiming {
+    /// Time sampled immediately before the command is enqueued to the single-writer lane.
+    pub command_admitted_ns: u64,
+    /// Time sampled when the lane receives and begins dispatching the direct command.
+    pub lane_wake_ns: u64,
+}
+
 /// Stable context repeated across partial writes for one logical payload.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WriteContext {
@@ -76,6 +85,8 @@ pub struct WriteContext {
     pub sequence: u64,
     /// Runtime-clock timestamp chosen for this logical dispatch.
     pub timestamp_ns: u64,
+    /// Admission and lane-wake stages for a direct report; absent for other write kinds.
+    pub direct_timing: Option<DirectWriteTiming>,
     /// Complete logical payload length.
     pub total_len: usize,
     /// Write purpose.

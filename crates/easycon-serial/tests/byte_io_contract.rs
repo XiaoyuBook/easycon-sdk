@@ -123,6 +123,7 @@ fn injectable_adapter_handles_partial_handshake_and_command_generation() {
         operation_id: Some(easycon_model_id(2)),
         sequence: 7,
         timestamp_ns: clock.now_ns(),
+        direct_timing: None,
         total_len: 2,
         kind: WriteKind::Command,
     };
@@ -191,6 +192,7 @@ fn zero_progress_deadline_and_cancellation_are_normalized() {
         operation_id: Some(easycon_model_id(2)),
         sequence: 1,
         timestamp_ns: 10,
+        direct_timing: None,
         total_len: 1,
         kind: WriteKind::Report,
     };

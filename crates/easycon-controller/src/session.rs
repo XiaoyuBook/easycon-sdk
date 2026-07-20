@@ -20,8 +20,9 @@ use crate::amiibo::{
 use crate::protocol::SwitchReport;
 use crate::sequence::PreciseSequence;
 use crate::transport::{
-    AUTO_BAUD_RATES, AckRequest, ControllerTransport, HANDSHAKE_REPLY, HANDSHAKE_REQUEST,
-    HandshakeRequest, TransportError, TransportErrorKind, WriteContext, WriteKind, WriteRequest,
+    AUTO_BAUD_RATES, AckRequest, ControllerTransport, DirectWriteTiming, HANDSHAKE_REPLY,
+    HANDSHAKE_REQUEST, HandshakeRequest, TransportError, TransportErrorKind, WriteContext,
+    WriteKind, WriteRequest,
 };
 
 /// Controller connection/resource state.
@@ -224,6 +225,7 @@ enum LaneCommand {
         operation: Operation,
         action: ControllerAction,
         lease_access: LeaseAccess,
+        command_admitted_ns: u64,
     },
     Sequence {
         operation: Operation,
@@ -329,6 +331,7 @@ struct ScheduledReport {
     operation: Operation,
     report: SwitchReport,
     mutation: Option<ControllerAction>,
+    direct_timing: Option<DirectWriteTiming>,
     kind: WriteKind,
     completion: ReportCompletion,
 }
@@ -485,9 +488,10 @@ impl ControllerSession {
                 "protocol timeout must be non-zero",
             ));
         }
-        self.enqueue_operation(options.operation_deadline_ns, |operation| {
-            LaneCommand::Connect { operation, options }
-        })
+        self.enqueue_operation(
+            options.operation_deadline_ns,
+            |operation, _admitted_at_ns| LaneCommand::Connect { operation, options },
+        )
     }
 
     /// Submits one direct desired-state mutation.
@@ -513,7 +517,7 @@ impl ControllerSession {
 
     /// Submits a validated precise sequence with an exclusive write lease.
     pub fn precise_sequence(&self, sequence: PreciseSequence) -> Result<Operation, EasyConError> {
-        self.enqueue_operation(None, |operation| LaneCommand::Sequence {
+        self.enqueue_operation(None, |operation, _admitted_at_ns| LaneCommand::Sequence {
             operation,
             sequence,
         })
@@ -534,7 +538,7 @@ impl ControllerSession {
                 "ACK command and protocol timeout must be non-empty",
             ));
         }
-        self.enqueue_operation(None, |operation| LaneCommand::Ack {
+        self.enqueue_operation(None, |operation, _admitted_at_ns| LaneCommand::Ack {
             operation,
             command,
             expected_reply,
@@ -569,14 +573,15 @@ impl ControllerSession {
         limits.validate_slot(slot)?;
         let data = data.into();
         limits.validate_data(data.len())?;
-        self.enqueue_operation(options.operation_deadline_ns, |operation| {
-            LaneCommand::AmiiboSave {
+        self.enqueue_operation(
+            options.operation_deadline_ns,
+            |operation, _admitted_at_ns| LaneCommand::AmiiboSave {
                 operation,
                 slot,
                 data,
                 options,
-            }
-        })
+            },
+        )
     }
 
     /// Selects one zero-based Amiibo slot under explicit device limits.
@@ -593,13 +598,14 @@ impl ControllerSession {
             ));
         }
         self.require_amiibo_limits()?.validate_slot(slot)?;
-        self.enqueue_operation(options.operation_deadline_ns, |operation| {
-            LaneCommand::AmiiboSelect {
+        self.enqueue_operation(
+            options.operation_deadline_ns,
+            |operation, _admitted_at_ns| LaneCommand::AmiiboSelect {
                 operation,
                 slot,
                 options,
-            }
-        })
+            },
+        )
     }
 
     fn require_amiibo_limits(&self) -> Result<AmiiboLimits, EasyConError> {
@@ -655,17 +661,18 @@ impl ControllerSession {
         action: ControllerAction,
         lease_access: LeaseAccess,
     ) -> Result<Operation, EasyConError> {
-        self.enqueue_operation(None, |operation| LaneCommand::Direct {
+        self.enqueue_operation(None, |operation, command_admitted_ns| LaneCommand::Direct {
             operation,
             action,
             lease_access,
+            command_admitted_ns,
         })
     }
 
     fn enqueue_operation(
         &self,
         deadline_ns: Option<u64>,
-        command: impl FnOnce(Operation) -> LaneCommand,
+        command: impl FnOnce(Operation, u64) -> LaneCommand,
     ) -> Result<Operation, EasyConError> {
         let _admission = self
             .inner
@@ -680,7 +687,13 @@ impl ControllerSession {
             .runtime
             .create_operation_with_parent(deadline_ns, &self.inner.resource_cancellation)?;
         self.attach_wake(&operation);
-        if self.inner.sender.send(command(operation.clone())).is_err() {
+        let command_admitted_ns = self.inner.runtime.clock().now_ns();
+        if self
+            .inner
+            .sender
+            .send(command(operation.clone(), command_admitted_ns))
+            .is_err()
+        {
             fail_closed_lane(&operation);
         }
         Ok(operation)
@@ -799,8 +812,13 @@ impl ControllerLane {
                     operation,
                     action,
                     lease_access,
+                    command_admitted_ns,
                 } => {
-                    self.handle_direct(operation, action, lease_access);
+                    let direct_timing = DirectWriteTiming {
+                        command_admitted_ns,
+                        lane_wake_ns: self.clock.now_ns(),
+                    };
+                    self.handle_direct(operation, action, lease_access, direct_timing);
                 }
                 LaneCommand::Sequence {
                     operation,
@@ -1067,6 +1085,7 @@ impl ControllerLane {
         operation: Operation,
         action: ControllerAction,
         lease_access: LeaseAccess,
+        direct_timing: DirectWriteTiming,
     ) {
         if self.finish_if_cancelled_before_start(&operation) {
             return;
@@ -1115,6 +1134,7 @@ impl ControllerLane {
             operation,
             report: self.desired_report,
             mutation: Some(action),
+            direct_timing: Some(direct_timing),
             kind: WriteKind::Report,
             completion: ReportCompletion::Direct,
         });
@@ -1213,6 +1233,7 @@ impl ControllerLane {
                 operation: waiting.operation.clone(),
                 report: planned_report,
                 mutation: None,
+                direct_timing: None,
                 kind: WriteKind::Report,
                 completion: ReportCompletion::Sequence {
                     final_report: index + 1 == group_count,
@@ -1397,7 +1418,7 @@ impl ControllerLane {
             .checked_add(1)
             .expect("ACK generation exhausted");
         let now = self.clock.now_ns();
-        self.write_payload(Some(operation), WriteKind::Command, now, command)?;
+        self.write_payload(Some(operation), WriteKind::Command, now, None, command)?;
         if self.cancel_or_deadline(operation, operation_deadline_ns) {
             return Err(cancelled_transport_error());
         }
@@ -1552,7 +1573,7 @@ impl ControllerLane {
             .checked_add(1)
             .expect("ACK generation exhausted");
         let now = self.clock.now_ns();
-        self.write_payload(None, WriteKind::Command, now, &reset_command())?;
+        self.write_payload(None, WriteKind::Command, now, None, &reset_command())?;
         let deadline_ns = self.clock.now_ns().saturating_add(reset_timeout_ns);
         loop {
             match self.transport.wait_for_ack(AckRequest {
@@ -1777,6 +1798,7 @@ impl ControllerLane {
             operation,
             report: SwitchReport::NEUTRAL,
             mutation: None,
+            direct_timing: None,
             kind: WriteKind::Neutralize,
             completion: ReportCompletion::Cancelled { release_sequence },
         });
@@ -1802,6 +1824,7 @@ impl ControllerLane {
             operation,
             report: SwitchReport::NEUTRAL,
             mutation: None,
+            direct_timing: None,
             kind: WriteKind::Neutralize,
             completion: ReportCompletion::Failed {
                 error,
@@ -1851,7 +1874,13 @@ impl ControllerLane {
             }
 
             let bytes = pending.report.encode();
-            match self.write_payload(Some(&pending.operation), pending.kind, now, &bytes) {
+            match self.write_payload(
+                Some(&pending.operation),
+                pending.kind,
+                now,
+                pending.direct_timing,
+                &bytes,
+            ) {
                 Ok(()) => {
                     let accepted_at_ns = self.clock.now_ns();
                     self.clock.record_dispatch(pending.deadline_id, now);
@@ -2015,6 +2044,7 @@ impl ControllerLane {
         operation: Option<&Operation>,
         kind: WriteKind,
         timestamp_ns: u64,
+        direct_timing: Option<DirectWriteTiming>,
         bytes: &[u8],
     ) -> Result<(), TransportError> {
         let operation_id = operation.map(Operation::id);
@@ -2028,6 +2058,7 @@ impl ControllerLane {
             operation_id,
             sequence,
             timestamp_ns,
+            direct_timing,
             total_len: bytes.len(),
             kind,
         };
@@ -2228,7 +2259,7 @@ impl ControllerLane {
             let deadline_id = self.clock.register_deadline(target_ns);
             self.wait_for_close_target(target_ns, &mut operations, &mut close_waiters);
             let dispatch_ns = self.clock.now_ns();
-            match self.write_payload(None, WriteKind::Neutralize, dispatch_ns, &bytes) {
+            match self.write_payload(None, WriteKind::Neutralize, dispatch_ns, None, &bytes) {
                 Ok(()) => {
                     let accepted_at_ns = self.clock.now_ns();
                     self.clock.record_dispatch(deadline_id, dispatch_ns);

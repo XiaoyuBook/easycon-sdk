@@ -3,6 +3,7 @@
 
 mod ch32;
 mod controller;
+mod latency;
 
 pub use ch32::{
     Ch32AcceptedReport, Ch32AckBehavior, Ch32AmiiboChunk, Ch32ByteSimulator, Ch32HandshakeBehavior,
@@ -11,3 +12,4 @@ pub use ch32::{
 pub use controller::{
     AcceptedWrite, AckOutcome, FakeControllerTransport, HandshakeAttemptRecord, HandshakeOutcome,
 };
+pub use latency::{DirectLatencyRecorder, DirectLatencySample, DirectLatencyTransport};

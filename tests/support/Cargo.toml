@@ -7,6 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[[bin]]
+name = "controller_latency"
+path = "tools/controller_latency.rs"
+
 [dependencies]
 easycon-controller = { path = "../../crates/easycon-controller" }
 easycon-model = { path = "../../crates/easycon-model" }
