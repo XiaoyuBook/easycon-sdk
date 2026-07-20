@@ -381,7 +381,7 @@ struct QualificationDecision {
 
 fn finalize_result(command: &str, execution: Result<Value, String>) -> (Value, Option<String>) {
     match execution {
-        Ok(result) if !all_cleanup_succeeded(&result) => {
+        Ok(result) if !cleanup_contract_succeeded(command, &result) => {
             let error = "deterministic cleanup did not complete".to_owned();
             (
                 json!({
@@ -584,18 +584,77 @@ fn qualification_check(name: &str, status: &str) -> Value {
     json!({"name": name, "status": status})
 }
 
-fn all_cleanup_succeeded(value: &Value) -> bool {
-    match value {
-        Value::Array(values) => values.iter().all(all_cleanup_succeeded),
-        Value::Object(object) => {
-            if object.get("kind").and_then(Value::as_str) == Some("runtime_cleanup")
-                && object.get("succeeded").and_then(Value::as_bool) != Some(true)
-            {
-                return false;
-            }
-            object.values().all(all_cleanup_succeeded)
+fn cleanup_contract_succeeded(command: &str, result: &Value) -> bool {
+    let expected_count = match command {
+        "handshake" | "smoke" | "home-wake" | "sequence" => 1,
+        "faults" => 3,
+        "hotplug" => 2,
+        "lifecycle" => result["records"].as_array().map_or(0, Vec::len),
+        "amiibo" if result["write_performed"].as_bool() == Some(true) => 1,
+        "discover" | "amiibo" => 0,
+        _ => 0,
+    };
+    if cleanup_slot_count(result) != expected_count
+        || runtime_cleanup_count(result) != expected_count
+    {
+        return false;
+    }
+
+    match command {
+        "handshake" | "smoke" | "home-wake" | "sequence" => cleanup_succeeded(&result["cleanup"]),
+        "faults" => {
+            cleanup_succeeded(&result["cleanup"])
+                && cleanup_succeeded(&result["secondary_cleanup"])
+                && cleanup_succeeded(&result["deadline_cleanup"])
         }
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => true,
+        "hotplug" => {
+            cleanup_succeeded(&result["cleanup"])
+                && cleanup_succeeded(&result["disconnect_cleanup"])
+        }
+        "lifecycle" => result["records"].as_array().is_some_and(|records| {
+            records
+                .iter()
+                .all(|record| cleanup_succeeded(&record["cleanup"]))
+        }),
+        "amiibo" if result["write_performed"].as_bool() == Some(true) => {
+            cleanup_succeeded(&result["cleanup"])
+        }
+        "discover" | "amiibo" => true,
+        _ => true,
+    }
+}
+
+fn cleanup_succeeded(value: &Value) -> bool {
+    value["kind"] == "runtime_cleanup"
+        && value["succeeded"].as_bool() == Some(true)
+        && value["outcome"] == "Closed"
+        && value["counts"]["active_operations"].as_u64() == Some(0)
+        && value["counts"]["active_resources"].as_u64() == Some(0)
+        && value["counts"]["active_tasks"].as_u64() == Some(0)
+}
+
+fn cleanup_slot_count(value: &Value) -> usize {
+    match value {
+        Value::Array(values) => values.iter().map(cleanup_slot_count).sum(),
+        Value::Object(object) => object
+            .iter()
+            .map(|(key, value)| {
+                usize::from(key == "cleanup" || key.ends_with("_cleanup"))
+                    + cleanup_slot_count(value)
+            })
+            .sum(),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => 0,
+    }
+}
+
+fn runtime_cleanup_count(value: &Value) -> usize {
+    match value {
+        Value::Array(values) => values.iter().map(runtime_cleanup_count).sum(),
+        Value::Object(object) => {
+            usize::from(object.get("kind").and_then(Value::as_str) == Some("runtime_cleanup"))
+                + object.values().map(runtime_cleanup_count).sum::<usize>()
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => 0,
     }
 }
 
@@ -1490,6 +1549,19 @@ mod tests {
         }
     }
 
+    fn successful_cleanup() -> Value {
+        json!({
+            "kind": "runtime_cleanup",
+            "succeeded": true,
+            "outcome": "Closed",
+            "counts": {
+                "active_operations": 0,
+                "active_resources": 0,
+                "active_tasks": 0,
+            },
+        })
+    }
+
     struct NoopTransport;
 
     impl ControllerTransport for NoopTransport {
@@ -1537,9 +1609,19 @@ mod tests {
                     "port_occupied_expected_failed": false,
                     "cancel_expected_cancelled": true,
                     "deadline_expected_cancelled": true,
+                    "cleanup": successful_cleanup(),
+                    "secondary_cleanup": successful_cleanup(),
+                    "deadline_cleanup": successful_cleanup(),
                 }),
             ),
-            ("hotplug", json!({"disconnect_detected": false})),
+            (
+                "hotplug",
+                json!({
+                    "disconnect_detected": false,
+                    "cleanup": successful_cleanup(),
+                    "disconnect_cleanup": successful_cleanup(),
+                }),
+            ),
             (
                 "lifecycle",
                 json!({"cycles": 100, "no_positive_growth": false, "records": []}),
@@ -1551,6 +1633,7 @@ mod tests {
                     "functional_success": false,
                     "accepted_report_count_before_final_reset": 10_000,
                     "recorded_complete_writes": 10_001,
+                    "cleanup": successful_cleanup(),
                 }),
             ),
         ];
@@ -1564,12 +1647,182 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_layout_is_required_and_exact_for_each_command() {
+        let cleanup = successful_cleanup;
+        let lifecycle_records = || {
+            (0..100)
+                .map(|cycle| {
+                    json!({
+                        "cycle": cycle + 1,
+                        "cleanup": cleanup(),
+                        "port_present": true,
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let valid_cases = [
+            (
+                "handshake",
+                json!({
+                    "operation": {"state": "Succeeded"},
+                    "actual_baud": 115_200,
+                    "cleanup": cleanup(),
+                }),
+            ),
+            (
+                "smoke",
+                json!({
+                    "final_snapshot": {"desired_report_neutral": true},
+                    "cleanup": cleanup(),
+                }),
+            ),
+            (
+                "home-wake",
+                json!({
+                    "final_snapshot": {"desired_report_neutral": true},
+                    "cleanup": cleanup(),
+                }),
+            ),
+            (
+                "faults",
+                json!({
+                    "port_occupied_expected_failed": true,
+                    "cancel_expected_cancelled": true,
+                    "deadline_expected_cancelled": true,
+                    "cleanup": cleanup(),
+                    "secondary_cleanup": cleanup(),
+                    "deadline_cleanup": cleanup(),
+                }),
+            ),
+            (
+                "hotplug",
+                json!({
+                    "disconnect_detected": true,
+                    "reconnect_operation": {"state": "Succeeded"},
+                    "stable_id": "DEVICE\\EXPECTED",
+                    "reconnected_identity": {"stable_id": "DEVICE\\EXPECTED"},
+                    "cleanup": cleanup(),
+                    "disconnect_cleanup": cleanup(),
+                }),
+            ),
+            (
+                "lifecycle",
+                json!({
+                    "cycles": 100,
+                    "no_positive_growth": true,
+                    "records": lifecycle_records(),
+                }),
+            ),
+            (
+                "sequence",
+                json!({
+                    "requested_steps": 10_000,
+                    "functional_success": true,
+                    "accepted_report_count_before_final_reset": 10_000,
+                    "recorded_complete_writes": 10_001,
+                    "cleanup": cleanup(),
+                }),
+            ),
+            (
+                "amiibo",
+                json!({
+                    "write_performed": true,
+                    "cleanup": cleanup(),
+                }),
+            ),
+        ];
+
+        for (command, result) in valid_cases {
+            let (document, _) = finalize_result(command, Ok(result.clone()));
+            assert_ne!(document["execution_status"], "failed", "valid {command}");
+
+            let mut missing = result.clone();
+            if command == "lifecycle" {
+                missing["records"][0]
+                    .as_object_mut()
+                    .expect("lifecycle record")
+                    .remove("cleanup");
+            } else {
+                missing
+                    .as_object_mut()
+                    .expect("command result")
+                    .remove("cleanup");
+            }
+            assert_cleanup_failure(command, missing);
+
+            let mut extra = result;
+            extra["misplaced"]["cleanup"] = cleanup();
+            assert_cleanup_failure(command, extra);
+        }
+
+        let mut failed_outcome = cleanup();
+        failed_outcome["outcome"] = json!("Failed");
+        assert_cleanup_failure(
+            "handshake",
+            json!({
+                "operation": {"state": "Succeeded"},
+                "actual_baud": 115_200,
+                "cleanup": failed_outcome,
+            }),
+        );
+        let mut nonzero_counts = cleanup();
+        nonzero_counts["counts"]["active_operations"] = json!(1);
+        assert_cleanup_failure(
+            "handshake",
+            json!({
+                "operation": {"state": "Succeeded"},
+                "actual_baud": 115_200,
+                "cleanup": nonzero_counts,
+            }),
+        );
+
+        for (command, mut result) in [
+            (
+                "discover",
+                json!({
+                    "samples": 3,
+                    "stable_across_samples": true,
+                    "snapshots": [
+                        [{"stable_id": "DEVICE\\EXPECTED"}],
+                        [{"stable_id": "DEVICE\\EXPECTED"}],
+                        [{"stable_id": "DEVICE\\EXPECTED"}],
+                    ],
+                }),
+            ),
+            (
+                "amiibo",
+                json!({
+                    "write_performed": false,
+                    "capability": "unknown",
+                }),
+            ),
+        ] {
+            let (document, _) = finalize_result(command, Ok(result.clone()));
+            assert_ne!(document["execution_status"], "failed", "valid {command}");
+            result["cleanup"] = cleanup();
+            assert_cleanup_failure(command, result);
+        }
+    }
+
+    fn assert_cleanup_failure(command: &str, result: Value) {
+        let (document, failure) = finalize_result(command, Ok(result));
+        assert!(
+            failure.is_some(),
+            "{command} must reject its cleanup layout"
+        );
+        assert_eq!(document["execution_status"], "failed", "{command}");
+        assert_eq!(document["qualification_status"], "failed", "{command}");
+        assert_eq!(document_exit_code(&document), 1, "{command}");
+    }
+
+    #[test]
     fn pending_observation_and_unwritten_amiibo_are_not_passed() {
         let (smoke, _) = finalize_result(
             "smoke",
             Ok(json!({
                 "final_snapshot": {"desired_report_neutral": true},
                 "switch_observation": "requires operator confirmation",
+                "cleanup": successful_cleanup(),
             })),
         );
         assert_eq!(smoke["status"], "unverified");
@@ -1580,6 +1833,7 @@ mod tests {
             Ok(json!({
                 "final_snapshot": {"desired_report_neutral": true},
                 "switch_observation": "requires operator confirmation",
+                "cleanup": successful_cleanup(),
             })),
         );
         assert_eq!(home["status"], "unverified");
@@ -1603,6 +1857,7 @@ mod tests {
                 "accepted_report_count_before_final_reset": 10_000,
                 "recorded_complete_writes": 10_001,
                 "physical_order_evidence": "open: no logic analyzer or firmware trace",
+                "cleanup": successful_cleanup(),
             })),
         );
 
