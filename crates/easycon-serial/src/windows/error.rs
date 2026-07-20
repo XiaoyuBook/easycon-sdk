@@ -18,10 +18,10 @@ pub(super) fn from_code(operation: &'static str, code: u32) -> SerialError {
         ERROR_ACCESS_DENIED => SerialErrorKind::AccessDenied,
         ERROR_SHARING_VIOLATION => SerialErrorKind::PortBusy,
         ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => SerialErrorKind::NotFound,
-        ERROR_DEVICE_NOT_CONNECTED | ERROR_GEN_FAILURE | ERROR_INVALID_HANDLE => {
-            SerialErrorKind::Disconnected
-        }
-        ERROR_OPERATION_ABORTED => SerialErrorKind::Cancelled,
+        ERROR_DEVICE_NOT_CONNECTED
+        | ERROR_GEN_FAILURE
+        | ERROR_INVALID_HANDLE
+        | ERROR_OPERATION_ABORTED => SerialErrorKind::Disconnected,
         ERROR_SEM_TIMEOUT => SerialErrorKind::DeadlineExceeded,
         _ => SerialErrorKind::Io,
     };
@@ -48,7 +48,7 @@ mod tests {
         );
         assert_eq!(
             from_code("read", ERROR_OPERATION_ABORTED).kind(),
-            SerialErrorKind::Cancelled
+            SerialErrorKind::Disconnected
         );
     }
 }
