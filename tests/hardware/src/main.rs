@@ -10,9 +10,9 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use easycon_controller::{
-    AckFrame, AckRequest, AmiiboLimits, AmiiboSaveOptions, AmiiboSelectOptions, ConnectOptions,
-    ControllerAction, ControllerOptions, ControllerSession, ControllerTransport, HandshakeRequest,
-    PreciseSequence, SequenceStep, TransportError, WriteKind, WriteRequest,
+    AUTO_BAUD_RATES, AckFrame, AckRequest, AmiiboLimits, AmiiboSaveOptions, AmiiboSelectOptions,
+    ConnectOptions, ControllerAction, ControllerOptions, ControllerSession, ControllerTransport,
+    HandshakeRequest, PreciseSequence, SequenceStep, TransportError, WriteKind, WriteRequest,
 };
 use easycon_hardware_qualification::{distribution, option_value, required_value, value_or};
 use easycon_model::{Button, Hat, StickPosition};
@@ -21,7 +21,8 @@ use easycon_runtime::{
     SystemClock, WaitResult, WaitTimeout,
 };
 use easycon_serial::{
-    SerialControllerTransport, SerialPortDescriptor, WindowsByteIoFactory, discover_system_ports,
+    ByteIo, ByteIoFactory, ByteIoRequest, SerialControllerTransport, SerialError,
+    SerialPortDescriptor, WindowsByteIoFactory, discover_system_ports,
 };
 use serde_json::{Value, json};
 
@@ -45,11 +46,43 @@ struct TimingSample {
     transport_accepted_ns: u64,
 }
 
+#[derive(Clone, Debug)]
+struct NativeOpenAttempt {
+    baud: u32,
+    error: Option<SerialError>,
+}
+
 #[derive(Default)]
 struct Telemetry {
     actual_baud: Option<u32>,
     handshake_attempts: Vec<HandshakeAttempt>,
+    native_open_attempts: Vec<NativeOpenAttempt>,
     timings: Vec<TimingSample>,
+}
+
+struct ObservedByteIoFactory {
+    inner: Box<dyn ByteIoFactory>,
+    telemetry: Arc<Mutex<Telemetry>>,
+}
+
+impl ByteIoFactory for ObservedByteIoFactory {
+    fn open(
+        &mut self,
+        port: &SerialPortDescriptor,
+        baud_rate: u32,
+        request: ByteIoRequest,
+    ) -> Result<Box<dyn ByteIo>, SerialError> {
+        let result = self.inner.open(port, baud_rate, request);
+        self.telemetry
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .native_open_attempts
+            .push(NativeOpenAttempt {
+                baud: baud_rate,
+                error: result.as_ref().err().cloned(),
+            });
+        result
+    }
 }
 
 struct ObservedTransport {
@@ -245,10 +278,14 @@ impl Harness {
         let descriptor = find_port(port_name)?;
         let clock: Arc<dyn Clock> = Arc::new(SystemClock::default());
         let telemetry = Arc::new(Mutex::new(Telemetry::default()));
+        let observed_factory = ObservedByteIoFactory {
+            inner: Box::new(WindowsByteIoFactory),
+            telemetry: telemetry.clone(),
+        };
         let serial = SerialControllerTransport::new(
             clock.clone(),
             descriptor.clone(),
-            Box::new(WindowsByteIoFactory),
+            Box::new(observed_factory),
         );
         let observed = ObservedTransport {
             inner: serial,
@@ -293,6 +330,10 @@ impl Harness {
 
     fn now_ns(&self) -> u64 {
         self.clock.now_ns()
+    }
+
+    fn native_open_attempts(&self) -> Value {
+        native_open_attempts_json(&self.telemetry)
     }
 }
 
@@ -460,6 +501,10 @@ fn qualification_decision(command: &str, result: &Value) -> QualificationDecisio
                 operation_matches(&result["port_occupied"], "Failed", "Io", "Transport", None),
             ),
             (
+                "port_occupied_exact_native_error",
+                exact_port_busy_open_attempts(&result["port_occupied_native_open_attempts"]),
+            ),
+            (
                 "cancel_exact_reason",
                 operation_matches(
                     &result["cancel"],
@@ -478,6 +523,13 @@ fn qualification_decision(command: &str, result: &Value) -> QualificationDecisio
                     "DeadlineExceeded",
                     Some("Deadline"),
                 ),
+            ),
+            (
+                "deadline_did_not_open_port",
+                result
+                    .get("deadline_native_open_attempts")
+                    .and_then(Value::as_array)
+                    .is_some_and(Vec::is_empty),
             ),
         ]),
         "hotplug" => required_checks(&[
@@ -588,6 +640,32 @@ fn operation_matches(
             .and_then(Value::as_str)
             .is_some_and(|message| !message.is_empty())
         && reason_matches
+}
+
+fn exact_port_busy_open_attempts(value: &Value) -> bool {
+    let Some(attempts) = value.as_array() else {
+        return false;
+    };
+    attempts.len() == AUTO_BAUD_RATES.len()
+        && attempts
+            .iter()
+            .zip(AUTO_BAUD_RATES)
+            .all(|(attempt, expected_baud)| {
+                let Some(attempt) = attempt.as_object() else {
+                    return false;
+                };
+                let Some(error) = attempt.get("error").and_then(Value::as_object) else {
+                    return false;
+                };
+                attempt.get("baud").and_then(Value::as_u64) == Some(u64::from(expected_baud))
+                    && attempt.get("succeeded").and_then(Value::as_bool) == Some(false)
+                    && error.get("kind").and_then(Value::as_str) == Some("PortBusy")
+                    && error.get("os_code").and_then(Value::as_u64) == Some(32)
+                    && error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .is_some_and(|message| !message.is_empty())
+            })
 }
 
 fn discovery_qualification(result: &Value) -> QualificationDecision {
@@ -1005,6 +1083,7 @@ fn run_faults(arguments: &[String]) -> Result<Value, String> {
         .map_err(|error| error.to_string())?;
     wait_terminal(&occupied_operation, OPERATION_TIMEOUT)?;
     let occupied_result = operation_json(&occupied_operation);
+    let occupied_open_attempts = occupied.native_open_attempts();
     let occupied_cleanup = occupied.close();
 
     let sequence = PreciseSequence::new(vec![
@@ -1029,17 +1108,20 @@ fn run_faults(arguments: &[String]) -> Result<Value, String> {
         .map_err(|error| error.to_string())?;
     wait_terminal(&deadline_operation, OPERATION_TIMEOUT)?;
     let deadline_result = operation_json(&deadline_operation);
+    let deadline_open_attempts = deadline.native_open_attempts();
     let deadline_cleanup = deadline.close();
 
     let result = json!({
         "command": "faults",
         "port_occupied": occupied_result,
         "port_occupied_expected_failed": occupied_operation.snapshot().state == OperationState::Failed,
+        "port_occupied_native_open_attempts": occupied_open_attempts,
         "cancel": operation_json(&cancelled),
         "cancel_expected_cancelled": cancelled.snapshot().state == OperationState::Cancelled,
         "post_cancel_snapshot": snapshot_json(&primary.controller),
         "deadline": deadline_result,
         "deadline_expected_cancelled": deadline_operation.snapshot().state == OperationState::Cancelled,
+        "deadline_native_open_attempts": deadline_open_attempts,
         "secondary_cleanup": occupied_cleanup,
         "deadline_cleanup": deadline_cleanup,
     });
@@ -1425,6 +1507,28 @@ fn handshake_json(telemetry: &Arc<Mutex<Telemetry>>) -> Value {
     )
 }
 
+fn native_open_attempts_json(telemetry: &Arc<Mutex<Telemetry>>) -> Value {
+    Value::Array(
+        telemetry
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .native_open_attempts
+            .iter()
+            .map(|attempt| {
+                json!({
+                    "baud": attempt.baud,
+                    "succeeded": attempt.error.is_none(),
+                    "error": attempt.error.as_ref().map(|error| json!({
+                        "kind": format!("{:?}", error.kind()),
+                        "os_code": error.os_code(),
+                        "message": error.message(),
+                    })),
+                })
+            })
+            .collect(),
+    )
+}
+
 fn latency_json(telemetry: &Arc<Mutex<Telemetry>>, baud: Option<u32>) -> Value {
     let telemetry = telemetry.lock().unwrap_or_else(|error| error.into_inner());
     let direct: Vec<_> = telemetry
@@ -1629,9 +1733,12 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+
     use easycon_controller::TransportErrorKind;
     use easycon_model::{EasyConError, ErrorCode, ErrorDomain};
-    use easycon_runtime::{CancellationReason, ManagedResource};
+    use easycon_runtime::{CancellationReason, CancellationToken, ManagedResource};
+    use easycon_serial::{ByteIoOperation, SerialErrorKind};
 
     struct TestDirectory(PathBuf);
 
@@ -1695,6 +1802,21 @@ mod tests {
     impl ManagedResource for PanickingResource {
         fn close(&self) {
             panic!("injected qualification close failure");
+        }
+    }
+
+    struct ScriptedOpenFactory {
+        errors: VecDeque<SerialError>,
+    }
+
+    impl ByteIoFactory for ScriptedOpenFactory {
+        fn open(
+            &mut self,
+            _port: &SerialPortDescriptor,
+            _baud_rate: u32,
+            _request: ByteIoRequest,
+        ) -> Result<Box<dyn ByteIo>, SerialError> {
+            Err(self.errors.pop_front().expect("scripted open error"))
         }
     }
 
@@ -1807,6 +1929,42 @@ mod tests {
     }
 
     #[test]
+    fn observed_factory_preserves_native_open_failures() {
+        let telemetry = Arc::new(Mutex::new(Telemetry::default()));
+        let inner = ScriptedOpenFactory {
+            errors: VecDeque::from([
+                SerialError::with_os_code(SerialErrorKind::PortBusy, "sharing violation", 32),
+                SerialError::with_os_code(SerialErrorKind::AccessDenied, "access denied", 5),
+            ]),
+        };
+        let mut factory = ObservedByteIoFactory {
+            inner: Box::new(inner),
+            telemetry: telemetry.clone(),
+        };
+        let descriptor = SerialPortDescriptor::new("DEVICE\\EXPECTED", "COM8").expect("descriptor");
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock::default());
+        let request = || ByteIoRequest {
+            operation: ByteIoOperation::Open,
+            clock: clock.clone(),
+            deadline_ns: u64::MAX,
+            cancellation: CancellationToken::root(),
+            resource_cancellation: CancellationToken::root(),
+        };
+
+        assert!(factory.open(&descriptor, 115_200, request()).is_err());
+        assert!(factory.open(&descriptor, 9_600, request()).is_err());
+
+        let attempts = native_open_attempts_json(&telemetry);
+        assert_eq!(attempts[0]["baud"], 115_200);
+        assert_eq!(attempts[0]["succeeded"], false);
+        assert_eq!(attempts[0]["error"]["kind"], "PortBusy");
+        assert_eq!(attempts[0]["error"]["os_code"], 32);
+        assert_eq!(attempts[1]["baud"], 9_600);
+        assert_eq!(attempts[1]["error"]["kind"], "AccessDenied");
+        assert_eq!(attempts[1]["error"]["os_code"], 5);
+    }
+
+    #[test]
     fn faults_require_exact_operation_causes() {
         let operation = |state: &str, domain: &str, code: &str, reason: Value| {
             json!({
@@ -1821,6 +1979,26 @@ mod tests {
         };
         let valid = json!({
             "port_occupied": operation("Failed", "Io", "Transport", Value::Null),
+            "port_occupied_native_open_attempts": [
+                {
+                    "baud": 115_200,
+                    "succeeded": false,
+                    "error": {
+                        "kind": "PortBusy",
+                        "os_code": 32,
+                        "message": "diagnostic only",
+                    },
+                },
+                {
+                    "baud": 9_600,
+                    "succeeded": false,
+                    "error": {
+                        "kind": "PortBusy",
+                        "os_code": 32,
+                        "message": "diagnostic only",
+                    },
+                },
+            ],
             "cancel": operation("Cancelled", "Runtime", "Cancelled", json!("Requested")),
             "deadline": operation(
                 "Cancelled",
@@ -1828,6 +2006,7 @@ mod tests {
                 "DeadlineExceeded",
                 json!("Deadline"),
             ),
+            "deadline_native_open_attempts": [],
             "port_occupied_expected_failed": true,
             "cancel_expected_cancelled": true,
             "deadline_expected_cancelled": true,
@@ -1863,6 +2042,76 @@ mod tests {
             .expect("deadline operation")
             .remove("structured_error");
         invalid.push(missing_deadline_error);
+
+        for result in invalid {
+            let decision = qualification_decision("faults", &result);
+            assert_eq!(decision.status, QualificationStatus::Failed);
+            assert!(decision.failure.is_some());
+        }
+    }
+
+    #[test]
+    fn faults_require_exact_native_open_evidence() {
+        let operation = |state: &str, domain: &str, code: &str, reason: Value| {
+            json!({
+                "state": state,
+                "structured_error": {
+                    "domain": domain,
+                    "code": code,
+                    "message": "diagnostic only",
+                },
+                "cancellation_reason": reason,
+            })
+        };
+        let attempt = |baud: u32| {
+            json!({
+                "baud": baud,
+                "succeeded": false,
+                "error": {
+                    "kind": "PortBusy",
+                    "os_code": 32,
+                    "message": "CreateFileW(serial port) failed",
+                },
+            })
+        };
+        let valid = json!({
+            "port_occupied": operation("Failed", "Io", "Transport", Value::Null),
+            "port_occupied_native_open_attempts": [attempt(115_200), attempt(9_600)],
+            "cancel": operation("Cancelled", "Runtime", "Cancelled", json!("Requested")),
+            "deadline": operation(
+                "Cancelled",
+                "Runtime",
+                "DeadlineExceeded",
+                json!("Deadline"),
+            ),
+            "deadline_native_open_attempts": [],
+        });
+        assert_eq!(
+            qualification_decision("faults", &valid).status,
+            QualificationStatus::Passed
+        );
+
+        let mut invalid = Vec::new();
+        let mut missing_occupied_attempts = valid.clone();
+        missing_occupied_attempts
+            .as_object_mut()
+            .expect("fault result")
+            .remove("port_occupied_native_open_attempts");
+        invalid.push(missing_occupied_attempts);
+
+        let mut access_denied = valid.clone();
+        access_denied["port_occupied_native_open_attempts"][0]["error"]["kind"] =
+            json!("AccessDenied");
+        access_denied["port_occupied_native_open_attempts"][0]["error"]["os_code"] = json!(5);
+        invalid.push(access_denied);
+
+        let mut wrong_baud_order = valid.clone();
+        wrong_baud_order["port_occupied_native_open_attempts"][0]["baud"] = json!(9_600);
+        invalid.push(wrong_baud_order);
+
+        let mut deadline_opened = valid;
+        deadline_opened["deadline_native_open_attempts"] = json!([attempt(115_200)]);
+        invalid.push(deadline_opened);
 
         for result in invalid {
             let decision = qualification_decision("faults", &result);
