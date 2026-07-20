@@ -11,8 +11,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use easycon_controller::{
     AUTO_BAUD_RATES, AckFrame, AckRequest, AmiiboLimits, AmiiboSaveOptions, AmiiboSelectOptions,
-    ConnectOptions, ControllerAction, ControllerOptions, ControllerSession, ControllerTransport,
-    HandshakeRequest, PreciseSequence, SequenceStep, TransportError, WriteKind, WriteRequest,
+    ConnectOptions, ControllerAction, ControllerLeaseState, ControllerOptions, ControllerSession,
+    ControllerSnapshot, ControllerTransport, HandshakeRequest, PreciseSequence, SequenceStep,
+    TransportError, WriteKind, WriteRequest,
 };
 use easycon_hardware_qualification::{distribution, option_value, required_value, value_or};
 use easycon_model::{Button, Hat, StickPosition};
@@ -515,6 +516,10 @@ fn qualification_decision(command: &str, result: &Value) -> QualificationDecisio
                 ),
             ),
             (
+                "cancel_nonvacuous_and_neutralized",
+                cancel_evidence_valid(result),
+            ),
+            (
                 "deadline_exact_reason",
                 operation_matches(
                     &result["deadline"],
@@ -666,6 +671,78 @@ fn exact_port_busy_open_attempts(value: &Value) -> bool {
                         .and_then(Value::as_str)
                         .is_some_and(|message| !message.is_empty())
             })
+}
+
+fn cancel_evidence_valid(result: &Value) -> bool {
+    let Some(cancel_id) = result["cancel"]["id"].as_u64() else {
+        return false;
+    };
+    let Some(baseline) = result["cancel_baseline_snapshot"].as_object() else {
+        return false;
+    };
+    let Some(before_request) = result["cancel_before_request_snapshot"].as_object() else {
+        return false;
+    };
+    let Some(after_cancel) = result["post_cancel_snapshot"].as_object() else {
+        return false;
+    };
+    let Some(baseline_count) = baseline
+        .get("accepted_report_count")
+        .and_then(Value::as_u64)
+    else {
+        return false;
+    };
+    let Some(before_count) = baseline_count.checked_add(1) else {
+        return false;
+    };
+    let Some(after_minimum) = before_count.checked_add(1) else {
+        return false;
+    };
+
+    baseline.get("state").and_then(Value::as_str) == Some("Connected")
+        && baseline
+            .get("desired_report_neutral")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && lease_detail_matches(baseline.get("lease_detail"), "available", None)
+        && before_request.get("state").and_then(Value::as_str) == Some("Connected")
+        && before_request
+            .get("accepted_report_count")
+            .and_then(Value::as_u64)
+            == Some(before_count)
+        && before_request
+            .get("desired_report_neutral")
+            .and_then(Value::as_bool)
+            == Some(false)
+        && lease_detail_matches(
+            before_request.get("lease_detail"),
+            "sequence",
+            Some(cancel_id),
+        )
+        && after_cancel.get("state").and_then(Value::as_str) == Some("Connected")
+        && after_cancel
+            .get("accepted_report_count")
+            .and_then(Value::as_u64)
+            .is_some_and(|count| count >= after_minimum)
+        && after_cancel
+            .get("desired_report_neutral")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && lease_detail_matches(after_cancel.get("lease_detail"), "available", None)
+}
+
+fn lease_detail_matches(value: Option<&Value>, kind: &str, operation_id: Option<u64>) -> bool {
+    let Some(value) = value.and_then(Value::as_object) else {
+        return false;
+    };
+    value.get("kind").and_then(Value::as_str) == Some(kind)
+        && match operation_id {
+            Some(operation_id) => {
+                value.len() == 2
+                    && value.get("operation_id").and_then(Value::as_u64) == Some(operation_id)
+            }
+            None => value.len() == 1,
+        }
 }
 
 fn discovery_qualification(result: &Value) -> QualificationDecision {
@@ -1085,18 +1162,59 @@ fn run_faults(arguments: &[String]) -> Result<Value, String> {
     let occupied_result = operation_json(&occupied_operation);
     let occupied_open_attempts = occupied.native_open_attempts();
     let occupied_cleanup = occupied.close();
+    if !cleanup_succeeded(&occupied_cleanup) {
+        let cleanup = primary.close();
+        return Ok(json!({
+            "command": "faults",
+            "port_occupied": occupied_result,
+            "port_occupied_native_open_attempts": occupied_open_attempts,
+            "cancel_status": "not_run: secondary cleanup failed",
+            "deadline_status": "not_run: secondary cleanup failed",
+            "secondary_cleanup": occupied_cleanup,
+            "cleanup": cleanup,
+        }));
+    }
 
+    let cancel_baseline = primary.controller.snapshot();
     let sequence = PreciseSequence::new(vec![
         SequenceStep::new(0, ControllerAction::ButtonDown(Button::A)),
-        SequenceStep::new(5_000_000_000, ControllerAction::ButtonUp(Button::A)),
+        SequenceStep::new(60_000_000_000, ControllerAction::ButtonUp(Button::A)),
     ])
     .map_err(|error| error.to_string())?;
     let cancelled = primary
         .controller
         .precise_sequence(sequence)
         .map_err(|error| error.to_string())?;
+    let cancel_before_request = wait_for_cancel_ready(
+        &primary.controller,
+        &cancelled,
+        cancel_baseline,
+        OPERATION_TIMEOUT,
+    )?;
     let _ = cancelled.cancel();
     wait_terminal(&cancelled, OPERATION_TIMEOUT)?;
+    let cancel_result = operation_json(&cancelled);
+    let post_cancel = primary.controller.snapshot();
+    let primary_cleanup = primary.close();
+
+    let mut result = json!({
+        "command": "faults",
+        "port_occupied": occupied_result,
+        "port_occupied_expected_failed": occupied_operation.snapshot().state == OperationState::Failed,
+        "port_occupied_native_open_attempts": occupied_open_attempts,
+        "cancel": cancel_result,
+        "cancel_expected_cancelled": cancelled.snapshot().state == OperationState::Cancelled,
+        "cancel_baseline_snapshot": controller_snapshot_json(cancel_baseline),
+        "cancel_before_request_snapshot": controller_snapshot_json(cancel_before_request),
+        "post_cancel_snapshot": controller_snapshot_json(post_cancel),
+        "deadline_status": "not_run",
+        "secondary_cleanup": occupied_cleanup,
+        "cleanup": primary_cleanup,
+    });
+    if !cleanup_succeeded(&result["cleanup"]) {
+        result["deadline_status"] = json!("not_run: primary cleanup failed");
+        return Ok(result);
+    }
 
     let deadline = Harness::new(&port, ControllerOptions::default())?;
     let deadline_operation = deadline
@@ -1110,23 +1228,13 @@ fn run_faults(arguments: &[String]) -> Result<Value, String> {
     let deadline_result = operation_json(&deadline_operation);
     let deadline_open_attempts = deadline.native_open_attempts();
     let deadline_cleanup = deadline.close();
-
-    let result = json!({
-        "command": "faults",
-        "port_occupied": occupied_result,
-        "port_occupied_expected_failed": occupied_operation.snapshot().state == OperationState::Failed,
-        "port_occupied_native_open_attempts": occupied_open_attempts,
-        "cancel": operation_json(&cancelled),
-        "cancel_expected_cancelled": cancelled.snapshot().state == OperationState::Cancelled,
-        "post_cancel_snapshot": snapshot_json(&primary.controller),
-        "deadline": deadline_result,
-        "deadline_expected_cancelled": deadline_operation.snapshot().state == OperationState::Cancelled,
-        "deadline_native_open_attempts": deadline_open_attempts,
-        "secondary_cleanup": occupied_cleanup,
-        "deadline_cleanup": deadline_cleanup,
-    });
-    let cleanup = primary.close();
-    Ok(with_cleanup(result, cleanup))
+    result["deadline_status"] = json!("completed");
+    result["deadline"] = deadline_result;
+    result["deadline_expected_cancelled"] =
+        json!(deadline_operation.snapshot().state == OperationState::Cancelled);
+    result["deadline_native_open_attempts"] = deadline_open_attempts;
+    result["deadline_cleanup"] = deadline_cleanup;
+    Ok(result)
 }
 
 fn run_hotplug(arguments: &[String]) -> Result<Value, String> {
@@ -1441,6 +1549,46 @@ fn wait_terminal(
     }
 }
 
+fn wait_for_cancel_ready(
+    controller: &ControllerSession,
+    operation: &Operation,
+    baseline: ControllerSnapshot,
+    timeout: Duration,
+) -> Result<ControllerSnapshot, String> {
+    if !baseline.desired_report.is_neutral() || baseline.lease != ControllerLeaseState::Available {
+        return Err("cancel fault baseline was not neutral and lease-available".to_owned());
+    }
+    let expected_count = baseline
+        .accepted_report_count
+        .checked_add(1)
+        .ok_or_else(|| "accepted report count exhausted".to_owned())?;
+    let started = Instant::now();
+    loop {
+        let snapshot = controller.snapshot();
+        if snapshot.accepted_report_count == expected_count {
+            if !snapshot.desired_report.is_neutral()
+                && snapshot.lease == ControllerLeaseState::Sequence(operation.id())
+            {
+                return Ok(snapshot);
+            }
+            return Err(
+                "first cancel-fault report did not retain the non-neutral sequence lease"
+                    .to_owned(),
+            );
+        }
+        if snapshot.accepted_report_count > expected_count {
+            return Err("more than one report was accepted before cancel request".to_owned());
+        }
+        if operation.snapshot().state.is_terminal() {
+            return Err("cancel-fault sequence reached terminal before cancel request".to_owned());
+        }
+        if started.elapsed() >= timeout {
+            return Err("timed out waiting for first cancel-fault report acceptance".to_owned());
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
 fn operation_failure(operation: &Operation) -> String {
     let snapshot = operation.snapshot();
     format!(
@@ -1479,14 +1627,32 @@ fn port_json(port: &SerialPortDescriptor) -> Value {
 }
 
 fn snapshot_json(controller: &ControllerSession) -> Value {
-    let snapshot = controller.snapshot();
+    controller_snapshot_json(controller.snapshot())
+}
+
+fn controller_snapshot_json(snapshot: ControllerSnapshot) -> Value {
     json!({
         "state": format!("{:?}", snapshot.state),
         "desired_report_neutral": snapshot.desired_report.is_neutral(),
         "accepted_report_count": snapshot.accepted_report_count,
         "last_report_timestamp_ns": snapshot.last_report_timestamp_ns,
         "lease": format!("{:?}", snapshot.lease),
+        "lease_detail": lease_json(snapshot.lease),
     })
+}
+
+fn lease_json(lease: ControllerLeaseState) -> Value {
+    match lease {
+        ControllerLeaseState::Available => json!({"kind": "available"}),
+        ControllerLeaseState::Sequence(operation_id) => json!({
+            "kind": "sequence",
+            "operation_id": operation_id.get(),
+        }),
+        ControllerLeaseState::Automation(lease_id) => json!({
+            "kind": "automation",
+            "lease_id": lease_id,
+        }),
+    }
 }
 
 fn handshake_json(telemetry: &Arc<Mutex<Telemetry>>) -> Value {
@@ -1776,6 +1942,82 @@ mod tests {
         })
     }
 
+    fn fault_operation(id: u64, state: &str, domain: &str, code: &str, reason: Value) -> Value {
+        json!({
+            "id": id,
+            "state": state,
+            "structured_error": {
+                "domain": domain,
+                "code": code,
+                "message": "diagnostic only",
+            },
+            "cancellation_reason": reason,
+        })
+    }
+
+    fn port_busy_attempt(baud: u32) -> Value {
+        json!({
+            "baud": baud,
+            "succeeded": false,
+            "error": {
+                "kind": "PortBusy",
+                "os_code": 32,
+                "message": "CreateFileW(serial port) failed",
+            },
+        })
+    }
+
+    fn valid_fault_projection() -> Value {
+        json!({
+            "port_occupied": fault_operation(41, "Failed", "Io", "Transport", Value::Null),
+            "port_occupied_native_open_attempts": [
+                port_busy_attempt(115_200),
+                port_busy_attempt(9_600),
+            ],
+            "cancel": fault_operation(
+                42,
+                "Cancelled",
+                "Runtime",
+                "Cancelled",
+                json!("Requested"),
+            ),
+            "cancel_baseline_snapshot": {
+                "state": "Connected",
+                "desired_report_neutral": true,
+                "accepted_report_count": 7,
+                "lease_detail": {"kind": "available"},
+            },
+            "cancel_before_request_snapshot": {
+                "state": "Connected",
+                "desired_report_neutral": false,
+                "accepted_report_count": 8,
+                "lease_detail": {"kind": "sequence", "operation_id": 42},
+            },
+            "post_cancel_snapshot": {
+                "state": "Connected",
+                "desired_report_neutral": true,
+                "accepted_report_count": 9,
+                "lease_detail": {"kind": "available"},
+            },
+            "deadline": fault_operation(
+                43,
+                "Cancelled",
+                "Runtime",
+                "DeadlineExceeded",
+                json!("Deadline"),
+            ),
+            "deadline_native_open_attempts": [],
+        })
+    }
+
+    fn valid_fault_projection_with_cleanup() -> Value {
+        let mut result = valid_fault_projection();
+        result["cleanup"] = successful_cleanup();
+        result["secondary_cleanup"] = successful_cleanup();
+        result["deadline_cleanup"] = successful_cleanup();
+        result
+    }
+
     struct NoopTransport;
 
     impl ControllerTransport for NoopTransport {
@@ -1966,51 +2208,7 @@ mod tests {
 
     #[test]
     fn faults_require_exact_operation_causes() {
-        let operation = |state: &str, domain: &str, code: &str, reason: Value| {
-            json!({
-                "state": state,
-                "structured_error": {
-                    "domain": domain,
-                    "code": code,
-                    "message": "diagnostic only",
-                },
-                "cancellation_reason": reason,
-            })
-        };
-        let valid = json!({
-            "port_occupied": operation("Failed", "Io", "Transport", Value::Null),
-            "port_occupied_native_open_attempts": [
-                {
-                    "baud": 115_200,
-                    "succeeded": false,
-                    "error": {
-                        "kind": "PortBusy",
-                        "os_code": 32,
-                        "message": "diagnostic only",
-                    },
-                },
-                {
-                    "baud": 9_600,
-                    "succeeded": false,
-                    "error": {
-                        "kind": "PortBusy",
-                        "os_code": 32,
-                        "message": "diagnostic only",
-                    },
-                },
-            ],
-            "cancel": operation("Cancelled", "Runtime", "Cancelled", json!("Requested")),
-            "deadline": operation(
-                "Cancelled",
-                "Runtime",
-                "DeadlineExceeded",
-                json!("Deadline"),
-            ),
-            "deadline_native_open_attempts": [],
-            "port_occupied_expected_failed": true,
-            "cancel_expected_cancelled": true,
-            "deadline_expected_cancelled": true,
-        });
+        let valid = valid_fault_projection();
         assert_eq!(
             qualification_decision("faults", &valid).status,
             QualificationStatus::Passed
@@ -2052,40 +2250,7 @@ mod tests {
 
     #[test]
     fn faults_require_exact_native_open_evidence() {
-        let operation = |state: &str, domain: &str, code: &str, reason: Value| {
-            json!({
-                "state": state,
-                "structured_error": {
-                    "domain": domain,
-                    "code": code,
-                    "message": "diagnostic only",
-                },
-                "cancellation_reason": reason,
-            })
-        };
-        let attempt = |baud: u32| {
-            json!({
-                "baud": baud,
-                "succeeded": false,
-                "error": {
-                    "kind": "PortBusy",
-                    "os_code": 32,
-                    "message": "CreateFileW(serial port) failed",
-                },
-            })
-        };
-        let valid = json!({
-            "port_occupied": operation("Failed", "Io", "Transport", Value::Null),
-            "port_occupied_native_open_attempts": [attempt(115_200), attempt(9_600)],
-            "cancel": operation("Cancelled", "Runtime", "Cancelled", json!("Requested")),
-            "deadline": operation(
-                "Cancelled",
-                "Runtime",
-                "DeadlineExceeded",
-                json!("Deadline"),
-            ),
-            "deadline_native_open_attempts": [],
-        });
+        let valid = valid_fault_projection();
         assert_eq!(
             qualification_decision("faults", &valid).status,
             QualificationStatus::Passed
@@ -2110,7 +2275,7 @@ mod tests {
         invalid.push(wrong_baud_order);
 
         let mut deadline_opened = valid;
-        deadline_opened["deadline_native_open_attempts"] = json!([attempt(115_200)]);
+        deadline_opened["deadline_native_open_attempts"] = json!([port_busy_attempt(115_200)]);
         invalid.push(deadline_opened);
 
         for result in invalid {
@@ -2118,6 +2283,101 @@ mod tests {
             assert_eq!(decision.status, QualificationStatus::Failed);
             assert!(decision.failure.is_some());
         }
+    }
+
+    #[test]
+    fn faults_require_nonvacuous_cancel_evidence() {
+        let valid = valid_fault_projection();
+        assert_eq!(
+            qualification_decision("faults", &valid).status,
+            QualificationStatus::Passed
+        );
+
+        let mut invalid = Vec::new();
+        let mut missing_baseline = valid.clone();
+        missing_baseline
+            .as_object_mut()
+            .expect("fault result")
+            .remove("cancel_baseline_snapshot");
+        invalid.push(missing_baseline);
+
+        let mut no_report_before_cancel = valid.clone();
+        no_report_before_cancel["cancel_before_request_snapshot"]["accepted_report_count"] =
+            json!(7);
+        invalid.push(no_report_before_cancel);
+
+        let mut neutral_before_cancel = valid.clone();
+        neutral_before_cancel["cancel_before_request_snapshot"]["desired_report_neutral"] =
+            json!(true);
+        invalid.push(neutral_before_cancel);
+
+        let mut wrong_sequence_owner = valid.clone();
+        wrong_sequence_owner["cancel_before_request_snapshot"]["lease_detail"]["operation_id"] =
+            json!(99);
+        invalid.push(wrong_sequence_owner);
+
+        let mut no_neutral_acceptance = valid.clone();
+        no_neutral_acceptance["post_cancel_snapshot"]["accepted_report_count"] = json!(8);
+        invalid.push(no_neutral_acceptance);
+
+        let mut nonneutral_terminal = valid;
+        nonneutral_terminal["post_cancel_snapshot"]["desired_report_neutral"] = json!(false);
+        invalid.push(nonneutral_terminal);
+
+        for result in invalid {
+            let decision = qualification_decision("faults", &result);
+            assert_eq!(decision.status, QualificationStatus::Failed);
+            assert!(decision.failure.is_some());
+        }
+    }
+
+    #[test]
+    fn cancel_fault_waits_for_a_nonneutral_acceptance_before_request() {
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock::default());
+        let runtime = Runtime::new(clock.clone());
+        let controller = ControllerSession::new(
+            &runtime,
+            Box::new(NoopTransport),
+            ControllerOptions::default(),
+        )
+        .expect("controller");
+        let connect = controller
+            .connect(ConnectOptions::default())
+            .expect("connect operation");
+        wait_succeeded(&connect, OPERATION_TIMEOUT).expect("connected");
+
+        let baseline = controller.snapshot();
+        let sequence = PreciseSequence::new(vec![
+            SequenceStep::new(0, ControllerAction::ButtonDown(Button::A)),
+            SequenceStep::new(60_000_000_000, ControllerAction::ButtonUp(Button::A)),
+        ])
+        .expect("sequence");
+        let operation = controller
+            .precise_sequence(sequence)
+            .expect("sequence operation");
+        let before_request =
+            wait_for_cancel_ready(&controller, &operation, baseline, OPERATION_TIMEOUT)
+                .expect("first non-neutral report acceptance");
+        assert_eq!(
+            before_request.accepted_report_count,
+            baseline.accepted_report_count + 1
+        );
+        assert!(!before_request.desired_report.is_neutral());
+        assert_eq!(
+            before_request.lease,
+            ControllerLeaseState::Sequence(operation.id())
+        );
+
+        operation.cancel();
+        wait_terminal(&operation, OPERATION_TIMEOUT).expect("cancel terminal");
+        let after_cancel = controller.snapshot();
+        assert_eq!(operation.snapshot().state, OperationState::Cancelled);
+        assert!(after_cancel.desired_report.is_neutral());
+        assert_eq!(after_cancel.lease, ControllerLeaseState::Available);
+        assert!(after_cancel.accepted_report_count >= baseline.accepted_report_count + 2);
+
+        controller.close();
+        assert_eq!(runtime.close(), Ok(CloseOutcome::Closed));
     }
 
     #[test]
@@ -2255,17 +2515,7 @@ mod tests {
                     "cleanup": cleanup(),
                 }),
             ),
-            (
-                "faults",
-                json!({
-                    "port_occupied_expected_failed": true,
-                    "cancel_expected_cancelled": true,
-                    "deadline_expected_cancelled": true,
-                    "cleanup": cleanup(),
-                    "secondary_cleanup": cleanup(),
-                    "deadline_cleanup": cleanup(),
-                }),
-            ),
+            ("faults", valid_fault_projection_with_cleanup()),
             (
                 "hotplug",
                 json!({
