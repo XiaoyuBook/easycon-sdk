@@ -145,12 +145,6 @@ impl ArtifactReservation {
 
         let output = artifact_dir.join(format!("{command}.json"));
         let temporary = output.with_extension("json.tmp");
-        ensure_artifact_absent(&output)?;
-        ensure_artifact_absent(&temporary)?;
-        if command == "sequence" {
-            ensure_artifact_absent(&artifact_dir.join("sequence-timings.csv"))?;
-        }
-
         let marker = artifact_dir.join(format!(".{command}.in-progress.json"));
         let mut file = OpenOptions::new()
             .write(true)
@@ -167,6 +161,25 @@ impl ArtifactReservation {
         .map_err(|error| error.to_string())?;
         file.flush().map_err(|error| error.to_string())?;
         file.sync_all().map_err(|error| error.to_string())?;
+        drop(file);
+
+        let validation = (|| {
+            ensure_artifact_absent(&output)?;
+            ensure_artifact_absent(&temporary)?;
+            if command == "sequence" {
+                ensure_artifact_absent(&artifact_dir.join("sequence-timings.csv"))?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = validation {
+            return match fs::remove_file(&marker) {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(format!(
+                    "{error}; cannot remove owned reservation {}: {cleanup}",
+                    marker.display()
+                )),
+            };
+        }
 
         Ok(Self {
             output,
@@ -195,14 +208,20 @@ impl ArtifactReservation {
             return Err(error);
         }
 
-        if let Err(error) = fs::rename(&self.temporary, &self.output) {
+        if let Err(error) = fs::hard_link(&self.temporary, &self.output) {
             let _ = fs::remove_file(&self.temporary);
             return Err(format!(
-                "cannot finalize {} as {}: {error}",
+                "cannot publish {} as {} without replacement: {error}",
                 self.temporary.display(),
                 self.output.display()
             ));
         }
+        fs::remove_file(&self.temporary).map_err(|error| {
+            format!(
+                "cannot remove linked temporary artifact {}: {error}",
+                self.temporary.display()
+            )
+        })?;
         fs::remove_file(&self.marker)
             .map_err(|error| format!("cannot remove {}: {error}", self.marker.display()))?;
         Ok(self.output)
@@ -1284,5 +1303,40 @@ mod tests {
         assert_eq!(fs::read(temporary).expect("preserved raced file"), sentinel);
         assert!(directory.0.join(".unknown.in-progress.json").exists());
         assert!(!directory.0.join("unknown.json").exists());
+    }
+
+    #[test]
+    fn commit_does_not_replace_a_final_file_created_after_reservation() {
+        let directory = TestDirectory::new("raced-final");
+        let reservation = ArtifactReservation::begin("unknown", &directory.0).expect("reserve run");
+        let output = directory.0.join("unknown.json");
+        let sentinel = b"final evidence owned by another writer\n";
+        fs::write(&output, sentinel).expect("seed raced final evidence");
+
+        let result = reservation.commit(&json!({"status": "failed"}));
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(output).expect("preserved final file"), sentinel);
+        assert!(directory.0.join(".unknown.in-progress.json").exists());
+        assert!(!directory.0.join("unknown.json.tmp").exists());
+    }
+
+    #[test]
+    fn marker_serializes_runners_and_final_is_rechecked_after_handoff() {
+        let directory = TestDirectory::new("marker-linearization");
+        let first = ArtifactReservation::begin("unknown", &directory.0).expect("first reserve");
+        assert!(ArtifactReservation::begin("unknown", &directory.0).is_err());
+
+        first
+            .commit(&json!({"status": "failed"}))
+            .expect("first commit");
+        let original = fs::read(directory.0.join("unknown.json")).expect("first final");
+
+        assert!(ArtifactReservation::begin("unknown", &directory.0).is_err());
+        assert_eq!(
+            fs::read(directory.0.join("unknown.json")).expect("preserved first final"),
+            original
+        );
+        assert!(!directory.0.join(".unknown.in-progress.json").exists());
     }
 }
