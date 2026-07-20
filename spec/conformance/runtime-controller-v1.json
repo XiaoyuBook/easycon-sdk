@@ -407,7 +407,7 @@
         { "id": "phase2a.serial.open", "action": "open only a canonical COM path through the Windows system leaf" },
         { "id": "phase2a.serial.handshake", "action": "run source-exact 115200 to 9600 fallback over injectable byte I/O" },
         { "id": "phase2a.serial.partial", "action": "split logical report and ACK traffic across partial and zero-progress calls" },
-        { "id": "phase2a.serial.fault", "action": "inject access denied, busy, wrong/late/duplicate ACK, deadline, disconnect, and hot unplug" },
+        { "id": "phase2a.serial.fault", "action": "inject access denied, busy, wrong/delayed/duplicate ACK, deadline, disconnect, and hot unplug" },
         { "id": "phase2a.serial.close", "action": "block write/read/close at controlled barriers and deterministically release every stream" }
       ],
       "assertions": [
@@ -458,7 +458,7 @@
         },
         {
           "id": "phase2a.serial.ack-faults",
-          "expect": "zero progress and delayed, duplicate, or wrong ACK bytes do not cross request generations",
+          "expect": "zero progress and delayed or wrong ACK bytes are bounded, while already queued duplicate bytes are purged before the next request",
           "test": "tests/support/tests/serial_ch32.rs::byte_ack_delay_duplicate_wrong_reply_and_zero_progress_are_isolated"
         },
         {

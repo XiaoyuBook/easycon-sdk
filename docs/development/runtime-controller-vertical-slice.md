@@ -49,6 +49,9 @@ Switch 执行时序或物理中立化已经验证，也不创建完整 Phase 2 �
 - serial partial write 使用同一个 logical `WriteContext` 连续推进；半帧错误或两次 partial call 间取消会
   关闭流，禁止后续 command 拼接到损坏帧。零进展、busy/access denied、deadline、close wake 和热拔插
   归一化为稳定错误。
+- Win32 `HANDLE`、event、SetupAPI list 和 registry key 均由窄 RAII owner 释放；pending `OVERLAPPED` 和
+  调用方 buffer 在 completion、cancel、wait failure 以及可注入 `Clock` panic 路径上都先经
+  `CancelIoEx`/`GetOverlappedResult` 同步结算，再允许释放或继续 unwind。
 - precise sequence 的 offset 相对 lane 获权时刻且始终为绝对目标；同 offset 按输入顺序合并
   成一个 report，不从上次 dispatch 累加目标。
 - sequence 取消或可恢复失败时，先让 transport 接受 neutral report，再释放 lease 并提交终态。
@@ -58,9 +61,13 @@ Switch 执行时序或物理中立化已经验证，也不创建完整 Phase 2 �
   report acceptance 观测。
 - ACK command 在同一 FIFO lane 中等待前序 direct report，只有独占 sequence/Automation lease 才
   返回 `RESOURCE_BUSY`；ACK 路径发现断线时重置 desired report、记录中立化 warning 并关闭 transport。
+- Controller generation matcher 和 command 前 input purge 可隔离 fake 中的旧 generation 及已经排队的
+  重复字节；CH32 wire ACK 本身没有 generation 字段，未来才到达的物理迟到 ACK 归属仍需 O-01/O-02
+  实物验证，Phase 2A 不把软件 matcher 外推为硬件保证。
 - Amiibo save 使用 `A5 off_lo off_hi len_lo len_hi slot 90` header 和最多 20 字节 payload，两段分别等待
   generation-matched `FF` ACK；select 使用 `A5 slot 91`。失败重试前发送三次 `A5 81` 并等待 `80`。
-  retry 有界；部分完成数、取消、绝对 deadline、断线和 cleanup 都进入 operation 终态契约。
+  retry 有界；重试耗尽的部分失败仍执行一次 bounded reset，reset 失败则先关闭 stream；部分完成数、
+  取消、绝对 deadline、断线和 cleanup 都进入 operation 终态契约。
 - Controller 默认没有 Amiibo slot/总长度 capability。只有显式 `AmiiboLimits` 才接纳请求；该 limit 本身
   不构成硬件支持证据，O-02 仍开放。
 - direct report 的 `WriteContext` 记录 command admission 和 lane wake，原有 `timestamp_ns` 记录 dispatch；
@@ -107,7 +114,7 @@ Phase 2A 专项测试还包括：
   target 验证无丢失、乱序、早发和漂移，并在 close 后验证三个 registry 为零；
 - `tests/support/tests/phase2a_latency.rs`：五段时间戳单调性与不丢样本的确定性 contract。
 
-当前完整 workspace 为 152 个非文档测试通过；Runtime Loom 模型 6/6；规范校验执行 5 schemas、1 behavior、
+当前完整 workspace 为 153 个非文档测试通过；Runtime Loom 模型 6/6；规范校验执行 5 schemas、1 behavior、
 3 controller fixtures、9 scenarios 和 61 个 exact Rust tests。最终提交前仍以实际完整门禁输出为准。
 
 ## 软件路径延迟结果
