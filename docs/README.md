@@ -23,6 +23,8 @@
 6. [构建、发布与合规](architecture/build-release.md)：首发平台、工具链、动态库布局、四类包和 GPL 边界。
 7. [测试策略](architecture/testing-strategy.md)：单元、ABI、一致性、差分、故障注入和硬件验收。
 8. [目标仓库与实施路线](architecture/repository-roadmap.md)：固定目录、阶段顺序、完成门槛和四语言任务拆分。
+9. [Phase 2B faults runner 所有权设计](development/phase2b-fault-runner.md)：资格 CLI 的单 owner、失败收口、
+   动态 cleanup contract 和无硬件 failpoint 测试边界。
 
 ## 决策记录
 
