@@ -55,6 +55,7 @@ dependencies = [
  "easycon-controller",
  "easycon-model",
  "easycon-runtime",
+ "windows-sys",
 ]
 
 [[package]]
