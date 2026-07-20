@@ -7,7 +7,8 @@ use easycon_controller::{
 use easycon_runtime::Clock;
 
 use crate::{
-    ByteIo, ByteIoFactory, ByteIoRequest, SerialError, SerialErrorKind, SerialPortDescriptor,
+    ByteIo, ByteIoFactory, ByteIoOperation, ByteIoRequest, SerialError, SerialErrorKind,
+    SerialPortDescriptor,
 };
 
 /// `ControllerTransport` adapter over an injectable serial byte stream.
@@ -17,6 +18,13 @@ pub struct SerialControllerTransport {
     factory: Box<dyn ByteIoFactory>,
     io: Option<Box<dyn ByteIo>>,
     prepared_command_sequence: Option<u64>,
+    active_write: Option<ActiveWrite>,
+}
+
+#[derive(Clone, Copy)]
+struct ActiveWrite {
+    context: easycon_controller::WriteContext,
+    accepted: usize,
 }
 
 impl SerialControllerTransport {
@@ -33,6 +41,7 @@ impl SerialControllerTransport {
             factory,
             io: None,
             prepared_command_sequence: None,
+            active_write: None,
         }
     }
 
@@ -47,8 +56,10 @@ impl SerialControllerTransport {
         deadline_ns: u64,
         cancellation: easycon_runtime::CancellationToken,
         resource_cancellation: easycon_runtime::CancellationToken,
+        operation: ByteIoOperation,
     ) -> ByteIoRequest {
         ByteIoRequest {
+            operation,
             clock: self.clock.clone(),
             deadline_ns,
             cancellation,
@@ -61,6 +72,7 @@ impl SerialControllerTransport {
             io.close();
         }
         self.prepared_command_sequence = None;
+        self.active_write = None;
     }
 }
 
@@ -69,8 +81,9 @@ impl ControllerTransport for SerialControllerTransport {
         self.close_stream();
         let io_request = self.request(
             request.deadline_ns,
-            request.cancellation,
-            request.resource_cancellation,
+            request.cancellation.clone(),
+            request.resource_cancellation.clone(),
+            ByteIoOperation::Open,
         );
         check_interruption(&io_request, IoPhase::Protocol)?;
         let mut io = self
@@ -82,12 +95,25 @@ impl ControllerTransport for SerialControllerTransport {
             write_all(
                 io.as_mut(),
                 &request.request_bytes,
-                &io_request,
+                &self.request(
+                    request.deadline_ns,
+                    request.cancellation.clone(),
+                    request.resource_cancellation.clone(),
+                    ByteIoOperation::HandshakeWrite,
+                ),
                 IoPhase::Protocol,
             )?;
             let mut reply = [0_u8; 1];
             let read = io
-                .read(&mut reply, io_request.clone())
+                .read(
+                    &mut reply,
+                    self.request(
+                        request.deadline_ns,
+                        request.cancellation,
+                        request.resource_cancellation,
+                        ByteIoOperation::HandshakeRead,
+                    ),
+                )
                 .map_err(|error| map_error(error, IoPhase::Protocol))?;
             validate_progress(read, reply.len(), IoPhase::Protocol)?;
             if reply[0] != request.expected_reply {
@@ -108,26 +134,86 @@ impl ControllerTransport for SerialControllerTransport {
     }
 
     fn write(&mut self, request: WriteRequest<'_>) -> Result<usize, TransportError> {
+        if request.context.total_len == 0 || request.bytes.is_empty() {
+            return Err(TransportError::new(
+                TransportErrorKind::Protocol,
+                "serial logical write must be non-empty",
+            ));
+        }
+        let Some(offset) = request.context.total_len.checked_sub(request.bytes.len()) else {
+            return Err(TransportError::new(
+                TransportErrorKind::Protocol,
+                "serial write remainder exceeds its logical payload",
+            ));
+        };
+        match self.active_write {
+            Some(active) if active.context != request.context || active.accepted != offset => {
+                self.close_stream();
+                return Err(TransportError::new(
+                    TransportErrorKind::Disconnected,
+                    "serial partial-write continuity was lost; stream closed",
+                ));
+            }
+            None if offset != 0 => {
+                self.close_stream();
+                return Err(TransportError::new(
+                    TransportErrorKind::Disconnected,
+                    "serial write resumed without an owned partial payload; stream closed",
+                ));
+            }
+            Some(_) | None => {}
+        }
         let io_request = self.request(
             request.deadline_ns,
             request.cancellation,
             request.resource_cancellation,
+            ByteIoOperation::ControllerWrite(request.context),
         );
-        check_interruption(&io_request, IoPhase::Write)?;
-        let io = self.io.as_mut().ok_or_else(disconnected)?;
+        if let Err(error) = check_interruption(&io_request, IoPhase::Write) {
+            return Err(self.close_after_partial_failure(offset, error));
+        }
+        if self.io.is_none() {
+            return Err(self.close_after_partial_failure(offset, disconnected()));
+        }
+        let io = self.io.as_mut().expect("serial stream checked above");
 
         if request.context.kind == WriteKind::Command
             && self.prepared_command_sequence != Some(request.context.sequence)
         {
-            io.discard_input(io_request.clone())
+            let mut purge_request = io_request.clone();
+            purge_request.operation = ByteIoOperation::DiscardInput {
+                write_sequence: request.context.sequence,
+            };
+            io.discard_input(purge_request)
                 .map_err(|error| map_error(error, IoPhase::Write))?;
             self.prepared_command_sequence = Some(request.context.sequence);
         }
 
-        let written = io
+        let result = io
             .write(request.bytes, io_request)
-            .map_err(|error| map_error(error, IoPhase::Write))?;
-        validate_progress(written, request.bytes.len(), IoPhase::Write)?;
+            .map_err(|error| map_error(error, IoPhase::Write))
+            .and_then(|written| {
+                validate_progress(written, request.bytes.len(), IoPhase::Write)?;
+                Ok(written)
+            });
+        let written = match result {
+            Ok(written) => written,
+            Err(error) if offset != 0 => {
+                return Err(self.close_after_partial_failure(offset, error));
+            }
+            Err(error) => return Err(error),
+        };
+        let accepted = offset
+            .checked_add(written)
+            .expect("serial accepted-byte count cannot overflow total length");
+        if accepted == request.context.total_len {
+            self.active_write = None;
+        } else {
+            self.active_write = Some(ActiveWrite {
+                context: request.context,
+                accepted,
+            });
+        }
         Ok(written)
     }
 
@@ -136,6 +222,9 @@ impl ControllerTransport for SerialControllerTransport {
             request.deadline_ns,
             request.cancellation,
             request.resource_cancellation,
+            ByteIoOperation::AckRead {
+                generation: request.generation,
+            },
         );
         check_interruption(&io_request, IoPhase::Protocol)?;
         let io = self.io.as_mut().ok_or_else(disconnected)?;
@@ -152,6 +241,23 @@ impl ControllerTransport for SerialControllerTransport {
 
     fn close(&mut self) {
         self.close_stream();
+    }
+}
+
+impl SerialControllerTransport {
+    fn close_after_partial_failure(
+        &mut self,
+        accepted_prefix: usize,
+        error: TransportError,
+    ) -> TransportError {
+        if accepted_prefix == 0 {
+            return error;
+        }
+        self.close_stream();
+        TransportError::new(
+            TransportErrorKind::Disconnected,
+            format!("serial stream closed after partial-write failure: {error}"),
+        )
     }
 }
 

@@ -505,6 +505,7 @@ mod tests {
     use easycon_runtime::{CancellationToken, VirtualClock};
 
     use super::*;
+    use crate::ByteIoOperation;
 
     #[test]
     fn port_paths_are_canonical_and_do_not_open_arbitrary_devices() {
@@ -534,6 +535,7 @@ mod tests {
             SerialPortDescriptor::new("ROOT\\TEST\\0", "COM-test").expect("structured descriptor");
         let clock = Arc::new(VirtualClock::new(1));
         let request = ByteIoRequest {
+            operation: ByteIoOperation::Open,
             clock,
             deadline_ns: 2,
             cancellation: CancellationToken::root(),

@@ -70,7 +70,7 @@ def main():
 
     cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
     if workspace_members(cargo) != EXPECTED_MEMBERS:
-        failures.append("workspace members differ from the four milestone packages")
+        failures.append("workspace members differ from the five Phase 2A packages")
     if 'license = "GPL-3.0-only"' not in cargo:
         failures.append("workspace license is not GPL-3.0-only")
 
@@ -87,6 +87,7 @@ def main():
             "easycon-controller",
             "easycon-model",
             "easycon-runtime",
+            "easycon-serial",
         },
     }
     for manifest, expected in expected_dependencies.items():

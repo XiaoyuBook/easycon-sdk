@@ -1,6 +1,7 @@
 use std::fmt;
 use std::sync::Arc;
 
+use easycon_controller::WriteContext;
 use easycon_runtime::{CancellationToken, Clock};
 
 use crate::SerialPortDescriptor;
@@ -100,6 +101,8 @@ impl std::error::Error for SerialError {}
 /// Shared absolute-deadline and cancellation context for one byte-I/O call.
 #[derive(Clone)]
 pub struct ByteIoRequest {
+    /// Logical operation at the serial/Controller boundary.
+    pub operation: ByteIoOperation,
     /// Runtime monotonic clock used to evaluate the absolute deadline.
     pub clock: Arc<dyn Clock>,
     /// Absolute deadline on `clock`.
@@ -108,6 +111,23 @@ pub struct ByteIoRequest {
     pub cancellation: CancellationToken,
     /// Cancellation owned by the Controller resource.
     pub resource_cancellation: CancellationToken,
+}
+
+/// Logical purpose carried across injectable byte-I/O calls without interpreting device state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ByteIoOperation {
+    /// Opening a stream for one handshake attempt.
+    Open,
+    /// Writing source-exact handshake bytes.
+    HandshakeWrite,
+    /// Reading the handshake reply.
+    HandshakeRead,
+    /// One partial call belonging to a Controller logical write.
+    ControllerWrite(WriteContext),
+    /// Reading one ACK for the current matcher generation.
+    AckRead { generation: u64 },
+    /// Purging bytes before a command generation starts.
+    DiscardInput { write_sequence: u64 },
 }
 
 impl ByteIoRequest {

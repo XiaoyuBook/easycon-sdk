@@ -65,6 +65,7 @@ dependencies = [
  "easycon-controller",
  "easycon-model",
  "easycon-runtime",
+ "easycon-serial",
  "serde_json",
 ]
 

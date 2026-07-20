@@ -9,7 +9,7 @@ mod transport;
 mod windows;
 
 pub use discovery::{SerialDiscovery, SerialPortDescriptor, UsbIdentifiers};
-pub use io::{ByteIo, ByteIoFactory, ByteIoRequest, SerialError, SerialErrorKind};
+pub use io::{ByteIo, ByteIoFactory, ByteIoOperation, ByteIoRequest, SerialError, SerialErrorKind};
 pub use transport::SerialControllerTransport;
 #[cfg(windows)]
 pub use windows::{WindowsByteIoFactory, WindowsSerialDiscovery, discover_system_ports};
