@@ -129,6 +129,9 @@ struct State {
     block_controller_write_after_bytes: Option<usize>,
     write_waiting: bool,
     read_waiting: bool,
+    block_next_close: bool,
+    close_waiting: bool,
+    close_release: bool,
     discarded_input_bytes: usize,
     byte_write_calls: usize,
 }
@@ -188,6 +191,9 @@ impl Ch32ByteSimulator {
                 block_controller_write_after_bytes: None,
                 write_waiting: false,
                 read_waiting: false,
+                block_next_close: false,
+                close_waiting: false,
+                close_release: false,
                 discarded_input_bytes: 0,
                 byte_write_calls: 0,
             }),
@@ -291,6 +297,33 @@ impl Ch32ByteSimulator {
             .lock()
             .expect("CH32 state")
             .block_next_write = true;
+    }
+
+    /// Blocks the next stream close at a deterministic barrier.
+    pub fn block_next_close(&self) {
+        let mut state = self.shared.state.lock().expect("CH32 state");
+        state.block_next_close = true;
+        state.close_release = false;
+    }
+
+    /// Waits until a stream close reaches the configured barrier.
+    #[must_use]
+    pub fn wait_until_close_blocked(&self, timeout: Duration) -> bool {
+        let state = self.shared.state.lock().expect("CH32 state");
+        let (state, _result) = self
+            .shared
+            .changed
+            .wait_timeout_while(state, timeout, |state| !state.close_waiting)
+            .expect("CH32 state while waiting for close");
+        state.close_waiting
+    }
+
+    /// Releases a stream close stopped at the deterministic barrier.
+    pub fn release_close(&self) {
+        let mut state = self.shared.state.lock().expect("CH32 state");
+        state.close_release = true;
+        drop(state);
+        self.shared.changed.notify_all();
     }
 
     /// Blocks the next read even if a byte is queued until cancel, deadline, or disconnect.
@@ -625,6 +658,15 @@ impl ByteIo for SimulatedByteIo {
         }
         self.closed = true;
         let mut state = self.shared.state.lock().expect("CH32 state");
+        if std::mem::take(&mut state.block_next_close) {
+            state.close_waiting = true;
+            self.shared.changed.notify_all();
+            while !state.close_release {
+                state = self.shared.changed.wait(state).expect("CH32 close barrier");
+            }
+            state.close_waiting = false;
+            state.close_release = false;
+        }
         if state.active_stream_id == Some(self.stream_id) {
             state.active_stream_id = None;
             state.active_streams = 0;

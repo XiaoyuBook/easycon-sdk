@@ -1964,6 +1964,7 @@ impl ControllerLane {
                     "controller.disconnected",
                     None,
                 );
+                self.transport.close();
             }
             self.publish_neutralization_warning(Some(operation_id), &error);
             if release_sequence {

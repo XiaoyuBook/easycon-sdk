@@ -268,11 +268,16 @@ fn blocked_ack_obeys_deadline_and_controller_close_wakes_a_second_wait() {
 fn hot_unplug_and_mid_payload_failure_close_the_stream_without_continuation() {
     let (_clock, runtime, simulator, controller) = connected();
     simulator.block_next_write();
+    simulator.block_next_close();
     let unplugged = controller
         .direct(ControllerAction::ButtonDown(Button::A))
         .expect("hot-unplug operation");
     assert!(simulator.wait_until_write_blocked(Duration::from_secs(2)));
     simulator.disconnect();
+    assert!(simulator.wait_until_close_blocked(Duration::from_secs(2)));
+    let state_before_close = unplugged.wait(WaitTimeout::Poll);
+    simulator.release_close();
+    assert_eq!(state_before_close, WaitResult::Timeout);
     wait_terminal(&unplugged);
 
     assert_eq!(
