@@ -942,12 +942,10 @@ fn partial_fault_cleanup_contract_succeeded(result: &Value) -> bool {
 
     let mut expected_cleanup_count = 0;
     let mut found_uncreated_role = false;
-    let mut created_roles = [false; ROLES.len()];
-    for (index, (role, cleanup_field)) in ROLES.into_iter().enumerate() {
+    for (role, cleanup_field) in ROLES {
         let Some(created) = resources[role].get("created").and_then(Value::as_bool) else {
             return false;
         };
-        created_roles[index] = created;
         if created && found_uncreated_role {
             return false;
         }
@@ -975,18 +973,32 @@ fn partial_fault_cleanup_contract_succeeded(result: &Value) -> bool {
     {
         return false;
     }
+    let Some(stage) = result["execution_error"]["stage"].as_str() else {
+        return false;
+    };
+    let Some((failed_scenario, expected_created_roles)) = partial_fault_stage_contract(stage)
+    else {
+        return false;
+    };
+    if expected_cleanup_count != expected_created_roles {
+        return false;
+    }
     let status = |scenario: &str| scenarios[scenario].get("status").and_then(Value::as_str);
-    let evidence_order_is_valid = match (
-        status("port_occupied"),
-        status("cancel"),
-        status("deadline"),
-    ) {
-        (Some("failed"), Some("not_run"), Some("not_run")) => true,
-        (Some("completed"), Some("failed"), Some("not_run")) => {
-            created_roles[0] && created_roles[1]
+    let evidence_order_is_valid = match failed_scenario {
+        "port_occupied" => {
+            status("port_occupied") == Some("failed")
+                && status("cancel") == Some("not_run")
+                && status("deadline") == Some("not_run")
         }
-        (Some("completed"), Some("completed"), Some("failed")) => {
-            created_roles[0] && created_roles[1] && created_roles[2]
+        "cancel" => {
+            status("port_occupied") == Some("completed")
+                && status("cancel") == Some("failed")
+                && status("deadline") == Some("not_run")
+        }
+        "deadline" => {
+            status("port_occupied") == Some("completed")
+                && status("cancel") == Some("completed")
+                && status("deadline") == Some("failed")
         }
         _ => false,
     };
@@ -994,6 +1006,37 @@ fn partial_fault_cleanup_contract_succeeded(result: &Value) -> bool {
     evidence_order_is_valid
         && cleanup_slot_count(result) == expected_cleanup_count
         && runtime_cleanup_count(result) == expected_cleanup_count
+}
+
+fn partial_fault_stage_contract(stage: &str) -> Option<(&'static str, usize)> {
+    match stage {
+        "occupier_create" => Some(("port_occupied", 0)),
+        "occupier_connect_admit"
+        | "occupier_connect_wait"
+        | "occupier_connect_terminal"
+        | "occupied_probe_create" => Some(("port_occupied", 1)),
+        "occupied_probe_connect_admit"
+        | "occupied_probe_connect_wait"
+        | "occupied_probe_connect_terminal"
+        | "occupied_probe_close"
+        | "occupier_close" => Some(("port_occupied", 2)),
+        "cancel_create" => Some(("cancel", 2)),
+        "cancel_connect_admit"
+        | "cancel_connect_wait"
+        | "cancel_connect_terminal"
+        | "cancel_sequence_build"
+        | "cancel_sequence_admit"
+        | "cancel_readiness"
+        | "cancel_request"
+        | "cancel_terminal_wait"
+        | "cancel_close" => Some(("cancel", 3)),
+        "deadline_create" => Some(("deadline", 3)),
+        "deadline_connect_admit"
+        | "deadline_terminal_wait"
+        | "deadline_connect_terminal"
+        | "deadline_close" => Some(("deadline", 4)),
+        _ => None,
+    }
 }
 
 fn cleanup_succeeded(value: &Value) -> bool {
@@ -2987,6 +3030,21 @@ mod tests {
         completed_without_probe["scenarios"]["port_occupied"]["status"] = json!("completed");
         completed_without_probe["scenarios"]["cancel"]["status"] = json!("failed");
         invalid.push(completed_without_probe);
+
+        let mut later_roles_after_early_failure = partial.clone();
+        later_roles_after_early_failure["resources"]["occupied_probe"]["created"] = json!(true);
+        later_roles_after_early_failure["resources"]["cancel"]["created"] = json!(true);
+        later_roles_after_early_failure["occupied_probe_cleanup"] = successful_cleanup();
+        later_roles_after_early_failure["cancel_cleanup"] = successful_cleanup();
+        invalid.push(later_roles_after_early_failure);
+
+        let mut stage_without_resource = partial.clone();
+        stage_without_resource["execution_error"]["stage"] = json!("deadline_terminal_wait");
+        invalid.push(stage_without_resource);
+
+        let mut unknown_stage = partial.clone();
+        unknown_stage["execution_error"]["stage"] = json!("future_fault_stage");
+        invalid.push(unknown_stage);
 
         let mut missing_scenario = partial.clone();
         missing_scenario["scenarios"]
