@@ -877,6 +877,10 @@ fn qualification_check(name: &str, status: &str) -> Value {
 }
 
 fn cleanup_contract_succeeded(command: &str, result: &Value) -> bool {
+    if command == "faults" && result.get("execution_error").is_some() {
+        return partial_fault_cleanup_contract_succeeded(result);
+    }
+
     let expected_count = match command {
         "handshake" | "smoke" | "home-wake" | "sequence" => 1,
         "faults" => 3,
@@ -914,6 +918,82 @@ fn cleanup_contract_succeeded(command: &str, result: &Value) -> bool {
         "discover" | "amiibo" => true,
         _ => true,
     }
+}
+
+fn partial_fault_cleanup_contract_succeeded(result: &Value) -> bool {
+    const ROLES: [(&str, &str); 4] = [
+        ("occupier", "occupier_cleanup"),
+        ("occupied_probe", "occupied_probe_cleanup"),
+        ("cancel", "cancel_cleanup"),
+        ("deadline", "deadline_cleanup"),
+    ];
+
+    let Some(result_object) = result.as_object() else {
+        return false;
+    };
+    let Some(resources) = result.get("resources").and_then(Value::as_object) else {
+        return false;
+    };
+    if resources.len() != ROLES.len()
+        || ROLES.iter().any(|(role, _)| !resources.contains_key(*role))
+    {
+        return false;
+    }
+
+    let mut expected_cleanup_count = 0;
+    let mut found_uncreated_role = false;
+    let mut created_roles = [false; ROLES.len()];
+    for (index, (role, cleanup_field)) in ROLES.into_iter().enumerate() {
+        let Some(created) = resources[role].get("created").and_then(Value::as_bool) else {
+            return false;
+        };
+        created_roles[index] = created;
+        if created && found_uncreated_role {
+            return false;
+        }
+        found_uncreated_role |= !created;
+
+        let cleanup_present = result_object.contains_key(cleanup_field);
+        if cleanup_present != created {
+            return false;
+        }
+        if created {
+            expected_cleanup_count += 1;
+            if !cleanup_succeeded(&result[cleanup_field]) {
+                return false;
+            }
+        }
+    }
+
+    let Some(scenarios) = result.get("scenarios").and_then(Value::as_object) else {
+        return false;
+    };
+    if scenarios.len() != 3
+        || ["port_occupied", "cancel", "deadline"]
+            .iter()
+            .any(|scenario| !scenarios.contains_key(*scenario))
+    {
+        return false;
+    }
+    let status = |scenario: &str| scenarios[scenario].get("status").and_then(Value::as_str);
+    let evidence_order_is_valid = match (
+        status("port_occupied"),
+        status("cancel"),
+        status("deadline"),
+    ) {
+        (Some("failed"), Some("not_run"), Some("not_run")) => true,
+        (Some("completed"), Some("failed"), Some("not_run")) => {
+            created_roles[0] && created_roles[1]
+        }
+        (Some("completed"), Some("completed"), Some("failed")) => {
+            created_roles[0] && created_roles[1] && created_roles[2]
+        }
+        _ => false,
+    };
+
+    evidence_order_is_valid
+        && cleanup_slot_count(result) == expected_cleanup_count
+        && runtime_cleanup_count(result) == expected_cleanup_count
 }
 
 fn cleanup_succeeded(value: &Value) -> bool {
@@ -2843,6 +2923,98 @@ mod tests {
         assert!(failure.is_none());
         assert_eq!(nonempty["qualification_status"], "passed");
         assert_eq!(document_exit_code(&nonempty), 0);
+    }
+
+    #[test]
+    fn partial_fault_cleanup_layout_tracks_created_roles_and_terminal_scenarios() {
+        let partial = json!({
+            "command": "faults",
+            "execution_error": {
+                "stage": "occupied_probe_create",
+                "message": "injected create failure",
+            },
+            "scenarios": {
+                "port_occupied": {"status": "failed"},
+                "cancel": {"status": "not_run"},
+                "deadline": {"status": "not_run"},
+            },
+            "resources": {
+                "occupier": {"created": true},
+                "occupied_probe": {"created": false},
+                "cancel": {"created": false},
+                "deadline": {"created": false},
+            },
+            "occupier_cleanup": successful_cleanup(),
+        });
+
+        assert!(cleanup_contract_succeeded("faults", &partial));
+        let (document, failure) = finalize_result("faults", Ok(partial.clone()));
+        assert_eq!(document["execution_status"], "failed");
+        assert_eq!(document["qualification_status"], "failed");
+        assert_eq!(document_exit_code(&document), 1);
+        assert_eq!(
+            document["checks"][1],
+            qualification_check("cleanup_evidence", "passed")
+        );
+        assert_eq!(
+            failure.as_deref(),
+            Some("occupied_probe_create: injected create failure")
+        );
+
+        let mut invalid = Vec::new();
+
+        let mut missing_created_cleanup = partial.clone();
+        missing_created_cleanup
+            .as_object_mut()
+            .expect("partial fault result")
+            .remove("occupier_cleanup");
+        invalid.push(missing_created_cleanup);
+
+        let mut cleanup_for_uncreated_role = partial.clone();
+        cleanup_for_uncreated_role["occupied_probe_cleanup"] = successful_cleanup();
+        invalid.push(cleanup_for_uncreated_role);
+
+        let mut out_of_order_creation = partial.clone();
+        out_of_order_creation["resources"]["cancel"]["created"] = json!(true);
+        out_of_order_creation["cancel_cleanup"] = successful_cleanup();
+        invalid.push(out_of_order_creation);
+
+        let mut nonterminal_scenario = partial.clone();
+        nonterminal_scenario["scenarios"]["port_occupied"]["status"] = json!("running");
+        invalid.push(nonterminal_scenario);
+
+        let mut completed_without_probe = partial.clone();
+        completed_without_probe["scenarios"]["port_occupied"]["status"] = json!("completed");
+        completed_without_probe["scenarios"]["cancel"]["status"] = json!("failed");
+        invalid.push(completed_without_probe);
+
+        let mut missing_scenario = partial.clone();
+        missing_scenario["scenarios"]
+            .as_object_mut()
+            .expect("fault scenarios")
+            .remove("deadline");
+        invalid.push(missing_scenario);
+
+        let mut misplaced_cleanup = partial.clone();
+        misplaced_cleanup["nested"]["occupier_cleanup"] = successful_cleanup();
+        invalid.push(misplaced_cleanup);
+
+        for result in invalid {
+            assert!(!cleanup_contract_succeeded("faults", &result));
+            let (document, _) = finalize_result("faults", Ok(result));
+            assert_eq!(
+                document["checks"][1],
+                qualification_check("cleanup_evidence", "incomplete_or_failed")
+            );
+            assert_eq!(document_exit_code(&document), 1);
+        }
+
+        let mut no_execution_error = partial;
+        no_execution_error
+            .as_object_mut()
+            .expect("partial fault result")
+            .remove("execution_error");
+        assert!(!cleanup_contract_succeeded("faults", &no_execution_error));
     }
 
     #[test]
