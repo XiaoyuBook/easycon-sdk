@@ -31,6 +31,8 @@
     reservation、retained staging、owned auxiliary 和 no-replace publish。
 12. [Phase 2B 设备身份接纳与诊断 readiness 证据设计](development/phase2b-device-admission-readiness.md)：
     expected stable identity、open 前后复核、hotplug 重绑定和 diagnostic prelude 的非 capability 边界。
+13. [Phase 2B 普通命令 runner 所有权与失败证据设计](development/phase2b-command-runner-ownership.md)：
+    非 faults 命令的单 owner、operation 失败收口和动态 partial-cleanup contract。
 
 ## 决策记录
 
