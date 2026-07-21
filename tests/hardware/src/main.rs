@@ -807,7 +807,7 @@ fn cancel_evidence_valid(result: &Value) -> bool {
         && after_cancel
             .get("accepted_report_count")
             .and_then(Value::as_u64)
-            .is_some_and(|count| count >= after_minimum)
+            == Some(after_minimum)
         && after_cancel
             .get("desired_report_neutral")
             .and_then(Value::as_bool)
@@ -3006,6 +3006,10 @@ mod tests {
         let mut no_neutral_acceptance = valid.clone();
         no_neutral_acceptance["post_cancel_snapshot"]["accepted_report_count"] = json!(8);
         invalid.push(no_neutral_acceptance);
+
+        let mut unexpected_extra_acceptance = valid.clone();
+        unexpected_extra_acceptance["post_cancel_snapshot"]["accepted_report_count"] = json!(10);
+        invalid.push(unexpected_extra_acceptance);
 
         let mut nonneutral_terminal = valid;
         nonneutral_terminal["post_cancel_snapshot"]["desired_report_neutral"] = json!(false);
