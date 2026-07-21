@@ -2,6 +2,7 @@
 
 mod amiibo;
 mod artifact;
+mod checkpoint;
 mod device;
 mod faults;
 mod journal;
@@ -1389,6 +1390,14 @@ fn real_main() -> Result<i32, String> {
     ArtifactReservation::validate_command(command)?;
     let provenance = RuntimeProvenance::capture();
     let artifact_dir = artifact_dir(&arguments)?;
+    let checkpoint_inputs = if command == "checkpoint" {
+        Some(checkpoint::CheckpointInputs::parse(
+            &arguments,
+            &artifact_dir,
+        )?)
+    } else {
+        None
+    };
     fs::create_dir_all(&artifact_dir).map_err(|error| error.to_string())?;
     let mut reservation = ArtifactReservation::begin_journaled(
         command,
@@ -1421,6 +1430,12 @@ fn real_main() -> Result<i32, String> {
             Ok(pre_harness_cancellation_result(command, failure))
         } else {
             match command {
+                "checkpoint" => checkpoint::run(
+                    checkpoint_inputs
+                        .as_ref()
+                        .expect("checkpoint inputs were parsed before reservation"),
+                    &mut control,
+                ),
                 "discover" => run_discover(&arguments, &mut control),
                 "handshake" => run_with_device_admission(
                     "handshake",
@@ -1584,7 +1599,10 @@ fn normalized_arguments(arguments: &[String]) -> Value {
             continue;
         }
         normalized.push(json!(argument));
-        redact_next = matches!(argument.as_str(), "--output-dir" | "--data");
+        redact_next = matches!(
+            argument.as_str(),
+            "--output-dir" | "--data" | "--runs-root" | "--attestations-root"
+        );
     }
     Value::Array(normalized)
 }
@@ -1826,6 +1844,24 @@ fn qualification_decision(command: &str, result: &Value) -> QualificationDecisio
         };
     }
     match command {
+        "checkpoint" => {
+            if checkpoint::projection_is_valid(&result["checkpoint"]) {
+                QualificationDecision {
+                    status: QualificationStatus::Unverified,
+                    checks: vec![
+                        qualification_check("checkpoint_projection", "passed"),
+                        qualification_check("hardware_qualification", "unverified"),
+                    ],
+                    failure: None,
+                }
+            } else {
+                QualificationDecision {
+                    status: QualificationStatus::Failed,
+                    checks: vec![qualification_check("checkpoint_projection", "failed")],
+                    failure: Some("checkpoint projection is malformed".to_owned()),
+                }
+            }
+        }
         "discover" => discovery_qualification(result),
         "handshake" => required_checks(&[
             (
@@ -2663,6 +2699,13 @@ fn cleanup_contract_succeeded(command: &str, result: &Value) -> bool {
     }
     if result.get("execution_error").is_some() {
         return match command {
+            "checkpoint" => {
+                result["resources"]
+                    .as_object()
+                    .is_some_and(|resources| resources.is_empty())
+                    && cleanup_slot_count(result) == 0
+                    && runtime_cleanup_count(result) == 0
+            }
             "faults" => partial_fault_cleanup_contract_succeeded(result),
             "hotplug" => partial_hotplug_cleanup_contract_succeeded(result),
             "lifecycle" => partial_lifecycle_cleanup_contract_succeeded(result),
@@ -2682,7 +2725,7 @@ fn cleanup_contract_succeeded(command: &str, result: &Value) -> bool {
         "hotplug" => 2,
         "lifecycle" => result["records"].as_array().map_or(0, Vec::len),
         "amiibo" if result["write_performed"].as_bool() == Some(true) => 1,
-        "discover" | "amiibo" => 0,
+        "checkpoint" | "discover" | "amiibo" => 0,
         _ => 0,
     };
     if cleanup_slot_count(result) != expected_count
@@ -2711,7 +2754,7 @@ fn cleanup_contract_succeeded(command: &str, result: &Value) -> bool {
         "amiibo" if result["write_performed"].as_bool() == Some(true) => {
             cleanup_succeeded(&result["cleanup"])
         }
-        "discover" | "amiibo" => true,
+        "checkpoint" | "discover" | "amiibo" => true,
         _ => true,
     }
 }
@@ -5610,7 +5653,8 @@ fn print_help() {
          easycon-hardware-qualification sequence --port COMx --expected-identity ID [--steps 10000]\n  \
          easycon-hardware-qualification amiibo [--port COMx --expected-identity ID --slot N --disposable-slot N \
          --slot-count N --maximum-data-len N --limits-source REF --data FILE --expected-sha256 HEX \
-         --authorize-write]\n\n  \
+         --authorize-write]\n  \
+         easycon-hardware-qualification checkpoint --runs-root PATH [--attestations-root PATH] --output-dir PATH\n\n  \
          Every command accepts --output-dir PATH."
     );
 }
@@ -6678,11 +6722,15 @@ mod tests {
     #[test]
     fn normalized_journal_arguments_do_not_retain_machine_paths() {
         let arguments = vec![
-            "amiibo".to_owned(),
+            "checkpoint".to_owned(),
             "--data".to_owned(),
             r"C:\private\payload.bin".to_owned(),
             "--output-dir".to_owned(),
             r"D:\private\run".to_owned(),
+            "--runs-root".to_owned(),
+            r"E:\private\runs".to_owned(),
+            "--attestations-root".to_owned(),
+            r"F:\private\attestations".to_owned(),
             "--slot".to_owned(),
             "1".to_owned(),
         ];
@@ -6691,7 +6739,9 @@ mod tests {
 
         assert_eq!(normalized[2], "<redacted-path>");
         assert_eq!(normalized[4], "<redacted-path>");
-        assert_eq!(normalized[6], "1");
+        assert_eq!(normalized[6], "<redacted-path>");
+        assert_eq!(normalized[8], "<redacted-path>");
+        assert_eq!(normalized[10], "1");
         let text = serde_json::to_string(&normalized).expect("normalized arguments");
         assert!(!text.contains("private"));
     }

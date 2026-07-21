@@ -4,6 +4,10 @@ use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
 #[cfg(windows)]
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -868,10 +872,46 @@ pub(crate) enum RunDirectoryStatus {
     Completed,
 }
 
+impl RunDirectoryStatus {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Vacant => "vacant",
+            Self::Incomplete => "incomplete",
+            Self::Polluted => "polluted",
+            Self::Completed => "completed",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RunDirectoryInspection {
     pub(crate) status: RunDirectoryStatus,
     pub(crate) reason: &'static str,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CompletedRunEvidence {
+    pub(crate) lease_id: String,
+    pub(crate) command: String,
+    pub(crate) primary_relative_path: String,
+    pub(crate) document: Value,
+    pub(crate) document_bytes: u64,
+    pub(crate) document_sha256: String,
+    pub(crate) journal_bytes: u64,
+    pub(crate) journal_sha256: String,
+    pub(crate) manifest_bytes: u64,
+    pub(crate) manifest_sha256: String,
+    pub(crate) completion_bytes: u64,
+    pub(crate) completion_sha256: String,
+    pub(crate) manifest_members: Value,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CheckpointRunEvidence {
+    pub(crate) inspection: RunDirectoryInspection,
+    pub(crate) snapshot_sha256: String,
+    pub(crate) snapshot_complete: bool,
+    pub(crate) completed: Option<CompletedRunEvidence>,
 }
 
 #[derive(Clone, Debug)]
@@ -1085,6 +1125,159 @@ pub(crate) fn classify_run_directory(directory: &Path) -> RunDirectoryInspection
     }
 }
 
+pub(crate) fn checkpoint_run_evidence(directory: &Path) -> CheckpointRunEvidence {
+    let first = classify_run_directory(directory);
+    let (first_snapshot_sha256, first_snapshot_complete) = checkpoint_directory_snapshot(directory);
+    if first.status != RunDirectoryStatus::Completed || !first_snapshot_complete {
+        return CheckpointRunEvidence {
+            inspection: first,
+            snapshot_sha256: first_snapshot_sha256,
+            snapshot_complete: first_snapshot_complete,
+            completed: None,
+        };
+    }
+
+    let completed = completed_run_evidence(directory);
+    let second = classify_run_directory(directory);
+    let (second_snapshot_sha256, second_snapshot_complete) =
+        checkpoint_directory_snapshot(directory);
+    if completed.is_err()
+        || second.status != RunDirectoryStatus::Completed
+        || !second_snapshot_complete
+        || first_snapshot_sha256 != second_snapshot_sha256
+    {
+        return CheckpointRunEvidence {
+            inspection: RunDirectoryInspection {
+                status: RunDirectoryStatus::Polluted,
+                reason: "checkpoint_read_race_or_failure",
+            },
+            snapshot_sha256: second_snapshot_sha256,
+            snapshot_complete: false,
+            completed: None,
+        };
+    }
+
+    CheckpointRunEvidence {
+        inspection: second,
+        snapshot_sha256: second_snapshot_sha256,
+        snapshot_complete: true,
+        completed: completed.ok(),
+    }
+}
+
+pub(crate) fn read_checkpoint_input_file(
+    path: &Path,
+    maximum_bytes: u64,
+) -> Result<Vec<u8>, String> {
+    let first = read_guarded_disk_file_bounded(path, maximum_bytes)?;
+    let second = read_guarded_disk_file_bounded(path, maximum_bytes)?;
+    if first.identity != second.identity || first.bytes != second.bytes {
+        return Err("checkpoint input changed while it was read".to_owned());
+    }
+    Ok(second.bytes)
+}
+
+fn completed_run_evidence(directory: &Path) -> Result<CompletedRunEvidence, String> {
+    let reservation = read_guarded_disk_file(&directory.join(RESERVATION_FILE_NAME))?;
+    let reservation_document: Value = serde_json::from_slice(&reservation.bytes)
+        .map_err(|_| "reservation JSON is invalid".to_owned())?;
+    let plan = DiskTransactionPlan::from_reservation(&reservation_document)?;
+    let primary = read_guarded_disk_file(&directory.join(&plan.primary.final_name))?;
+    let document: Value = serde_json::from_slice(&primary.bytes)
+        .map_err(|_| "primary document JSON is invalid".to_owned())?;
+    let journal = read_guarded_disk_file(&directory.join(JOURNAL_FILE_NAME))?;
+    let manifest = read_guarded_disk_file(&directory.join(&plan.manifest.final_name))?;
+    let manifest_document: Value = serde_json::from_slice(&manifest.bytes)
+        .map_err(|_| "manifest JSON is invalid".to_owned())?;
+    let completion = read_guarded_disk_file(&directory.join(&plan.completion.final_name))?;
+
+    Ok(CompletedRunEvidence {
+        lease_id: plan.lease_id,
+        command: plan.command,
+        primary_relative_path: plan.primary.final_name,
+        document,
+        document_bytes: checked_len(&primary.bytes)?,
+        document_sha256: sha256_bytes(&primary.bytes),
+        journal_bytes: checked_len(&journal.bytes)?,
+        journal_sha256: sha256_bytes(&journal.bytes),
+        manifest_bytes: checked_len(&manifest.bytes)?,
+        manifest_sha256: sha256_bytes(&manifest.bytes),
+        completion_bytes: checked_len(&completion.bytes)?,
+        completion_sha256: sha256_bytes(&completion.bytes),
+        manifest_members: manifest_document["members"].clone(),
+    })
+}
+
+fn checkpoint_directory_snapshot(directory: &Path) -> (String, bool) {
+    let mut digest_input = Vec::new();
+    append_snapshot_field(&mut digest_input, b"easycon-checkpoint-run-snapshot-v1");
+    let Ok(read) = fs::read_dir(directory) else {
+        append_snapshot_field(&mut digest_input, b"directory-unreadable");
+        return (sha256_bytes(&digest_input), false);
+    };
+    let mut names = Vec::new();
+    for entry in read {
+        let Ok(entry) = entry else {
+            append_snapshot_field(&mut digest_input, b"entry-unreadable");
+            return (sha256_bytes(&digest_input), false);
+        };
+        names.push(entry.file_name());
+    }
+    names.sort();
+    let mut complete = true;
+    for name in names {
+        let name_bytes = checkpoint_os_name_bytes(&name);
+        append_snapshot_field(&mut digest_input, &name_bytes);
+        if name.to_str().is_none() {
+            complete = false;
+        }
+        let path = directory.join(&name);
+        match read_guarded_disk_file(&path) {
+            Ok(file) => {
+                append_snapshot_field(&mut digest_input, b"regular-file");
+                append_snapshot_field(
+                    &mut digest_input,
+                    &u64::try_from(file.bytes.len())
+                        .unwrap_or(u64::MAX)
+                        .to_le_bytes(),
+                );
+                append_snapshot_field(&mut digest_input, sha256_bytes(&file.bytes).as_bytes());
+            }
+            Err(_) => {
+                append_snapshot_field(&mut digest_input, b"unreadable-or-nonregular");
+                complete = false;
+            }
+        }
+    }
+    (sha256_bytes(&digest_input), complete)
+}
+
+fn append_snapshot_field(output: &mut Vec<u8>, bytes: &[u8]) {
+    output.extend_from_slice(&u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
+    output.extend_from_slice(bytes);
+}
+
+#[cfg(windows)]
+fn checkpoint_os_name_bytes(name: &OsString) -> Vec<u8> {
+    name.encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>()
+}
+
+#[cfg(unix)]
+fn checkpoint_os_name_bytes(name: &OsString) -> Vec<u8> {
+    name.as_bytes().to_vec()
+}
+
+#[cfg(not(any(windows, unix)))]
+fn checkpoint_os_name_bytes(name: &OsString) -> Vec<u8> {
+    name.to_string_lossy().as_bytes().to_vec()
+}
+
+fn checked_len(bytes: &[u8]) -> Result<u64, String> {
+    u64::try_from(bytes.len()).map_err(|_| "evidence member length does not fit u64".to_owned())
+}
+
 fn classify_run_directory_inner(directory: &Path) -> Result<RunDirectoryInspection, String> {
     let actual = directory_entries(directory)?;
     if actual.is_empty() {
@@ -1225,13 +1418,40 @@ fn disk_manifest_members(
 }
 
 fn read_guarded_disk_file(path: &Path) -> Result<GuardedDiskFile, String> {
+    read_guarded_disk_file_inner(path, None)
+}
+
+fn read_guarded_disk_file_bounded(
+    path: &Path,
+    maximum_bytes: u64,
+) -> Result<GuardedDiskFile, String> {
+    read_guarded_disk_file_inner(path, Some(maximum_bytes))
+}
+
+fn read_guarded_disk_file_inner(
+    path: &Path,
+    maximum_bytes: Option<u64>,
+) -> Result<GuardedDiskFile, String> {
     let mut file = SYSTEM_FINAL_GUARD_OPENER.open(path, final_guard_open_spec())?;
     let metadata = SYSTEM_FINAL_GUARD_METADATA_PROVIDER.metadata(&file, path)?;
     validate_final_guard_metadata(metadata, path)?;
     let identity = SYSTEM_FILE_IDENTITY_PROVIDER.high_resolution_identity(&file, path)?;
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .map_err(|error| format!("cannot read guarded evidence file: {error}"))?;
+    match maximum_bytes {
+        Some(maximum_bytes) => {
+            Read::by_ref(&mut file)
+                .take(maximum_bytes.saturating_add(1))
+                .read_to_end(&mut bytes)
+                .map_err(|error| format!("cannot read guarded evidence file: {error}"))?;
+            if u64::try_from(bytes.len()).map_or(true, |length| length > maximum_bytes) {
+                return Err("checkpoint input exceeds its byte limit".to_owned());
+            }
+        }
+        None => {
+            file.read_to_end(&mut bytes)
+                .map_err(|error| format!("cannot read guarded evidence file: {error}"))?;
+        }
+    }
     Ok(GuardedDiskFile { bytes, identity })
 }
 
@@ -1510,6 +1730,30 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn checkpoint_snapshot_hashes_name_kind_length_and_content_digest() {
+        let directory = TestDirectory::new("checkpoint-snapshot");
+        let name = OsString::from("evidence.bin");
+        let payload = b"stable snapshot payload";
+        fs::write(directory.0.join(&name), payload).expect("snapshot member");
+
+        let (actual, complete) = checkpoint_directory_snapshot(&directory.0);
+        let mut expected_input = Vec::new();
+        append_snapshot_field(&mut expected_input, b"easycon-checkpoint-run-snapshot-v1");
+        append_snapshot_field(&mut expected_input, &checkpoint_os_name_bytes(&name));
+        append_snapshot_field(&mut expected_input, b"regular-file");
+        append_snapshot_field(
+            &mut expected_input,
+            &u64::try_from(payload.len())
+                .expect("payload length")
+                .to_le_bytes(),
+        );
+        append_snapshot_field(&mut expected_input, sha256_bytes(payload).as_bytes());
+
+        assert!(complete);
+        assert_eq!(actual, sha256_bytes(&expected_input));
     }
 
     fn journal_metadata() -> RunStartMetadata {
