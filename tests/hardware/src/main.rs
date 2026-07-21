@@ -19,7 +19,7 @@ use artifact::{ArtifactReservation, AuxiliaryKind, SEQUENCE_TIMINGS_FILE_NAME};
 use device::{
     AdmissionDecision, AdmissionEvidence, AdmittedDevice, DeviceDiscovery, DeviceTargetRequest,
     IdentityGuardedByteIoFactory, IdentityOpenRecorder, InnerOpenOutcome, OpenGuardCheck,
-    SystemDeviceDiscovery, admit_device,
+    RebindDecision, SystemDeviceDiscovery, admit_device, rebind_device,
 };
 use easycon_controller::{
     AUTO_BAUD_RATES, AckFrame, AckRequest, AmiiboLimits, AmiiboSaveOptions, AmiiboSelectOptions,
@@ -41,6 +41,19 @@ use serde_json::{Value, json};
 
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
 const MINIMUM_REPORT_INTERVAL_NS: u64 = 30_000_000;
+const HOTPLUG_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+trait QualificationDelay {
+    fn wait(&self, duration: Duration);
+}
+
+struct ThreadDelay;
+
+impl QualificationDelay for ThreadDelay {
+    fn wait(&self, duration: Duration) {
+        thread::sleep(duration);
+    }
+}
 
 #[derive(Clone, Debug)]
 struct HandshakeAttempt {
@@ -888,6 +901,31 @@ fn execution_error(result: &Value) -> Option<String> {
     Some(parsed.unwrap_or_else(|| "malformed execution_error evidence".to_owned()))
 }
 
+fn hotplug_success_transitions_are_exact(result: &Value) -> bool {
+    const EXPECTED: [&str; 9] = [
+        "requested",
+        "initial_admitted",
+        "initial_connected",
+        "awaiting_expected_absent",
+        "initial_closed",
+        "awaiting_expected_return",
+        "rebound_admitted",
+        "reconnected",
+        "closed",
+    ];
+    result["hotplug_transitions"]
+        .as_array()
+        .is_some_and(|transitions| {
+            transitions.len() == EXPECTED.len()
+                && transitions.iter().zip(EXPECTED).enumerate().all(
+                    |(index, (transition, expected))| {
+                        transition["sequence"].as_u64() == u64::try_from(index + 1).ok()
+                            && transition["state"].as_str() == Some(expected)
+                    },
+                )
+        })
+}
+
 fn qualification_decision(command: &str, result: &Value) -> QualificationDecision {
     if result["identity_admission"]["status"] == "rejected" {
         return QualificationDecision {
@@ -975,6 +1013,17 @@ fn qualification_decision(command: &str, result: &Value) -> QualificationDecisio
                 "stable_identity_preserved",
                 result["stable_id"].as_str()
                     == result["reconnected_identity"]["stable_id"].as_str(),
+            ),
+            (
+                "identity_rebound_from_discovery",
+                result["return_poll"]["outcome"] == "expected_present"
+                    && result["rebound_admission"]["status"] == "rebound"
+                    && result["rebound_admission"]["observed_expected"]["stable_id"].as_str()
+                        == result["stable_id"].as_str(),
+            ),
+            (
+                "hotplug_state_machine_closed",
+                hotplug_success_transitions_are_exact(result),
             ),
         ]),
         "lifecycle" => {
@@ -1302,6 +1351,9 @@ fn cleanup_contract_succeeded(command: &str, result: &Value) -> bool {
             _ => false,
         };
     }
+    if command == "hotplug" {
+        return completed_hotplug_cleanup_contract_succeeded(result);
+    }
 
     let expected_count = match command {
         "handshake" | "smoke" | "home-wake" | "sequence" => 1,
@@ -1340,6 +1392,49 @@ fn cleanup_contract_succeeded(command: &str, result: &Value) -> bool {
         }
         "discover" | "amiibo" => true,
         _ => true,
+    }
+}
+
+fn completed_hotplug_cleanup_contract_succeeded(result: &Value) -> bool {
+    let Some(resources) = result.get("resources").and_then(Value::as_object) else {
+        return false;
+    };
+    if resources.len() != 2 {
+        return false;
+    }
+    let created = |role: &str| {
+        resources
+            .get(role)
+            .and_then(Value::as_object)
+            .and_then(|role| {
+                (role.len() == 1)
+                    .then(|| role.get("created").and_then(Value::as_bool))
+                    .flatten()
+            })
+    };
+    if created("initial") != Some(true) {
+        return false;
+    }
+    let Some(reconnected_created) = created("reconnected") else {
+        return false;
+    };
+    if !cleanup_succeeded(&result["disconnect_cleanup"]) {
+        return false;
+    }
+
+    if reconnected_created {
+        result.get("hotplug_machine_failure").is_none()
+            && result.get("cleanup").is_some()
+            && cleanup_slot_count(result) == 2
+            && runtime_cleanup_count(result) == 2
+            && cleanup_succeeded(&result["cleanup"])
+    } else {
+        matches!(
+            result["hotplug_machine_failure"]["kind"].as_str(),
+            Some("expected_absent_timeout" | "expected_return_timeout")
+        ) && result.get("cleanup").is_none()
+            && cleanup_slot_count(result) == 1
+            && runtime_cleanup_count(result) == 1
     }
 }
 
@@ -1989,6 +2084,7 @@ fn run_smoke(
         .iter()
         .any(|argument| argument == "--wake-left-stick");
     let wake_home = arguments.iter().any(|argument| argument == "--wake-home");
+    let post_home_neutral_delay_ms = smoke_home_delay(arguments, wake_home)?;
     let hold_ms = value_or(arguments, "--hold-ms", 0_u64)?;
     validate_hold_ms(hold_ms)?;
     let harness = Harness::new(&target, discovery, ControllerOptions::default())?;
@@ -1997,7 +2093,8 @@ fn run_smoke(
         "stage": if full { "full" } else { "a_only" },
         "wake_left_stick": wake_left_stick,
         "wake_home": wake_home,
-        "wake_home_to_a_delay_ms": wake_home.then_some(3_000),
+        "configured_post_home_neutral_delay_ms": post_home_neutral_delay_ms,
+        "diagnostic_prelude_steps": [],
         "a_hold_ms": hold_ms,
         "port": port_json(&harness.descriptor),
         "actions": [],
@@ -2020,35 +2117,42 @@ fn run_smoke(
             )?;
             if wake_home {
                 for (label, action) in home_wake_actions() {
-                    exercise_action_for_command(harness, label, action, &mut result["actions"])?;
+                    exercise_smoke_action(harness, label, action, result, true)?;
                 }
-                thread::sleep(Duration::from_secs(3));
+                record_configured_home_delay(
+                    result,
+                    post_home_neutral_delay_ms.expect("wake-home requires a configured delay"),
+                    &ThreadDelay,
+                );
             }
             if wake_left_stick {
                 for (label, action) in left_stick_wake_actions() {
-                    exercise_action_for_command(harness, label, action, &mut result["actions"])?;
+                    exercise_smoke_action(harness, label, action, result, wake_home)?;
                 }
             }
-            exercise_action_for_command(
+            exercise_smoke_action(
                 harness,
                 "button.A.down",
                 ControllerAction::ButtonDown(Button::A),
-                &mut result["actions"],
+                result,
+                wake_home,
             )?;
             if hold_ms != 0 {
                 thread::sleep(Duration::from_millis(hold_ms));
             }
-            exercise_action_for_command(
+            exercise_smoke_action(
                 harness,
                 "button.A.up",
                 ControllerAction::ButtonUp(Button::A),
-                &mut result["actions"],
+                result,
+                wake_home,
             )?;
-            exercise_action_for_command(
+            exercise_smoke_action(
                 harness,
                 "neutral",
                 ControllerAction::Reset,
-                &mut result["actions"],
+                result,
+                wake_home,
             )?;
 
             if full {
@@ -2237,24 +2341,175 @@ fn run_faults(
     Ok(faults::run(target, discovery))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HotplugExpectedState {
+    Absent,
+    Present,
+}
+
+trait HotplugPollTimer {
+    fn elapsed(&self) -> Duration;
+    fn wait(&mut self, duration: Duration);
+}
+
+struct SystemHotplugPollTimer {
+    started: Instant,
+}
+
+impl SystemHotplugPollTimer {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+        }
+    }
+}
+
+impl HotplugPollTimer for SystemHotplugPollTimer {
+    fn elapsed(&self) -> Duration {
+        self.started.elapsed()
+    }
+
+    fn wait(&mut self, duration: Duration) {
+        thread::sleep(duration);
+    }
+}
+
+enum HotplugPollOutcome {
+    ExpectedAbsent,
+    Rebound(Box<AdmittedDevice>),
+    TimedOut,
+    DiscoveryError(SerialError),
+    AmbiguousSnapshot,
+}
+
+struct HotplugPollTrace {
+    observations: Vec<AdmissionEvidence>,
+    outcome: HotplugPollOutcome,
+}
+
+fn poll_hotplug_identity(
+    discovery: &dyn DeviceDiscovery,
+    request: &DeviceTargetRequest,
+    expected_state: HotplugExpectedState,
+    timeout: Duration,
+    timer: &mut dyn HotplugPollTimer,
+) -> HotplugPollTrace {
+    let mut observations = Vec::new();
+    loop {
+        if timer.elapsed() >= timeout {
+            return HotplugPollTrace {
+                observations,
+                outcome: HotplugPollOutcome::TimedOut,
+            };
+        }
+        let snapshot = match discovery.discover() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return HotplugPollTrace {
+                    observations,
+                    outcome: HotplugPollOutcome::DiscoveryError(error),
+                };
+            }
+        };
+        match rebind_device(request, snapshot) {
+            RebindDecision::Rebound(target) => {
+                observations.push(target.evidence().clone());
+                if expected_state == HotplugExpectedState::Present {
+                    return HotplugPollTrace {
+                        observations,
+                        outcome: HotplugPollOutcome::Rebound(Box::new(target)),
+                    };
+                }
+            }
+            RebindDecision::ExpectedAbsent(evidence) => {
+                observations.push(evidence);
+                if expected_state == HotplugExpectedState::Absent {
+                    return HotplugPollTrace {
+                        observations,
+                        outcome: HotplugPollOutcome::ExpectedAbsent,
+                    };
+                }
+            }
+            RebindDecision::Ambiguous(evidence) => {
+                observations.push(evidence);
+                return HotplugPollTrace {
+                    observations,
+                    outcome: HotplugPollOutcome::AmbiguousSnapshot,
+                };
+            }
+        }
+
+        let elapsed = timer.elapsed();
+        if elapsed >= timeout {
+            return HotplugPollTrace {
+                observations,
+                outcome: HotplugPollOutcome::TimedOut,
+            };
+        }
+        timer.wait(HOTPLUG_POLL_INTERVAL.min(timeout - elapsed));
+    }
+}
+
+fn hotplug_poll_trace_json(trace: &HotplugPollTrace) -> Value {
+    let (outcome, structured_error) = match &trace.outcome {
+        HotplugPollOutcome::ExpectedAbsent => ("expected_absent", Value::Null),
+        HotplugPollOutcome::Rebound(_) => ("expected_present", Value::Null),
+        HotplugPollOutcome::TimedOut => ("timed_out", Value::Null),
+        HotplugPollOutcome::DiscoveryError(error) => ("discovery_error", serial_error_json(error)),
+        HotplugPollOutcome::AmbiguousSnapshot => ("ambiguous_snapshot", Value::Null),
+    };
+    json!({
+        "outcome": outcome,
+        "observations": trace.observations.iter().map(|evidence| {
+            let status = match evidence.reason().map(|reason| reason.as_str()) {
+                None => "expected_present",
+                Some("expected_absent") => "expected_absent",
+                Some("ambiguous_snapshot") => "ambiguous_snapshot",
+                Some(_) => "conflict",
+            };
+            admission_evidence_json(evidence, status)
+        }).collect::<Vec<_>>(),
+        "structured_error": structured_error,
+    })
+}
+
+fn push_hotplug_transition(result: &mut Value, state: &str) {
+    let transitions = result["hotplug_transitions"]
+        .as_array_mut()
+        .expect("hotplug transitions are an array");
+    transitions.push(json!({
+        "sequence": transitions.len() + 1,
+        "state": state,
+    }));
+}
+
+fn set_hotplug_machine_failure(result: &mut Value, kind: &str) {
+    result["hotplug_machine_failure"] = json!({"kind": kind});
+}
+
 fn run_hotplug(
     arguments: &[String],
     target: AdmittedDevice,
     discovery: Arc<dyn DeviceDiscovery>,
 ) -> Result<Value, String> {
     let timeout_seconds = value_or(arguments, "--timeout-seconds", 180_u64)?;
+    let timeout = Duration::from_secs(timeout_seconds);
+    let request = target.request().clone();
     let port = target.descriptor().port_name().to_owned();
     let harness = Harness::new(&target, discovery.clone(), ControllerOptions::default())?;
     let stable_id = harness.descriptor.stable_id().to_owned();
-    let result = json!({
+    let mut result = json!({
         "command": "hotplug",
         "stable_id": stable_id,
         "initial_port": port_json(&harness.descriptor),
+        "hotplug_transitions": [],
         "resources": {
             "initial": {"created": true},
             "reconnected": {"created": false},
         },
     });
+    push_hotplug_transition(&mut result, "requested");
+    push_hotplug_transition(&mut result, "initial_admitted");
     let mut result = finish_harness_phase(
         harness,
         result,
@@ -2269,12 +2524,41 @@ fn run_hotplug(
                 "hotplug_initial_connect_wait",
                 "hotplug_initial_connect_terminal",
             )?;
+            push_hotplug_transition(result, "initial_connected");
             println!("HOTPLUG_READY: unplug {port} now");
             std::io::stdout().flush().map_err(|error| {
                 CommandFailure::new("hotplug_unplug_marker_flush", error.to_string())
             })?;
-            wait_for_presence(&stable_id, false, Duration::from_secs(timeout_seconds))
-                .map_err(|error| CommandFailure::new("hotplug_wait_absent", error))?;
+            push_hotplug_transition(result, "awaiting_expected_absent");
+            let mut timer = SystemHotplugPollTimer::new();
+            let trace = poll_hotplug_identity(
+                discovery.as_ref(),
+                &request,
+                HotplugExpectedState::Absent,
+                timeout,
+                &mut timer,
+            );
+            result["absence_poll"] = hotplug_poll_trace_json(&trace);
+            match trace.outcome {
+                HotplugPollOutcome::ExpectedAbsent => {}
+                HotplugPollOutcome::TimedOut => {
+                    result["disconnect_detected"] = json!(false);
+                    set_hotplug_machine_failure(result, "expected_absent_timeout");
+                    return Ok(());
+                }
+                HotplugPollOutcome::DiscoveryError(error) => {
+                    return Err(CommandFailure::new("hotplug_wait_absent", error.message()));
+                }
+                HotplugPollOutcome::AmbiguousSnapshot => {
+                    return Err(CommandFailure::new(
+                        "hotplug_wait_absent",
+                        "ambiguous serial snapshot while waiting for expected identity absence",
+                    ));
+                }
+                HotplugPollOutcome::Rebound(_) => {
+                    unreachable!("absence poll cannot return a present target")
+                }
+            }
             let disconnected = harness.controller.reset().map_err(|error| {
                 CommandFailure::new("hotplug_disconnect_admit", error.to_string())
             })?;
@@ -2288,7 +2572,15 @@ fn run_hotplug(
             Ok(())
         },
     );
+    if cleanup_succeeded(&result["disconnect_cleanup"]) {
+        push_hotplug_transition(&mut result, "initial_closed");
+    }
     if result.get("execution_error").is_some() {
+        push_hotplug_transition(&mut result, "failed");
+        return Ok(result);
+    }
+    if result.get("hotplug_machine_failure").is_some() {
+        push_hotplug_transition(&mut result, "failed");
         return Ok(result);
     }
 
@@ -2298,28 +2590,65 @@ fn run_hotplug(
             &mut result,
             CommandFailure::new("hotplug_reconnect_marker_flush", error.to_string()),
         );
+        push_hotplug_transition(&mut result, "failed");
         return Ok(result);
     }
-    if let Err(error) = wait_for_presence(&stable_id, true, Duration::from_secs(timeout_seconds)) {
-        set_command_failure(
-            &mut result,
-            CommandFailure::new("hotplug_wait_return", error),
-        );
-        return Ok(result);
-    }
-    let reconnected = match Harness::new(&target, discovery, ControllerOptions::default()) {
+    push_hotplug_transition(&mut result, "awaiting_expected_return");
+    let mut timer = SystemHotplugPollTimer::new();
+    let trace = poll_hotplug_identity(
+        discovery.as_ref(),
+        &request,
+        HotplugExpectedState::Present,
+        timeout,
+        &mut timer,
+    );
+    result["return_poll"] = hotplug_poll_trace_json(&trace);
+    let rebound = match trace.outcome {
+        HotplugPollOutcome::Rebound(target) => target,
+        HotplugPollOutcome::TimedOut => {
+            set_hotplug_machine_failure(&mut result, "expected_return_timeout");
+            push_hotplug_transition(&mut result, "failed");
+            return Ok(result);
+        }
+        HotplugPollOutcome::DiscoveryError(error) => {
+            set_command_failure(
+                &mut result,
+                CommandFailure::new("hotplug_wait_return", error.message()),
+            );
+            push_hotplug_transition(&mut result, "failed");
+            return Ok(result);
+        }
+        HotplugPollOutcome::AmbiguousSnapshot => {
+            set_command_failure(
+                &mut result,
+                CommandFailure::new(
+                    "hotplug_wait_return",
+                    "ambiguous serial snapshot while waiting for expected identity return",
+                ),
+            );
+            push_hotplug_transition(&mut result, "failed");
+            return Ok(result);
+        }
+        HotplugPollOutcome::ExpectedAbsent => {
+            unreachable!("return poll cannot complete with an absent target")
+        }
+    };
+    result["rebound_admission"] = admission_evidence_json(rebound.evidence(), "rebound");
+    result["reconnected_identity"] = port_json(rebound.descriptor());
+    push_hotplug_transition(&mut result, "rebound_admitted");
+    let reconnected = match Harness::new(&rebound, discovery, ControllerOptions::default()) {
         Ok(harness) => harness,
         Err(error) => {
             set_command_failure(
                 &mut result,
                 CommandFailure::new("hotplug_reconnected_create", error),
             );
+            push_hotplug_transition(&mut result, "failed");
             return Ok(result);
         }
     };
     result["resources"]["reconnected"]["created"] = json!(true);
-    result["reconnected_identity"] = port_json(&reconnected.descriptor);
-    Ok(finish_harness_phase(
+    let mut result = finish_harness_phase(
         reconnected,
         result,
         "cleanup",
@@ -2334,9 +2663,16 @@ fn run_hotplug(
                 "hotplug_reconnect_terminal",
             )?;
             result["reconnect_baud"] = json!(harness.actual_baud());
+            push_hotplug_transition(result, "reconnected");
             Ok(())
         },
-    ))
+    );
+    if result.get("execution_error").is_none() && cleanup_succeeded(&result["cleanup"]) {
+        push_hotplug_transition(&mut result, "closed");
+    } else {
+        push_hotplug_transition(&mut result, "failed");
+    }
+    Ok(result)
 }
 
 fn run_lifecycle(
@@ -2724,6 +3060,72 @@ fn exercise_action_for_command(
     Ok(())
 }
 
+fn exercise_smoke_action(
+    harness: &Harness,
+    label: &str,
+    action: ControllerAction,
+    result: &mut Value,
+    record_diagnostic_step: bool,
+) -> Result<(), CommandFailure> {
+    exercise_action_for_command(harness, label, action, &mut result["actions"])?;
+    if record_diagnostic_step {
+        record_last_smoke_action_in_diagnostic(result);
+    }
+    Ok(())
+}
+
+fn record_last_smoke_action_in_diagnostic(result: &mut Value) {
+    let action = result["actions"]
+        .as_array()
+        .and_then(|actions| actions.last())
+        .cloned()
+        .expect("a completed smoke action was just recorded");
+    result["diagnostic_prelude_steps"]
+        .as_array_mut()
+        .expect("diagnostic prelude steps are an array")
+        .push(json!({
+            "kind": "action",
+            "label": action["label"],
+            "operation": action["operation"],
+        }));
+}
+
+fn smoke_home_delay(arguments: &[String], wake_home: bool) -> Result<Option<u64>, String> {
+    let configured = option_value(arguments, "--post-home-neutral-delay-ms")?;
+    match (wake_home, configured) {
+        (true, Some(value)) => {
+            let delay_ms = value
+                .parse::<u64>()
+                .map_err(|_| "invalid value for --post-home-neutral-delay-ms".to_owned())?;
+            if delay_ms > 60_000 {
+                return Err("--post-home-neutral-delay-ms must be in 0..=60000".to_owned());
+            }
+            Ok(Some(delay_ms))
+        }
+        (true, None) => {
+            Err("--wake-home requires --post-home-neutral-delay-ms in 0..=60000".to_owned())
+        }
+        (false, Some(_)) => Err("--post-home-neutral-delay-ms requires --wake-home".to_owned()),
+        (false, None) => Ok(None),
+    }
+}
+
+fn record_configured_home_delay(
+    result: &mut Value,
+    configured_delay_ms: u64,
+    delay: &dyn QualificationDelay,
+) {
+    delay.wait(Duration::from_millis(configured_delay_ms));
+    result["diagnostic_prelude_steps"]
+        .as_array_mut()
+        .expect("diagnostic prelude steps are an array")
+        .push(json!({
+            "kind": "configured_wait",
+            "configured_post_home_neutral_delay_ms": configured_delay_ms,
+            "status": "completed",
+        }));
+}
+
 fn validate_hold_ms(hold_ms: u64) -> Result<(), String> {
     if hold_ms <= 5_000 {
         Ok(())
@@ -2770,24 +3172,6 @@ fn validate_home_wake(attempts: usize, interval_seconds: u64) -> Result<(), Stri
 
 fn home_attempt_marker(attempt: usize) -> String {
     attempt.to_string()
-}
-
-fn wait_for_presence(stable_id: &str, present: bool, timeout: Duration) -> Result<(), String> {
-    let started = std::time::Instant::now();
-    while started.elapsed() < timeout {
-        let found = discover_system_ports()
-            .map_err(|error| error.to_string())?
-            .iter()
-            .any(|port| port.stable_id() == stable_id);
-        if found == present {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(250));
-    }
-    Err(format!(
-        "timed out waiting for stable identity to become {}",
-        if present { "present" } else { "absent" }
-    ))
 }
 
 #[cfg(test)]
@@ -3279,7 +3663,7 @@ fn print_help() {
     println!(
         "Usage:\n  easycon-hardware-qualification discover [--samples N]\n  \
          easycon-hardware-qualification handshake --port COMx --expected-identity ID\n  \
-         easycon-hardware-qualification smoke --port COMx --expected-identity ID [--full] [--wake-left-stick] [--wake-home] [--hold-ms N]\n  \
+         easycon-hardware-qualification smoke --port COMx --expected-identity ID [--full] [--wake-left-stick] [--wake-home --post-home-neutral-delay-ms N] [--hold-ms N]\n  \
          easycon-hardware-qualification home-wake --port COMx --expected-identity ID [--attempts 20] [--interval-seconds 3]\n  \
          easycon-hardware-qualification faults --port COMx --expected-identity ID\n  \
          easycon-hardware-qualification hotplug --port COMx --expected-identity ID [--timeout-seconds N]\n  \
@@ -3645,10 +4029,57 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
 
+    struct SequencedDeviceDiscovery {
+        results: Mutex<VecDeque<Result<Vec<SerialPortDescriptor>, SerialError>>>,
+        calls: Arc<AtomicUsize>,
+    }
+
     impl DeviceDiscovery for ScriptedDeviceDiscovery {
         fn discover(&self) -> Result<Vec<SerialPortDescriptor>, SerialError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.result.clone()
+        }
+    }
+
+    impl DeviceDiscovery for SequencedDeviceDiscovery {
+        fn discover(&self) -> Result<Vec<SerialPortDescriptor>, SerialError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.results
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .pop_front()
+                .expect("scripted hotplug discovery result")
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeHotplugTimer {
+        elapsed: Duration,
+        waits: Vec<Duration>,
+    }
+
+    impl HotplugPollTimer for FakeHotplugTimer {
+        fn elapsed(&self) -> Duration {
+            self.elapsed
+        }
+
+        fn wait(&mut self, duration: Duration) {
+            self.waits.push(duration);
+            self.elapsed += duration;
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeDelay {
+        waits: Mutex<Vec<Duration>>,
+    }
+
+    impl QualificationDelay for FakeDelay {
+        fn wait(&self, duration: Duration) {
+            self.waits
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(duration);
         }
     }
 
@@ -3790,6 +4221,174 @@ mod tests {
             assert!(result.is_err());
         }
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn hotplug_poll_rebinds_new_port_and_records_the_old_port_conflict() {
+        let request = DeviceTargetRequest::new("DEVICE\\EXPECTED", "COM8").expect("request");
+        let expected_old =
+            || SerialPortDescriptor::new("DEVICE\\EXPECTED", "COM8").expect("expected old");
+        let other_old = || SerialPortDescriptor::new("DEVICE\\OTHER", "COM8").expect("other old");
+        let expected_new =
+            || SerialPortDescriptor::new("DEVICE\\EXPECTED", "COM11").expect("expected new");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let discovery = SequencedDeviceDiscovery {
+            results: Mutex::new(
+                vec![
+                    Ok(vec![expected_old()]),
+                    Ok(vec![other_old()]),
+                    Ok(vec![other_old()]),
+                    Ok(vec![other_old(), expected_new()]),
+                ]
+                .into(),
+            ),
+            calls: Arc::clone(&calls),
+        };
+
+        let mut absence_timer = FakeHotplugTimer::default();
+        let absence = poll_hotplug_identity(
+            &discovery,
+            &request,
+            HotplugExpectedState::Absent,
+            Duration::from_secs(1),
+            &mut absence_timer,
+        );
+        assert!(matches!(
+            absence.outcome,
+            HotplugPollOutcome::ExpectedAbsent
+        ));
+        assert_eq!(absence.observations.len(), 2);
+        assert_eq!(absence_timer.waits, [HOTPLUG_POLL_INTERVAL]);
+        assert_eq!(
+            absence.observations[1]
+                .hint()
+                .map(SerialPortDescriptor::stable_id),
+            Some("DEVICE\\OTHER")
+        );
+
+        let mut return_timer = FakeHotplugTimer::default();
+        let returned = poll_hotplug_identity(
+            &discovery,
+            &request,
+            HotplugExpectedState::Present,
+            Duration::from_secs(1),
+            &mut return_timer,
+        );
+        let returned_json = hotplug_poll_trace_json(&returned);
+        let HotplugPollOutcome::Rebound(target) = returned.outcome else {
+            panic!("expected identity must return");
+        };
+        assert_eq!(target.descriptor().port_name(), "COM11");
+        assert_eq!(target.request().initial_port_hint(), "COM8");
+        assert_eq!(return_timer.waits, [HOTPLUG_POLL_INTERVAL]);
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert_eq!(returned_json["outcome"], "expected_present");
+        assert_eq!(
+            returned_json["observations"][1]["observed_hint"]["stable_id"],
+            "DEVICE\\OTHER"
+        );
+        assert_eq!(
+            returned_json["observations"][1]["observed_expected"]["port"],
+            "COM11"
+        );
+    }
+
+    #[test]
+    fn hotplug_poll_timeout_error_and_ambiguity_are_deterministic() {
+        let request = DeviceTargetRequest::new("DEVICE\\EXPECTED", "COM8").expect("request");
+        let expected = || SerialPortDescriptor::new("DEVICE\\EXPECTED", "COM8").expect("expected");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let timeout_discovery = SequencedDeviceDiscovery {
+            results: Mutex::new(vec![Ok(vec![expected()]), Ok(vec![expected()])].into()),
+            calls: Arc::clone(&calls),
+        };
+        let mut timer = FakeHotplugTimer::default();
+        let timed_out = poll_hotplug_identity(
+            &timeout_discovery,
+            &request,
+            HotplugExpectedState::Absent,
+            Duration::from_millis(500),
+            &mut timer,
+        );
+        assert!(matches!(timed_out.outcome, HotplugPollOutcome::TimedOut));
+        assert_eq!(timed_out.observations.len(), 2);
+        assert_eq!(timer.waits, [HOTPLUG_POLL_INTERVAL, HOTPLUG_POLL_INTERVAL]);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        let discovery_error = SerialError::with_os_code(
+            easycon_serial::SerialErrorKind::Io,
+            "injected hotplug discovery failure",
+            31,
+        );
+        let error_discovery = SequencedDeviceDiscovery {
+            results: Mutex::new(vec![Err(discovery_error.clone())].into()),
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let failed = poll_hotplug_identity(
+            &error_discovery,
+            &request,
+            HotplugExpectedState::Present,
+            Duration::from_secs(1),
+            &mut FakeHotplugTimer::default(),
+        );
+        assert!(matches!(
+            &failed.outcome,
+            HotplugPollOutcome::DiscoveryError(error) if error == &discovery_error
+        ));
+        assert_eq!(
+            hotplug_poll_trace_json(&failed)["structured_error"]["os_code"],
+            31
+        );
+
+        let ambiguous_discovery = SequencedDeviceDiscovery {
+            results: Mutex::new(
+                vec![Ok(vec![
+                    expected(),
+                    SerialPortDescriptor::new("DEVICE\\EXPECTED", "COM11")
+                        .expect("duplicate expected"),
+                ])]
+                .into(),
+            ),
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let ambiguous = poll_hotplug_identity(
+            &ambiguous_discovery,
+            &request,
+            HotplugExpectedState::Present,
+            Duration::from_secs(1),
+            &mut FakeHotplugTimer::default(),
+        );
+        assert!(matches!(
+            ambiguous.outcome,
+            HotplugPollOutcome::AmbiguousSnapshot
+        ));
+        assert_eq!(
+            hotplug_poll_trace_json(&ambiguous)["outcome"],
+            "ambiguous_snapshot"
+        );
+    }
+
+    #[test]
+    fn hotplug_timeouts_are_completed_failures_when_initial_cleanup_succeeds() {
+        for kind in ["expected_absent_timeout", "expected_return_timeout"] {
+            let result = json!({
+                "command": "hotplug",
+                "disconnect_detected": kind == "expected_return_timeout",
+                "stable_id": "DEVICE\\EXPECTED",
+                "hotplug_machine_failure": {"kind": kind},
+                "resources": {
+                    "initial": {"created": true},
+                    "reconnected": {"created": false},
+                },
+                "disconnect_cleanup": successful_cleanup(),
+            });
+            assert!(cleanup_contract_succeeded("hotplug", &result));
+            let (document, failure) = finalize_result("hotplug", Ok(result));
+            assert_eq!(document["execution_status"], "completed");
+            assert_eq!(document["qualification_status"], "failed");
+            assert!(failure.is_some());
+            assert_eq!(document_exit_code(&document), 1);
+        }
     }
 
     #[test]
@@ -4708,6 +5307,26 @@ mod tests {
                     "reconnect_operation": {"state": "Succeeded"},
                     "stable_id": "DEVICE\\EXPECTED",
                     "reconnected_identity": {"stable_id": "DEVICE\\EXPECTED"},
+                    "return_poll": {"outcome": "expected_present"},
+                    "rebound_admission": {
+                        "status": "rebound",
+                        "observed_expected": {"stable_id": "DEVICE\\EXPECTED"},
+                    },
+                    "hotplug_transitions": [
+                        {"sequence": 1, "state": "requested"},
+                        {"sequence": 2, "state": "initial_admitted"},
+                        {"sequence": 3, "state": "initial_connected"},
+                        {"sequence": 4, "state": "awaiting_expected_absent"},
+                        {"sequence": 5, "state": "initial_closed"},
+                        {"sequence": 6, "state": "awaiting_expected_return"},
+                        {"sequence": 7, "state": "rebound_admitted"},
+                        {"sequence": 8, "state": "reconnected"},
+                        {"sequence": 9, "state": "closed"},
+                    ],
+                    "resources": {
+                        "initial": {"created": true},
+                        "reconnected": {"created": true},
+                    },
                     "cleanup": cleanup(),
                     "disconnect_cleanup": cleanup(),
                 }),
@@ -5182,6 +5801,73 @@ mod tests {
         assert!(validate_hold_ms(0).is_ok());
         assert!(validate_hold_ms(5_000).is_ok());
         assert!(validate_hold_ms(5_001).is_err());
+    }
+
+    #[test]
+    fn home_diagnostic_delay_is_explicit_exclusive_and_bounded() {
+        let arguments = |value: &str| {
+            vec![
+                "smoke".to_owned(),
+                "--wake-home".to_owned(),
+                "--post-home-neutral-delay-ms".to_owned(),
+                value.to_owned(),
+            ]
+        };
+        assert_eq!(smoke_home_delay(&arguments("0"), true), Ok(Some(0)));
+        assert_eq!(
+            smoke_home_delay(&arguments("60000"), true),
+            Ok(Some(60_000))
+        );
+        assert!(smoke_home_delay(&arguments("60001"), true).is_err());
+        assert!(smoke_home_delay(&["smoke".to_owned()], true).is_err());
+        assert!(smoke_home_delay(&arguments("3000"), false).is_err());
+        assert_eq!(smoke_home_delay(&["smoke".to_owned()], false), Ok(None));
+    }
+
+    #[test]
+    fn diagnostic_prelude_records_real_action_order_around_the_fake_delay() {
+        let mut result = json!({
+            "actions": [],
+            "diagnostic_prelude_steps": [],
+        });
+        let record = |result: &mut Value, label: &str| {
+            result["actions"]
+                .as_array_mut()
+                .expect("actions")
+                .push(json!({
+                    "label": label,
+                    "operation": {"state": "Succeeded"},
+                }));
+            record_last_smoke_action_in_diagnostic(result);
+        };
+        for (label, _) in home_wake_actions() {
+            record(&mut result, label);
+        }
+        let delay = FakeDelay::default();
+        record_configured_home_delay(&mut result, 3_000, &delay);
+        for (label, _) in left_stick_wake_actions() {
+            record(&mut result, label);
+        }
+        record(&mut result, "button.A.down");
+
+        assert_eq!(
+            delay.waits.lock().expect("fake delay").as_slice(),
+            [Duration::from_secs(3)]
+        );
+        let steps = result["diagnostic_prelude_steps"]
+            .as_array()
+            .expect("diagnostic steps");
+        assert_eq!(steps[0]["label"], "wake.Home.down");
+        assert_eq!(steps[1]["label"], "wake.Home.up");
+        assert_eq!(steps[2]["label"], "wake.Home.neutral");
+        assert_eq!(steps[3]["kind"], "configured_wait");
+        assert_eq!(steps[3]["configured_post_home_neutral_delay_ms"], 3_000);
+        assert_eq!(steps[4]["label"], "wake.left_stick.right");
+        assert_eq!(steps.last().expect("A action")["label"], "button.A.down");
+        let projection = serde_json::to_string(&result).expect("projection");
+        assert!(!projection.contains("measured"));
+        assert!(!projection.contains("readiness"));
+        assert!(!projection.contains("capability"));
     }
 
     #[test]

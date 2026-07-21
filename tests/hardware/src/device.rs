@@ -140,6 +140,13 @@ pub(super) enum AdmissionDecision {
     Ambiguous(AdmissionEvidence),
 }
 
+#[derive(Clone, Debug)]
+pub(super) enum RebindDecision {
+    Rebound(AdmittedDevice),
+    ExpectedAbsent(AdmissionEvidence),
+    Ambiguous(AdmissionEvidence),
+}
+
 pub(super) fn admit_device(
     discovery: &dyn DeviceDiscovery,
     request: DeviceTargetRequest,
@@ -206,6 +213,51 @@ pub(super) fn select_device(
         expected,
         hint,
     })
+}
+
+pub(super) fn rebind_device(
+    request: &DeviceTargetRequest,
+    snapshot: Vec<SerialPortDescriptor>,
+) -> RebindDecision {
+    if snapshot_is_ambiguous(&snapshot) {
+        return RebindDecision::Ambiguous(AdmissionEvidence {
+            request: request.clone(),
+            snapshot,
+            reason: Some(AdmissionReason::AmbiguousSnapshot),
+            expected: None,
+            hint: None,
+        });
+    }
+
+    let expected = snapshot
+        .iter()
+        .find(|descriptor| descriptor.stable_id() == request.expected_stable_id())
+        .cloned();
+    let hint = snapshot
+        .iter()
+        .find(|descriptor| {
+            descriptor
+                .port_name()
+                .eq_ignore_ascii_case(request.initial_port_hint())
+        })
+        .cloned();
+    let evidence = AdmissionEvidence {
+        request: request.clone(),
+        snapshot,
+        reason: expected
+            .is_none()
+            .then_some(AdmissionReason::ExpectedAbsent),
+        expected: expected.clone(),
+        hint,
+    };
+
+    match expected {
+        Some(descriptor) => RebindDecision::Rebound(AdmittedDevice {
+            descriptor,
+            evidence,
+        }),
+        None => RebindDecision::ExpectedAbsent(evidence),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -497,6 +549,7 @@ mod tests {
     #[derive(Default)]
     struct IoTrace {
         opens: Vec<u32>,
+        open_ports: Vec<String>,
         writes: usize,
         closes: usize,
     }
@@ -547,15 +600,14 @@ mod tests {
     impl ByteIoFactory for FakeByteIoFactory {
         fn open(
             &mut self,
-            _port: &SerialPortDescriptor,
+            port: &SerialPortDescriptor,
             baud_rate: u32,
             _request: ByteIoRequest,
         ) -> Result<Box<dyn ByteIo>, SerialError> {
-            self.trace
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .opens
-                .push(baud_rate);
+            let mut trace = self.trace.lock().unwrap_or_else(|error| error.into_inner());
+            trace.opens.push(baud_rate);
+            trace.open_ports.push(port.port_name().to_owned());
+            drop(trace);
             if let Some(error) = &self.error {
                 return Err(error.clone());
             }
@@ -729,6 +781,75 @@ mod tests {
         assert!(DeviceTargetRequest::new("DEVICE\\EXPECTED", "ttyS0").is_err());
         assert!(DeviceTargetRequest::new("DEVICE\\EXPECTED", "COM0").is_err());
         assert!(DeviceTargetRequest::new("DEVICE\\EXPECTED", "COM8").is_ok());
+    }
+
+    #[test]
+    fn rebind_follows_the_expected_identity_and_never_the_old_port() {
+        let request = DeviceTargetRequest::new("DEVICE\\EXPECTED", "COM8").expect("request");
+        let returned = vec![
+            descriptor("DEVICE\\OTHER", "COM8"),
+            descriptor("DEVICE\\EXPECTED", "COM11"),
+        ];
+        let RebindDecision::Rebound(target) = rebind_device(&request, returned.clone()) else {
+            panic!("expected identity must be rebound");
+        };
+        assert_eq!(target.descriptor().port_name(), "COM11");
+        assert_eq!(
+            target
+                .evidence()
+                .hint()
+                .map(SerialPortDescriptor::stable_id),
+            Some("DEVICE\\OTHER")
+        );
+
+        let discovery = Arc::new(ScriptedDiscovery::new(vec![
+            Ok(returned.clone()),
+            Ok(returned),
+        ]));
+        let trace = Arc::new(Mutex::new(IoTrace::default()));
+        let recorder = IdentityOpenRecorder::default();
+        let mut factory = IdentityGuardedByteIoFactory::new(
+            Box::new(FakeByteIoFactory {
+                trace: Arc::clone(&trace),
+                error: None,
+            }),
+            discovery,
+            target.clone(),
+            recorder,
+        );
+
+        let mut stream = factory
+            .open(target.descriptor(), 115_200, open_request())
+            .expect("rebound stream");
+        stream.close();
+
+        assert_eq!(trace.lock().expect("trace").open_ports, ["COM11"]);
+    }
+
+    #[test]
+    fn rebind_reports_absence_and_ambiguous_snapshots_without_a_target() {
+        let request = DeviceTargetRequest::new("DEVICE\\EXPECTED", "COM8").expect("request");
+        let RebindDecision::ExpectedAbsent(absent) =
+            rebind_device(&request, vec![descriptor("DEVICE\\OTHER", "COM8")])
+        else {
+            panic!("expected identity is absent");
+        };
+        assert_eq!(absent.reason(), Some(AdmissionReason::ExpectedAbsent));
+        assert_eq!(
+            absent.hint().map(SerialPortDescriptor::stable_id),
+            Some("DEVICE\\OTHER")
+        );
+
+        assert!(matches!(
+            rebind_device(
+                &request,
+                vec![
+                    descriptor("DEVICE\\EXPECTED", "COM8"),
+                    descriptor("DEVICE\\EXPECTED", "COM11"),
+                ],
+            ),
+            RebindDecision::Ambiguous(_)
+        ));
     }
 
     #[test]
