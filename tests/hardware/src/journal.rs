@@ -5,6 +5,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use serde_json::{Value, json};
@@ -29,7 +30,15 @@ pub(crate) enum JournalEventKind {
     CancellationTerminal,
     AmiiboWriteIntent,
     AmiiboChunkIntent,
+    AmiiboChunkProgress,
     AmiiboChunkTerminal,
+    AmiiboSaveTerminal,
+    AmiiboSelectIntent,
+    AmiiboSelectProgress,
+    AmiiboSelectTerminal,
+    AmiiboCleanupIntent,
+    AmiiboCleanupProgress,
+    AmiiboCleanupTerminal,
 }
 
 impl JournalEventKind {
@@ -49,7 +58,15 @@ impl JournalEventKind {
             Self::CancellationTerminal => "cancellation_terminal",
             Self::AmiiboWriteIntent => "amiibo_write_intent",
             Self::AmiiboChunkIntent => "amiibo_chunk_intent",
+            Self::AmiiboChunkProgress => "amiibo_chunk_progress",
             Self::AmiiboChunkTerminal => "amiibo_chunk_terminal",
+            Self::AmiiboSaveTerminal => "amiibo_save_terminal",
+            Self::AmiiboSelectIntent => "amiibo_select_intent",
+            Self::AmiiboSelectProgress => "amiibo_select_progress",
+            Self::AmiiboSelectTerminal => "amiibo_select_terminal",
+            Self::AmiiboCleanupIntent => "amiibo_cleanup_intent",
+            Self::AmiiboCleanupProgress => "amiibo_cleanup_progress",
+            Self::AmiiboCleanupTerminal => "amiibo_cleanup_terminal",
         }
     }
 
@@ -69,7 +86,15 @@ impl JournalEventKind {
             "cancellation_terminal" => Some(Self::CancellationTerminal),
             "amiibo_write_intent" => Some(Self::AmiiboWriteIntent),
             "amiibo_chunk_intent" => Some(Self::AmiiboChunkIntent),
+            "amiibo_chunk_progress" => Some(Self::AmiiboChunkProgress),
             "amiibo_chunk_terminal" => Some(Self::AmiiboChunkTerminal),
+            "amiibo_save_terminal" => Some(Self::AmiiboSaveTerminal),
+            "amiibo_select_intent" => Some(Self::AmiiboSelectIntent),
+            "amiibo_select_progress" => Some(Self::AmiiboSelectProgress),
+            "amiibo_select_terminal" => Some(Self::AmiiboSelectTerminal),
+            "amiibo_cleanup_intent" => Some(Self::AmiiboCleanupIntent),
+            "amiibo_cleanup_progress" => Some(Self::AmiiboCleanupProgress),
+            "amiibo_cleanup_terminal" => Some(Self::AmiiboCleanupTerminal),
             _ => None,
         }
     }
@@ -105,6 +130,15 @@ impl JournalObserver for NoopJournalObserver {}
 static NOOP_JOURNAL_OBSERVER: NoopJournalObserver = NoopJournalObserver;
 
 pub(crate) struct EvidenceJournal {
+    state: Arc<Mutex<JournalState>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct JournalWriter {
+    state: Arc<Mutex<JournalState>>,
+}
+
+struct JournalState {
     path: PathBuf,
     file: File,
     expected: Vec<u8>,
@@ -117,14 +151,16 @@ pub(crate) struct EvidenceJournal {
 impl EvidenceJournal {
     pub(crate) fn create(path: PathBuf, start: JournalStart) -> Result<Self, String> {
         let file = open_journal(&path)?;
-        let mut journal = Self {
-            path,
-            file,
-            expected: Vec::new(),
-            projection: Vec::new(),
-            origin: Instant::now(),
-            sealed: false,
-            poisoned: None,
+        let journal = Self {
+            state: Arc::new(Mutex::new(JournalState {
+                path,
+                file,
+                expected: Vec::new(),
+                projection: Vec::new(),
+                origin: Instant::now(),
+                sealed: false,
+                poisoned: None,
+            })),
         };
         journal.append(
             JournalEventKind::RunStarted,
@@ -140,10 +176,81 @@ impl EvidenceJournal {
         Ok(journal)
     }
 
-    pub(crate) fn append(&mut self, kind: JournalEventKind, payload: Value) -> Result<(), String> {
+    pub(crate) fn writer(&self) -> JournalWriter {
+        JournalWriter {
+            state: Arc::clone(&self.state),
+        }
+    }
+
+    pub(crate) fn append(&self, kind: JournalEventKind, payload: Value) -> Result<(), String> {
         self.append_observed(kind, payload, &NOOP_JOURNAL_OBSERVER)
     }
 
+    fn append_observed(
+        &self,
+        kind: JournalEventKind,
+        payload: Value,
+        observer: &dyn JournalObserver,
+    ) -> Result<(), String> {
+        append_locked(&self.state, kind, payload, observer)
+    }
+
+    pub(crate) fn seal(&self, payload: Value) -> Result<(), String> {
+        let mut state = lock_state(&self.state)?;
+        state.append_observed(
+            JournalEventKind::ArtifactFinalizationStarted,
+            payload,
+            &NOOP_JOURNAL_OBSERVER,
+        )?;
+        state.verify()?;
+        state.sealed = true;
+        Ok(())
+    }
+
+    pub(crate) fn verify(&self) -> Result<(), String> {
+        lock_state(&self.state)?.verify()
+    }
+
+    pub(crate) fn readback(&self) -> Result<Vec<u8>, String> {
+        lock_state(&self.state)?.readback()
+    }
+
+    pub(crate) fn projection_json(&self) -> Result<Value, String> {
+        Ok(lock_state(&self.state)?.projection_json())
+    }
+
+    pub(crate) fn is_sealed(&self) -> Result<bool, String> {
+        Ok(lock_state(&self.state)?.sealed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expected_bytes(&self) -> Result<Vec<u8>, String> {
+        Ok(lock_state(&self.state)?.expected.clone())
+    }
+}
+
+impl JournalWriter {
+    pub(crate) fn append(&self, kind: JournalEventKind, payload: Value) -> Result<(), String> {
+        append_locked(&self.state, kind, payload, &NOOP_JOURNAL_OBSERVER)
+    }
+}
+
+fn append_locked(
+    state: &Arc<Mutex<JournalState>>,
+    kind: JournalEventKind,
+    payload: Value,
+    observer: &dyn JournalObserver,
+) -> Result<(), String> {
+    lock_state(state)?.append_observed(kind, payload, observer)
+}
+
+fn lock_state(state: &Arc<Mutex<JournalState>>) -> Result<MutexGuard<'_, JournalState>, String> {
+    state
+        .lock()
+        .map_err(|_| "evidence journal lock is poisoned".to_owned())
+}
+
+impl JournalState {
     fn append_observed(
         &mut self,
         kind: JournalEventKind,
@@ -200,18 +307,11 @@ impl EvidenceJournal {
         Ok(())
     }
 
-    pub(crate) fn seal(&mut self, payload: Value) -> Result<(), String> {
-        self.append(JournalEventKind::ArtifactFinalizationStarted, payload)?;
-        self.verify()?;
-        self.sealed = true;
-        Ok(())
-    }
-
-    pub(crate) fn verify(&mut self) -> Result<(), String> {
+    fn verify(&mut self) -> Result<(), String> {
         self.readback().map(|_| ())
     }
 
-    pub(crate) fn readback(&mut self) -> Result<Vec<u8>, String> {
+    fn readback(&mut self) -> Result<Vec<u8>, String> {
         if let Some(error) = &self.poisoned {
             return Err(format!("evidence journal is poisoned: {error}"));
         }
@@ -235,22 +335,13 @@ impl EvidenceJournal {
         Ok(actual)
     }
 
-    pub(crate) fn projection_json(&self) -> Value {
+    fn projection_json(&self) -> Value {
         json!({
             "event_count": self.projection.len(),
             "last_sequence": self.projection.last().and_then(|event| event["sequence"].as_u64()),
             "last_event": self.projection.last().and_then(|event| event["event"].as_str()),
             "sealed": self.sealed,
         })
-    }
-
-    pub(crate) const fn is_sealed(&self) -> bool {
-        self.sealed
-    }
-
-    #[cfg(test)]
-    pub(crate) fn expected_bytes(&self) -> &[u8] {
-        &self.expected
     }
 }
 
@@ -337,7 +428,7 @@ fn open_journal(_path: &Path) -> Result<File, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::sync::{Arc, Barrier, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
@@ -415,9 +506,9 @@ mod tests {
     fn durable_append_updates_projection_only_after_sync() {
         for point in [FailPoint::Write, FailPoint::Flush, FailPoint::Sync] {
             let directory = TestDirectory::new(&format!("fail-{point:?}"));
-            let mut journal = EvidenceJournal::create(directory.0.join(JOURNAL_FILE_NAME), start())
+            let journal = EvidenceJournal::create(directory.0.join(JOURNAL_FILE_NAME), start())
                 .expect("initial journal");
-            let before = journal.projection_json();
+            let before = journal.projection_json().expect("projection");
             let observer = FailingObserver {
                 point,
                 calls: Mutex::new(Vec::new()),
@@ -432,12 +523,48 @@ mod tests {
                     )
                     .is_err()
             );
-            assert_eq!(journal.projection_json(), before);
+            assert_eq!(journal.projection_json().expect("projection"), before);
             assert!(
                 journal
                     .append(JournalEventKind::CleanupTerminal, json!({}))
                     .is_err()
             );
+        }
+    }
+
+    #[test]
+    fn amiibo_write_intent_failpoints_precede_destructive_transport() {
+        for point in [FailPoint::Write, FailPoint::Flush, FailPoint::Sync] {
+            let directory = TestDirectory::new(&format!("amiibo-intent-{point:?}"));
+            let journal = EvidenceJournal::create(directory.0.join(JOURNAL_FILE_NAME), start())
+                .expect("initial journal");
+            let observer = FailingObserver {
+                point,
+                calls: Mutex::new(Vec::new()),
+            };
+            let destructive_writes = std::sync::atomic::AtomicUsize::new(0);
+
+            let admitted = journal
+                .append_observed(
+                    JournalEventKind::AmiiboWriteIntent,
+                    json!({
+                        "slot": 3,
+                        "payload_length": 20,
+                        "payload_sha256": "A".repeat(64),
+                    }),
+                    &observer,
+                )
+                .map(|()| {
+                    destructive_writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                });
+
+            assert!(admitted.is_err(), "{point:?}");
+            assert_eq!(
+                destructive_writes.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "{point:?}"
+            );
+            assert!(journal.verify().is_err(), "{point:?}");
         }
     }
 
@@ -456,7 +583,7 @@ mod tests {
     #[test]
     fn parser_rejects_partial_duplicate_unknown_and_backwards_entries() {
         let directory = TestDirectory::new("parser");
-        let mut journal =
+        let journal =
             EvidenceJournal::create(directory.0.join(JOURNAL_FILE_NAME), start()).expect("journal");
         journal
             .append(
@@ -464,7 +591,7 @@ mod tests {
                 json!({"command": "handshake"}),
             )
             .expect("second event");
-        let valid = journal.expected_bytes().to_vec();
+        let valid = journal.expected_bytes().expect("expected bytes");
         assert_eq!(parse_journal(&valid).expect("valid").len(), 2);
 
         assert!(parse_journal(&valid[..valid.len() - 1]).is_err());
@@ -486,12 +613,12 @@ mod tests {
     #[test]
     fn sealed_journal_is_exact_and_rejects_further_events() {
         let directory = TestDirectory::new("sealed");
-        let mut journal =
+        let journal =
             EvidenceJournal::create(directory.0.join(JOURNAL_FILE_NAME), start()).expect("journal");
         journal
             .seal(json!({"primary": "handshake.json"}))
             .expect("seal");
-        assert!(journal.is_sealed());
+        assert!(journal.is_sealed().expect("sealed state"));
         assert!(journal.verify().is_ok());
         assert!(
             journal
@@ -499,8 +626,65 @@ mod tests {
                 .is_err()
         );
         assert_eq!(
-            journal.projection_json()["last_event"],
+            journal.projection_json().expect("projection")["last_event"],
             "artifact_finalization_started"
+        );
+    }
+
+    #[test]
+    fn shared_writer_serializes_controller_and_owner_appends() {
+        let directory = TestDirectory::new("shared-writer");
+        let journal =
+            EvidenceJournal::create(directory.0.join(JOURNAL_FILE_NAME), start()).expect("journal");
+        let writer = journal.writer();
+        let barrier = Arc::new(Barrier::new(2));
+        let controller_barrier = Arc::clone(&barrier);
+        let controller = std::thread::spawn(move || {
+            controller_barrier.wait();
+            writer
+                .append(
+                    JournalEventKind::AmiiboChunkIntent,
+                    json!({"offset": 0, "length": 20}),
+                )
+                .expect("controller append");
+        });
+
+        barrier.wait();
+        journal
+            .append(
+                JournalEventKind::ActionGroupTerminal,
+                json!({"owner": "command"}),
+            )
+            .expect("owner append");
+        controller.join().expect("controller writer");
+
+        let events = parse_journal(&journal.readback().expect("journal bytes")).expect("events");
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["event"], "run_started");
+        let appended = events[1..]
+            .iter()
+            .map(|event| event["event"].as_str().expect("event"))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            appended,
+            std::collections::BTreeSet::from(["action_group_terminal", "amiibo_chunk_intent",])
+        );
+    }
+
+    #[test]
+    fn shared_writer_cannot_append_after_owner_seals() {
+        let directory = TestDirectory::new("shared-writer-sealed");
+        let journal =
+            EvidenceJournal::create(directory.0.join(JOURNAL_FILE_NAME), start()).expect("journal");
+        let writer = journal.writer();
+        journal
+            .seal(json!({"primary": "amiibo.json"}))
+            .expect("seal");
+
+        assert!(
+            writer
+                .append(JournalEventKind::AmiiboChunkIntent, json!({"offset": 0}))
+                .is_err()
         );
     }
 

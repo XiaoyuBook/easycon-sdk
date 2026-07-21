@@ -15,7 +15,9 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
 };
 
-use crate::journal::{EvidenceJournal, JOURNAL_FILE_NAME, JournalEventKind, JournalStart};
+use crate::journal::{
+    EvidenceJournal, JOURNAL_FILE_NAME, JournalEventKind, JournalStart, JournalWriter,
+};
 use crate::provenance::sha256_bytes;
 
 pub(crate) const RESERVATION_FILE_NAME: &str = ".easycon-hardware-run.reservation.json";
@@ -453,7 +455,14 @@ impl ArtifactReservation {
     pub(crate) fn journal_projection(&self) -> Result<Value, String> {
         self.journal
             .as_ref()
-            .map(EvidenceJournal::projection_json)
+            .ok_or_else(|| "artifact reservation has no evidence journal".to_owned())
+            .and_then(EvidenceJournal::projection_json)
+    }
+
+    pub(crate) fn journal_writer(&self) -> Result<JournalWriter, String> {
+        self.journal
+            .as_ref()
+            .map(EvidenceJournal::writer)
             .ok_or_else(|| "artifact reservation has no evidence journal".to_owned())
     }
 
@@ -560,7 +569,7 @@ impl ArtifactReservation {
             return Err(format!("artifact reservation is poisoned: {error}"));
         }
         if let Some(journal) = &mut self.journal {
-            if !journal.is_sealed() {
+            if !journal.is_sealed()? {
                 return Err("evidence journal must be sealed before artifact commit".to_owned());
             }
             journal.verify()?;

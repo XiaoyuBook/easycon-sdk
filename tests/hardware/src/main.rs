@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod amiibo;
 mod artifact;
 mod device;
 mod faults;
@@ -16,6 +17,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use amiibo::{
+    AmiiboEvidenceBinding, AmiiboEvidenceConfig, AmiiboEvidenceRecorder, AmiiboEvidenceTransport,
+};
 #[cfg(test)]
 use artifact::RESERVATION_FILE_NAME;
 use artifact::{ArtifactReservation, AuxiliaryKind, RunStartMetadata, SEQUENCE_TIMINGS_FILE_NAME};
@@ -85,6 +89,10 @@ impl<'a> RunControl<'a> {
 
     fn lease_id(&self) -> &str {
         self.reservation.lease_id()
+    }
+
+    fn journal_writer(&self) -> Result<journal::JournalWriter, String> {
+        self.reservation.journal_writer()
     }
 
     fn marker(
@@ -609,6 +617,15 @@ impl Harness {
         discovery: Arc<dyn DeviceDiscovery>,
         options: ControllerOptions,
     ) -> Result<Self, String> {
+        Self::new_with_amiibo_evidence(target, discovery, options, None)
+    }
+
+    fn new_with_amiibo_evidence(
+        target: &AdmittedDevice,
+        discovery: Arc<dyn DeviceDiscovery>,
+        options: ControllerOptions,
+        amiibo_evidence: Option<AmiiboEvidenceConfig>,
+    ) -> Result<Self, String> {
         let descriptor = target.descriptor().clone();
         let clock: Arc<dyn Clock> = Arc::new(SystemClock::default());
         let telemetry = Arc::new(Mutex::new(Telemetry::default()));
@@ -628,8 +645,17 @@ impl Harness {
             descriptor.clone(),
             Box::new(observed_factory),
         );
+        let transport: Box<dyn ControllerTransport> = match amiibo_evidence {
+            Some(evidence) => Box::new(AmiiboEvidenceTransport::new(
+                Box::new(serial),
+                evidence.journal,
+                evidence.binding,
+                evidence.recorder,
+            )),
+            None => Box::new(serial),
+        };
         let observed = ObservedTransport {
-            inner: Box::new(serial),
+            inner: transport,
             clock: clock.clone(),
             telemetry: telemetry.clone(),
         };
@@ -1015,6 +1041,81 @@ fn wait_for_command_terminal_core(
         ));
     }
     Ok((operation, snapshot.state))
+}
+
+struct AmiiboOperationWaitSpec {
+    timeout: Duration,
+    wait_stage: &'static str,
+    terminal_stage: &'static str,
+    journal_kind: JournalEventKind,
+    result_field: &'static str,
+    durable_field: &'static str,
+}
+
+fn wait_for_amiibo_operation(
+    operation: Operation,
+    control: &mut RunControl<'_>,
+    result: &mut Value,
+    spec: AmiiboOperationWaitSpec,
+) -> Result<(), CommandFailure> {
+    match wait_for_command_terminal_controlled(operation, control, spec.timeout, spec.wait_stage) {
+        Ok((operation, state)) => {
+            let evidence = operation_json(&operation);
+            result[spec.result_field] = evidence.clone();
+            control
+                .record_event(
+                    spec.journal_kind,
+                    json!({
+                        "layer": "operation",
+                        "stage": spec.result_field,
+                        "operation": evidence,
+                    }),
+                )
+                .map_err(|error| {
+                    CommandFailure::with_operation(
+                        spec.terminal_stage,
+                        format!("cannot persist Amiibo operation terminal: {error}"),
+                        operation.clone(),
+                    )
+                })?;
+            result[spec.durable_field] = json!(true);
+            if state == OperationState::Succeeded {
+                Ok(())
+            } else {
+                Err(CommandFailure::with_operation(
+                    spec.terminal_stage,
+                    operation_failure(&operation),
+                    operation,
+                ))
+            }
+        }
+        Err(failure) => {
+            if let Some(operation) = failure.operation.as_ref() {
+                let evidence = operation_json(operation);
+                result[spec.result_field] = evidence.clone();
+                if operation.snapshot().state.is_terminal() {
+                    control
+                        .record_event(
+                            spec.journal_kind,
+                            json!({
+                                "layer": "operation",
+                                "stage": spec.result_field,
+                                "operation": evidence,
+                            }),
+                        )
+                        .map_err(|error| {
+                            CommandFailure::with_operation(
+                                spec.terminal_stage,
+                                format!("cannot persist Amiibo operation terminal: {error}"),
+                                operation.clone(),
+                            )
+                        })?;
+                    result[spec.durable_field] = json!(true);
+                }
+            }
+            Err(failure)
+        }
+    }
 }
 
 fn run_with_device_admission(
@@ -1750,16 +1851,182 @@ fn qualification_decision(command: &str, result: &Value) -> QualificationDecisio
             checks: vec![qualification_check("authorized_write_performed", "not_run")],
             failure: None,
         },
-        "amiibo" => QualificationDecision {
-            status: QualificationStatus::Unverified,
-            checks: vec![
-                qualification_check("save_and_select_completed", "passed"),
-                qualification_check("capacity_and_payload_evidence", "unverified"),
-            ],
-            failure: None,
-        },
+        "amiibo" => amiibo_qualification(result),
         _ => required_checks(&[("known_qualification_command", false)]),
     }
+}
+
+fn amiibo_qualification(result: &Value) -> QualificationDecision {
+    let authorization = &result["authorization"];
+    let limits = &result["declared_limits"];
+    let payload = &result["payload"];
+    let slot = result["slot"].as_u64();
+    let slot_count = limits["slot_count"].as_u64();
+    let maximum_data_len = limits["maximum_data_len"].as_u64();
+    let actual_length = payload["actual_length"].as_u64();
+    let expected_hash = payload["expected_sha256"].as_str();
+    let recomputed_hash = payload["recomputed_sha256"].as_str();
+    let expected_identity = authorization["expected_stable_id"].as_str();
+    let observed_identity = authorization["observed_stable_id"].as_str();
+    let authorization_valid = authorization["status"] == "authorized"
+        && authorization["one_time"] == true
+        && authorization["all_predicates_satisfied"] == true
+        && authorization["lease_id"]
+            .as_str()
+            .is_some_and(|lease| !lease.is_empty())
+        && slot.is_some()
+        && authorization["slot"].as_u64() == slot
+        && authorization["disposable_slot"].as_u64() == slot
+        && expected_identity.is_some()
+        && expected_identity == observed_identity
+        && result["device_target"]["expected_stable_id"].as_str() == expected_identity
+        && result["identity_admission"]["observed_expected"]["stable_id"].as_str()
+            == observed_identity;
+    let limits_valid = limits["classification"] == "declared_external"
+        && limits["measured"] == false
+        && slot
+            .zip(slot_count)
+            .is_some_and(|(slot, count)| count != 0 && count <= 256 && slot < count)
+        && maximum_data_len.is_some_and(|length| (1..=16_384).contains(&length))
+        && limits["source"]
+            .as_str()
+            .is_some_and(|source| validate_limits_source(source).is_ok());
+    let hash_valid = expected_hash.is_some_and(valid_sha256)
+        && expected_hash == recomputed_hash
+        && payload["hash_matches"] == true
+        && payload["raw_bytes_recorded"] == false
+        && payload["source"]["kind"] == "local_file"
+        && payload["source"]["path_recorded"] == false
+        && actual_length
+            .zip(maximum_data_len)
+            .is_some_and(|(actual, maximum)| actual != 0 && actual <= maximum);
+    let operation_evidence_valid = result["write_attempted"] == true
+        && result["write_performed"] == true
+        && result["select_performed"] == true
+        && result["write_intent_durable"] == true
+        && result["save_terminal_durable"] == true
+        && result["select_intent_durable"] == true
+        && result["select_terminal_durable"] == true
+        && result["save"]["state"] == "Succeeded"
+        && result["select"]["state"] == "Succeeded";
+    let protocol_evidence_valid = actual_length
+        .and_then(|length| usize::try_from(length).ok())
+        .is_some_and(|length| {
+            valid_amiibo_protocol_evidence(&result["amiibo_protocol_evidence"], length)
+        });
+    let boundary_valid =
+        result["capability_inference"] == "none" && result["o_02_status"] == "open";
+
+    let checks = [
+        ("destructive_authorization", authorization_valid),
+        ("declared_external_limits", limits_valid),
+        ("payload_hash_and_length", hash_valid),
+        ("save_select_operations", operation_evidence_valid),
+        ("chunk_and_cleanup_journal", protocol_evidence_valid),
+        ("o_02_remains_open", boundary_valid),
+    ];
+    if checks.iter().any(|(_, passed)| !passed) {
+        let mut decision = required_checks(&checks);
+        decision.failure =
+            Some("Amiibo qualification evidence is incomplete or contradictory".to_owned());
+        return decision;
+    }
+    QualificationDecision {
+        status: QualificationStatus::Unverified,
+        checks: checks
+            .into_iter()
+            .map(|(name, _)| qualification_check(name, "passed"))
+            .chain([qualification_check("hardware_capacity", "unverified")])
+            .collect(),
+        failure: None,
+    }
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_lowercase())
+}
+
+fn valid_amiibo_protocol_evidence(evidence: &Value, payload_len: usize) -> bool {
+    let Some(chunks) = evidence["chunks"].as_array() else {
+        return false;
+    };
+    if chunks.is_empty()
+        || evidence["evidence_errors"]
+            .as_array()
+            .is_none_or(|errors| !errors.is_empty())
+        || evidence["transport_closed_in_state"] != "complete"
+        || evidence["selects"].as_array().is_none_or(|selects| {
+            selects.len() != 1
+                || selects[0]["accepted_bytes"] != 3
+                || selects[0]["acknowledged"] != true
+                || selects[0]["status"] != "acked"
+                || !selects[0]["error"].is_null()
+        })
+        || evidence["cleanup_resets"].as_array().is_none_or(|resets| {
+            resets.iter().any(|reset| {
+                reset["accepted_bytes"] != 6
+                    || reset["acknowledged"] != true
+                    || reset["status"] != "acked"
+                    || !reset["error"].is_null()
+            })
+        })
+    {
+        return false;
+    }
+
+    let mut next_offset = 0_usize;
+    let mut next_attempt = 1_u64;
+    for chunk in chunks {
+        let Some(offset) = chunk["offset"]
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+        else {
+            return false;
+        };
+        let Some(length) = chunk["length"]
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+        else {
+            return false;
+        };
+        if offset != next_offset
+            || length != (payload_len - next_offset).min(20)
+            || chunk["attempt"].as_u64() != Some(next_attempt)
+        {
+            return false;
+        }
+        match chunk["status"].as_str() {
+            Some("failed")
+                if chunk["error"].is_object()
+                    && chunk["header_accepted_bytes"]
+                        .as_u64()
+                        .is_some_and(|accepted| accepted <= 7)
+                    && chunk["payload_accepted_bytes"]
+                        .as_u64()
+                        .is_some_and(|accepted| accepted <= u64::try_from(length).unwrap_or(0))
+                    && chunk["payload_acknowledged"] == false
+                    && (chunk["header_acknowledged"] == true
+                        || chunk["payload_accepted_bytes"] == 0) =>
+            {
+                next_attempt = next_attempt.saturating_add(1);
+            }
+            Some("acked")
+                if chunk["header_accepted_bytes"] == 7
+                    && chunk["header_acknowledged"] == true
+                    && chunk["payload_accepted_bytes"].as_u64() == u64::try_from(length).ok()
+                    && chunk["payload_acknowledged"] == true
+                    && chunk["error"].is_null() =>
+            {
+                next_offset += length;
+                next_attempt = 1;
+            }
+            _ => return false,
+        }
+    }
+    next_offset == payload_len
 }
 
 fn operation_matches(
@@ -4099,13 +4366,27 @@ fn run_amiibo(
         limits,
     } = authorization;
     let observed_stable_id = target.descriptor().stable_id().to_owned();
-    let harness = Harness::new(
+    let recorder = AmiiboEvidenceRecorder::default();
+    let amiibo_evidence = AmiiboEvidenceConfig {
+        journal: control.journal_writer()?,
+        binding: AmiiboEvidenceBinding {
+            lease_id: lease_id.clone(),
+            expected_stable_id: expected_stable_id.clone(),
+            observed_stable_id: observed_stable_id.clone(),
+            slot,
+            payload_len: payload.len(),
+            payload_sha256: recomputed_sha256.clone(),
+        },
+        recorder: recorder.clone(),
+    };
+    let harness = Harness::new_with_amiibo_evidence(
         &target,
         discovery,
         ControllerOptions {
             amiibo_limits: Some(limits),
             ..ControllerOptions::default()
         },
+        Some(amiibo_evidence),
     )?;
     let result = json!({
         "command": "amiibo",
@@ -4113,6 +4394,9 @@ fn run_amiibo(
         "write_performed": false,
         "select_performed": false,
         "write_intent_durable": false,
+        "save_terminal_durable": false,
+        "select_intent_durable": false,
+        "select_terminal_durable": false,
         "slot": slot,
         "authorization": {
             "status": "authorized",
@@ -4144,65 +4428,98 @@ fn run_amiibo(
         "o_02_status": "open",
         "resources": {"primary": {"created": true}},
     });
-    Ok(finish_harness_phase(
+    let mut result = finish_harness_phase(
         harness,
         result,
         "cleanup",
         "harness_evidence",
         "amiibo_close",
-        move |harness, result| {
-            result["connect_operation"] = connect_for_command_controlled(
-                harness,
-                control,
-                ConnectOptions::default(),
-                "amiibo_connect_admit",
-                "amiibo_connect_wait",
-                "amiibo_connect_terminal",
-            )?;
-            control.checkpoint("amiibo_save_admit")?;
-            control
-                .record_event(
-                    JournalEventKind::AmiiboWriteIntent,
-                    json!({
-                        "command": "amiibo",
-                        "authorization": result["authorization"].clone(),
-                        "declared_limits": result["declared_limits"].clone(),
-                        "payload": result["payload"].clone(),
-                        "capability_inference": "none",
-                        "o_02_status": "open",
-                    }),
-                )
-                .map_err(|error| CommandFailure::new("amiibo_write_intent_journal", error))?;
-            result["write_intent_durable"] = json!(true);
-            result["write_attempted"] = json!(true);
-            let save = harness
-                .controller
-                .save_amiibo(slot, payload, AmiiboSaveOptions::default())
-                .map_err(|error| CommandFailure::new("amiibo_save_admit", error.to_string()))?;
-            result["save"] = wait_for_command_success_controlled(
-                save,
-                control,
-                Duration::from_secs(60),
-                "amiibo_save_wait",
-                "amiibo_save_terminal",
-            )?;
-            result["write_performed"] = json!(true);
-            control.checkpoint("amiibo_select_admit")?;
-            let select = harness
-                .controller
-                .select_amiibo(slot, AmiiboSelectOptions::default())
-                .map_err(|error| CommandFailure::new("amiibo_select_admit", error.to_string()))?;
-            result["select"] = wait_for_command_success_controlled(
-                select,
-                control,
-                OPERATION_TIMEOUT,
-                "amiibo_select_wait",
-                "amiibo_select_terminal",
-            )?;
-            result["select_performed"] = json!(true);
-            Ok(())
+        move |harness, result| execute_amiibo(harness, control, slot, payload, result),
+    );
+    result["amiibo_protocol_evidence"] = recorder.projection();
+    Ok(result)
+}
+
+fn execute_amiibo(
+    harness: &Harness,
+    control: &mut RunControl<'_>,
+    slot: u8,
+    payload: Arc<[u8]>,
+    result: &mut Value,
+) -> Result<(), CommandFailure> {
+    result["connect_operation"] = connect_for_command_controlled(
+        harness,
+        control,
+        ConnectOptions::default(),
+        "amiibo_connect_admit",
+        "amiibo_connect_wait",
+        "amiibo_connect_terminal",
+    )?;
+    control.checkpoint("amiibo_save_admit")?;
+    control
+        .record_event(
+            JournalEventKind::AmiiboWriteIntent,
+            json!({
+                "command": "amiibo",
+                "authorization": result["authorization"].clone(),
+                "declared_limits": result["declared_limits"].clone(),
+                "payload": result["payload"].clone(),
+                "capability_inference": "none",
+                "o_02_status": "open",
+            }),
+        )
+        .map_err(|error| CommandFailure::new("amiibo_write_intent_journal", error))?;
+    result["write_intent_durable"] = json!(true);
+    result["write_attempted"] = json!(true);
+    let save = harness
+        .controller
+        .save_amiibo(slot, payload, AmiiboSaveOptions::default())
+        .map_err(|error| CommandFailure::new("amiibo_save_admit", error.to_string()))?;
+    wait_for_amiibo_operation(
+        save,
+        control,
+        result,
+        AmiiboOperationWaitSpec {
+            timeout: Duration::from_secs(60),
+            wait_stage: "amiibo_save_wait",
+            terminal_stage: "amiibo_save_terminal",
+            journal_kind: JournalEventKind::AmiiboSaveTerminal,
+            result_field: "save",
+            durable_field: "save_terminal_durable",
         },
-    ))
+    )?;
+    result["write_performed"] = json!(true);
+    control.checkpoint("amiibo_select_admit")?;
+    control
+        .record_event(
+            JournalEventKind::AmiiboSelectIntent,
+            json!({
+                "layer": "operation_admission",
+                "authorization": result["authorization"].clone(),
+                "slot": slot,
+            }),
+        )
+        .map_err(|error| CommandFailure::new("amiibo_select_intent_journal", error))?;
+    result["select_intent_durable"] = json!(true);
+    let select = harness
+        .controller
+        .select_amiibo(slot, AmiiboSelectOptions::default())
+        .map_err(|error| CommandFailure::new("amiibo_select_admit", error.to_string()))?;
+    wait_for_amiibo_operation(
+        select,
+        control,
+        result,
+        AmiiboOperationWaitSpec {
+            timeout: OPERATION_TIMEOUT,
+            wait_stage: "amiibo_select_wait",
+            terminal_stage: "amiibo_select_terminal",
+            journal_kind: JournalEventKind::AmiiboSelectTerminal,
+            result_field: "select",
+            durable_field: "select_terminal_durable",
+        },
+    )?;
+    result["select_performed"] = json!(true);
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -5112,6 +5429,7 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc::{Receiver, SyncSender};
 
     use easycon_controller::TransportErrorKind;
     use easycon_model::{EasyConError, ErrorCode, ErrorDomain};
@@ -5333,6 +5651,99 @@ mod tests {
         fn close(&mut self) {}
     }
 
+    struct SuccessfulAmiiboTransport;
+
+    impl ControllerTransport for SuccessfulAmiiboTransport {
+        fn handshake(&mut self, _request: HandshakeRequest) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn write(&mut self, request: WriteRequest<'_>) -> Result<usize, TransportError> {
+            Ok(request.bytes.len())
+        }
+
+        fn wait_for_ack(&mut self, request: AckRequest) -> Result<AckFrame, TransportError> {
+            Ok(AckFrame {
+                generation: request.generation,
+                byte: request.expected_reply,
+            })
+        }
+
+        fn close(&mut self) {}
+    }
+
+    struct AmiiboFinalNeutralFailureTransport;
+
+    impl ControllerTransport for AmiiboFinalNeutralFailureTransport {
+        fn handshake(&mut self, _request: HandshakeRequest) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn write(&mut self, request: WriteRequest<'_>) -> Result<usize, TransportError> {
+            if request.context.kind == WriteKind::Neutralize
+                && request.context.operation_id.is_none()
+            {
+                Err(TransportError::new(
+                    TransportErrorKind::Io,
+                    "injected Amiibo final neutral failure",
+                ))
+            } else {
+                Ok(request.bytes.len())
+            }
+        }
+
+        fn wait_for_ack(&mut self, request: AckRequest) -> Result<AckFrame, TransportError> {
+            Ok(AckFrame {
+                generation: request.generation,
+                byte: request.expected_reply,
+            })
+        }
+
+        fn close(&mut self) {}
+    }
+
+    struct BlockingAmiiboAckTransport {
+        block_at_ack: usize,
+        ack_count: usize,
+        entered: Option<SyncSender<()>>,
+    }
+
+    impl ControllerTransport for BlockingAmiiboAckTransport {
+        fn handshake(&mut self, _request: HandshakeRequest) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn write(&mut self, request: WriteRequest<'_>) -> Result<usize, TransportError> {
+            Ok(request.bytes.len())
+        }
+
+        fn wait_for_ack(&mut self, request: AckRequest) -> Result<AckFrame, TransportError> {
+            self.ack_count += 1;
+            if self.ack_count == self.block_at_ack {
+                self.entered
+                    .take()
+                    .expect("one blocking ACK")
+                    .send(())
+                    .expect("announce blocking ACK");
+                let (cancelled, wait_cancelled) = std::sync::mpsc::sync_channel(1);
+                request.cancellation.on_cancel(move || {
+                    let _ = cancelled.send(());
+                });
+                wait_cancelled.recv().expect("operation cancellation");
+                return Err(TransportError::new(
+                    TransportErrorKind::Cancelled,
+                    "injected cancellable Amiibo ACK",
+                ));
+            }
+            Ok(AckFrame {
+                generation: request.generation,
+                byte: request.expected_reply,
+            })
+        }
+
+        fn close(&mut self) {}
+    }
+
     struct HandshakeFailureTransport;
 
     impl ControllerTransport for HandshakeFailureTransport {
@@ -5476,6 +5887,151 @@ mod tests {
             descriptor: SerialPortDescriptor::new(format!("TEST\\{label}"), "COM1")
                 .expect("descriptor"),
         }
+    }
+
+    fn observed_amiibo_harness(
+        transport: Box<dyn ControllerTransport>,
+        writer: journal::JournalWriter,
+        recorder: AmiiboEvidenceRecorder,
+        lease_id: &str,
+        label: &str,
+        payload: &[u8],
+    ) -> Harness {
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock::default());
+        let runtime = Runtime::new(clock.clone());
+        let telemetry = Arc::new(Mutex::new(Telemetry::default()));
+        let stable_id = format!("TEST\\{label}");
+        let instrumented = AmiiboEvidenceTransport::new(
+            transport,
+            writer,
+            AmiiboEvidenceBinding {
+                lease_id: lease_id.to_owned(),
+                expected_stable_id: stable_id.clone(),
+                observed_stable_id: stable_id.clone(),
+                slot: 3,
+                payload_len: payload.len(),
+                payload_sha256: sha256_bytes(payload),
+            },
+            recorder,
+        );
+        let observed = ObservedTransport {
+            inner: Box::new(instrumented),
+            clock: clock.clone(),
+            telemetry: telemetry.clone(),
+        };
+        let controller = ControllerSession::new(
+            &runtime,
+            Box::new(observed),
+            ControllerOptions {
+                amiibo_limits: Some(AmiiboLimits::new(8, 64).expect("limits")),
+                ..ControllerOptions::default()
+            },
+        )
+        .expect("controller");
+        Harness {
+            runtime,
+            clock,
+            controller,
+            telemetry,
+            identity_open_recorder: IdentityOpenRecorder::default(),
+            descriptor: SerialPortDescriptor::new(stable_id, "COM1").expect("descriptor"),
+        }
+    }
+
+    fn amiibo_execution_result(lease_id: &str, stable_id: &str, payload: &[u8]) -> Value {
+        let payload_sha256 = sha256_bytes(payload);
+        json!({
+            "command": "amiibo",
+            "device_target": {
+                "expected_stable_id": stable_id,
+                "initial_port_hint": "COM1",
+            },
+            "identity_admission": {
+                "status": "admitted",
+                "observed_expected": {"stable_id": stable_id, "port": "COM1"},
+            },
+            "write_attempted": false,
+            "write_performed": false,
+            "select_performed": false,
+            "write_intent_durable": false,
+            "save_terminal_durable": false,
+            "select_intent_durable": false,
+            "select_terminal_durable": false,
+            "slot": 3,
+            "authorization": {
+                "status": "authorized",
+                "one_time": true,
+                "lease_id": lease_id,
+                "expected_stable_id": stable_id,
+                "observed_stable_id": stable_id,
+                "initial_port_hint": "COM1",
+                "slot": 3,
+                "disposable_slot": 3,
+                "all_predicates_satisfied": true,
+            },
+            "declared_limits": {
+                "classification": "declared_external",
+                "slot_count": 8,
+                "maximum_data_len": 64,
+                "source": "operator-attestation:test-fixture",
+                "measured": false,
+            },
+            "payload": {
+                "source": {"kind": "local_file", "path_recorded": false},
+                "actual_length": payload.len(),
+                "expected_sha256": payload_sha256,
+                "recomputed_sha256": payload_sha256,
+                "hash_matches": true,
+                "raw_bytes_recorded": false,
+            },
+            "capability_inference": "none",
+            "o_02_status": "open",
+            "resources": {"primary": {"created": true}},
+        })
+    }
+
+    fn valid_amiibo_qualification_result() -> Value {
+        let payload = [1_u8, 2, 3];
+        let mut result = amiibo_execution_result("lease-amiibo", "DEVICE\\EXPECTED", &payload);
+        result["write_attempted"] = json!(true);
+        result["write_performed"] = json!(true);
+        result["select_performed"] = json!(true);
+        result["write_intent_durable"] = json!(true);
+        result["save_terminal_durable"] = json!(true);
+        result["select_intent_durable"] = json!(true);
+        result["select_terminal_durable"] = json!(true);
+        result["save"] = json!({"state": "Succeeded"});
+        result["select"] = json!({"state": "Succeeded"});
+        result["amiibo_protocol_evidence"] = json!({
+            "chunks": [{
+                "operation_id": 1,
+                "offset": 0,
+                "length": 3,
+                "attempt": 1,
+                "header_write_sequence": 1,
+                "header_accepted_bytes": 7,
+                "header_acknowledged": true,
+                "payload_write_sequence": 2,
+                "payload_accepted_bytes": 3,
+                "payload_acknowledged": true,
+                "status": "acked",
+                "error": null,
+            }],
+            "selects": [{
+                "operation_id": 2,
+                "slot": 3,
+                "write_sequence": 3,
+                "accepted_bytes": 3,
+                "acknowledged": true,
+                "status": "acked",
+                "error": null,
+            }],
+            "cleanup_resets": [],
+            "evidence_errors": [],
+            "transport_closed_in_state": "complete",
+        });
+        result["cleanup"] = successful_cleanup();
+        result
     }
 
     struct PanickingResource;
@@ -7778,6 +8334,383 @@ mod tests {
             prepare_amiibo_command(&arguments, "lease-amiibo"),
             Ok(AmiiboCommand::Unauthorized)
         ));
+    }
+
+    #[test]
+    fn amiibo_runner_journals_chunks_save_select_and_cleanup_in_order() {
+        let directory = TestDirectory::new("amiibo-runner-success");
+        let mut reservation = ArtifactReservation::begin_journaled(
+            "amiibo",
+            &directory.0,
+            RunStartMetadata {
+                normalized_arguments: json!(["amiibo"]),
+                provenance: json!({"trusted": true}),
+            },
+        )
+        .expect("journaled reservation");
+        let lease_id = reservation.lease_id().to_owned();
+        let writer = reservation.journal_writer().expect("journal writer");
+        let payload = Arc::<[u8]>::from([0x42_u8; 23]);
+        let recorder = AmiiboEvidenceRecorder::default();
+        let harness = observed_amiibo_harness(
+            Box::new(SuccessfulAmiiboTransport),
+            writer,
+            recorder.clone(),
+            &lease_id,
+            "AMIIBO-SUCCESS",
+            &payload,
+        );
+        let stable_id = harness.descriptor.stable_id().to_owned();
+        let result = amiibo_execution_result(&lease_id, &stable_id, &payload);
+        let mut port = ScriptedOperatorPort::new([]);
+        let mut result = {
+            let mut control =
+                RunControl::new(&mut reservation, &mut port, InterruptToken::default());
+            finish_harness_phase(
+                harness,
+                result,
+                "cleanup",
+                "harness_evidence",
+                "amiibo_close",
+                |harness, result| execute_amiibo(harness, &mut control, 3, payload, result),
+            )
+        };
+
+        assert_eq!(result["write_intent_durable"], true);
+        assert_eq!(result["save_terminal_durable"], true);
+        assert_eq!(result["select_intent_durable"], true);
+        assert_eq!(result["select_terminal_durable"], true);
+        assert_eq!(result["write_performed"], true);
+        assert_eq!(result["select_performed"], true);
+        assert!(cleanup_succeeded(&result["cleanup"]));
+        let projection = recorder.projection();
+        assert_eq!(projection["chunks"].as_array().map(Vec::len), Some(2));
+        assert_eq!(projection["chunks"][0]["status"], "acked");
+        assert_eq!(projection["chunks"][1]["status"], "acked");
+        assert_eq!(projection["selects"][0]["status"], "acked");
+        assert_eq!(projection["transport_closed_in_state"], "complete");
+        result["amiibo_protocol_evidence"] = projection;
+
+        let events = journal::parse_journal(
+            &fs::read(directory.0.join(journal::JOURNAL_FILE_NAME)).expect("journal"),
+        )
+        .expect("events");
+        let names = events
+            .iter()
+            .map(|event| event["event"].as_str().expect("event"))
+            .collect::<Vec<_>>();
+        let write_intent = names
+            .iter()
+            .position(|event| *event == "amiibo_write_intent")
+            .expect("write intent");
+        let first_chunk_intent = names
+            .iter()
+            .position(|event| *event == "amiibo_chunk_intent")
+            .expect("chunk intent");
+        let save_terminal = names
+            .iter()
+            .position(|event| *event == "amiibo_save_terminal")
+            .expect("save terminal");
+        let first_select_intent = names
+            .iter()
+            .position(|event| *event == "amiibo_select_intent")
+            .expect("select intent");
+        assert!(write_intent < first_chunk_intent);
+        assert!(save_terminal < first_select_intent);
+        assert_eq!(
+            names
+                .iter()
+                .filter(|event| **event == "amiibo_chunk_terminal")
+                .count(),
+            2
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|event| **event == "amiibo_select_intent")
+                .count(),
+            2
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|event| **event == "amiibo_select_terminal")
+                .count(),
+            2
+        );
+        let (document, failure) = finalize_result("amiibo", Ok(result));
+        assert!(failure.is_none());
+        assert_eq!(document["execution_status"], "completed");
+        assert_eq!(document["qualification_status"], "unverified");
+        assert_eq!(document_exit_code(&document), 2);
+    }
+
+    #[test]
+    fn amiibo_cleanup_failures_preserve_destructive_progress_and_fail_closed() {
+        let directory = TestDirectory::new("amiibo-cleanup-failure");
+        let mut reservation = ArtifactReservation::begin_journaled(
+            "amiibo",
+            &directory.0,
+            RunStartMetadata {
+                normalized_arguments: json!(["amiibo"]),
+                provenance: json!({"trusted": true}),
+            },
+        )
+        .expect("journaled reservation");
+        let lease_id = reservation.lease_id().to_owned();
+        let writer = reservation.journal_writer().expect("journal writer");
+        let payload = Arc::<[u8]>::from([0x31_u8; 20]);
+        let recorder = AmiiboEvidenceRecorder::default();
+        let harness = observed_amiibo_harness(
+            Box::new(AmiiboFinalNeutralFailureTransport),
+            writer,
+            recorder.clone(),
+            &lease_id,
+            "AMIIBO-CLEANUP-FAILURE",
+            &payload,
+        );
+        let resource: Arc<dyn ManagedResource> = Arc::new(PanickingResource);
+        let _registration = harness
+            .runtime
+            .register_resource(resource.clone())
+            .expect("failing resource");
+        let stable_id = harness.descriptor.stable_id().to_owned();
+        let result = amiibo_execution_result(&lease_id, &stable_id, &payload);
+        let mut port = ScriptedOperatorPort::new([]);
+        let mut result = {
+            let mut control =
+                RunControl::new(&mut reservation, &mut port, InterruptToken::default());
+            finish_harness_phase(
+                harness,
+                result,
+                "cleanup",
+                "harness_evidence",
+                "amiibo_close",
+                |harness, result| execute_amiibo(harness, &mut control, 3, payload, result),
+            )
+        };
+        result["amiibo_protocol_evidence"] = recorder.projection();
+
+        assert_eq!(result["write_performed"], true);
+        assert_eq!(result["select_performed"], true);
+        assert_eq!(
+            result["amiibo_protocol_evidence"]["chunks"][0]["status"],
+            "acked"
+        );
+        assert_eq!(
+            result["amiibo_protocol_evidence"]["selects"][0]["status"],
+            "acked"
+        );
+        assert_eq!(
+            result["cleanup"]["controller"]["neutralization"],
+            "not_delivered"
+        );
+        assert_eq!(result["cleanup"]["runtime"]["outcome"], "Failed");
+        assert_eq!(result["execution_error"]["stage"], "amiibo_close");
+        assert!(!cleanup_succeeded(&result["cleanup"]));
+        let names = journal::parse_journal(
+            &fs::read(directory.0.join(journal::JOURNAL_FILE_NAME)).expect("journal"),
+        )
+        .expect("events")
+        .into_iter()
+        .map(|event| event["event"].as_str().expect("event").to_owned())
+        .collect::<Vec<_>>();
+        assert!(names.contains(&"amiibo_chunk_terminal".to_owned()));
+        assert!(names.contains(&"amiibo_save_terminal".to_owned()));
+        assert_eq!(
+            names
+                .iter()
+                .filter(|event| **event == "amiibo_select_terminal")
+                .count(),
+            2
+        );
+
+        let (document, failure) = finalize_result("amiibo", Ok(result));
+        assert!(failure.is_some());
+        assert_eq!(document["execution_status"], "failed");
+        assert_eq!(document["qualification_status"], "failed");
+        assert_eq!(document_exit_code(&document), 1);
+    }
+
+    fn interrupt_after_ack_entry(
+        entered: Receiver<()>,
+        token: InterruptToken,
+    ) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            entered.recv().expect("blocking ACK entered");
+            token.request();
+        })
+    }
+
+    #[test]
+    fn amiibo_interrupt_during_save_or_select_preserves_progress_and_cleanup() {
+        for (label, block_at_ack) in [("save", 2_usize), ("select", 3_usize)] {
+            let directory = TestDirectory::new(&format!("amiibo-interrupt-{label}"));
+            let mut reservation = ArtifactReservation::begin_journaled(
+                "amiibo",
+                &directory.0,
+                RunStartMetadata {
+                    normalized_arguments: json!(["amiibo"]),
+                    provenance: json!({"trusted": true}),
+                },
+            )
+            .expect("journaled reservation");
+            let lease_id = reservation.lease_id().to_owned();
+            let writer = reservation.journal_writer().expect("journal writer");
+            let payload = Arc::<[u8]>::from([0x24_u8; 20]);
+            let recorder = AmiiboEvidenceRecorder::default();
+            let (entered, wait_entered) = std::sync::mpsc::sync_channel(0);
+            let harness = observed_amiibo_harness(
+                Box::new(BlockingAmiiboAckTransport {
+                    block_at_ack,
+                    ack_count: 0,
+                    entered: Some(entered),
+                }),
+                writer,
+                recorder.clone(),
+                &lease_id,
+                &format!("AMIIBO-INTERRUPT-{label}"),
+                &payload,
+            );
+            let stable_id = harness.descriptor.stable_id().to_owned();
+            let result = amiibo_execution_result(&lease_id, &stable_id, &payload);
+            let mut port = ScriptedOperatorPort::new([]);
+            let token = InterruptToken::default();
+            let requester = interrupt_after_ack_entry(wait_entered, token.clone());
+            let result = {
+                let mut control = RunControl::new(&mut reservation, &mut port, token);
+                finish_harness_phase(
+                    harness,
+                    result,
+                    "cleanup",
+                    "harness_evidence",
+                    "amiibo_close",
+                    |harness, result| execute_amiibo(harness, &mut control, 3, payload, result),
+                )
+            };
+            requester.join().expect("interrupt requester");
+
+            assert_eq!(
+                result["operator_terminal_outcome"], "interrupted",
+                "{label}"
+            );
+            assert!(cleanup_succeeded(&result["cleanup"]), "{label}");
+            assert_eq!(result["save_terminal_durable"], true, "{label}");
+            assert_eq!(result["write_performed"], label == "select", "{label}");
+            assert_eq!(
+                result["select_terminal_durable"],
+                label == "select",
+                "{label}"
+            );
+            let projection = recorder.projection();
+            assert_eq!(
+                projection["chunks"][0]["status"],
+                if label == "save" { "failed" } else { "acked" }
+            );
+            assert_eq!(projection["cleanup_resets"][0]["status"], "acked");
+            if label == "select" {
+                assert_eq!(projection["selects"][0]["status"], "failed");
+            }
+            let events = journal::parse_journal(
+                &fs::read(directory.0.join(journal::JOURNAL_FILE_NAME)).expect("journal"),
+            )
+            .expect("events");
+            let names = events
+                .iter()
+                .map(|event| event["event"].as_str().expect("event"))
+                .collect::<Vec<_>>();
+            let interrupt = names
+                .iter()
+                .position(|event| *event == "interrupt_requested")
+                .expect("interrupt event");
+            let cleanup_terminal = names
+                .iter()
+                .position(|event| *event == "amiibo_cleanup_terminal")
+                .expect("cleanup terminal");
+            let cancellation = names
+                .iter()
+                .position(|event| *event == "cancellation_terminal")
+                .expect("cancellation terminal");
+            assert!(interrupt < cleanup_terminal && cleanup_terminal < cancellation);
+            let (document, failure) = finalize_result("amiibo", Ok(result));
+            assert!(failure.is_none());
+            assert_eq!(document["execution_status"], "cancelled", "{label}");
+            assert_eq!(document["qualification_status"], "unverified", "{label}");
+            assert_eq!(document_exit_code(&document), 130, "{label}");
+        }
+    }
+
+    #[test]
+    fn amiibo_qualification_accepts_retry_evidence_but_rejects_contradictions() {
+        let valid = valid_amiibo_qualification_result();
+        let (document, failure) = finalize_result("amiibo", Ok(valid.clone()));
+        assert!(failure.is_none());
+        assert_eq!(document["execution_status"], "completed");
+        assert_eq!(document["qualification_status"], "unverified");
+        assert_eq!(document_exit_code(&document), 2);
+
+        let mut retried = valid.clone();
+        retried["amiibo_protocol_evidence"]["chunks"]
+            .as_array_mut()
+            .expect("chunks")
+            .insert(
+                0,
+                json!({
+                    "operation_id": 1,
+                    "offset": 0,
+                    "length": 3,
+                    "attempt": 1,
+                    "header_write_sequence": 1,
+                    "header_accepted_bytes": 7,
+                    "header_acknowledged": false,
+                    "payload_write_sequence": null,
+                    "payload_accepted_bytes": 0,
+                    "payload_acknowledged": false,
+                    "status": "failed",
+                    "error": {"kind": "Timeout", "message": "injected"},
+                }),
+            );
+        retried["amiibo_protocol_evidence"]["chunks"][1]["attempt"] = json!(2);
+        retried["amiibo_protocol_evidence"]["cleanup_resets"] = json!([{
+            "operation_id": 1,
+            "write_sequence": 2,
+            "accepted_bytes": 6,
+            "acknowledged": true,
+            "resume": "save",
+            "status": "acked",
+            "error": null,
+        }]);
+        let (document, failure) = finalize_result("amiibo", Ok(retried));
+        assert!(failure.is_none());
+        assert_eq!(document["qualification_status"], "unverified");
+
+        let mut invalid = Vec::new();
+        let mut missing_authorization = valid.clone();
+        missing_authorization["authorization"]["one_time"] = json!(false);
+        invalid.push(missing_authorization);
+        let mut hash_mismatch = valid.clone();
+        hash_mismatch["payload"]["recomputed_sha256"] = json!("0".repeat(64));
+        invalid.push(hash_mismatch);
+        let mut chunk_gap = valid.clone();
+        chunk_gap["amiibo_protocol_evidence"]["chunks"][0]["offset"] = json!(1);
+        invalid.push(chunk_gap);
+        let mut missing_select = valid.clone();
+        missing_select["select_terminal_durable"] = json!(false);
+        invalid.push(missing_select);
+        let mut false_capability = valid.clone();
+        false_capability["o_02_status"] = json!("closed");
+        invalid.push(false_capability);
+        let mut path_leak = valid;
+        path_leak["payload"]["source"]["path_recorded"] = json!(true);
+        invalid.push(path_leak);
+
+        for result in invalid {
+            let (document, failure) = finalize_result("amiibo", Ok(result));
+            assert!(failure.is_some());
+            assert_eq!(document["execution_status"], "completed");
+            assert_eq!(document["qualification_status"], "failed");
+            assert_eq!(document_exit_code(&document), 1);
+        }
     }
 
     #[test]
