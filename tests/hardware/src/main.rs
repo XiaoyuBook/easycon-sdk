@@ -10,7 +10,7 @@ mod provenance;
 use std::env;
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -81,6 +81,10 @@ impl<'a> RunControl<'a> {
 
     fn record_event(&mut self, kind: JournalEventKind, payload: Value) -> Result<(), String> {
         self.reservation.record_event(kind, payload)
+    }
+
+    fn lease_id(&self) -> &str {
+        self.reservation.lease_id()
     }
 
     fn marker(
@@ -1337,13 +1341,18 @@ fn real_main() -> Result<i32, String> {
                         )
                     },
                 ),
-                "amiibo" if amiibo_write_authorized(&arguments) => run_with_device_admission(
-                    "amiibo",
-                    &arguments,
-                    &mut control,
-                    |target, discovery, control| run_amiibo(&arguments, target, discovery, control),
-                ),
-                "amiibo" => run_unauthorized_amiibo(),
+                "amiibo" => match prepare_amiibo_command(&arguments, control.lease_id()) {
+                    Ok(AmiiboCommand::Unauthorized) => run_unauthorized_amiibo(),
+                    Ok(AmiiboCommand::Authorized(authorization)) => run_with_device_admission(
+                        "amiibo",
+                        &arguments,
+                        &mut control,
+                        move |target, discovery, control| {
+                            run_amiibo(authorization, target, discovery, control)
+                        },
+                    ),
+                    Err(error) => Err(error),
+                },
                 _ => Err(format!("unknown command: {command}")),
             }
         }
@@ -3950,43 +3959,146 @@ fn run_sequence(
     Ok((result, timing_csv))
 }
 
-fn amiibo_write_authorized(arguments: &[String]) -> bool {
-    arguments
+enum AmiiboCommand {
+    Unauthorized,
+    Authorized(AmiiboAuthorization),
+}
+
+struct AmiiboAuthorization {
+    lease_id: String,
+    expected_stable_id: String,
+    initial_port_hint: String,
+    slot: u8,
+    disposable_slot: u8,
+    slot_count: u16,
+    maximum_data_len: usize,
+    limits_source: String,
+    expected_sha256: String,
+    recomputed_sha256: String,
+    payload: Arc<[u8]>,
+    limits: AmiiboLimits,
+}
+
+fn prepare_amiibo_command(arguments: &[String], lease_id: &str) -> Result<AmiiboCommand, String> {
+    match arguments
         .iter()
-        .any(|argument| argument == "--authorize-write")
+        .filter(|argument| argument.as_str() == "--authorize-write")
+        .count()
+    {
+        0 => return Ok(AmiiboCommand::Unauthorized),
+        1 => {}
+        _ => return Err("--authorize-write may be supplied only once".to_owned()),
+    }
+    if arguments
+        .iter()
+        .any(|argument| argument == "--confirm-disposable")
+    {
+        return Err("--confirm-disposable is not slot-bound; use --disposable-slot N".to_owned());
+    }
+
+    let target = device_target_request(arguments)?;
+    let slot: u8 = required_value(arguments, "--slot")?;
+    let disposable_slot: u8 = required_value(arguments, "--disposable-slot")?;
+    if disposable_slot != slot {
+        return Err("--disposable-slot must exactly match --slot".to_owned());
+    }
+    let slot_count: u16 = required_value(arguments, "--slot-count")?;
+    let maximum_data_len: usize = required_value(arguments, "--maximum-data-len")?;
+    let limits =
+        AmiiboLimits::new(slot_count, maximum_data_len).map_err(|error| error.to_string())?;
+    if u16::from(slot) >= slot_count {
+        return Err("--slot is outside the declared slot count".to_owned());
+    }
+
+    let limits_source = required_non_option_string(arguments, "--limits-source")?;
+    validate_limits_source(&limits_source)?;
+    let data_path = PathBuf::from(required_non_option_string(arguments, "--data")?);
+    let payload =
+        fs::read(&data_path).map_err(|error| format!("cannot read Amiibo data: {error}"))?;
+    if payload.is_empty() {
+        return Err("Amiibo payload must be non-empty".to_owned());
+    }
+    if payload.len() > maximum_data_len {
+        return Err("Amiibo payload exceeds --maximum-data-len".to_owned());
+    }
+    let expected_sha256 = required_non_option_string(arguments, "--expected-sha256")?;
+    if expected_sha256.len() != 64 || !expected_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("--expected-sha256 must contain exactly 64 hexadecimal digits".to_owned());
+    }
+    let expected_sha256 = expected_sha256.to_ascii_uppercase();
+    let recomputed_sha256 = sha256_bytes(&payload);
+    if expected_sha256 != recomputed_sha256 {
+        return Err("Amiibo payload SHA-256 does not match --expected-sha256".to_owned());
+    }
+
+    Ok(AmiiboCommand::Authorized(AmiiboAuthorization {
+        lease_id: lease_id.to_owned(),
+        expected_stable_id: target.expected_stable_id().to_owned(),
+        initial_port_hint: target.initial_port_hint().to_owned(),
+        slot,
+        disposable_slot,
+        slot_count,
+        maximum_data_len,
+        limits_source,
+        expected_sha256,
+        recomputed_sha256,
+        payload: Arc::from(payload),
+        limits,
+    }))
+}
+
+fn validate_limits_source(source: &str) -> Result<(), String> {
+    if source.trim().is_empty()
+        || source.trim() != source
+        || source.chars().any(char::is_control)
+        || Path::new(source).is_absolute()
+    {
+        return Err(
+            "--limits-source must be a non-empty external reference, not a machine path".to_owned(),
+        );
+    }
+    Ok(())
 }
 
 fn run_unauthorized_amiibo() -> Result<Value, String> {
     Ok(json!({
         "command": "amiibo",
         "capability": "unknown",
+        "capability_inference": "none",
+        "o_02_status": "open",
         "write_performed": false,
         "reason": "the v1 protocol has no safe capacity query; explicit limits and write authorization are required",
     }))
 }
 
 fn run_amiibo(
-    arguments: &[String],
+    authorization: AmiiboAuthorization,
     target: AdmittedDevice,
     discovery: Arc<dyn DeviceDiscovery>,
     control: &mut RunControl<'_>,
 ) -> Result<Value, String> {
-    if !arguments
-        .iter()
-        .any(|argument| argument == "--confirm-disposable")
+    if authorization.expected_stable_id != target.request().expected_stable_id()
+        || authorization.initial_port_hint != target.request().initial_port_hint()
+        || authorization.lease_id != control.lease_id()
     {
-        return Err("Amiibo write also requires --confirm-disposable".to_owned());
+        return Err("Amiibo authorization is not bound to this run and device target".to_owned());
     }
-    let slot: u8 = required_value(arguments, "--slot")?;
-    let slot_count: u16 = required_value(arguments, "--slot-count")?;
-    let maximum_data_len: usize = required_value(arguments, "--maximum-data-len")?;
-    let data_path = PathBuf::from(
-        option_value(arguments, "--data")?
-            .ok_or_else(|| "missing required option --data".to_owned())?,
-    );
-    let data = fs::read(&data_path).map_err(|error| error.to_string())?;
-    let limits =
-        AmiiboLimits::new(slot_count, maximum_data_len).map_err(|error| error.to_string())?;
+    let AmiiboAuthorization {
+        lease_id,
+        expected_stable_id,
+        initial_port_hint,
+        slot,
+        disposable_slot,
+        slot_count,
+        maximum_data_len,
+        limits_source,
+        expected_sha256,
+        recomputed_sha256,
+        payload,
+        limits,
+    } = authorization;
+    let observed_stable_id = target.descriptor().stable_id().to_owned();
     let harness = Harness::new(
         &target,
         discovery,
@@ -3999,11 +4111,37 @@ fn run_amiibo(
         "command": "amiibo",
         "write_attempted": false,
         "write_performed": false,
+        "select_performed": false,
+        "write_intent_durable": false,
         "slot": slot,
-        "slot_count": slot_count,
-        "maximum_data_len": maximum_data_len,
-        "data_path": data_path,
-        "actual_payload_len": data.len(),
+        "authorization": {
+            "status": "authorized",
+            "one_time": true,
+            "lease_id": lease_id,
+            "expected_stable_id": expected_stable_id,
+            "observed_stable_id": observed_stable_id,
+            "initial_port_hint": initial_port_hint,
+            "slot": slot,
+            "disposable_slot": disposable_slot,
+            "all_predicates_satisfied": true,
+        },
+        "declared_limits": {
+            "classification": "declared_external",
+            "slot_count": slot_count,
+            "maximum_data_len": maximum_data_len,
+            "source": limits_source,
+            "measured": false,
+        },
+        "payload": {
+            "source": {"kind": "local_file", "path_recorded": false},
+            "actual_length": payload.len(),
+            "expected_sha256": expected_sha256,
+            "recomputed_sha256": recomputed_sha256,
+            "hash_matches": true,
+            "raw_bytes_recorded": false,
+        },
+        "capability_inference": "none",
+        "o_02_status": "open",
         "resources": {"primary": {"created": true}},
     });
     Ok(finish_harness_phase(
@@ -4022,10 +4160,24 @@ fn run_amiibo(
                 "amiibo_connect_terminal",
             )?;
             control.checkpoint("amiibo_save_admit")?;
+            control
+                .record_event(
+                    JournalEventKind::AmiiboWriteIntent,
+                    json!({
+                        "command": "amiibo",
+                        "authorization": result["authorization"].clone(),
+                        "declared_limits": result["declared_limits"].clone(),
+                        "payload": result["payload"].clone(),
+                        "capability_inference": "none",
+                        "o_02_status": "open",
+                    }),
+                )
+                .map_err(|error| CommandFailure::new("amiibo_write_intent_journal", error))?;
+            result["write_intent_durable"] = json!(true);
             result["write_attempted"] = json!(true);
             let save = harness
                 .controller
-                .save_amiibo(slot, data, AmiiboSaveOptions::default())
+                .save_amiibo(slot, payload, AmiiboSaveOptions::default())
                 .map_err(|error| CommandFailure::new("amiibo_save_admit", error.to_string()))?;
             result["save"] = wait_for_command_success_controlled(
                 save,
@@ -4047,6 +4199,7 @@ fn run_amiibo(
                 "amiibo_select_wait",
                 "amiibo_select_terminal",
             )?;
+            result["select_performed"] = json!(true);
             Ok(())
         },
     ))
@@ -4947,8 +5100,9 @@ fn print_help() {
          easycon-hardware-qualification hotplug --port COMx --expected-identity ID [--timeout-seconds N]\n  \
          easycon-hardware-qualification lifecycle --port COMx --expected-identity ID [--cycles 100]\n  \
          easycon-hardware-qualification sequence --port COMx --expected-identity ID [--steps 10000]\n  \
-         easycon-hardware-qualification amiibo [--port COMx --expected-identity ID --slot N --slot-count N \
-         --maximum-data-len N --data FILE --authorize-write --confirm-disposable]\n\n  \
+         easycon-hardware-qualification amiibo [--port COMx --expected-identity ID --slot N --disposable-slot N \
+         --slot-count N --maximum-data-len N --limits-source REF --data FILE --expected-sha256 HEX \
+         --authorize-write]\n\n  \
          Every command accepts --output-dir PATH."
     );
 }
@@ -7477,6 +7631,153 @@ mod tests {
         );
         assert_eq!(amiibo["status"], "not_run");
         assert_eq!(document_exit_code(&amiibo), 2);
+    }
+
+    fn authorized_amiibo_arguments(data_path: &Path, expected_sha256: &str) -> Vec<String> {
+        vec![
+            "amiibo".to_owned(),
+            "--port".to_owned(),
+            "COM8".to_owned(),
+            "--expected-identity".to_owned(),
+            "DEVICE\\EXPECTED".to_owned(),
+            "--slot".to_owned(),
+            "3".to_owned(),
+            "--disposable-slot".to_owned(),
+            "3".to_owned(),
+            "--slot-count".to_owned(),
+            "8".to_owned(),
+            "--maximum-data-len".to_owned(),
+            "64".to_owned(),
+            "--limits-source".to_owned(),
+            "operator-attestation:test-fixture".to_owned(),
+            "--data".to_owned(),
+            data_path.to_string_lossy().into_owned(),
+            "--expected-sha256".to_owned(),
+            expected_sha256.to_owned(),
+            "--authorize-write".to_owned(),
+        ]
+    }
+
+    #[test]
+    fn amiibo_authorization_binds_identity_slot_limits_and_payload_hash() {
+        let directory = TestDirectory::new("amiibo-authorization-valid");
+        let data_path = directory.0.join("payload.bin");
+        let payload = b"qualification-only-amiibo-payload";
+        fs::write(&data_path, payload).expect("payload");
+        let expected_sha256 = sha256_bytes(payload);
+        let arguments = authorized_amiibo_arguments(&data_path, &expected_sha256);
+
+        let AmiiboCommand::Authorized(authorization) =
+            prepare_amiibo_command(&arguments, "lease-amiibo").expect("authorization")
+        else {
+            panic!("write flag must produce an authorization");
+        };
+        assert_eq!(authorization.lease_id, "lease-amiibo");
+        assert_eq!(authorization.expected_stable_id, "DEVICE\\EXPECTED");
+        assert_eq!(authorization.slot, 3);
+        assert_eq!(authorization.disposable_slot, 3);
+        assert_eq!(authorization.slot_count, 8);
+        assert_eq!(authorization.maximum_data_len, 64);
+        assert_eq!(authorization.payload.as_ref(), payload);
+        assert_eq!(authorization.expected_sha256, expected_sha256);
+        assert_eq!(authorization.recomputed_sha256, expected_sha256);
+        assert_eq!(
+            authorization.limits_source,
+            "operator-attestation:test-fixture"
+        );
+    }
+
+    #[test]
+    fn amiibo_authorization_rejects_every_unbound_or_unverified_input() {
+        let directory = TestDirectory::new("amiibo-authorization-invalid");
+        let data_path = directory.0.join("payload.bin");
+        let payload = b"qualification-only-amiibo-payload";
+        fs::write(&data_path, payload).expect("payload");
+        let expected_sha256 = sha256_bytes(payload);
+        let valid = authorized_amiibo_arguments(&data_path, &expected_sha256);
+        let option_index = |arguments: &[String], option: &str| {
+            arguments
+                .iter()
+                .position(|argument| argument == option)
+                .expect("option")
+        };
+
+        let mut invalid = Vec::new();
+        let mut duplicate_authorization = valid.clone();
+        duplicate_authorization.push("--authorize-write".to_owned());
+        invalid.push(duplicate_authorization);
+
+        let mut blanket_disposable = valid.clone();
+        blanket_disposable.push("--confirm-disposable".to_owned());
+        invalid.push(blanket_disposable);
+
+        let mut mismatched_slot = valid.clone();
+        let index = option_index(&mismatched_slot, "--disposable-slot");
+        mismatched_slot[index + 1] = "4".to_owned();
+        invalid.push(mismatched_slot);
+
+        let mut missing_source = valid.clone();
+        let index = option_index(&missing_source, "--limits-source");
+        missing_source.drain(index..=index + 1);
+        invalid.push(missing_source);
+
+        let mut absolute_source = valid.clone();
+        let index = option_index(&absolute_source, "--limits-source");
+        absolute_source[index + 1] = directory
+            .0
+            .join("capacity.txt")
+            .to_string_lossy()
+            .into_owned();
+        invalid.push(absolute_source);
+
+        let mut malformed_hash = valid.clone();
+        let index = option_index(&malformed_hash, "--expected-sha256");
+        malformed_hash[index + 1] = "not-a-sha256".to_owned();
+        invalid.push(malformed_hash);
+
+        let mut mismatched_hash = valid.clone();
+        let index = option_index(&mismatched_hash, "--expected-sha256");
+        mismatched_hash[index + 1] = "0".repeat(64);
+        invalid.push(mismatched_hash);
+
+        let mut slot_out_of_range = valid.clone();
+        let index = option_index(&slot_out_of_range, "--slot-count");
+        slot_out_of_range[index + 1] = "3".to_owned();
+        invalid.push(slot_out_of_range);
+
+        let mut length_out_of_range = valid.clone();
+        let index = option_index(&length_out_of_range, "--maximum-data-len");
+        length_out_of_range[index + 1] = "4".to_owned();
+        invalid.push(length_out_of_range);
+
+        let empty_path = directory.0.join("empty.bin");
+        fs::write(&empty_path, []).expect("empty payload");
+        invalid.push(authorized_amiibo_arguments(&empty_path, &sha256_bytes(&[])));
+
+        for arguments in invalid {
+            assert!(
+                prepare_amiibo_command(&arguments, "lease-amiibo").is_err(),
+                "unsafe authorization was accepted: {arguments:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn amiibo_without_write_flag_remains_not_run_without_reading_payload() {
+        let directory = TestDirectory::new("amiibo-unauthorized-missing-payload");
+        let arguments = vec![
+            "amiibo".to_owned(),
+            "--data".to_owned(),
+            directory
+                .0
+                .join("does-not-exist.bin")
+                .to_string_lossy()
+                .into_owned(),
+        ];
+        assert!(matches!(
+            prepare_amiibo_command(&arguments, "lease-amiibo"),
+            Ok(AmiiboCommand::Unauthorized)
+        ));
     }
 
     #[test]
