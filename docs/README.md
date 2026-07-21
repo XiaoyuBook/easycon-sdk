@@ -41,6 +41,8 @@
     一次性写入授权、外部 limits 来源、payload hash、chunk write-ahead journal 和 synthetic failpoint 边界。
 17. [Phase 2B telemetry 与资格投影设计](development/phase2b-telemetry-qualification-projection.md)：
     logical report partial 聚合、native I/O error、checked timing、物理未验证边界和唯一终态三元组。
+18. [Phase 2B checkpoint 软件收口设计](development/phase2b-checkpoint-software-closeout.md)：
+    磁盘 evidence 重验、五类 checkpoint、handoff attestation 边界和 Hardware Unverified transaction。
 
 ## 决策记录
 
