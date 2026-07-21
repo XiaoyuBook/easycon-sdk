@@ -34,7 +34,7 @@ use easycon_hardware_qualification::{distribution, option_value, required_value,
 use easycon_model::{Button, Hat, ResourceId, StickPosition};
 use easycon_runtime::{
     Clock, CloseOutcome, CloseRejection, Operation, OperationState, Runtime, RuntimeCounts,
-    SystemClock, WaitResult, WaitTimeout,
+    SystemClock, TransitionOutcome, WaitResult, WaitTimeout,
 };
 use easycon_serial::{
     ByteIo, ByteIoFactory, ByteIoRequest, SerialControllerTransport, SerialError,
@@ -45,13 +45,14 @@ use serde_json::{Value, json};
 use journal::JournalEventKind;
 use operator::{
     ActionMarker, ConsoleOperatorPort, InterruptToken, ObservationRequest, OperatorOutcome,
-    OperatorPort,
+    OperatorPort, install_console_interrupt_handler,
 };
 use provenance::{RuntimeProvenance, sha256_bytes};
 
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
 const MINIMUM_REPORT_INTERVAL_NS: u64 = 30_000_000;
 const HOTPLUG_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const INTERRUPT_POLL_SLICE: Duration = Duration::from_millis(50);
 
 struct RunControl<'a> {
     reservation: &'a mut ArtifactReservation,
@@ -190,6 +191,117 @@ impl<'a> RunControl<'a> {
         self.cancellation_terminal_recorded = true;
         Ok(())
     }
+
+    fn checkpoint(&mut self, stage: &'static str) -> Result<(), CommandFailure> {
+        if !self.interrupt.is_requested() {
+            return Ok(());
+        }
+        self.record_interrupt_without_operation()?;
+        self.record_cancellation_without_operation()?;
+        Err(CommandFailure::interrupted(
+            stage,
+            "operator interrupt stopped action admission",
+            None,
+        ))
+    }
+
+    fn cancel_operation(&mut self, operation: &Operation, stage: &'static str) -> CommandFailure {
+        let snapshot_before = operation.snapshot();
+        let interrupt_journal = self.record_interrupt_for_operation(operation, &snapshot_before);
+        let cancel_outcome = operation.cancel();
+        let terminal = wait_terminal_sliced(operation, OPERATION_TIMEOUT);
+        if let Err(error) = interrupt_journal {
+            return CommandFailure::with_operation(
+                "interrupt_journal",
+                format!("{error}; cancel outcome {cancel_outcome:?}"),
+                operation.clone(),
+            );
+        }
+        let snapshot = match terminal {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return CommandFailure::with_operation(
+                    "interrupt_cancel_settle",
+                    format!("{error}; cancel outcome {cancel_outcome:?}"),
+                    operation.clone(),
+                );
+            }
+        };
+        if let Err(error) =
+            self.record_cancellation_for_operation(operation, cancel_outcome, &snapshot)
+        {
+            return CommandFailure::with_operation(
+                "cancellation_terminal_journal",
+                error,
+                operation.clone(),
+            );
+        }
+        let cancellation_is_exact = snapshot.state == OperationState::Cancelled
+            && snapshot.cancellation_reason == Some(easycon_runtime::CancellationReason::Requested)
+            && matches!(
+                cancel_outcome,
+                TransitionOutcome::Applied | TransitionOutcome::Unchanged
+            );
+        let success_won_race = snapshot.state == OperationState::Succeeded
+            && cancel_outcome == TransitionOutcome::AlreadyTerminal;
+        if !cancellation_is_exact && !success_won_race {
+            return CommandFailure::with_operation(
+                "interrupt_cancel_terminal",
+                format!(
+                    "operator interrupt ended operation in {:?} with reason {:?} and request outcome {cancel_outcome:?}",
+                    snapshot.state, snapshot.cancellation_reason
+                ),
+                operation.clone(),
+            );
+        }
+        CommandFailure::interrupted(
+            stage,
+            "operator interrupt cancelled command execution",
+            Some(operation.clone()),
+        )
+    }
+
+    fn record_interrupt_for_operation(
+        &mut self,
+        operation: &Operation,
+        snapshot: &easycon_runtime::OperationSnapshot,
+    ) -> Result<(), String> {
+        if self.interrupt_recorded {
+            return Ok(());
+        }
+        self.record_event(
+            JournalEventKind::InterruptRequested,
+            json!({
+                "source": "operator_interrupt",
+                "operation_id": operation.id().get(),
+                "operation_state": format!("{:?}", snapshot.state),
+            }),
+        )?;
+        self.interrupt_recorded = true;
+        Ok(())
+    }
+
+    fn record_cancellation_for_operation(
+        &mut self,
+        operation: &Operation,
+        cancel_outcome: TransitionOutcome,
+        snapshot: &easycon_runtime::OperationSnapshot,
+    ) -> Result<(), String> {
+        if self.cancellation_terminal_recorded {
+            return Ok(());
+        }
+        self.record_event(
+            JournalEventKind::CancellationTerminal,
+            json!({
+                "source": "operator_interrupt",
+                "operation_id": operation.id().get(),
+                "request_outcome": format!("{cancel_outcome:?}"),
+                "terminal": operation_snapshot_json(snapshot),
+            }),
+        )?;
+        self.cancellation_terminal_recorded = true;
+        Ok(())
+    }
 }
 
 struct ActionOperationEvidence {
@@ -208,6 +320,22 @@ impl QualificationDelay for ThreadDelay {
     fn wait(&self, duration: Duration) {
         thread::sleep(duration);
     }
+}
+
+fn wait_controlled(
+    control: &mut RunControl<'_>,
+    duration: Duration,
+    delay: &dyn QualificationDelay,
+    stage: &'static str,
+) -> Result<(), CommandFailure> {
+    let mut remaining = duration;
+    while !remaining.is_zero() {
+        control.checkpoint(stage)?;
+        let current = remaining.min(INTERRUPT_POLL_SLICE);
+        delay.wait(current);
+        remaining = remaining.saturating_sub(current);
+    }
+    control.checkpoint(stage)
 }
 
 #[derive(Clone, Debug)]
@@ -571,14 +699,22 @@ impl Harness {
 }
 
 struct CommandFailure {
+    kind: CommandFailureKind,
     stage: &'static str,
     message: String,
     operation: Option<Operation>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommandFailureKind {
+    Failed,
+    Interrupted,
+}
+
 impl CommandFailure {
     fn new(stage: &'static str, message: impl Into<String>) -> Self {
         Self {
+            kind: CommandFailureKind::Failed,
             stage,
             message: message.into(),
             operation: None,
@@ -591,11 +727,38 @@ impl CommandFailure {
         operation: Operation,
     ) -> Self {
         Self {
+            kind: CommandFailureKind::Failed,
             stage,
             message: message.into(),
             operation: Some(operation),
         }
     }
+
+    fn interrupted(
+        stage: &'static str,
+        message: impl Into<String>,
+        operation: Option<Operation>,
+    ) -> Self {
+        Self {
+            kind: CommandFailureKind::Interrupted,
+            stage,
+            message: message.into(),
+            operation,
+        }
+    }
+}
+
+fn pre_harness_cancellation_result(command: &str, failure: CommandFailure) -> Value {
+    json!({
+        "command": command,
+        "operator_terminal_outcome": "interrupted",
+        "operator_cancellation": {
+            "stage": failure.stage,
+            "message": failure.message,
+            "operation": failure.operation.as_ref().map(operation_json),
+        },
+        "resources": {},
+    })
 }
 
 fn finish_harness_phase(
@@ -635,17 +798,34 @@ fn finish_harness_phase(
     if !cleanup_complete {
         let close_failure =
             CommandFailure::new(close_stage, format!("{cleanup_field} did not complete"));
-        if failure.is_some() {
-            append_cleanup_error(&mut result, &close_failure);
-        } else {
-            failure = Some(close_failure);
+        match failure.as_ref().map(|failure| failure.kind) {
+            Some(CommandFailureKind::Failed) => {
+                append_cleanup_error(&mut result, &close_failure);
+            }
+            Some(CommandFailureKind::Interrupted) => {
+                append_cleanup_error(&mut result, &close_failure);
+                failure = Some(close_failure);
+            }
+            None => failure = Some(close_failure),
         }
     }
     if let Some(failure) = failure {
-        result["execution_error"] = json!({
-            "stage": failure.stage,
-            "message": failure.message,
-        });
+        match failure.kind {
+            CommandFailureKind::Failed => {
+                result["execution_error"] = json!({
+                    "stage": failure.stage,
+                    "message": failure.message,
+                });
+            }
+            CommandFailureKind::Interrupted => {
+                result["operator_terminal_outcome"] = json!("interrupted");
+                result["operator_cancellation"] = json!({
+                    "stage": failure.stage,
+                    "message": failure.message,
+                    "operation": failure.operation.as_ref().map(operation_json),
+                });
+            }
+        }
     }
     result
 }
@@ -662,10 +842,22 @@ fn append_cleanup_error(result: &mut Value, failure: &CommandFailure) {
 }
 
 fn set_command_failure(result: &mut Value, failure: CommandFailure) {
-    result["execution_error"] = json!({
-        "stage": failure.stage,
-        "message": failure.message,
-    });
+    match failure.kind {
+        CommandFailureKind::Failed => {
+            result["execution_error"] = json!({
+                "stage": failure.stage,
+                "message": failure.message,
+            });
+        }
+        CommandFailureKind::Interrupted => {
+            result["operator_terminal_outcome"] = json!("interrupted");
+            result["operator_cancellation"] = json!({
+                "stage": failure.stage,
+                "message": failure.message,
+                "operation": failure.operation.as_ref().map(operation_json),
+            });
+        }
+    }
 }
 
 fn harness_evidence_json(harness: &Harness) -> Value {
@@ -679,6 +871,7 @@ fn harness_evidence_json(harness: &Harness) -> Value {
     })
 }
 
+#[cfg(test)]
 fn connect_for_command(
     harness: &Harness,
     options: ConnectOptions,
@@ -693,6 +886,29 @@ fn connect_for_command(
     wait_for_command_success(operation, OPERATION_TIMEOUT, wait_stage, terminal_stage)
 }
 
+fn connect_for_command_controlled(
+    harness: &Harness,
+    control: &mut RunControl<'_>,
+    options: ConnectOptions,
+    admit_stage: &'static str,
+    wait_stage: &'static str,
+    terminal_stage: &'static str,
+) -> Result<Value, CommandFailure> {
+    control.checkpoint(admit_stage)?;
+    let operation = harness
+        .controller
+        .connect(options)
+        .map_err(|error| CommandFailure::new(admit_stage, error.to_string()))?;
+    wait_for_command_success_controlled(
+        operation,
+        control,
+        OPERATION_TIMEOUT,
+        wait_stage,
+        terminal_stage,
+    )
+}
+
+#[cfg(test)]
 fn wait_for_command_success(
     operation: Operation,
     timeout: Duration,
@@ -712,19 +928,75 @@ fn wait_for_command_success(
     }
 }
 
+fn wait_for_command_success_controlled(
+    operation: Operation,
+    control: &mut RunControl<'_>,
+    timeout: Duration,
+    wait_stage: &'static str,
+    terminal_stage: &'static str,
+) -> Result<Value, CommandFailure> {
+    let (operation, state) =
+        wait_for_command_terminal_core(operation, timeout, wait_stage, Some(control))?;
+    if state == OperationState::Succeeded {
+        Ok(operation_json(&operation))
+    } else {
+        let message = operation_failure(&operation);
+        Err(CommandFailure::with_operation(
+            terminal_stage,
+            message,
+            operation,
+        ))
+    }
+}
+
+#[cfg(test)]
 fn wait_for_command_terminal(
     operation: Operation,
     timeout: Duration,
     wait_stage: &'static str,
 ) -> Result<(Operation, OperationState), CommandFailure> {
-    let snapshot = match operation.wait(WaitTimeout::For(timeout)) {
-        WaitResult::Completed(snapshot) => snapshot,
-        WaitResult::Timeout => {
+    wait_for_command_terminal_core(operation, timeout, wait_stage, None)
+}
+
+fn wait_for_command_terminal_controlled(
+    operation: Operation,
+    control: &mut RunControl<'_>,
+    timeout: Duration,
+    wait_stage: &'static str,
+) -> Result<(Operation, OperationState), CommandFailure> {
+    wait_for_command_terminal_core(operation, timeout, wait_stage, Some(control))
+}
+
+fn wait_for_command_terminal_core(
+    operation: Operation,
+    timeout: Duration,
+    wait_stage: &'static str,
+    mut control: Option<&mut RunControl<'_>>,
+) -> Result<(Operation, OperationState), CommandFailure> {
+    let started = Instant::now();
+    let snapshot = loop {
+        if let Some(control) = control.as_deref_mut()
+            && control.interrupt.is_requested()
+        {
+            return Err(control.cancel_operation(&operation, wait_stage));
+        }
+        let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
             return Err(CommandFailure::with_operation(
                 wait_stage,
                 format!("operation {} wait timed out", operation.id().get()),
                 operation,
             ));
+        };
+        if remaining.is_zero() {
+            return Err(CommandFailure::with_operation(
+                wait_stage,
+                format!("operation {} wait timed out", operation.id().get()),
+                operation,
+            ));
+        }
+        match operation.wait(WaitTimeout::For(remaining.min(INTERRUPT_POLL_SLICE))) {
+            WaitResult::Completed(snapshot) => break snapshot,
+            WaitResult::Timeout => {}
         }
     };
     if !snapshot.state.is_terminal() {
@@ -751,13 +1023,53 @@ fn run_with_device_admission(
         &mut RunControl<'_>,
     ) -> Result<Value, String>,
 ) -> Result<Value, String> {
-    run_with_device_admission_core(
+    run_with_device_admission_controlled_using(
         command,
         arguments,
         Arc::new(SystemDeviceDiscovery),
         control,
-        |control, payload| control.record_event(JournalEventKind::IdentityAdmission, payload),
         runner,
+    )
+}
+
+fn run_with_device_admission_controlled_using(
+    command: &'static str,
+    arguments: &[String],
+    discovery: Arc<dyn DeviceDiscovery>,
+    control: &mut RunControl<'_>,
+    runner: impl FnOnce(
+        AdmittedDevice,
+        Arc<dyn DeviceDiscovery>,
+        &mut RunControl<'_>,
+    ) -> Result<Value, String>,
+) -> Result<Value, String> {
+    if control.interrupt.is_requested() {
+        let request = device_target_request(arguments)?;
+        let failure = control
+            .checkpoint("identity_admission_interrupt")
+            .expect_err("requested interrupt must stop admission");
+        let mut result = pre_harness_cancellation_result(command, failure);
+        result["device_target"] = device_target_json(&request);
+        result["identity_admission"] = json!({
+            "status": "not_run",
+            "reason": "operator_interrupt",
+            "snapshot": [],
+            "observed_expected": null,
+            "observed_hint": null,
+            "structured_error": null,
+        });
+        return Ok(result);
+    }
+    run_with_device_admission_core(
+        command,
+        arguments,
+        discovery,
+        control,
+        |control, payload| control.record_event(JournalEventKind::IdentityAdmission, payload),
+        |target, discovery, control| match control.checkpoint("runner_interrupt") {
+            Ok(()) => runner(target, discovery, control),
+            Err(failure) => Ok(pre_harness_cancellation_result(command, failure)),
+        },
     )
 }
 
@@ -958,65 +1270,82 @@ fn real_main() -> Result<i32, String> {
     let mut sequence_timings = None;
     let mut operator = ConsoleOperatorPort::new();
     let interrupt = InterruptToken::default();
-    let execution = {
+    let handler_install = install_console_interrupt_handler(&interrupt);
+    let execution = if let Err(error) = handler_install {
+        Err(error)
+    } else {
         let mut control = RunControl::new(&mut reservation, &mut operator, interrupt);
-        match command {
-            "discover" => run_discover(&arguments),
-            "handshake" => run_with_device_admission(
-                "handshake",
-                &arguments,
-                &mut control,
-                |target, discovery, _| run_handshake(&arguments, target, discovery),
-            ),
-            "smoke" => run_with_device_admission(
-                "smoke",
-                &arguments,
-                &mut control,
-                |target, discovery, control| run_smoke(&arguments, target, discovery, control),
-            ),
-            "home-wake" => run_with_device_admission(
-                "home-wake",
-                &arguments,
-                &mut control,
-                |target, discovery, control| run_home_wake(&arguments, target, discovery, control),
-            ),
-            "faults" => run_with_device_admission(
-                "faults",
-                &arguments,
-                &mut control,
-                |target, discovery, _| run_faults(target, discovery),
-            ),
-            "hotplug" => run_with_device_admission(
-                "hotplug",
-                &arguments,
-                &mut control,
-                |target, discovery, _| run_hotplug(&arguments, target, discovery),
-            ),
-            "lifecycle" => run_with_device_admission(
-                "lifecycle",
-                &arguments,
-                &mut control,
-                |target, discovery, _| run_lifecycle(&arguments, target, discovery),
-            ),
-            "sequence" => run_with_device_admission(
-                "sequence",
-                &arguments,
-                &mut control,
-                |target, discovery, _| {
-                    run_sequence(&arguments, target, discovery).map(|(result, timings)| {
-                        sequence_timings = timings;
-                        result
-                    })
-                },
-            ),
-            "amiibo" if amiibo_write_authorized(&arguments) => run_with_device_admission(
-                "amiibo",
-                &arguments,
-                &mut control,
-                |target, discovery, _| run_amiibo(&arguments, target, discovery),
-            ),
-            "amiibo" => run_unauthorized_amiibo(),
-            _ => Err(format!("unknown command: {command}")),
+        if control.interrupt.is_requested() {
+            let failure = control
+                .checkpoint("command_dispatch_interrupt")
+                .expect_err("requested interrupt must stop dispatch");
+            Ok(pre_harness_cancellation_result(command, failure))
+        } else {
+            match command {
+                "discover" => run_discover(&arguments, &mut control),
+                "handshake" => run_with_device_admission(
+                    "handshake",
+                    &arguments,
+                    &mut control,
+                    |target, discovery, control| {
+                        run_handshake(&arguments, target, discovery, control)
+                    },
+                ),
+                "smoke" => run_with_device_admission(
+                    "smoke",
+                    &arguments,
+                    &mut control,
+                    |target, discovery, control| run_smoke(&arguments, target, discovery, control),
+                ),
+                "home-wake" => run_with_device_admission(
+                    "home-wake",
+                    &arguments,
+                    &mut control,
+                    |target, discovery, control| {
+                        run_home_wake(&arguments, target, discovery, control)
+                    },
+                ),
+                "faults" => {
+                    run_with_device_admission("faults", &arguments, &mut control, run_faults)
+                }
+                "hotplug" => run_with_device_admission(
+                    "hotplug",
+                    &arguments,
+                    &mut control,
+                    |target, discovery, control| {
+                        run_hotplug(&arguments, target, discovery, control)
+                    },
+                ),
+                "lifecycle" => run_with_device_admission(
+                    "lifecycle",
+                    &arguments,
+                    &mut control,
+                    |target, discovery, control| {
+                        run_lifecycle(&arguments, target, discovery, control)
+                    },
+                ),
+                "sequence" => run_with_device_admission(
+                    "sequence",
+                    &arguments,
+                    &mut control,
+                    |target, discovery, control| {
+                        run_sequence(&arguments, target, discovery, control).map(
+                            |(result, timings)| {
+                                sequence_timings = timings;
+                                result
+                            },
+                        )
+                    },
+                ),
+                "amiibo" if amiibo_write_authorized(&arguments) => run_with_device_admission(
+                    "amiibo",
+                    &arguments,
+                    &mut control,
+                    |target, discovery, control| run_amiibo(&arguments, target, discovery, control),
+                ),
+                "amiibo" => run_unauthorized_amiibo(),
+                _ => Err(format!("unknown command: {command}")),
+            }
         }
     };
     reservation.record_event(
@@ -1804,6 +2133,9 @@ const FAULT_CLEANUP_ROLES: [(&str, &str); 4] = [
 const FAULT_SCENARIOS: [&str; 3] = ["port_occupied", "cancel", "deadline"];
 
 fn cleanup_contract_succeeded(command: &str, result: &Value) -> bool {
+    if result["operator_terminal_outcome"] == "interrupted" {
+        return interrupted_cleanup_contract_succeeded(command, result);
+    }
     if result["identity_admission"]["status"] == "rejected" {
         return pre_harness_admission_contract_succeeded(result, "rejected");
     }
@@ -1873,6 +2205,95 @@ fn cleanup_contract_succeeded(command: &str, result: &Value) -> bool {
         "discover" | "amiibo" => true,
         _ => true,
     }
+}
+
+fn interrupted_cleanup_contract_succeeded(command: &str, result: &Value) -> bool {
+    let Some(resources) = result.get("resources").and_then(Value::as_object) else {
+        return false;
+    };
+    if resources.is_empty() {
+        return cleanup_slot_count(result) == 0 && runtime_cleanup_count(result) == 0;
+    }
+    match command {
+        "handshake" | "smoke" | "home-wake" | "sequence" | "amiibo" => {
+            partial_single_harness_cleanup_contract_succeeded(result)
+        }
+        "hotplug" => interrupted_hotplug_cleanup_succeeded(result),
+        "lifecycle" => interrupted_lifecycle_cleanup_succeeded(result),
+        "faults" => interrupted_fault_cleanup_succeeded(result),
+        _ => false,
+    }
+}
+
+fn interrupted_hotplug_cleanup_succeeded(result: &Value) -> bool {
+    let Some(resources) = result["resources"].as_object() else {
+        return false;
+    };
+    let created = |role: &str| {
+        resources
+            .get(role)
+            .and_then(Value::as_object)
+            .and_then(|resource| resource.get("created"))
+            .and_then(Value::as_bool)
+    };
+    if resources.len() != 2 || created("initial") != Some(true) {
+        return false;
+    }
+    let Some(reconnected) = created("reconnected") else {
+        return false;
+    };
+    let expected = 1 + usize::from(reconnected);
+    cleanup_slot_count(result) == expected
+        && runtime_cleanup_count(result) == expected
+        && cleanup_succeeded(&result["disconnect_cleanup"])
+        && (!reconnected || cleanup_succeeded(&result["cleanup"]))
+}
+
+fn interrupted_lifecycle_cleanup_succeeded(result: &Value) -> bool {
+    let Some(records) = result["records"].as_array() else {
+        return false;
+    };
+    let created_cycles = result["resources"]["created_cycles"]
+        .as_u64()
+        .and_then(|value| usize::try_from(value).ok());
+    created_cycles == Some(records.len())
+        && records.iter().enumerate().all(|(index, record)| {
+            record["cycle"].as_u64() == u64::try_from(index + 1).ok()
+                && matches!(record["status"].as_str(), Some("completed" | "cancelled"))
+                && primary_resource_was_created(record)
+                && cleanup_succeeded(&record["cleanup"])
+        })
+        && cleanup_slot_count(result) == records.len()
+        && runtime_cleanup_count(result) == records.len()
+}
+
+fn interrupted_fault_cleanup_succeeded(result: &Value) -> bool {
+    let Some(resources) = result["resources"].as_object() else {
+        return false;
+    };
+    if resources.len() != FAULT_CLEANUP_ROLES.len() {
+        return false;
+    }
+    let mut expected = 0;
+    let mut uncreated_seen = false;
+    for (role, cleanup) in FAULT_CLEANUP_ROLES {
+        let Some(created) = resources[role]["created"].as_bool() else {
+            return false;
+        };
+        if created && uncreated_seen {
+            return false;
+        }
+        uncreated_seen |= !created;
+        if created {
+            expected += 1;
+            if !cleanup_succeeded(&result[cleanup]) {
+                return false;
+            }
+        } else if result.get(cleanup).is_some() {
+            return false;
+        }
+    }
+    cleanup_slot_count(result) == expected && runtime_cleanup_count(result) == expected
 }
 
 fn completed_hotplug_cleanup_contract_succeeded(result: &Value) -> bool {
@@ -2514,17 +2935,27 @@ fn apply_provenance_policy(document: &mut Value, provenance: &RuntimeProvenance)
     }
 }
 
-fn run_discover(arguments: &[String]) -> Result<Value, String> {
+fn run_discover(arguments: &[String], control: &mut RunControl<'_>) -> Result<Value, String> {
     let samples = value_or(arguments, "--samples", 3_usize)?;
     if samples == 0 {
         return Err("--samples must be non-zero".to_owned());
     }
     let mut snapshots = Vec::with_capacity(samples);
     for index in 0..samples {
+        if let Err(failure) = control.checkpoint("discover_interrupt") {
+            return Ok(pre_harness_cancellation_result("discover", failure));
+        }
         let ports = discover_system_ports().map_err(|error| error.to_string())?;
         snapshots.push(Value::Array(ports.iter().map(port_json).collect()));
-        if index + 1 != samples {
-            thread::sleep(Duration::from_millis(250));
+        if index + 1 != samples
+            && let Err(failure) = wait_controlled(
+                control,
+                Duration::from_millis(250),
+                &ThreadDelay,
+                "discover_interrupt",
+            )
+        {
+            return Ok(pre_harness_cancellation_result("discover", failure));
         }
     }
     let stable = snapshots.windows(2).all(|pair| pair[0] == pair[1]);
@@ -2541,6 +2972,7 @@ fn run_handshake(
     _arguments: &[String],
     target: AdmittedDevice,
     discovery: Arc<dyn DeviceDiscovery>,
+    control: &mut RunControl<'_>,
 ) -> Result<Value, String> {
     let harness = Harness::new(&target, discovery, ControllerOptions::default())?;
     let result = json!({
@@ -2555,8 +2987,9 @@ fn run_handshake(
         "harness_evidence",
         "handshake_close",
         |harness, result| {
-            result["operation"] = connect_for_command(
+            result["operation"] = connect_for_command_controlled(
                 harness,
+                control,
                 ConnectOptions::default(),
                 "handshake_connect_admit",
                 "handshake_connect_wait",
@@ -2617,8 +3050,9 @@ fn run_smoke(
         "harness_evidence",
         "smoke_close",
         |harness, result| {
-            result["connect_operation"] = connect_for_command(
+            result["connect_operation"] = connect_for_command_controlled(
                 harness,
+                control,
                 ConnectOptions::default(),
                 "smoke_connect_admit",
                 "smoke_connect_wait",
@@ -2626,17 +3060,22 @@ fn run_smoke(
             )?;
             if wake_home {
                 for (label, action) in home_wake_actions() {
-                    exercise_smoke_action(harness, label, action, result, true)?;
+                    exercise_smoke_action_controlled(
+                        harness, control, label, action, result, true,
+                    )?;
                 }
-                record_configured_home_delay(
+                record_configured_home_delay_controlled(
                     result,
+                    control,
                     post_home_neutral_delay_ms.expect("wake-home requires a configured delay"),
                     &ThreadDelay,
-                );
+                )?;
             }
             if wake_left_stick {
                 for (label, action) in left_stick_wake_actions() {
-                    exercise_smoke_action(harness, label, action, result, wake_home)?;
+                    exercise_smoke_action_controlled(
+                        harness, control, label, action, result, wake_home,
+                    )?;
                 }
             }
             for spec in action_specs {
@@ -2704,8 +3143,9 @@ fn run_home_wake(
         "harness_evidence",
         "home_wake_close",
         |harness, result| {
-            result["connect_operation"] = connect_for_command(
+            result["connect_operation"] = connect_for_command_controlled(
                 harness,
+                control,
                 ConnectOptions::default(),
                 "home_wake_connect_admit",
                 "home_wake_connect_wait",
@@ -2719,7 +3159,12 @@ fn run_home_wake(
                         .saturating_mul(interval_seconds),
                 );
                 if let Some(remaining) = target.checked_sub(started.elapsed()) {
-                    thread::sleep(remaining);
+                    wait_controlled(
+                        control,
+                        remaining,
+                        &ThreadDelay,
+                        "home_wake_interval_interrupt",
+                    )?;
                 }
                 let attempt_started_ms =
                     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -2779,8 +3224,12 @@ fn run_home_wake(
 fn run_faults(
     target: AdmittedDevice,
     discovery: Arc<dyn DeviceDiscovery>,
+    control: &mut RunControl<'_>,
 ) -> Result<Value, String> {
-    Ok(faults::run(target, discovery))
+    if let Err(failure) = control.checkpoint("faults_interrupt") {
+        return Ok(pre_harness_cancellation_result("faults", failure));
+    }
+    Ok(faults::run(target, discovery, control))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2829,6 +3278,7 @@ struct HotplugPollTrace {
     outcome: HotplugPollOutcome,
 }
 
+#[cfg(test)]
 fn poll_hotplug_identity(
     discovery: &dyn DeviceDiscovery,
     request: &DeviceTargetRequest,
@@ -2892,6 +3342,77 @@ fn poll_hotplug_identity(
     }
 }
 
+fn poll_hotplug_identity_controlled(
+    discovery: &dyn DeviceDiscovery,
+    request: &DeviceTargetRequest,
+    expected_state: HotplugExpectedState,
+    timeout: Duration,
+    timer: &mut dyn HotplugPollTimer,
+    control: &mut RunControl<'_>,
+) -> Result<HotplugPollTrace, CommandFailure> {
+    let mut observations = Vec::new();
+    loop {
+        control.checkpoint("hotplug_poll_interrupt")?;
+        if timer.elapsed() >= timeout {
+            return Ok(HotplugPollTrace {
+                observations,
+                outcome: HotplugPollOutcome::TimedOut,
+            });
+        }
+        let snapshot = match discovery.discover() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return Ok(HotplugPollTrace {
+                    observations,
+                    outcome: HotplugPollOutcome::DiscoveryError(error),
+                });
+            }
+        };
+        match rebind_device(request, snapshot) {
+            RebindDecision::Rebound(target) => {
+                observations.push(target.evidence().clone());
+                if expected_state == HotplugExpectedState::Present {
+                    return Ok(HotplugPollTrace {
+                        observations,
+                        outcome: HotplugPollOutcome::Rebound(Box::new(target)),
+                    });
+                }
+            }
+            RebindDecision::ExpectedAbsent(evidence) => {
+                observations.push(evidence);
+                if expected_state == HotplugExpectedState::Absent {
+                    return Ok(HotplugPollTrace {
+                        observations,
+                        outcome: HotplugPollOutcome::ExpectedAbsent,
+                    });
+                }
+            }
+            RebindDecision::Ambiguous(evidence) => {
+                observations.push(evidence);
+                return Ok(HotplugPollTrace {
+                    observations,
+                    outcome: HotplugPollOutcome::AmbiguousSnapshot,
+                });
+            }
+        }
+
+        let elapsed = timer.elapsed();
+        if elapsed >= timeout {
+            return Ok(HotplugPollTrace {
+                observations,
+                outcome: HotplugPollOutcome::TimedOut,
+            });
+        }
+        let mut remaining = HOTPLUG_POLL_INTERVAL.min(timeout - elapsed);
+        while !remaining.is_zero() {
+            control.checkpoint("hotplug_poll_interrupt")?;
+            let current = remaining.min(INTERRUPT_POLL_SLICE);
+            timer.wait(current);
+            remaining = remaining.saturating_sub(current);
+        }
+    }
+}
+
 fn hotplug_poll_trace_json(trace: &HotplugPollTrace) -> Value {
     let (outcome, structured_error) = match &trace.outcome {
         HotplugPollOutcome::ExpectedAbsent => ("expected_absent", Value::Null),
@@ -2933,6 +3454,7 @@ fn run_hotplug(
     arguments: &[String],
     target: AdmittedDevice,
     discovery: Arc<dyn DeviceDiscovery>,
+    control: &mut RunControl<'_>,
 ) -> Result<Value, String> {
     let timeout_seconds = value_or(arguments, "--timeout-seconds", 180_u64)?;
     let timeout = Duration::from_secs(timeout_seconds);
@@ -2959,8 +3481,9 @@ fn run_hotplug(
         "initial_harness_evidence",
         "hotplug_initial_close",
         |harness, result| {
-            result["initial_connect_operation"] = connect_for_command(
+            result["initial_connect_operation"] = connect_for_command_controlled(
                 harness,
+                control,
                 ConnectOptions::default(),
                 "hotplug_initial_connect_admit",
                 "hotplug_initial_connect_wait",
@@ -2973,13 +3496,14 @@ fn run_hotplug(
             })?;
             push_hotplug_transition(result, "awaiting_expected_absent");
             let mut timer = SystemHotplugPollTimer::new();
-            let trace = poll_hotplug_identity(
+            let trace = poll_hotplug_identity_controlled(
                 discovery.as_ref(),
                 &request,
                 HotplugExpectedState::Absent,
                 timeout,
                 &mut timer,
-            );
+                control,
+            )?;
             result["absence_poll"] = hotplug_poll_trace_json(&trace);
             match trace.outcome {
                 HotplugPollOutcome::ExpectedAbsent => {}
@@ -3001,11 +3525,13 @@ fn run_hotplug(
                     unreachable!("absence poll cannot return a present target")
                 }
             }
+            control.checkpoint("hotplug_disconnect_admit")?;
             let disconnected = harness.controller.reset().map_err(|error| {
                 CommandFailure::new("hotplug_disconnect_admit", error.to_string())
             })?;
-            let (disconnected, state) = wait_for_command_terminal(
+            let (disconnected, state) = wait_for_command_terminal_controlled(
                 disconnected,
+                control,
                 OPERATION_TIMEOUT,
                 "hotplug_disconnect_wait",
             )?;
@@ -3016,6 +3542,10 @@ fn run_hotplug(
     );
     if cleanup_succeeded(&result["disconnect_cleanup"]) {
         push_hotplug_transition(&mut result, "initial_closed");
+    }
+    if result["operator_terminal_outcome"] == "interrupted" {
+        push_hotplug_transition(&mut result, "cancelled");
+        return Ok(result);
     }
     if result.get("execution_error").is_some() {
         push_hotplug_transition(&mut result, "failed");
@@ -3037,13 +3567,21 @@ fn run_hotplug(
     }
     push_hotplug_transition(&mut result, "awaiting_expected_return");
     let mut timer = SystemHotplugPollTimer::new();
-    let trace = poll_hotplug_identity(
+    let trace = match poll_hotplug_identity_controlled(
         discovery.as_ref(),
         &request,
         HotplugExpectedState::Present,
         timeout,
         &mut timer,
-    );
+        control,
+    ) {
+        Ok(trace) => trace,
+        Err(failure) => {
+            set_command_failure(&mut result, failure);
+            push_hotplug_transition(&mut result, "cancelled");
+            return Ok(result);
+        }
+    };
     result["return_poll"] = hotplug_poll_trace_json(&trace);
     let rebound = match trace.outcome {
         HotplugPollOutcome::Rebound(target) => target,
@@ -3078,6 +3616,11 @@ fn run_hotplug(
     result["rebound_admission"] = admission_evidence_json(rebound.evidence(), "rebound");
     result["reconnected_identity"] = port_json(rebound.descriptor());
     push_hotplug_transition(&mut result, "rebound_admitted");
+    if let Err(failure) = control.checkpoint("hotplug_reconnect_interrupt") {
+        set_command_failure(&mut result, failure);
+        push_hotplug_transition(&mut result, "cancelled");
+        return Ok(result);
+    }
     let reconnected = match Harness::new(&rebound, discovery, ControllerOptions::default()) {
         Ok(harness) => harness,
         Err(error) => {
@@ -3097,8 +3640,9 @@ fn run_hotplug(
         "reconnected_harness_evidence",
         "hotplug_reconnected_close",
         |harness, result| {
-            result["reconnect_operation"] = connect_for_command(
+            result["reconnect_operation"] = connect_for_command_controlled(
                 harness,
+                control,
                 ConnectOptions::default(),
                 "hotplug_reconnect_admit",
                 "hotplug_reconnect_wait",
@@ -3109,7 +3653,9 @@ fn run_hotplug(
             Ok(())
         },
     );
-    if result.get("execution_error").is_none() && cleanup_succeeded(&result["cleanup"]) {
+    if result["operator_terminal_outcome"] == "interrupted" {
+        push_hotplug_transition(&mut result, "cancelled");
+    } else if result.get("execution_error").is_none() && cleanup_succeeded(&result["cleanup"]) {
         push_hotplug_transition(&mut result, "closed");
     } else {
         push_hotplug_transition(&mut result, "failed");
@@ -3121,6 +3667,7 @@ fn run_lifecycle(
     arguments: &[String],
     initial_target: AdmittedDevice,
     discovery: Arc<dyn DeviceDiscovery>,
+    control: &mut RunControl<'_>,
 ) -> Result<Value, String> {
     let cycles = value_or(arguments, "--cycles", 100_usize)?;
     if cycles == 0 {
@@ -3137,6 +3684,10 @@ fn run_lifecycle(
         "resources": {"created_cycles": 0},
     });
     for cycle in 1..=cycles {
+        if let Err(failure) = control.checkpoint("lifecycle_cycle_interrupt") {
+            set_command_failure(&mut result, failure);
+            return Ok(result);
+        }
         let target = next_target
             .take()
             .expect("a successful prior admission provides the next lifecycle target");
@@ -3163,8 +3714,9 @@ fn run_lifecycle(
             "harness_evidence",
             "lifecycle_close",
             |harness, record| {
-                record["connect_operation"] = connect_for_command(
+                record["connect_operation"] = connect_for_command_controlled(
                     harness,
+                    control,
                     ConnectOptions::default(),
                     "lifecycle_connect_admit",
                     "lifecycle_connect_wait",
@@ -3203,6 +3755,15 @@ fn run_lifecycle(
         };
         record["status"] = json!("completed");
         record["process"] = metrics;
+        if let Err(failure) = control.checkpoint("lifecycle_discovery_interrupt") {
+            record["status"] = json!("cancelled");
+            result["records"]
+                .as_array_mut()
+                .expect("lifecycle records are an array")
+                .push(record);
+            set_command_failure(&mut result, failure);
+            return Ok(result);
+        }
         match admit_device(discovery.as_ref(), request.clone()) {
             Ok(AdmissionDecision::Admitted(admitted)) => {
                 record["port_present"] = json!(true);
@@ -3285,6 +3846,7 @@ fn run_sequence(
     arguments: &[String],
     target: AdmittedDevice,
     discovery: Arc<dyn DeviceDiscovery>,
+    control: &mut RunControl<'_>,
 ) -> Result<(Value, Option<Vec<u8>>), String> {
     let steps = value_or(arguments, "--steps", 10_000_usize)?;
     if !(1..=10_000).contains(&steps) {
@@ -3306,8 +3868,9 @@ fn run_sequence(
         "harness_evidence",
         "sequence_close",
         |harness, result| {
-            result["connect_operation"] = connect_for_command(
+            result["connect_operation"] = connect_for_command_controlled(
                 harness,
+                control,
                 ConnectOptions::default(),
                 "sequence_connect_admit",
                 "sequence_connect_wait",
@@ -3329,6 +3892,7 @@ fn run_sequence(
             let sequence = PreciseSequence::new(sequence_steps)
                 .map_err(|error| CommandFailure::new("sequence_build", error.to_string()))?;
             let started = harness.now_ns();
+            control.checkpoint("sequence_admit")?;
             let operation = harness
                 .controller
                 .precise_sequence(sequence)
@@ -3338,20 +3902,23 @@ fn run_sequence(
                 .saturating_mul(30)
                 .div_ceil(1_000)
                 .saturating_add(60);
-            let (operation, state) = wait_for_command_terminal(
+            let (operation, state) = wait_for_command_terminal_controlled(
                 operation,
+                control,
                 Duration::from_secs(expected_seconds),
                 "sequence_terminal_wait",
             )?;
             let ended = harness.now_ns();
             result["operation"] = operation_json(&operation);
             result["functional_success"] = json!(state == OperationState::Succeeded);
+            control.checkpoint("sequence_reset_admit")?;
             let reset = harness
                 .controller
                 .reset()
                 .map_err(|error| CommandFailure::new("sequence_reset_admit", error.to_string()))?;
-            result["reset_operation"] = wait_for_command_success(
+            result["reset_operation"] = wait_for_command_success_controlled(
                 reset,
+                control,
                 OPERATION_TIMEOUT,
                 "sequence_reset_wait",
                 "sequence_reset_terminal",
@@ -3402,6 +3969,7 @@ fn run_amiibo(
     arguments: &[String],
     target: AdmittedDevice,
     discovery: Arc<dyn DeviceDiscovery>,
+    control: &mut RunControl<'_>,
 ) -> Result<Value, String> {
     if !arguments
         .iter()
@@ -3445,31 +4013,36 @@ fn run_amiibo(
         "harness_evidence",
         "amiibo_close",
         move |harness, result| {
-            result["connect_operation"] = connect_for_command(
+            result["connect_operation"] = connect_for_command_controlled(
                 harness,
+                control,
                 ConnectOptions::default(),
                 "amiibo_connect_admit",
                 "amiibo_connect_wait",
                 "amiibo_connect_terminal",
             )?;
+            control.checkpoint("amiibo_save_admit")?;
             result["write_attempted"] = json!(true);
             let save = harness
                 .controller
                 .save_amiibo(slot, data, AmiiboSaveOptions::default())
                 .map_err(|error| CommandFailure::new("amiibo_save_admit", error.to_string()))?;
-            result["save"] = wait_for_command_success(
+            result["save"] = wait_for_command_success_controlled(
                 save,
+                control,
                 Duration::from_secs(60),
                 "amiibo_save_wait",
                 "amiibo_save_terminal",
             )?;
             result["write_performed"] = json!(true);
+            control.checkpoint("amiibo_select_admit")?;
             let select = harness
                 .controller
                 .select_amiibo(slot, AmiiboSelectOptions::default())
                 .map_err(|error| CommandFailure::new("amiibo_select_admit", error.to_string()))?;
-            result["select"] = wait_for_command_success(
+            result["select"] = wait_for_command_success_controlled(
                 select,
+                control,
                 OPERATION_TIMEOUT,
                 "amiibo_select_wait",
                 "amiibo_select_terminal",
@@ -3604,21 +4177,29 @@ fn exercise_observed_action_unit(
         &spec.label,
     );
     control.announce(&marker)?;
-    let active = exercise_action_for_command(
+    let active = exercise_action_for_command_controlled(
         harness,
+        control,
         &spec.active_label,
         spec.active,
         &mut result["actions"],
     )?;
-    delay.wait(Duration::from_millis(observation_window_ms));
-    let release = exercise_action_for_command(
+    wait_controlled(
+        control,
+        Duration::from_millis(observation_window_ms),
+        delay,
+        "observation_window_interrupt",
+    )?;
+    let release = exercise_action_for_command_controlled(
         harness,
+        control,
         &spec.release_label,
         spec.release,
         &mut result["actions"],
     )?;
-    let neutral = exercise_action_for_command(
+    let neutral = exercise_action_for_command_controlled(
         harness,
+        control,
         "neutral",
         ControllerAction::Reset,
         &mut result["actions"],
@@ -3648,6 +4229,7 @@ fn exercise_observed_action_unit(
     Ok(outcome)
 }
 
+#[cfg(test)]
 fn exercise_action_for_command(
     harness: &Harness,
     label: &str,
@@ -3671,14 +4253,47 @@ fn exercise_action_for_command(
     Ok(operation)
 }
 
-fn exercise_smoke_action(
+fn exercise_action_for_command_controlled(
     harness: &Harness,
+    control: &mut RunControl<'_>,
+    label: &str,
+    action: ControllerAction,
+    output: &mut Value,
+) -> Result<Value, CommandFailure> {
+    control.checkpoint("action_admit")?;
+    let operation = harness
+        .controller
+        .direct(action)
+        .map_err(|error| CommandFailure::new("action_admit", format!("{label}: {error}")))?;
+    let operation = wait_for_command_success_controlled(
+        operation,
+        control,
+        OPERATION_TIMEOUT,
+        "action_wait",
+        "action_terminal",
+    )?;
+    output
+        .as_array_mut()
+        .expect("action output is an array")
+        .push(json!({"label": label, "operation": operation.clone()}));
+    Ok(operation)
+}
+
+fn exercise_smoke_action_controlled(
+    harness: &Harness,
+    control: &mut RunControl<'_>,
     label: &str,
     action: ControllerAction,
     result: &mut Value,
     record_diagnostic_step: bool,
 ) -> Result<(), CommandFailure> {
-    exercise_action_for_command(harness, label, action, &mut result["actions"])?;
+    exercise_action_for_command_controlled(
+        harness,
+        control,
+        label,
+        action,
+        &mut result["actions"],
+    )?;
     if record_diagnostic_step {
         record_last_smoke_action_in_diagnostic(result);
     }
@@ -3721,6 +4336,7 @@ fn smoke_home_delay(arguments: &[String], wake_home: bool) -> Result<Option<u64>
     }
 }
 
+#[cfg(test)]
 fn record_configured_home_delay(
     result: &mut Value,
     configured_delay_ms: u64,
@@ -3735,6 +4351,29 @@ fn record_configured_home_delay(
             "configured_post_home_neutral_delay_ms": configured_delay_ms,
             "status": "completed",
         }));
+}
+
+fn record_configured_home_delay_controlled(
+    result: &mut Value,
+    control: &mut RunControl<'_>,
+    configured_delay_ms: u64,
+    delay: &dyn QualificationDelay,
+) -> Result<(), CommandFailure> {
+    wait_controlled(
+        control,
+        Duration::from_millis(configured_delay_ms),
+        delay,
+        "diagnostic_delay_interrupt",
+    )?;
+    result["diagnostic_prelude_steps"]
+        .as_array_mut()
+        .expect("diagnostic prelude steps are an array")
+        .push(json!({
+            "kind": "configured_wait",
+            "configured_post_home_neutral_delay_ms": configured_delay_ms,
+            "status": "completed",
+        }));
+    Ok(())
 }
 
 fn validate_hold_ms(hold_ms: u64) -> Result<(), String> {
@@ -3798,6 +4437,25 @@ fn wait_terminal(
     match operation.wait(WaitTimeout::For(timeout)) {
         WaitResult::Completed(snapshot) => Ok(snapshot),
         WaitResult::Timeout => Err(format!("operation {} wait timed out", operation.id().get())),
+    }
+}
+
+fn wait_terminal_sliced(
+    operation: &Operation,
+    timeout: Duration,
+) -> Result<easycon_runtime::OperationSnapshot, String> {
+    let started = Instant::now();
+    loop {
+        let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
+            return Err(format!("operation {} wait timed out", operation.id().get()));
+        };
+        if remaining.is_zero() {
+            return Err(format!("operation {} wait timed out", operation.id().get()));
+        }
+        match operation.wait(WaitTimeout::For(remaining.min(INTERRUPT_POLL_SLICE))) {
+            WaitResult::Completed(snapshot) => return Ok(snapshot),
+            WaitResult::Timeout => {}
+        }
     }
 }
 
@@ -3874,6 +4532,19 @@ fn operation_json(operation: &Operation) -> Value {
     let snapshot = operation.snapshot();
     json!({
         "id": operation.id().get(),
+        "state": format!("{:?}", snapshot.state),
+        "error": snapshot.error.as_ref().map(ToString::to_string),
+        "structured_error": snapshot.error.as_ref().map(|error| json!({
+            "domain": format!("{:?}", error.domain()),
+            "code": format!("{:?}", error.code()),
+            "message": error.message(),
+        })),
+        "cancellation_reason": snapshot.cancellation_reason.map(|reason| format!("{reason:?}")),
+    })
+}
+
+fn operation_snapshot_json(snapshot: &easycon_runtime::OperationSnapshot) -> Value {
+    json!({
         "state": format!("{:?}", snapshot.state),
         "error": snapshot.error.as_ref().map(ToString::to_string),
         "structured_error": snapshot.error.as_ref().map(|error| json!({
@@ -4290,7 +4961,7 @@ mod tests {
 
     use easycon_controller::TransportErrorKind;
     use easycon_model::{EasyConError, ErrorCode, ErrorDomain};
-    use easycon_runtime::{CancellationReason, CancellationToken, ManagedResource};
+    use easycon_runtime::{CancellationReason, CancellationToken, ManagedResource, OperationValue};
     use easycon_serial::{ByteIoOperation, SerialErrorKind};
 
     struct TestDirectory(PathBuf);
@@ -4724,6 +5395,18 @@ mod tests {
         }
     }
 
+    struct InterruptingDelay {
+        token: InterruptToken,
+        calls: AtomicUsize,
+    }
+
+    impl QualificationDelay for InterruptingDelay {
+        fn wait(&self, _duration: Duration) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.token.request();
+        }
+    }
+
     impl ByteIoFactory for ScriptedOpenFactory {
         fn open(
             &mut self,
@@ -4783,6 +5466,71 @@ mod tests {
         assert_eq!(document["qualification_status"], "passed");
         assert_eq!(document_exit_code(&document), 0);
         assert_eq!(document["provenance"]["trusted"], true);
+    }
+
+    #[test]
+    fn pre_harness_interrupt_skips_discovery_and_action_admission() {
+        let directory = TestDirectory::new("pre-harness-interrupt");
+        let mut reservation = ArtifactReservation::begin_journaled(
+            "handshake",
+            &directory.0,
+            RunStartMetadata {
+                normalized_arguments: json!(["handshake"]),
+                provenance: json!({"trusted": true}),
+            },
+        )
+        .expect("journaled reservation");
+        let discovery_calls = Arc::new(AtomicUsize::new(0));
+        let runner_calls = Arc::new(AtomicUsize::new(0));
+        let discovery: Arc<dyn DeviceDiscovery> = Arc::new(ScriptedDeviceDiscovery {
+            result: Ok(vec![
+                SerialPortDescriptor::new("DEVICE\\EXPECTED", "COM8").expect("descriptor"),
+            ]),
+            calls: Arc::clone(&discovery_calls),
+        });
+        let arguments = vec![
+            "handshake".to_owned(),
+            "--port".to_owned(),
+            "COM8".to_owned(),
+            "--expected-identity".to_owned(),
+            "DEVICE\\EXPECTED".to_owned(),
+        ];
+        let mut port = ScriptedOperatorPort::new([]);
+        let token = InterruptToken::default();
+        token.request();
+        let observed_runner_calls = Arc::clone(&runner_calls);
+        let result = {
+            let mut control = RunControl::new(&mut reservation, &mut port, token);
+            run_with_device_admission_controlled_using(
+                "handshake",
+                &arguments,
+                discovery,
+                &mut control,
+                move |_, _, _| {
+                    observed_runner_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(json!({"unexpected": true}))
+                },
+            )
+            .expect("cancelled admission")
+        };
+
+        assert_eq!(discovery_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(runner_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(result["identity_admission"]["status"], "not_run");
+        assert_eq!(result["operator_terminal_outcome"], "interrupted");
+        assert_eq!(result["resources"], json!({}));
+        assert!(cleanup_contract_succeeded("handshake", &result));
+        let events = journal::parse_journal(
+            &fs::read(directory.0.join(journal::JOURNAL_FILE_NAME)).expect("journal"),
+        )
+        .expect("events");
+        assert_eq!(events[1]["event"], "interrupt_requested");
+        assert_eq!(events[2]["event"], "cancellation_terminal");
+        let (document, failure) = finalize_result("handshake", Ok(result));
+        assert!(failure.is_none());
+        assert_eq!(document["execution_status"], "cancelled");
+        assert_eq!(document["qualification_status"], "unverified");
+        assert_eq!(document_exit_code(&document), 130);
     }
 
     #[test]
@@ -4978,7 +5726,10 @@ mod tests {
             assert_eq!(port.announced.len(), 1);
             assert_eq!(port.observed.len(), 1);
             assert_eq!(port.announced[0].action_id, "button.A");
-            assert_eq!(waits, [Duration::from_millis(100)]);
+            assert_eq!(
+                waits,
+                [Duration::from_millis(50), Duration::from_millis(50)]
+            );
             assert_eq!(result["actions"].as_array().map(Vec::len), Some(3));
             assert_eq!(
                 result["operator_observations"][0]["response_timeout_ms"],
@@ -5024,6 +5775,310 @@ mod tests {
         result["operator_observations"][0]["action_id"] = json!("button.B");
         let (document, _) = finalize_result("smoke", Ok(result));
         assert_eq!(document["execution_status"], "completed");
+        assert_eq!(document["qualification_status"], "failed");
+        assert_eq!(document_exit_code(&document), 1);
+    }
+
+    #[test]
+    fn interrupt_cancels_one_owned_operation_and_preserves_the_unique_terminal() {
+        for success_wins in [false, true] {
+            let directory = TestDirectory::new(if success_wins {
+                "interrupt-success-race"
+            } else {
+                "interrupt-cancel"
+            });
+            let mut reservation = ArtifactReservation::begin_journaled(
+                "handshake",
+                &directory.0,
+                RunStartMetadata {
+                    normalized_arguments: json!(["handshake"]),
+                    provenance: json!({"trusted": true}),
+                },
+            )
+            .expect("journaled reservation");
+            let mut port = ScriptedOperatorPort::new([]);
+            let token = InterruptToken::default();
+            let runtime = Runtime::new(Arc::new(SystemClock::default()));
+            let operation = runtime.create_operation(None).expect("operation");
+            assert_eq!(operation.start(), TransitionOutcome::Applied);
+            if success_wins {
+                assert_eq!(
+                    operation.succeed(OperationValue::Unit),
+                    TransitionOutcome::Applied
+                );
+            } else {
+                let completing = operation.clone();
+                operation.on_cancel(move || {
+                    assert_eq!(completing.finish_cancelled(), TransitionOutcome::Applied);
+                });
+            }
+            token.request();
+            let failure = {
+                let mut control = RunControl::new(&mut reservation, &mut port, token);
+                match wait_for_command_terminal_controlled(
+                    operation.clone(),
+                    &mut control,
+                    Duration::from_secs(1),
+                    "interrupt_wait",
+                ) {
+                    Ok(_) => panic!("interrupt must stop the wait"),
+                    Err(failure) => failure,
+                }
+            };
+            assert_eq!(failure.kind, CommandFailureKind::Interrupted);
+            let snapshot = operation.snapshot();
+            assert_eq!(
+                snapshot.state,
+                if success_wins {
+                    OperationState::Succeeded
+                } else {
+                    OperationState::Cancelled
+                }
+            );
+            if !success_wins {
+                assert_eq!(
+                    snapshot.cancellation_reason,
+                    Some(CancellationReason::Requested)
+                );
+            }
+            let events = journal::parse_journal(
+                &fs::read(directory.0.join(journal::JOURNAL_FILE_NAME)).expect("journal"),
+            )
+            .expect("events");
+            assert_eq!(events[1]["event"], "interrupt_requested");
+            assert_eq!(events[2]["event"], "cancellation_terminal");
+            assert_eq!(
+                events[2]["payload"]["request_outcome"],
+                if success_wins {
+                    "AlreadyTerminal"
+                } else {
+                    "Applied"
+                }
+            );
+            assert_eq!(runtime.close(), Ok(CloseOutcome::Closed));
+        }
+    }
+
+    #[test]
+    fn nonneutral_interrupt_closes_cleanly_before_cancelled_artifact_commit() {
+        let directory = TestDirectory::new("interrupt-action-window");
+        let mut reservation = ArtifactReservation::begin_journaled(
+            "smoke",
+            &directory.0,
+            RunStartMetadata {
+                normalized_arguments: json!(["smoke"]),
+                provenance: json!({"trusted": true}),
+            },
+        )
+        .expect("journaled reservation");
+        let mut port = ScriptedOperatorPort::new([]);
+        let token = InterruptToken::default();
+        let delay = InterruptingDelay {
+            token: token.clone(),
+            calls: AtomicUsize::new(0),
+        };
+        let harness = observed_harness(Box::new(NoopTransport), "INTERRUPT-WINDOW");
+        let expected_stable_id = harness.descriptor.stable_id().to_owned();
+        let spec = smoke_observation_specs(false).remove(0);
+        let result = json!({
+            "command": "smoke",
+            "stage": "a_only",
+            "device_target": {"expected_stable_id": expected_stable_id},
+            "identity_admission": {
+                "status": "admitted",
+                "observed_expected": {"stable_id": expected_stable_id},
+            },
+            "required_operator_action_ids": ["button.A"],
+            "operator_observations": [],
+            "actions": [],
+            "resources": {"primary": {"created": true}},
+        });
+        let result = {
+            let mut control = RunControl::new(&mut reservation, &mut port, token);
+            finish_harness_phase(
+                harness,
+                result,
+                "cleanup",
+                "harness_evidence",
+                "smoke_close",
+                |harness, result| {
+                    result["connect_operation"] = connect_for_command_controlled(
+                        harness,
+                        &mut control,
+                        ConnectOptions::default(),
+                        "smoke_connect_admit",
+                        "smoke_connect_wait",
+                        "smoke_connect_terminal",
+                    )?;
+                    exercise_observed_action_unit(
+                        harness,
+                        &mut control,
+                        "smoke",
+                        &expected_stable_id,
+                        &expected_stable_id,
+                        &spec,
+                        100,
+                        Duration::from_secs(1),
+                        result,
+                        &delay,
+                    )?;
+                    Ok(())
+                },
+            )
+        };
+        assert_eq!(delay.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(result["actions"].as_array().map(Vec::len), Some(1));
+        assert_eq!(result["operator_terminal_outcome"], "interrupted");
+        assert!(cleanup_succeeded(&result["cleanup"]));
+        assert_eq!(
+            result["cleanup"]["controller"]["neutralization"],
+            "accepted"
+        );
+
+        let execution = Ok(result.clone());
+        reservation
+            .record_event(
+                JournalEventKind::OperationTerminal,
+                execution_journal_payload("smoke", &execution),
+            )
+            .expect("operation terminal");
+        reservation
+            .record_event(
+                JournalEventKind::CleanupTerminal,
+                cleanup_journal_payload("smoke", &execution),
+            )
+            .expect("cleanup terminal");
+        let (mut document, _) = finalize_result("smoke", execution);
+        let ended_unix_ns = current_unix_ns().expect("end time");
+        document["run"] = reservation.run_identity_json(ended_unix_ns);
+        document["auxiliary_artifacts"] = json!([]);
+        reservation
+            .record_event(
+                JournalEventKind::RunProjectionFinalized,
+                json!({"ended_unix_ns": ended_unix_ns, "document": document.clone()}),
+            )
+            .expect("projection");
+        reservation
+            .seal_journal(json!({"primary_artifact": "smoke.json"}))
+            .expect("seal");
+        document["run"]["journal_projection"] =
+            reservation.journal_projection().expect("projection");
+        reservation.commit(&document).expect("cancelled artifact");
+
+        let saved: Value = serde_json::from_slice(
+            &fs::read(directory.0.join("smoke.json")).expect("saved artifact"),
+        )
+        .expect("saved JSON");
+        assert_eq!(saved["execution_status"], "cancelled");
+        assert_eq!(saved["qualification_status"], "unverified");
+        assert_eq!(document_exit_code(&saved), 130);
+        let events = journal::parse_journal(
+            &fs::read(directory.0.join(journal::JOURNAL_FILE_NAME)).expect("journal"),
+        )
+        .expect("events");
+        let event_names = events
+            .iter()
+            .map(|event| event["event"].as_str().expect("event"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            &event_names[1..],
+            [
+                "interrupt_requested",
+                "cancellation_terminal",
+                "operation_terminal",
+                "cleanup_terminal",
+                "run_projection_finalized",
+                "artifact_finalization_started",
+            ]
+        );
+    }
+
+    #[test]
+    fn cleanup_failure_overrides_an_interrupted_action_outcome() {
+        let directory = TestDirectory::new("interrupt-cleanup-failure");
+        let mut reservation = ArtifactReservation::begin_journaled(
+            "smoke",
+            &directory.0,
+            RunStartMetadata {
+                normalized_arguments: json!(["smoke"]),
+                provenance: json!({"trusted": true}),
+            },
+        )
+        .expect("journaled reservation");
+        let mut port = ScriptedOperatorPort::new([]);
+        let token = InterruptToken::default();
+        let delay = InterruptingDelay {
+            token: token.clone(),
+            calls: AtomicUsize::new(0),
+        };
+        let harness = observed_harness(
+            Box::new(FinalNeutralFailureTransport),
+            "INTERRUPT-CLEANUP-FAILURE",
+        );
+        let expected_stable_id = harness.descriptor.stable_id().to_owned();
+        let spec = smoke_observation_specs(false).remove(0);
+        let result = json!({
+            "command": "smoke",
+            "stage": "a_only",
+            "device_target": {"expected_stable_id": expected_stable_id},
+            "identity_admission": {
+                "status": "admitted",
+                "observed_expected": {"stable_id": expected_stable_id},
+            },
+            "required_operator_action_ids": ["button.A"],
+            "operator_observations": [],
+            "actions": [],
+            "resources": {"primary": {"created": true}},
+        });
+        let result = {
+            let mut control = RunControl::new(&mut reservation, &mut port, token);
+            finish_harness_phase(
+                harness,
+                result,
+                "cleanup",
+                "harness_evidence",
+                "smoke_close",
+                |harness, result| {
+                    result["connect_operation"] = connect_for_command_controlled(
+                        harness,
+                        &mut control,
+                        ConnectOptions::default(),
+                        "smoke_connect_admit",
+                        "smoke_connect_wait",
+                        "smoke_connect_terminal",
+                    )?;
+                    exercise_observed_action_unit(
+                        harness,
+                        &mut control,
+                        "smoke",
+                        &expected_stable_id,
+                        &expected_stable_id,
+                        &spec,
+                        100,
+                        Duration::from_secs(1),
+                        result,
+                        &delay,
+                    )?;
+                    Ok(())
+                },
+            )
+        };
+
+        assert_eq!(delay.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(result["execution_error"]["stage"], "smoke_close");
+        assert_eq!(result["cleanup_errors"][0]["stage"], "smoke_close");
+        assert!(result.get("operator_terminal_outcome").is_none());
+        assert!(!cleanup_succeeded(&result["cleanup"]));
+        assert_eq!(
+            result["cleanup"]["controller"]["neutralization"],
+            "not_delivered"
+        );
+        let (document, failure) = finalize_result("smoke", Ok(result));
+        assert_eq!(
+            failure.as_deref(),
+            Some("smoke_close: cleanup did not complete")
+        );
+        assert_eq!(document["execution_status"], "failed");
         assert_eq!(document["qualification_status"], "failed");
         assert_eq!(document_exit_code(&document), 1);
     }

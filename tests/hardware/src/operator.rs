@@ -22,6 +22,15 @@ impl InterruptToken {
     }
 }
 
+pub(crate) fn install_console_interrupt_handler(token: &InterruptToken) -> Result<(), String> {
+    ctrlc::set_handler(interrupt_handler(token.clone()))
+        .map_err(|error| format!("cannot install console interrupt handler: {error}"))
+}
+
+fn interrupt_handler(token: InterruptToken) -> impl FnMut() + Send + 'static {
+    move || token.request()
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OperatorOutcome {
     Yes,
@@ -233,5 +242,14 @@ mod tests {
             port.observe(&request(), &token),
             Ok(OperatorOutcome::Interrupted)
         );
+    }
+
+    #[test]
+    fn console_callback_only_sets_the_interrupt_token() {
+        let token = InterruptToken::default();
+        let mut handler = interrupt_handler(token.clone());
+        handler();
+        handler();
+        assert!(token.is_requested());
     }
 }

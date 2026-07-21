@@ -3,15 +3,16 @@ use easycon_controller::{
     SequenceStep,
 };
 use easycon_model::Button;
-use easycon_runtime::{Operation, OperationSnapshot, OperationState};
+use easycon_runtime::{Operation, OperationSnapshot, OperationState, WaitResult, WaitTimeout};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use super::{
-    CancelSnapshotReadiness, Harness, OPERATION_TIMEOUT, cancel_snapshot_readiness,
-    cleanup_succeeded, controller_snapshot_json, operation_failure, operation_json, wait_terminal,
+    CancelSnapshotReadiness, CommandFailure, CommandFailureKind, Harness, INTERRUPT_POLL_SLICE,
+    OPERATION_TIMEOUT, RunControl, cancel_snapshot_readiness, cleanup_succeeded,
+    controller_snapshot_json, operation_failure, operation_json, wait_terminal,
 };
 use crate::device::{AdmittedDevice, DeviceDiscovery};
 
@@ -87,17 +88,48 @@ enum FaultWaitStage {
     Deadline,
 }
 
+impl FaultWaitStage {
+    const fn failure_stage(self) -> &'static str {
+        match self {
+            Self::OccupierConnect => "occupier_connect_wait",
+            Self::OccupiedProbe => "occupied_probe_connect_wait",
+            Self::CancelConnect => "cancel_connect_wait",
+            Self::CancelTerminal => "cancel_terminal_wait",
+            Self::Deadline => "deadline_terminal_wait",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FaultFailure {
+    kind: FaultFailureKind,
     stage: &'static str,
     message: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FaultFailureKind {
+    Failed,
+    Interrupted,
 }
 
 impl FaultFailure {
     fn new(stage: &'static str, message: impl Into<String>) -> Self {
         Self {
+            kind: FaultFailureKind::Failed,
             stage,
             message: message.into(),
+        }
+    }
+
+    fn from_command(failure: CommandFailure) -> Self {
+        Self {
+            kind: match failure.kind {
+                CommandFailureKind::Failed => FaultFailureKind::Failed,
+                CommandFailureKind::Interrupted => FaultFailureKind::Interrupted,
+            },
+            stage: failure.stage,
+            message: failure.message,
         }
     }
 }
@@ -127,20 +159,26 @@ trait FaultHarnessFactory {
 }
 
 trait FaultWaiter {
+    fn checkpoint(
+        &mut self,
+        stage: &'static str,
+        operation: Option<&Operation>,
+    ) -> Result<(), FaultFailure>;
+
     fn wait_terminal(
         &mut self,
         stage: FaultWaitStage,
         operation: &Operation,
-    ) -> Result<OperationSnapshot, String>;
+    ) -> Result<OperationSnapshot, FaultFailure>;
 
     fn wait_cancel_ready<H: FaultHarness>(
         &mut self,
         harness: &H,
         operation: &Operation,
         baseline: ControllerSnapshot,
-    ) -> Result<ControllerSnapshot, String>;
+    ) -> Result<ControllerSnapshot, FaultFailure>;
 
-    fn settle(&mut self, operation: &Operation) -> Result<OperationSnapshot, String>;
+    fn settle(&mut self, operation: &Operation) -> Result<OperationSnapshot, FaultFailure>;
 }
 
 trait FaultSequenceBuilder {
@@ -163,15 +201,57 @@ impl FaultHarnessFactory for ProductionFactory {
     }
 }
 
-struct ProductionWaiter;
+#[derive(Default)]
+struct ProductionWaiter<'control, 'run> {
+    control: Option<&'control mut RunControl<'run>>,
+}
 
-impl FaultWaiter for ProductionWaiter {
+impl FaultWaiter for ProductionWaiter<'_, '_> {
+    fn checkpoint(
+        &mut self,
+        stage: &'static str,
+        operation: Option<&Operation>,
+    ) -> Result<(), FaultFailure> {
+        let Some(control) = self.control.as_deref_mut() else {
+            return Ok(());
+        };
+        if !control.interrupt.is_requested() {
+            return Ok(());
+        }
+        let failure = match operation {
+            Some(operation) => control.cancel_operation(operation, stage),
+            None => control
+                .checkpoint(stage)
+                .expect_err("requested interrupt must stop fault admission"),
+        };
+        Err(FaultFailure::from_command(failure))
+    }
+
     fn wait_terminal(
         &mut self,
-        _stage: FaultWaitStage,
+        stage: FaultWaitStage,
         operation: &Operation,
-    ) -> Result<OperationSnapshot, String> {
-        wait_terminal(operation, OPERATION_TIMEOUT)
+    ) -> Result<OperationSnapshot, FaultFailure> {
+        let started = Instant::now();
+        loop {
+            self.checkpoint(stage.failure_stage(), Some(operation))?;
+            let Some(remaining) = OPERATION_TIMEOUT.checked_sub(started.elapsed()) else {
+                return Err(FaultFailure::new(
+                    stage.failure_stage(),
+                    format!("operation {} wait timed out", operation.id().get()),
+                ));
+            };
+            if remaining.is_zero() {
+                return Err(FaultFailure::new(
+                    stage.failure_stage(),
+                    format!("operation {} wait timed out", operation.id().get()),
+                ));
+            }
+            match operation.wait(WaitTimeout::For(remaining.min(INTERRUPT_POLL_SLICE))) {
+                WaitResult::Completed(snapshot) => return Ok(snapshot),
+                WaitResult::Timeout => {}
+            }
+        }
     }
 
     fn wait_cancel_ready<H: FaultHarness>(
@@ -179,38 +259,51 @@ impl FaultWaiter for ProductionWaiter {
         harness: &H,
         operation: &Operation,
         baseline: ControllerSnapshot,
-    ) -> Result<ControllerSnapshot, String> {
+    ) -> Result<ControllerSnapshot, FaultFailure> {
         if !baseline.desired_report.is_neutral()
             || baseline.lease != easycon_controller::ControllerLeaseState::Available
         {
-            return Err("cancel fault baseline was not neutral and lease-available".to_owned());
+            return Err(FaultFailure::new(
+                "cancel_readiness",
+                "cancel fault baseline was not neutral and lease-available",
+            ));
         }
         let expected_count = baseline
             .accepted_report_count
             .checked_add(1)
-            .ok_or_else(|| "accepted report count exhausted".to_owned())?;
+            .ok_or_else(|| {
+                FaultFailure::new("cancel_readiness", "accepted report count exhausted")
+            })?;
         let started = Instant::now();
         loop {
+            self.checkpoint("cancel_readiness", Some(operation))?;
             let snapshot = harness.controller_snapshot();
             match cancel_snapshot_readiness(&snapshot, expected_count, operation.id()) {
                 CancelSnapshotReadiness::Ready => return Ok(snapshot),
                 CancelSnapshotReadiness::Pending => {}
-                CancelSnapshotReadiness::Invalid(message) => return Err(message.to_owned()),
+                CancelSnapshotReadiness::Invalid(message) => {
+                    return Err(FaultFailure::new("cancel_readiness", message));
+                }
             }
             if operation.snapshot().state.is_terminal() {
-                return Err(
-                    "cancel-fault sequence reached terminal before cancel request".to_owned(),
-                );
+                return Err(FaultFailure::new(
+                    "cancel_readiness",
+                    "cancel-fault sequence reached terminal before cancel request",
+                ));
             }
             if started.elapsed() >= OPERATION_TIMEOUT {
-                return Err("timed out waiting for first cancel-fault report acceptance".to_owned());
+                return Err(FaultFailure::new(
+                    "cancel_readiness",
+                    "timed out waiting for first cancel-fault report acceptance",
+                ));
             }
             thread::sleep(Duration::from_millis(1));
         }
     }
 
-    fn settle(&mut self, operation: &Operation) -> Result<OperationSnapshot, String> {
+    fn settle(&mut self, operation: &Operation) -> Result<OperationSnapshot, FaultFailure> {
         wait_terminal(operation, OPERATION_TIMEOUT)
+            .map_err(|error| FaultFailure::new("fault_recovery_settle", error))
     }
 }
 
@@ -446,7 +539,10 @@ impl<H: FaultHarness> FaultRun<H> {
         });
         if !active.operation.snapshot().state.is_terminal() {
             let cancel_outcome = active.operation.cancel();
-            let settle_error = waiter.settle(&active.operation).err();
+            let settle_error = waiter
+                .settle(&active.operation)
+                .err()
+                .map(|failure| failure.message);
             self.result["recovery_operation"] = json!(active.evidence_field);
             self.result["recovery_cancel_outcome"] = json!(format!("{cancel_outcome:?}"));
             self.result["recovery_settle_error"] = json!(settle_error);
@@ -477,24 +573,25 @@ impl<H: FaultHarness> FaultRun<H> {
             FaultRole::Occupier,
         ] {
             if let Err(close_failure) = self.close_role(role) {
-                if failure.is_none() {
-                    failure = Some(close_failure);
-                } else {
-                    let entry = json!({
-                        "stage": close_failure.stage,
-                        "message": close_failure.message,
-                    });
-                    match self.result.get_mut("cleanup_errors") {
-                        Some(Value::Array(errors)) => errors.push(entry),
-                        _ => self.result["cleanup_errors"] = json!([entry]),
+                match failure.as_ref().map(|failure| failure.kind) {
+                    Some(FaultFailureKind::Failed) => {
+                        append_fault_cleanup_error(&mut self.result, &close_failure);
                     }
+                    Some(FaultFailureKind::Interrupted) => {
+                        append_fault_cleanup_error(&mut self.result, &close_failure);
+                        failure = Some(close_failure);
+                    }
+                    None => failure = Some(close_failure),
                 }
             }
         }
 
         if let Some(failure) = failure {
             let scenario = scenario_for_stage(failure.stage);
-            self.result["scenarios"][scenario]["status"] = json!("failed");
+            self.result["scenarios"][scenario]["status"] = json!(match failure.kind {
+                FaultFailureKind::Failed => "failed",
+                FaultFailureKind::Interrupted => "cancelled",
+            });
             self.result["scenarios"][scenario]["failure_stage"] = json!(failure.stage);
             let scenarios = ["port_occupied", "cancel", "deadline"];
             let failed_index = scenarios
@@ -503,19 +600,44 @@ impl<H: FaultHarness> FaultRun<H> {
                 .expect("fault failure maps to a known scenario");
             for later in &scenarios[failed_index + 1..] {
                 self.result["scenarios"][*later]["reason"] = json!({
-                    "kind": "prior_failure",
+                    "kind": match failure.kind {
+                        FaultFailureKind::Failed => "prior_failure",
+                        FaultFailureKind::Interrupted => "operator_interrupt",
+                    },
                     "stage": failure.stage,
                 });
             }
             if scenario == "cancel" && self.result.get("cancel_request_outcome").is_none() {
                 self.result["cancel_request_outcome"] = Value::Null;
             }
-            self.result["execution_error"] = json!({
-                "stage": failure.stage,
-                "message": failure.message,
-            });
+            match failure.kind {
+                FaultFailureKind::Failed => {
+                    self.result["execution_error"] = json!({
+                        "stage": failure.stage,
+                        "message": failure.message,
+                    });
+                }
+                FaultFailureKind::Interrupted => {
+                    self.result["operator_terminal_outcome"] = json!("interrupted");
+                    self.result["operator_cancellation"] = json!({
+                        "stage": failure.stage,
+                        "message": failure.message,
+                    });
+                }
+            }
         }
         self.result
+    }
+}
+
+fn append_fault_cleanup_error(result: &mut Value, failure: &FaultFailure) {
+    let entry = json!({
+        "stage": failure.stage,
+        "message": failure.message,
+    });
+    match result.get_mut("cleanup_errors") {
+        Some(Value::Array(errors)) => errors.push(entry),
+        _ => result["cleanup_errors"] = json!([entry]),
     }
 }
 
@@ -575,8 +697,10 @@ where
     W: FaultWaiter,
     B: FaultSequenceBuilder,
 {
+    waiter.checkpoint("occupier_create", None)?;
     run.begin_scenario("port_occupied");
     create_and_install(run, factory, FaultRole::Occupier, target)?;
+    waiter.checkpoint("occupier_connect_admit", None)?;
     admit_connect(
         run,
         FaultRole::Occupier,
@@ -584,9 +708,7 @@ where
         "occupier_connect_admit",
         "occupier_connect",
     )?;
-    let snapshot = waiter
-        .wait_terminal(FaultWaitStage::OccupierConnect, run.active_operation())
-        .map_err(|error| FaultFailure::new("occupier_connect_wait", error))?;
+    let snapshot = waiter.wait_terminal(FaultWaitStage::OccupierConnect, run.active_operation())?;
     if !snapshot.state.is_terminal() {
         return Err(FaultFailure::new(
             "occupier_connect_terminal",
@@ -601,7 +723,9 @@ where
         ));
     }
 
+    waiter.checkpoint("occupied_probe_create", None)?;
     create_and_install(run, factory, FaultRole::OccupiedProbe, target)?;
+    waiter.checkpoint("occupied_probe_connect_admit", None)?;
     admit_connect(
         run,
         FaultRole::OccupiedProbe,
@@ -612,9 +736,7 @@ where
         "occupied_probe_connect_admit",
         "port_occupied",
     )?;
-    let snapshot = waiter
-        .wait_terminal(FaultWaitStage::OccupiedProbe, run.active_operation())
-        .map_err(|error| FaultFailure::new("occupied_probe_connect_wait", error))?;
+    let snapshot = waiter.wait_terminal(FaultWaitStage::OccupiedProbe, run.active_operation())?;
     if !snapshot.state.is_terminal() {
         return Err(FaultFailure::new(
             "occupied_probe_connect_terminal",
@@ -629,8 +751,10 @@ where
     run.close_role(FaultRole::Occupier)?;
     run.complete_scenario("port_occupied");
 
+    waiter.checkpoint("cancel_create", None)?;
     run.begin_scenario("cancel");
     create_and_install(run, factory, FaultRole::Cancel, target)?;
+    waiter.checkpoint("cancel_connect_admit", None)?;
     admit_connect(
         run,
         FaultRole::Cancel,
@@ -638,9 +762,7 @@ where
         "cancel_connect_admit",
         "cancel_connect",
     )?;
-    let snapshot = waiter
-        .wait_terminal(FaultWaitStage::CancelConnect, run.active_operation())
-        .map_err(|error| FaultFailure::new("cancel_connect_wait", error))?;
+    let snapshot = waiter.wait_terminal(FaultWaitStage::CancelConnect, run.active_operation())?;
     if !snapshot.state.is_terminal() {
         return Err(FaultFailure::new(
             "cancel_connect_terminal",
@@ -657,9 +779,11 @@ where
 
     let baseline = run.harness(FaultRole::Cancel).controller_snapshot();
     run.result["cancel_baseline_snapshot"] = controller_snapshot_json(baseline);
+    waiter.checkpoint("cancel_sequence_build", None)?;
     let sequence = sequence_builder
         .build()
         .map_err(|error| FaultFailure::new("cancel_sequence_build", error))?;
+    waiter.checkpoint("cancel_sequence_admit", None)?;
     let operation = run
         .harness(FaultRole::Cancel)
         .admit_sequence(sequence)
@@ -674,15 +798,14 @@ where
         Err(error) => {
             let observed = run.harness(FaultRole::Cancel).controller_snapshot();
             run.result["cancel_before_request_snapshot"] = controller_snapshot_json(observed);
-            return Err(FaultFailure::new("cancel_readiness", error));
+            return Err(error);
         }
     };
     run.result["cancel_before_request_snapshot"] = controller_snapshot_json(before_request);
+    waiter.checkpoint("cancel_request", Some(run.active_operation()))?;
     let request_outcome = run.active_operation().cancel();
     run.result["cancel_request_outcome"] = json!(format!("{request_outcome:?}"));
-    let snapshot = waiter
-        .wait_terminal(FaultWaitStage::CancelTerminal, run.active_operation())
-        .map_err(|error| FaultFailure::new("cancel_terminal_wait", error))?;
+    let snapshot = waiter.wait_terminal(FaultWaitStage::CancelTerminal, run.active_operation())?;
     if !snapshot.state.is_terminal() {
         return Err(FaultFailure::new(
             "cancel_operation_terminal",
@@ -697,9 +820,11 @@ where
     run.close_role(FaultRole::Cancel)?;
     run.complete_scenario("cancel");
 
+    waiter.checkpoint("deadline_create", None)?;
     run.begin_scenario("deadline");
     create_and_install(run, factory, FaultRole::Deadline, target)?;
     let deadline_ns = run.harness(FaultRole::Deadline).now_ns();
+    waiter.checkpoint("deadline_connect_admit", None)?;
     admit_connect(
         run,
         FaultRole::Deadline,
@@ -710,9 +835,7 @@ where
         "deadline_connect_admit",
         "deadline",
     )?;
-    let snapshot = waiter
-        .wait_terminal(FaultWaitStage::Deadline, run.active_operation())
-        .map_err(|error| FaultFailure::new("deadline_terminal_wait", error))?;
+    let snapshot = waiter.wait_terminal(FaultWaitStage::Deadline, run.active_operation())?;
     if !snapshot.state.is_terminal() {
         return Err(FaultFailure::new(
             "deadline_connect_terminal",
@@ -744,9 +867,15 @@ where
     run.finish(execution, waiter)
 }
 
-pub(super) fn run(target: AdmittedDevice, discovery: Arc<dyn DeviceDiscovery>) -> Value {
+pub(super) fn run(
+    target: AdmittedDevice,
+    discovery: Arc<dyn DeviceDiscovery>,
+    control: &mut RunControl<'_>,
+) -> Value {
     let mut factory = ProductionFactory { discovery };
-    let mut waiter = ProductionWaiter;
+    let mut waiter = ProductionWaiter {
+        control: Some(control),
+    };
     let mut sequence_builder = ProductionSequenceBuilder;
     run_with(&target, &mut factory, &mut waiter, &mut sequence_builder)
 }
@@ -810,6 +939,7 @@ mod tests {
     #[derive(Clone, Copy, Debug, Default)]
     struct FakeScript {
         failure: Option<FailPoint>,
+        interrupt_at: Option<&'static str>,
         additional_close_failure: Option<FaultRole>,
         recovery_settle_failure: bool,
         final_native_attempt: bool,
@@ -1078,14 +1208,36 @@ mod tests {
     }
 
     impl FaultWaiter for FakeWaiter {
+        fn checkpoint(
+            &mut self,
+            stage: &'static str,
+            operation: Option<&Operation>,
+        ) -> Result<(), FaultFailure> {
+            if self.script.interrupt_at == Some(stage) {
+                if let Some(operation) = operation {
+                    let _ = operation.request_cancel(CancellationReason::Requested);
+                    let _ = operation.finish_cancelled();
+                }
+                return Err(FaultFailure {
+                    kind: FaultFailureKind::Interrupted,
+                    stage,
+                    message: "injected operator interrupt".to_owned(),
+                });
+            }
+            Ok(())
+        }
+
         fn wait_terminal(
             &mut self,
             stage: FaultWaitStage,
             operation: &Operation,
-        ) -> Result<OperationSnapshot, String> {
+        ) -> Result<OperationSnapshot, FaultFailure> {
             let point = FailPoint::Wait(stage);
             if self.script.fails(point) {
-                return Err(format!("injected {}", point.stage()));
+                return Err(FaultFailure::new(
+                    stage.failure_stage(),
+                    format!("injected {}", point.stage()),
+                ));
             }
             if self.script.nonterminal_wait == Some(stage) {
                 let mut snapshot = operation.snapshot();
@@ -1103,9 +1255,13 @@ mod tests {
             _harness: &H,
             operation: &Operation,
             baseline: ControllerSnapshot,
-        ) -> Result<ControllerSnapshot, String> {
+        ) -> Result<ControllerSnapshot, FaultFailure> {
+            self.checkpoint("cancel_readiness", Some(operation))?;
             if self.script.fails(FailPoint::CancelReady) {
-                return Err(format!("injected {}", FailPoint::CancelReady.stage()));
+                return Err(FaultFailure::new(
+                    "cancel_readiness",
+                    format!("injected {}", FailPoint::CancelReady.stage()),
+                ));
             }
             Ok(ControllerSnapshot {
                 state: ControllerState::Connected,
@@ -1121,9 +1277,12 @@ mod tests {
             })
         }
 
-        fn settle(&mut self, operation: &Operation) -> Result<OperationSnapshot, String> {
+        fn settle(&mut self, operation: &Operation) -> Result<OperationSnapshot, FaultFailure> {
             if self.script.recovery_settle_failure {
-                return Err("injected recovery_settle".to_owned());
+                return Err(FaultFailure::new(
+                    "fault_recovery_settle",
+                    "injected recovery_settle",
+                ));
             }
             if !operation.snapshot().state.is_terminal() {
                 let _ = operation.finish_cancelled();
@@ -1271,7 +1430,7 @@ mod tests {
         let operation = harness
             .admit_sequence(sequence)
             .expect("sequence operation");
-        let mut waiter = ProductionWaiter;
+        let mut waiter = ProductionWaiter::default();
         let before_close = waiter
             .wait_cancel_ready(&harness, &operation, baseline)
             .expect("non-neutral acceptance");
@@ -1322,7 +1481,7 @@ mod tests {
         run.begin_scenario("port_occupied");
         run.install(FaultRole::Occupier, harness);
 
-        let result = run.finish(Ok(()), &mut ProductionWaiter);
+        let result = run.finish(Ok(()), &mut ProductionWaiter::default());
 
         assert_eq!(result["execution_error"]["stage"], "occupier_close");
         assert_eq!(result["scenarios"]["port_occupied"]["status"], "failed");
@@ -1365,6 +1524,58 @@ mod tests {
         assert_eq!(document["execution_status"], "completed");
         assert_eq!(document["qualification_status"], "passed");
         assert_eq!(document_exit_code(&document), 0);
+    }
+
+    #[test]
+    fn interrupt_during_cancel_readiness_closes_prefix_and_skips_deadline() {
+        let script = FakeScript {
+            interrupt_at: Some("cancel_readiness"),
+            ..FakeScript::default()
+        };
+        let (result, trace) = run_fake(script);
+
+        assert_eq!(
+            trace.attempted,
+            [
+                FaultRole::Occupier,
+                FaultRole::OccupiedProbe,
+                FaultRole::Cancel,
+            ]
+        );
+        assert_closed_once(
+            &trace,
+            &[
+                FaultRole::Occupier,
+                FaultRole::OccupiedProbe,
+                FaultRole::Cancel,
+            ],
+        );
+        assert_eq!(
+            trace.closed,
+            [
+                FaultRole::OccupiedProbe,
+                FaultRole::Occupier,
+                FaultRole::Cancel,
+            ]
+        );
+        assert_eq!(result["resources"]["deadline"]["created"], false);
+        assert_eq!(result["scenarios"]["cancel"]["status"], "cancelled");
+        assert_eq!(
+            result["scenarios"]["deadline"]["reason"],
+            json!({
+                "kind": "operator_interrupt",
+                "stage": "cancel_readiness",
+            })
+        );
+        assert_eq!(result["operator_terminal_outcome"], "interrupted");
+        assert_eq!(result["operator_cancellation"]["stage"], "cancel_readiness");
+        assert!(cleanup_contract_succeeded("faults", &result));
+
+        let (document, failure) = finalize_result("faults", Ok(result));
+        assert!(failure.is_none());
+        assert_eq!(document["execution_status"], "cancelled");
+        assert_eq!(document["qualification_status"], "unverified");
+        assert_eq!(document_exit_code(&document), 130);
     }
 
     #[test]
@@ -1496,6 +1707,7 @@ mod tests {
         for case in cases {
             let script = FakeScript {
                 failure: Some(case.point),
+                interrupt_at: None,
                 additional_close_failure: None,
                 recovery_settle_failure: false,
                 final_native_attempt: false,
@@ -1614,6 +1826,7 @@ mod tests {
     fn cancel_wait_error_remains_authoritative_when_recovery_close_also_fails() {
         let script = FakeScript {
             failure: Some(FailPoint::Wait(FaultWaitStage::CancelTerminal)),
+            interrupt_at: None,
             additional_close_failure: Some(FaultRole::Cancel),
             recovery_settle_failure: false,
             final_native_attempt: false,
@@ -1662,6 +1875,7 @@ mod tests {
     fn recovery_settle_timeout_retains_operation_until_owner_close() {
         let script = FakeScript {
             failure: Some(FailPoint::Wait(FaultWaitStage::CancelTerminal)),
+            interrupt_at: None,
             additional_close_failure: None,
             recovery_settle_failure: true,
             final_native_attempt: false,
@@ -1691,6 +1905,7 @@ mod tests {
     fn close_refreshes_native_attempts_after_wait_failure() {
         let script = FakeScript {
             failure: Some(FailPoint::Wait(FaultWaitStage::OccupiedProbe)),
+            interrupt_at: None,
             additional_close_failure: None,
             recovery_settle_failure: false,
             final_native_attempt: true,
@@ -1719,6 +1934,7 @@ mod tests {
     fn nonterminal_cancel_wait_keeps_operation_owned_and_uses_precise_stage() {
         let script = FakeScript {
             failure: None,
+            interrupt_at: None,
             additional_close_failure: None,
             recovery_settle_failure: false,
             final_native_attempt: false,

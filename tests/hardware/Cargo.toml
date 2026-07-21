@@ -13,6 +13,7 @@ resolver = "3"
 
 [dependencies]
 crossterm = "0.29.0"
+ctrlc = "3.5.0"
 easycon-controller = { path = "../../crates/easycon-controller" }
 easycon-model = { path = "../../crates/easycon-model" }
 easycon-runtime = { path = "../../crates/easycon-runtime" }
