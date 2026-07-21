@@ -13,7 +13,7 @@ mod telemetry;
 use std::env;
 use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -1593,7 +1593,7 @@ fn normalized_arguments(arguments: &[String]) -> Value {
     let mut normalized = Vec::with_capacity(arguments.len());
     let mut redact_next = false;
     for argument in arguments {
-        if redact_next {
+        if redact_next || is_machine_path(argument) {
             normalized.push(json!("<redacted-path>"));
             redact_next = false;
             continue;
@@ -1601,10 +1601,17 @@ fn normalized_arguments(arguments: &[String]) -> Value {
         normalized.push(json!(argument));
         redact_next = matches!(
             argument.as_str(),
-            "--output-dir" | "--data" | "--runs-root" | "--attestations-root"
+            "--output-dir" | "--data" | "--runs-root" | "--attestations-root" | "--limits-source"
         );
     }
     Value::Array(normalized)
+}
+
+fn is_machine_path(value: &str) -> bool {
+    let path = Path::new(value);
+    path.is_absolute()
+        || path.has_root()
+        || matches!(path.components().next(), Some(Component::Prefix(_)))
 }
 
 fn current_unix_ns() -> Result<u64, String> {
@@ -4611,7 +4618,7 @@ fn validate_limits_source(source: &str) -> Result<(), String> {
     if source.trim().is_empty()
         || source.trim() != source
         || source.chars().any(char::is_control)
-        || Path::new(source).is_absolute()
+        || is_machine_path(source)
     {
         return Err(
             "--limits-source must be a non-empty external reference, not a machine path".to_owned(),
@@ -6744,6 +6751,34 @@ mod tests {
         assert_eq!(normalized[10], "1");
         let text = serde_json::to_string(&normalized).expect("normalized arguments");
         assert!(!text.contains("private"));
+    }
+
+    #[test]
+    fn normalized_arguments_redact_rejected_and_unbound_machine_paths() {
+        let arguments = vec![
+            "amiibo".to_owned(),
+            "--limits-source".to_owned(),
+            r"C:\private\capacity.txt".to_owned(),
+            r"G:\private\unexpected.txt".to_owned(),
+            "--slot".to_owned(),
+            "1".to_owned(),
+        ];
+
+        let normalized = normalized_arguments(&arguments);
+
+        assert_eq!(normalized[2], "<redacted-path>");
+        assert_eq!(normalized[3], "<redacted-path>");
+        assert_eq!(normalized[5], "1");
+        assert!(
+            !serde_json::to_string(&normalized)
+                .expect("normalized arguments")
+                .contains("private")
+        );
+    }
+
+    #[test]
+    fn limits_source_rejects_windows_drive_relative_paths() {
+        assert!(validate_limits_source(r"C:capacity.txt").is_err());
     }
 
     fn scripted_smoke_observation(

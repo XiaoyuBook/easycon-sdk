@@ -28,8 +28,10 @@ cleanup 各阶段保存最后已知进度。进程异常终止后，现有 journ
    native open 的 pre/post identity guard。
 3. `--slot N` 与 `--disposable-slot N` 都恰好出现一次且数值完全相同。旧的 blanket
    `--confirm-disposable` 不能单独或共同形成授权。
-4. `--slot-count`、`--maximum-data-len` 和 `--limits-source` 都恰好出现一次。source 是非空、无控制字符、非本机
-   绝对路径的外部证明引用；结果明确标记这些 limits 为 `declared_external`，不能标记为 measured 或 discovered。
+4. `--slot-count`、`--maximum-data-len` 和 `--limits-source` 都恰好出现一次。source 是非空、无控制字符、不含
+   absolute、rooted 或 Windows drive-prefix 本机路径的外部证明引用；结果明确标记这些 limits 为
+   `declared_external`，不能标记为 measured 或 discovered。normalized journal 始终脱敏 raw source，只有通过校验
+   的引用进入结构化授权证据。
 5. `--data` 指向的文件先完整读入内存；artifact 和 normalized arguments 不保存该机器路径。
 6. `--expected-sha256` 必须是恰好 64 位十六进制。工具对实际 bytes 重算大写 SHA-256；expected、recomputed、
    actual length、slot、declared limits 和 source 全部一致后才构造 authorization。
