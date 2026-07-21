@@ -41,6 +41,10 @@ name = "easycon-model"
 version = "0.1.0"
 
 [[package]]
+name = "easycon-native-sys"
+version = "0.1.0"
+
+[[package]]
 name = "easycon-runtime"
 version = "0.1.0"
 dependencies = [
@@ -67,6 +71,15 @@ dependencies = [
  "easycon-runtime",
  "easycon-serial",
  "serde_json",
+]
+
+[[package]]
+name = "easycon-vision"
+version = "0.1.0"
+dependencies = [
+ "easycon-model",
+ "easycon-native-sys",
+ "easycon-runtime",
 ]
 
 [[package]]

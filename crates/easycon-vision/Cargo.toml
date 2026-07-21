@@ -1,0 +1,16 @@
+[package]
+name = "easycon-vision"
+description = "Frames, labels, capture, and Vision scheduling for EasyCon SDK"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+easycon-model = { path = "../easycon-model" }
+easycon-native-sys = { path = "../easycon-native-sys" }
+easycon-runtime = { path = "../easycon-runtime" }
+
+[lints]
+workspace = true

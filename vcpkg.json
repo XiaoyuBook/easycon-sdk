@@ -1,0 +1,21 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "easycon-native-bridge",
+  "version-string": "0.1.0",
+  "description": "Private native dependencies for the EasyCon SDK Vision candidate",
+  "dependencies": [
+    {
+      "name": "opencv4",
+      "default-features": false,
+      "features": [
+        "dshow",
+        "intrinsics",
+        "jpeg",
+        "msmf",
+        "png",
+        "thread"
+      ]
+    },
+    "tesseract"
+  ]
+}

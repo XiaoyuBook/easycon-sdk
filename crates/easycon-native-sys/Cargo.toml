@@ -1,0 +1,16 @@
+[package]
+name = "easycon-native-sys"
+description = "Safe Rust ownership layer for the private EasyCon native bridge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+links = "easycon_native_bridge"
+build = "build.rs"
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

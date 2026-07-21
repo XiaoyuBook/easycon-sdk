@@ -1,0 +1,8 @@
+LIBRARY easycon_native_bridge_fuzz_target
+EXPORTS
+    easycon_native_buffer_release
+    easycon_native_debug_counts
+    easycon_native_debug_handle_create
+    easycon_native_debug_handle_destroy
+    easycon_native_error_release
+    easycon_native_test_raise

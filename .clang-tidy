@@ -1,0 +1,11 @@
+Checks: >-
+  -*,
+  bugprone-*,
+  clang-analyzer-*,
+  performance-*,
+  portability-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-exception-escape
+WarningsAsErrors: '*'
+HeaderFilterRegex: 'native[/\\]bridge[/\\].*'
+FormatStyle: none

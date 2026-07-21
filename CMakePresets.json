@@ -1,0 +1,124 @@
+{
+  "version": 10,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 30,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/cmake-build-${presetName}",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+        "VCPKG_OVERLAY_TRIPLETS": "${sourceDir}/cmake/triplets",
+        "VCPKG_TARGET_TRIPLET": "x64-windows-static-md",
+        "EASYCON_BUILD_COMPONENT_TESTS": "ON"
+      },
+      "environment": {
+        "VCPKG_FEATURE_FLAGS": "manifests,registries,versions"
+      }
+    },
+    {
+      "name": "msvc-debug",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_CXX_COMPILER": "cl.exe"
+      }
+    },
+    {
+      "name": "msvc-release",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CXX_COMPILER": "cl.exe"
+      }
+    },
+    {
+      "name": "clang-asan",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_CXX_COMPILER": "clang-cl.exe",
+        "EASYCON_ENABLE_ASAN": "ON"
+      }
+    },
+    {
+      "name": "clang-ubsan",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_CXX_COMPILER": "clang-cl.exe",
+        "EASYCON_ENABLE_UBSAN": "ON"
+      }
+    },
+    {
+      "name": "clang-tidy",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_CXX_COMPILER": "clang-cl.exe",
+        "EASYCON_ENABLE_CLANG_TIDY": "ON",
+        "EASYCON_BUILD_FUZZERS": "ON"
+      }
+    },
+    {
+      "name": "msvc-analyze",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_CXX_COMPILER": "cl.exe",
+        "EASYCON_ENABLE_MSVC_ANALYZE": "ON"
+      }
+    },
+    {
+      "name": "clang-fuzz",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_CXX_COMPILER": "clang-cl.exe",
+        "EASYCON_BUILD_FUZZERS": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "msvc-debug", "configurePreset": "msvc-debug" },
+    { "name": "msvc-release", "configurePreset": "msvc-release" },
+    { "name": "clang-asan", "configurePreset": "clang-asan" },
+    { "name": "clang-ubsan", "configurePreset": "clang-ubsan" },
+    { "name": "clang-tidy", "configurePreset": "clang-tidy" },
+    { "name": "msvc-analyze", "configurePreset": "msvc-analyze" },
+    { "name": "clang-fuzz", "configurePreset": "clang-fuzz" }
+  ],
+  "testPresets": [
+    {
+      "name": "msvc-debug",
+      "configurePreset": "msvc-debug",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "msvc-release",
+      "configurePreset": "msvc-release",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "clang-asan",
+      "configurePreset": "clang-asan",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "clang-ubsan",
+      "configurePreset": "clang-ubsan",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "clang-fuzz",
+      "configurePreset": "clang-fuzz",
+      "output": { "outputOnFailure": true }
+    }
+  ]
+}

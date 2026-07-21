@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Enforce Phase 2A ownership, dependency, license, and architecture guards."""
+"""Enforce frozen workspace, dependency, license, and architecture guards."""
 
+import json
 import re
 import subprocess
 import sys
@@ -13,20 +14,19 @@ EXPECTED_MEMBERS = {
     "crates/easycon-runtime",
     "crates/easycon-controller",
     "crates/easycon-serial",
+    "crates/easycon-native-sys",
+    "crates/easycon-vision",
     "tests/support",
 }
 FORBIDDEN_PREFIXES = (
     "bindings/",
     "ci/",
     "firmware/",
-    "native/",
     "services/",
     "ui/",
     "crates/easycon-capi/",
     "crates/easycon-ecs/",
-    "crates/easycon-native-sys/",
     "crates/easycon-sdk/",
-    "crates/easycon-vision/",
 )
 FORBIDDEN_RUNTIME_PATTERNS = {
     "gRPC": re.compile(r"\bgrpc\b", re.IGNORECASE),
@@ -39,21 +39,44 @@ FORBIDDEN_RUNTIME_PATTERNS = {
 
 def git_files():
     output = subprocess.check_output(
-        ["git", "ls-files", "-z"], cwd=str(ROOT), stderr=subprocess.STDOUT
+        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+        cwd=str(ROOT),
+        stderr=subprocess.STDOUT,
     )
     return [item.decode("utf-8") for item in output.split(b"\0") if item]
 
 
-def workspace_members(cargo_text):
-    match = re.search(r"members\s*=\s*\[(.*?)\]", cargo_text, re.DOTALL)
-    if not match:
-        return set()
-    return set(re.findall(r'"([^"]+)"', match.group(1)))
+def cargo_metadata():
+    output = subprocess.check_output(
+        ["cargo", "metadata", "--format-version", "1", "--no-deps"],
+        cwd=str(ROOT),
+        stderr=subprocess.STDOUT,
+    )
+    return json.loads(output.decode("utf-8"))
 
 
-def workspace_dependencies(manifest):
-    text = (ROOT / manifest).read_text(encoding="utf-8")
-    return set(re.findall(r"\b(easycon-[a-z-]+)\s*=", text))
+def relative_manifest(package):
+    return Path(package["manifest_path"]).resolve().relative_to(ROOT).as_posix()
+
+
+def workspace_members(metadata):
+    member_ids = set(metadata["workspace_members"])
+    return {
+        str(Path(relative_manifest(package)).parent).replace("\\", "/")
+        for package in metadata["packages"]
+        if package["id"] in member_ids
+    }
+
+
+def workspace_dependencies(metadata, path):
+    package = next(
+        package for package in metadata["packages"] if relative_manifest(package) == path
+    )
+    return {
+        dependency["name"]
+        for dependency in package["dependencies"]
+        if dependency["kind"] != "build" and dependency["name"].startswith("easycon-")
+    }
 
 
 def main():
@@ -67,12 +90,17 @@ def main():
     for prefix in FORBIDDEN_PREFIXES:
         if any(path.startswith(prefix) for path in tracked):
             failures.append("out-of-scope tracked path: {}".format(prefix))
+    if any(path.startswith("native/") and not path.startswith("native/bridge/") for path in tracked):
+        failures.append("native content exists outside native/bridge")
+    if any(path.lower().endswith(".traineddata") for path in tracked):
+        failures.append("traineddata must not be tracked")
 
-    cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
-    if workspace_members(cargo) != EXPECTED_MEMBERS:
-        failures.append("workspace members differ from the five Phase 2A packages")
-    if 'license = "GPL-3.0-only"' not in cargo:
-        failures.append("workspace license is not GPL-3.0-only")
+    metadata = cargo_metadata()
+    if workspace_members(metadata) != EXPECTED_MEMBERS:
+        failures.append("workspace members differ from frozen Phase 2A plus Phase 3 packages")
+    for package in metadata["packages"]:
+        if package["id"] in metadata["workspace_members"] and package["license"] != "GPL-3.0-only":
+            failures.append("{} is not GPL-3.0-only".format(package["name"]))
 
     expected_dependencies = {
         "crates/easycon-model/Cargo.toml": set(),
@@ -83,6 +111,12 @@ def main():
             "easycon-model",
             "easycon-runtime",
         },
+        "crates/easycon-native-sys/Cargo.toml": set(),
+        "crates/easycon-vision/Cargo.toml": {
+            "easycon-model",
+            "easycon-native-sys",
+            "easycon-runtime",
+        },
         "tests/support/Cargo.toml": {
             "easycon-controller",
             "easycon-model",
@@ -90,20 +124,20 @@ def main():
             "easycon-serial",
         },
     }
-    for manifest, expected in expected_dependencies.items():
-        if workspace_dependencies(manifest) != expected:
-            failures.append("workspace dependency direction changed in {}".format(manifest))
-        text = (ROOT / manifest).read_text(encoding="utf-8")
+    for manifest_path, expected in expected_dependencies.items():
+        if workspace_dependencies(metadata, manifest_path) != expected:
+            failures.append("workspace dependency direction changed in {}".format(manifest_path))
+        text = (ROOT / manifest_path).read_text(encoding="utf-8")
         if "license.workspace = true" not in text:
-            failures.append("{} does not inherit GPL workspace license".format(manifest))
+            failures.append("{} does not inherit GPL workspace license".format(manifest_path))
         if "EasyCon/" in text or "EasyCon\\" in text:
-            failures.append("{} references the ignored source snapshot".format(manifest))
+            failures.append("{} references the ignored source snapshot".format(manifest_path))
 
     source_paths = [
         path
         for path in tracked
-        if (path.startswith("crates/") or path.startswith("tests/"))
-        and Path(path).suffix in {".rs", ".toml"}
+        if (path.startswith("crates/") or path.startswith("tests/") or path.startswith("native/"))
+        and Path(path).suffix in {".rs", ".toml", ".h", ".hpp", ".cpp"}
         and (ROOT / path).is_file()
     ]
     for relative in source_paths:
@@ -113,6 +147,18 @@ def main():
         for label, pattern in FORBIDDEN_RUNTIME_PATTERNS.items():
             if pattern.search(text):
                 failures.append("legacy {} architecture keyword in {}".format(label, relative))
+        if "easycon_v1_" in text:
+            failures.append("public C ABI symbol leaked into Phase 3 source: {}".format(relative))
+
+    cmake_paths = ["CMakeLists.txt", "native/bridge/CMakeLists.txt"]
+    for relative in cmake_paths:
+        text = (ROOT / relative).read_text(encoding="utf-8")
+        if re.search(r"(^|\s)install\s*\(", text, re.IGNORECASE):
+            failures.append("Phase 3 private native targets must not install files")
+
+    vcpkg_configuration = (ROOT / "vcpkg-configuration.json").read_text(encoding="utf-8")
+    if "cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3" not in vcpkg_configuration:
+        failures.append("Phase 3 vcpkg registry baseline changed")
 
     runtime_source = (ROOT / "crates/easycon-runtime/src/runtime.rs").read_text(
         encoding="utf-8"
@@ -127,8 +173,8 @@ def main():
             print("  " + failure, file=sys.stderr)
         return 1
     print(
-        "repository guards passed: Phase 2A workspace, dependency direction, GPL license, "
-        "source boundary, Drop finalizer ban, and legacy service-process scan"
+        "repository guards passed: frozen workspace, Phase 3 dependency direction, GPL license, "
+        "private native boundary, source boundary, Drop finalizer ban, and legacy process scan"
     )
     return 0
 
