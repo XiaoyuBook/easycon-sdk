@@ -457,6 +457,10 @@ impl ArtifactReservation {
             .ok_or_else(|| "artifact reservation has no evidence journal".to_owned())
     }
 
+    pub(crate) fn lease_id(&self) -> &str {
+        &self.lease_id
+    }
+
     pub(crate) fn run_identity_json(&self, ended_unix_ns: u64) -> Value {
         json!({
             "lease_id": self.lease_id,

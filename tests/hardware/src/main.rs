@@ -4,6 +4,7 @@ mod artifact;
 mod device;
 mod faults;
 mod journal;
+mod operator;
 mod provenance;
 
 use std::env;
@@ -42,11 +43,160 @@ use easycon_serial::{
 use serde_json::{Value, json};
 
 use journal::JournalEventKind;
+use operator::{
+    ActionMarker, ConsoleOperatorPort, InterruptToken, ObservationRequest, OperatorOutcome,
+    OperatorPort,
+};
 use provenance::{RuntimeProvenance, sha256_bytes};
 
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
 const MINIMUM_REPORT_INTERVAL_NS: u64 = 30_000_000;
 const HOTPLUG_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+struct RunControl<'a> {
+    reservation: &'a mut ArtifactReservation,
+    operator: &'a mut dyn OperatorPort,
+    interrupt: InterruptToken,
+    observation_sequence: u64,
+    interrupt_recorded: bool,
+    cancellation_terminal_recorded: bool,
+}
+
+impl<'a> RunControl<'a> {
+    fn new(
+        reservation: &'a mut ArtifactReservation,
+        operator: &'a mut dyn OperatorPort,
+        interrupt: InterruptToken,
+    ) -> Self {
+        Self {
+            reservation,
+            operator,
+            interrupt,
+            observation_sequence: 0,
+            interrupt_recorded: false,
+            cancellation_terminal_recorded: false,
+        }
+    }
+
+    fn record_event(&mut self, kind: JournalEventKind, payload: Value) -> Result<(), String> {
+        self.reservation.record_event(kind, payload)
+    }
+
+    fn marker(
+        &self,
+        command: &str,
+        expected_stable_id: &str,
+        observed_stable_id: &str,
+        action_id: &str,
+        label: &str,
+    ) -> ActionMarker {
+        ActionMarker {
+            lease_id: self.reservation.lease_id().to_owned(),
+            command: command.to_owned(),
+            expected_stable_id: expected_stable_id.to_owned(),
+            observed_stable_id: observed_stable_id.to_owned(),
+            action_id: action_id.to_owned(),
+            label: label.to_owned(),
+        }
+    }
+
+    fn announce(&mut self, marker: &ActionMarker) -> Result<(), CommandFailure> {
+        self.operator
+            .announce(marker)
+            .map_err(|error| CommandFailure::new("operator_marker", error))
+    }
+
+    fn observe_action(
+        &mut self,
+        marker: ActionMarker,
+        observation_window_ms: u64,
+        response_timeout: Duration,
+        operations: ActionOperationEvidence,
+        neutral_snapshot: Value,
+    ) -> Result<(OperatorOutcome, Value), CommandFailure> {
+        let request = ObservationRequest {
+            marker: marker.clone(),
+            response_timeout,
+        };
+        let outcome = self
+            .operator
+            .observe(&request, &self.interrupt)
+            .map_err(|error| CommandFailure::new("operator_response", error))?;
+        if outcome == OperatorOutcome::Interrupted {
+            self.record_interrupt_without_operation()?;
+        }
+        self.observation_sequence = self.observation_sequence.checked_add(1).ok_or_else(|| {
+            CommandFailure::new("operator_response", "observation sequence exhausted")
+        })?;
+        let response_timeout_ms = u64::try_from(response_timeout.as_millis()).map_err(|_| {
+            CommandFailure::new("operator_response", "response timeout does not fit u64")
+        })?;
+        let observation = json!({
+            "sequence": self.observation_sequence,
+            "lease_id": marker.lease_id,
+            "command": marker.command,
+            "expected_stable_id": marker.expected_stable_id,
+            "observed_stable_id": marker.observed_stable_id,
+            "action_id": marker.action_id,
+            "label": marker.label,
+            "observation_window_ms": observation_window_ms,
+            "response_timeout_ms": response_timeout_ms,
+            "outcome": outcome.as_str(),
+            "active_operation": operations.active,
+            "release_operation": operations.release,
+            "neutral_operation": operations.neutral,
+            "neutral_snapshot": neutral_snapshot,
+        });
+        self.record_event(JournalEventKind::OperatorObservation, observation.clone())
+            .map_err(|error| CommandFailure::new("operator_observation_journal", error))?;
+        if outcome == OperatorOutcome::Interrupted {
+            self.record_cancellation_without_operation()?;
+        }
+        Ok((outcome, observation))
+    }
+
+    fn record_interrupt_without_operation(&mut self) -> Result<(), CommandFailure> {
+        self.interrupt.request();
+        if self.interrupt_recorded {
+            return Ok(());
+        }
+        self.record_event(
+            JournalEventKind::InterruptRequested,
+            json!({
+                "source": "operator_interrupt",
+                "operation_id": null,
+                "operation_state": "none",
+            }),
+        )
+        .map_err(|error| CommandFailure::new("interrupt_journal", error))?;
+        self.interrupt_recorded = true;
+        Ok(())
+    }
+
+    fn record_cancellation_without_operation(&mut self) -> Result<(), CommandFailure> {
+        if self.cancellation_terminal_recorded {
+            return Ok(());
+        }
+        self.record_event(
+            JournalEventKind::CancellationTerminal,
+            json!({
+                "source": "operator_interrupt",
+                "operation_id": null,
+                "terminal_state": "no_current_operation",
+                "cancellation_reason": null,
+            }),
+        )
+        .map_err(|error| CommandFailure::new("cancellation_terminal_journal", error))?;
+        self.cancellation_terminal_recorded = true;
+        Ok(())
+    }
+}
+
+struct ActionOperationEvidence {
+    active: Value,
+    release: Value,
+    neutral: Value,
+}
 
 trait QualificationDelay {
     fn wait(&self, duration: Duration);
@@ -594,14 +744,19 @@ fn wait_for_command_terminal(
 fn run_with_device_admission(
     command: &'static str,
     arguments: &[String],
-    reservation: &mut ArtifactReservation,
-    runner: impl FnOnce(AdmittedDevice, Arc<dyn DeviceDiscovery>) -> Result<Value, String>,
+    control: &mut RunControl<'_>,
+    runner: impl FnOnce(
+        AdmittedDevice,
+        Arc<dyn DeviceDiscovery>,
+        &mut RunControl<'_>,
+    ) -> Result<Value, String>,
 ) -> Result<Value, String> {
     run_with_device_admission_core(
         command,
         arguments,
         Arc::new(SystemDeviceDiscovery),
-        |payload| reservation.record_event(JournalEventKind::IdentityAdmission, payload),
+        control,
+        |control, payload| control.record_event(JournalEventKind::IdentityAdmission, payload),
         runner,
     )
 }
@@ -613,26 +768,37 @@ fn run_with_device_admission_using(
     discovery: Arc<dyn DeviceDiscovery>,
     runner: impl FnOnce(AdmittedDevice, Arc<dyn DeviceDiscovery>) -> Result<Value, String>,
 ) -> Result<Value, String> {
-    run_with_device_admission_core(command, arguments, discovery, |_| Ok(()), runner)
+    run_with_device_admission_core(
+        command,
+        arguments,
+        discovery,
+        &mut (),
+        |(), _| Ok(()),
+        |target, discovery, ()| runner(target, discovery),
+    )
 }
 
-fn run_with_device_admission_core(
+fn run_with_device_admission_core<C>(
     command: &'static str,
     arguments: &[String],
     discovery: Arc<dyn DeviceDiscovery>,
-    mut record_admission: impl FnMut(Value) -> Result<(), String>,
-    runner: impl FnOnce(AdmittedDevice, Arc<dyn DeviceDiscovery>) -> Result<Value, String>,
+    context: &mut C,
+    mut record_admission: impl FnMut(&mut C, Value) -> Result<(), String>,
+    runner: impl FnOnce(AdmittedDevice, Arc<dyn DeviceDiscovery>, &mut C) -> Result<Value, String>,
 ) -> Result<Value, String> {
     let request = device_target_request(arguments)?;
     match admit_device(discovery.as_ref(), request.clone()) {
         Ok(AdmissionDecision::Admitted(target)) => {
             let evidence = target.evidence().clone();
-            record_admission(json!({
-                "command": command,
-                "device_target": device_target_json(evidence.request()),
-                "identity_admission": admission_evidence_json(&evidence, "admitted"),
-            }))?;
-            match runner(target, discovery) {
+            record_admission(
+                context,
+                json!({
+                    "command": command,
+                    "device_target": device_target_json(evidence.request()),
+                    "identity_admission": admission_evidence_json(&evidence, "admitted"),
+                }),
+            )?;
+            match runner(target, discovery, context) {
                 Ok(result) => Ok(attach_admission_evidence(result, &evidence, "admitted")),
                 Err(error) => Ok(attach_admission_evidence(
                     json!({
@@ -654,7 +820,7 @@ fn run_with_device_admission_core(
                 "identity_admission": admission_evidence_json(&evidence, "rejected"),
                 "capability_inference": "none",
             });
-            record_admission(result.clone())?;
+            record_admission(context, result.clone())?;
             Ok(result)
         }
         Ok(AdmissionDecision::Ambiguous(evidence)) => {
@@ -668,7 +834,7 @@ fn run_with_device_admission_core(
                     "message": "system discovery returned an ambiguous serial snapshot",
                 },
             });
-            record_admission(result.clone())?;
+            record_admission(context, result.clone())?;
             Ok(result)
         }
         Err(error) => {
@@ -689,7 +855,7 @@ fn run_with_device_admission_core(
                     "message": error.message(),
                 },
             });
-            record_admission(result.clone())?;
+            record_admission(context, result.clone())?;
             Ok(result)
         }
     }
@@ -790,58 +956,68 @@ fn real_main() -> Result<i32, String> {
         json!({"command": command}),
     )?;
     let mut sequence_timings = None;
-    let execution = match command {
-        "discover" => run_discover(&arguments),
-        "handshake" => run_with_device_admission(
-            "handshake",
-            &arguments,
-            &mut reservation,
-            |target, discovery| run_handshake(&arguments, target, discovery),
-        ),
-        "smoke" => run_with_device_admission(
-            "smoke",
-            &arguments,
-            &mut reservation,
-            |target, discovery| run_smoke(&arguments, target, discovery),
-        ),
-        "home-wake" => run_with_device_admission(
-            "home-wake",
-            &arguments,
-            &mut reservation,
-            |target, discovery| run_home_wake(&arguments, target, discovery),
-        ),
-        "faults" => run_with_device_admission("faults", &arguments, &mut reservation, run_faults),
-        "hotplug" => run_with_device_admission(
-            "hotplug",
-            &arguments,
-            &mut reservation,
-            |target, discovery| run_hotplug(&arguments, target, discovery),
-        ),
-        "lifecycle" => run_with_device_admission(
-            "lifecycle",
-            &arguments,
-            &mut reservation,
-            |target, discovery| run_lifecycle(&arguments, target, discovery),
-        ),
-        "sequence" => run_with_device_admission(
-            "sequence",
-            &arguments,
-            &mut reservation,
-            |target, discovery| {
-                run_sequence(&arguments, target, discovery).map(|(result, timings)| {
-                    sequence_timings = timings;
-                    result
-                })
-            },
-        ),
-        "amiibo" if amiibo_write_authorized(&arguments) => run_with_device_admission(
-            "amiibo",
-            &arguments,
-            &mut reservation,
-            |target, discovery| run_amiibo(&arguments, target, discovery),
-        ),
-        "amiibo" => run_unauthorized_amiibo(),
-        _ => Err(format!("unknown command: {command}")),
+    let mut operator = ConsoleOperatorPort::new();
+    let interrupt = InterruptToken::default();
+    let execution = {
+        let mut control = RunControl::new(&mut reservation, &mut operator, interrupt);
+        match command {
+            "discover" => run_discover(&arguments),
+            "handshake" => run_with_device_admission(
+                "handshake",
+                &arguments,
+                &mut control,
+                |target, discovery, _| run_handshake(&arguments, target, discovery),
+            ),
+            "smoke" => run_with_device_admission(
+                "smoke",
+                &arguments,
+                &mut control,
+                |target, discovery, control| run_smoke(&arguments, target, discovery, control),
+            ),
+            "home-wake" => run_with_device_admission(
+                "home-wake",
+                &arguments,
+                &mut control,
+                |target, discovery, control| run_home_wake(&arguments, target, discovery, control),
+            ),
+            "faults" => run_with_device_admission(
+                "faults",
+                &arguments,
+                &mut control,
+                |target, discovery, _| run_faults(target, discovery),
+            ),
+            "hotplug" => run_with_device_admission(
+                "hotplug",
+                &arguments,
+                &mut control,
+                |target, discovery, _| run_hotplug(&arguments, target, discovery),
+            ),
+            "lifecycle" => run_with_device_admission(
+                "lifecycle",
+                &arguments,
+                &mut control,
+                |target, discovery, _| run_lifecycle(&arguments, target, discovery),
+            ),
+            "sequence" => run_with_device_admission(
+                "sequence",
+                &arguments,
+                &mut control,
+                |target, discovery, _| {
+                    run_sequence(&arguments, target, discovery).map(|(result, timings)| {
+                        sequence_timings = timings;
+                        result
+                    })
+                },
+            ),
+            "amiibo" if amiibo_write_authorized(&arguments) => run_with_device_admission(
+                "amiibo",
+                &arguments,
+                &mut control,
+                |target, discovery, _| run_amiibo(&arguments, target, discovery),
+            ),
+            "amiibo" => run_unauthorized_amiibo(),
+            _ => Err(format!("unknown command: {command}")),
+        }
     };
     reservation.record_event(
         JournalEventKind::OperationTerminal,
@@ -1017,6 +1193,21 @@ fn finalize_result(command: &str, execution: Result<Value, String>) -> (Value, O
                 Some(error),
             )
         }
+        Ok(result) if result["operator_terminal_outcome"] == "interrupted" => (
+            json!({
+                "schema_version": 1,
+                "command": command,
+                "status": "unverified",
+                "execution_status": "cancelled",
+                "qualification_status": "unverified",
+                "checks": [
+                    qualification_check("operator_interrupt", "cancelled"),
+                    qualification_check("cleanup", "passed"),
+                ],
+                "result": result,
+            }),
+            None,
+        ),
         Ok(result) => {
             let decision = qualification_decision(command, &result);
             let status = decision.status.as_str();
@@ -1101,22 +1292,7 @@ fn qualification_decision(command: &str, result: &Value) -> QualificationDecisio
             ),
             ("actual_baud_recorded", result["actual_baud"].is_u64()),
         ]),
-        "smoke" | "home-wake" => {
-            let neutral =
-                result["final_snapshot"]["desired_report_neutral"].as_bool() == Some(true);
-            if neutral {
-                QualificationDecision {
-                    status: QualificationStatus::Unverified,
-                    checks: vec![
-                        qualification_check("final_report_neutral", "passed"),
-                        qualification_check("operator_observation", "unverified"),
-                    ],
-                    failure: None,
-                }
-            } else {
-                required_checks(&[("final_report_neutral", false)])
-            }
-        }
+        "smoke" | "home-wake" => operator_observation_qualification(command, result),
         "faults" => required_checks(&[
             (
                 "port_occupied_exact_error",
@@ -1445,6 +1621,152 @@ fn discovery_qualification(result: &Value) -> QualificationDecision {
             .push(qualification_check("devices_discovered", "not_run"));
     }
     decision
+}
+
+fn operator_observation_qualification(command: &str, result: &Value) -> QualificationDecision {
+    if result["final_snapshot"]["desired_report_neutral"].as_bool() != Some(true) {
+        return required_checks(&[("final_report_neutral", false)]);
+    }
+    let Some(observations) = result["operator_observations"].as_array() else {
+        return QualificationDecision {
+            status: QualificationStatus::Unverified,
+            checks: vec![
+                qualification_check("final_report_neutral", "passed"),
+                qualification_check("operator_observations", "unverified"),
+            ],
+            failure: None,
+        };
+    };
+    let Some(expected_action_ids) = expected_operator_action_ids(command, result) else {
+        return failed_operator_observation_decision("operator action plan is invalid");
+    };
+    if result["required_operator_action_ids"] != json!(expected_action_ids) {
+        return failed_operator_observation_decision(
+            "required operator action IDs do not match the command plan",
+        );
+    }
+    if observations.len() > expected_action_ids.len() {
+        return failed_operator_observation_decision(
+            "operator observation count exceeds the command plan",
+        );
+    }
+    let expected_stable_id = result["device_target"]["expected_stable_id"].as_str();
+    let observed_stable_id =
+        result["identity_admission"]["observed_expected"]["stable_id"].as_str();
+    let mut lease_id = None;
+    for (index, observation) in observations.iter().enumerate() {
+        let current_lease = observation["lease_id"].as_str();
+        if observation["sequence"].as_u64() != u64::try_from(index + 1).ok()
+            || observation["command"].as_str() != Some(command)
+            || observation["action_id"].as_str()
+                != expected_action_ids.get(index).map(String::as_str)
+            || expected_stable_id.is_none()
+            || observation["expected_stable_id"].as_str() != expected_stable_id
+            || observed_stable_id.is_none()
+            || observation["observed_stable_id"].as_str() != observed_stable_id
+            || current_lease.is_none_or(str::is_empty)
+            || lease_id.is_some_and(|expected| current_lease != Some(expected))
+            || observation["neutral_snapshot"]["desired_report_neutral"] != true
+            || observation["active_operation"]["state"] != "Succeeded"
+            || observation["release_operation"]["state"] != "Succeeded"
+            || observation["neutral_operation"]["state"] != "Succeeded"
+        {
+            return failed_operator_observation_decision(
+                "operator observation binding or operation evidence is invalid",
+            );
+        }
+        lease_id = current_lease;
+        if !matches!(
+            observation["outcome"].as_str(),
+            Some("yes" | "no" | "eof" | "timeout" | "ambiguous" | "interrupted")
+        ) {
+            return failed_operator_observation_decision("operator observation outcome is invalid");
+        }
+    }
+
+    let terminal = result["operator_terminal_outcome"].as_str();
+    let last_outcome = observations
+        .last()
+        .and_then(|observation| observation["outcome"].as_str());
+    if terminal == Some("no") && last_outcome == Some("no") {
+        return failed_operator_observation_decision("operator reported no");
+    }
+    if matches!(terminal, Some("eof" | "timeout" | "ambiguous")) && terminal == last_outcome {
+        return QualificationDecision {
+            status: QualificationStatus::Unverified,
+            checks: vec![
+                qualification_check("final_report_neutral", "passed"),
+                qualification_check("operator_observations", "unverified"),
+            ],
+            failure: None,
+        };
+    }
+    if terminal == Some("all_yes")
+        && observations.len() == expected_action_ids.len()
+        && observations
+            .iter()
+            .all(|observation| observation["outcome"] == "yes")
+    {
+        return QualificationDecision {
+            status: QualificationStatus::Passed,
+            checks: vec![
+                qualification_check("final_report_neutral", "passed"),
+                qualification_check("operator_observations", "passed"),
+            ],
+            failure: None,
+        };
+    }
+    if observations.is_empty() || observations.len() < expected_action_ids.len() {
+        return QualificationDecision {
+            status: QualificationStatus::Unverified,
+            checks: vec![
+                qualification_check("final_report_neutral", "passed"),
+                qualification_check("operator_observations", "unverified"),
+            ],
+            failure: None,
+        };
+    }
+    failed_operator_observation_decision("operator observation terminal is inconsistent")
+}
+
+fn expected_operator_action_ids(command: &str, result: &Value) -> Option<Vec<String>> {
+    match command {
+        "smoke" => match result["stage"].as_str() {
+            Some("a_only") => Some(
+                smoke_observation_specs(false)
+                    .into_iter()
+                    .map(|spec| spec.action_id)
+                    .collect(),
+            ),
+            Some("full") => Some(
+                smoke_observation_specs(true)
+                    .into_iter()
+                    .map(|spec| spec.action_id)
+                    .collect(),
+            ),
+            _ => None,
+        },
+        "home-wake" => {
+            let attempts = usize::try_from(result["attempts"].as_u64()?).ok()?;
+            (1..=100).contains(&attempts).then(|| {
+                (1..=attempts)
+                    .map(|attempt| format!("home-wake.attempt.{attempt}"))
+                    .collect()
+            })
+        }
+        _ => None,
+    }
+}
+
+fn failed_operator_observation_decision(message: &str) -> QualificationDecision {
+    QualificationDecision {
+        status: QualificationStatus::Failed,
+        checks: vec![
+            qualification_check("final_report_neutral", "passed"),
+            qualification_check("operator_observations", "failed"),
+        ],
+        failure: Some(message.to_owned()),
+    }
 }
 
 fn required_checks(checks: &[(&str, bool)]) -> QualificationDecision {
@@ -2251,6 +2573,7 @@ fn run_smoke(
     arguments: &[String],
     target: AdmittedDevice,
     discovery: Arc<dyn DeviceDiscovery>,
+    control: &mut RunControl<'_>,
 ) -> Result<Value, String> {
     let full = arguments.iter().any(|argument| argument == "--full");
     let wake_left_stick = arguments
@@ -2260,6 +2583,15 @@ fn run_smoke(
     let post_home_neutral_delay_ms = smoke_home_delay(arguments, wake_home)?;
     let hold_ms = value_or(arguments, "--hold-ms", 0_u64)?;
     validate_hold_ms(hold_ms)?;
+    let (observation_window_ms, operator_timeout) =
+        operator_timing(arguments, (hold_ms != 0).then_some(hold_ms))?;
+    let expected_stable_id = target.request().expected_stable_id().to_owned();
+    let observed_stable_id = target.descriptor().stable_id().to_owned();
+    let action_specs = smoke_observation_specs(full);
+    let required_action_ids = action_specs
+        .iter()
+        .map(|spec| spec.action_id.clone())
+        .collect::<Vec<_>>();
     let harness = Harness::new(&target, discovery, ControllerOptions::default())?;
     let result = json!({
         "command": "smoke",
@@ -2269,9 +2601,13 @@ fn run_smoke(
         "configured_post_home_neutral_delay_ms": post_home_neutral_delay_ms,
         "diagnostic_prelude_steps": [],
         "a_hold_ms": hold_ms,
+        "observation_window_ms": observation_window_ms,
+        "operator_timeout_ms": operator_timeout.as_millis(),
+        "required_operator_action_ids": required_action_ids,
+        "operator_observations": [],
+        "operator_terminal_outcome": null,
         "port": port_json(&harness.descriptor),
         "actions": [],
-        "switch_observation": "requires operator confirmation",
         "resources": {"primary": {"created": true}},
     });
     Ok(finish_harness_phase(
@@ -2303,111 +2639,26 @@ fn run_smoke(
                     exercise_smoke_action(harness, label, action, result, wake_home)?;
                 }
             }
-            exercise_smoke_action(
-                harness,
-                "button.A.down",
-                ControllerAction::ButtonDown(Button::A),
-                result,
-                wake_home,
-            )?;
-            if hold_ms != 0 {
-                thread::sleep(Duration::from_millis(hold_ms));
+            for spec in action_specs {
+                let outcome = exercise_observed_action_unit(
+                    harness,
+                    control,
+                    "smoke",
+                    &expected_stable_id,
+                    &observed_stable_id,
+                    &spec,
+                    observation_window_ms,
+                    operator_timeout,
+                    result,
+                    &ThreadDelay,
+                )?;
+                if outcome != OperatorOutcome::Yes {
+                    result["operator_terminal_outcome"] = json!(outcome.as_str());
+                    break;
+                }
             }
-            exercise_smoke_action(
-                harness,
-                "button.A.up",
-                ControllerAction::ButtonUp(Button::A),
-                result,
-                wake_home,
-            )?;
-            exercise_smoke_action(
-                harness,
-                "neutral",
-                ControllerAction::Reset,
-                result,
-                wake_home,
-            )?;
-
-            if full {
-                for button in Button::ALL {
-                    if button != Button::A {
-                        exercise_action_for_command(
-                            harness,
-                            &format!("button.{button:?}.down"),
-                            ControllerAction::ButtonDown(button),
-                            &mut result["actions"],
-                        )?;
-                        exercise_action_for_command(
-                            harness,
-                            &format!("button.{button:?}.up"),
-                            ControllerAction::ButtonUp(button),
-                            &mut result["actions"],
-                        )?;
-                        exercise_action_for_command(
-                            harness,
-                            "neutral",
-                            ControllerAction::Reset,
-                            &mut result["actions"],
-                        )?;
-                    }
-                }
-                for hat in Hat::ALL.into_iter().filter(|hat| *hat != Hat::Center) {
-                    exercise_action_for_command(
-                        harness,
-                        &format!("hat.{hat:?}"),
-                        ControllerAction::Hat(hat),
-                        &mut result["actions"],
-                    )?;
-                    exercise_action_for_command(
-                        harness,
-                        "hat.Center",
-                        ControllerAction::Hat(Hat::Center),
-                        &mut result["actions"],
-                    )?;
-                    exercise_action_for_command(
-                        harness,
-                        "neutral",
-                        ControllerAction::Reset,
-                        &mut result["actions"],
-                    )?;
-                }
-                let boundaries = [
-                    StickPosition::new(0, 0),
-                    StickPosition::new(0, 255),
-                    StickPosition::new(255, 0),
-                    StickPosition::new(255, 255),
-                ];
-                for (side, constructor) in [
-                    (
-                        "left",
-                        ControllerAction::LeftStick as fn(StickPosition) -> ControllerAction,
-                    ),
-                    (
-                        "right",
-                        ControllerAction::RightStick as fn(StickPosition) -> ControllerAction,
-                    ),
-                ] {
-                    for position in boundaries {
-                        exercise_action_for_command(
-                            harness,
-                            &format!("stick.{side}.{},{}", position.x, position.y),
-                            constructor(position),
-                            &mut result["actions"],
-                        )?;
-                        exercise_action_for_command(
-                            harness,
-                            &format!("stick.{side}.center"),
-                            constructor(StickPosition::CENTER),
-                            &mut result["actions"],
-                        )?;
-                        exercise_action_for_command(
-                            harness,
-                            "neutral",
-                            ControllerAction::Reset,
-                            &mut result["actions"],
-                        )?;
-                    }
-                }
+            if result["operator_terminal_outcome"].is_null() {
+                result["operator_terminal_outcome"] = json!("all_yes");
             }
             result["actual_baud"] = json!(harness.actual_baud());
             result["final_snapshot"] = snapshot_json(&harness.controller);
@@ -2421,10 +2672,17 @@ fn run_home_wake(
     arguments: &[String],
     target: AdmittedDevice,
     discovery: Arc<dyn DeviceDiscovery>,
+    control: &mut RunControl<'_>,
 ) -> Result<Value, String> {
     let attempts = value_or(arguments, "--attempts", 20_usize)?;
     let interval_seconds = value_or(arguments, "--interval-seconds", 3_u64)?;
     validate_home_wake(attempts, interval_seconds)?;
+    let (observation_window_ms, operator_timeout) = operator_timing(arguments, None)?;
+    let expected_stable_id = target.request().expected_stable_id().to_owned();
+    let observed_stable_id = target.descriptor().stable_id().to_owned();
+    let required_action_ids = (1..=attempts)
+        .map(|attempt| format!("home-wake.attempt.{attempt}"))
+        .collect::<Vec<_>>();
     let harness = Harness::new(&target, discovery, ControllerOptions::default())?;
     let result = json!({
         "command": "home-wake",
@@ -2432,7 +2690,11 @@ fn run_home_wake(
         "interval_seconds": interval_seconds,
         "port": port_json(&harness.descriptor),
         "records": [],
-        "switch_observation": "requires operator confirmation",
+        "observation_window_ms": observation_window_ms,
+        "operator_timeout_ms": operator_timeout.as_millis(),
+        "required_operator_action_ids": required_action_ids,
+        "operator_observations": [],
+        "operator_terminal_outcome": null,
         "resources": {"primary": {"created": true}},
     });
     Ok(finish_harness_phase(
@@ -2461,43 +2723,50 @@ fn run_home_wake(
                 }
                 let attempt_started_ms =
                     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                let action_id = format!("home-wake.attempt.{}", attempt + 1);
+                let spec = ObservedActionSpec {
+                    label: action_id.clone(),
+                    active_label: "button.Home.down".to_owned(),
+                    active: ControllerAction::ButtonDown(Button::Home),
+                    release_label: "button.Home.up".to_owned(),
+                    release: ControllerAction::ButtonUp(Button::Home),
+                    action_id,
+                };
+                let mut unit = json!({"actions": [], "operator_observations": []});
+                let outcome = exercise_observed_action_unit(
+                    harness,
+                    control,
+                    "home-wake",
+                    &expected_stable_id,
+                    &observed_stable_id,
+                    &spec,
+                    observation_window_ms,
+                    operator_timeout,
+                    &mut unit,
+                    &ThreadDelay,
+                )?;
+                let observation = unit["operator_observations"][0].clone();
+                result["operator_observations"]
+                    .as_array_mut()
+                    .expect("operator observations are an array")
+                    .push(observation.clone());
                 result["records"]
                     .as_array_mut()
                     .expect("home-wake records are an array")
                     .push(json!({
                         "attempt": attempt + 1,
                         "started_after_ms": attempt_started_ms,
-                        "status": "running",
-                        "actions": [],
+                        "status": "completed",
+                        "actions": unit["actions"],
+                        "operator_observation": observation,
                     }));
-                let record = result["records"]
-                    .as_array_mut()
-                    .expect("home-wake records are an array")
-                    .last_mut()
-                    .expect("current home-wake record exists");
-                exercise_action_for_command(
-                    harness,
-                    "button.Home.down",
-                    ControllerAction::ButtonDown(Button::Home),
-                    &mut record["actions"],
-                )?;
-                println!("{}", home_attempt_marker(attempt + 1));
-                std::io::stdout().flush().map_err(|error| {
-                    CommandFailure::new("home_wake_marker_flush", error.to_string())
-                })?;
-                exercise_action_for_command(
-                    harness,
-                    "button.Home.up",
-                    ControllerAction::ButtonUp(Button::Home),
-                    &mut record["actions"],
-                )?;
-                exercise_action_for_command(
-                    harness,
-                    "neutral",
-                    ControllerAction::Reset,
-                    &mut record["actions"],
-                )?;
-                record["status"] = json!("completed");
+                if outcome != OperatorOutcome::Yes {
+                    result["operator_terminal_outcome"] = json!(outcome.as_str());
+                    break;
+                }
+            }
+            if result["operator_terminal_outcome"].is_null() {
+                result["operator_terminal_outcome"] = json!("all_yes");
             }
             result["actual_baud"] = json!(harness.actual_baud());
             result["final_snapshot"] = snapshot_json(&harness.controller);
@@ -3210,12 +3479,181 @@ fn run_amiibo(
     ))
 }
 
+#[derive(Clone, Debug)]
+struct ObservedActionSpec {
+    action_id: String,
+    label: String,
+    active_label: String,
+    active: ControllerAction,
+    release_label: String,
+    release: ControllerAction,
+}
+
+fn smoke_observation_specs(full: bool) -> Vec<ObservedActionSpec> {
+    let buttons: &[Button] = if full { &Button::ALL } else { &[Button::A] };
+    let mut specs = buttons
+        .iter()
+        .copied()
+        .map(|button| {
+            let action_id = format!("button.{button:?}");
+            ObservedActionSpec {
+                label: action_id.clone(),
+                active_label: format!("{action_id}.down"),
+                active: ControllerAction::ButtonDown(button),
+                release_label: format!("{action_id}.up"),
+                release: ControllerAction::ButtonUp(button),
+                action_id,
+            }
+        })
+        .collect::<Vec<_>>();
+    if !full {
+        return specs;
+    }
+    specs.extend(
+        Hat::ALL
+            .into_iter()
+            .filter(|hat| *hat != Hat::Center)
+            .map(|hat| {
+                let action_id = format!("hat.{hat:?}");
+                ObservedActionSpec {
+                    label: action_id.clone(),
+                    active_label: action_id.clone(),
+                    active: ControllerAction::Hat(hat),
+                    release_label: "hat.Center".to_owned(),
+                    release: ControllerAction::Hat(Hat::Center),
+                    action_id,
+                }
+            }),
+    );
+    let boundaries = [
+        StickPosition::new(0, 0),
+        StickPosition::new(0, 255),
+        StickPosition::new(255, 0),
+        StickPosition::new(255, 255),
+    ];
+    for (side, constructor) in [
+        (
+            "left",
+            ControllerAction::LeftStick as fn(StickPosition) -> ControllerAction,
+        ),
+        (
+            "right",
+            ControllerAction::RightStick as fn(StickPosition) -> ControllerAction,
+        ),
+    ] {
+        for position in boundaries {
+            let action_id = format!("stick.{side}.{},{}", position.x, position.y);
+            specs.push(ObservedActionSpec {
+                label: action_id.clone(),
+                active_label: action_id.clone(),
+                active: constructor(position),
+                release_label: format!("stick.{side}.center"),
+                release: constructor(StickPosition::CENTER),
+                action_id,
+            });
+        }
+    }
+    specs
+}
+
+fn operator_timing(
+    arguments: &[String],
+    legacy_hold_ms: Option<u64>,
+) -> Result<(u64, Duration), String> {
+    if arguments.iter().any(|argument| argument == "--yes") {
+        return Err("blanket --yes is not supported for operator observations".to_owned());
+    }
+    let configured_window = option_value(arguments, "--observation-window-ms")?;
+    if configured_window.is_some() && legacy_hold_ms.is_some() {
+        return Err("--hold-ms and --observation-window-ms cannot be used together".to_owned());
+    }
+    let observation_window_ms = match configured_window {
+        Some(value) => value
+            .parse::<u64>()
+            .map_err(|_| "invalid value for --observation-window-ms".to_owned())?,
+        None => legacy_hold_ms.unwrap_or(1_000),
+    };
+    if !(100..=5_000).contains(&observation_window_ms) {
+        return Err("--observation-window-ms must be in 100..=5000".to_owned());
+    }
+    let timeout_seconds = value_or(arguments, "--operator-timeout-seconds", 30_u64)?;
+    if !(1..=300).contains(&timeout_seconds) {
+        return Err("--operator-timeout-seconds must be in 1..=300".to_owned());
+    }
+    Ok((observation_window_ms, Duration::from_secs(timeout_seconds)))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn exercise_observed_action_unit(
+    harness: &Harness,
+    control: &mut RunControl<'_>,
+    command: &str,
+    expected_stable_id: &str,
+    observed_stable_id: &str,
+    spec: &ObservedActionSpec,
+    observation_window_ms: u64,
+    response_timeout: Duration,
+    result: &mut Value,
+    delay: &dyn QualificationDelay,
+) -> Result<OperatorOutcome, CommandFailure> {
+    let marker = control.marker(
+        command,
+        expected_stable_id,
+        observed_stable_id,
+        &spec.action_id,
+        &spec.label,
+    );
+    control.announce(&marker)?;
+    let active = exercise_action_for_command(
+        harness,
+        &spec.active_label,
+        spec.active,
+        &mut result["actions"],
+    )?;
+    delay.wait(Duration::from_millis(observation_window_ms));
+    let release = exercise_action_for_command(
+        harness,
+        &spec.release_label,
+        spec.release,
+        &mut result["actions"],
+    )?;
+    let neutral = exercise_action_for_command(
+        harness,
+        "neutral",
+        ControllerAction::Reset,
+        &mut result["actions"],
+    )?;
+    let neutral_snapshot = snapshot_json(&harness.controller);
+    if neutral_snapshot["desired_report_neutral"] != true {
+        return Err(CommandFailure::new(
+            "operator_observation_neutral",
+            format!("action {} did not return to neutral", spec.action_id),
+        ));
+    }
+    let (outcome, observation) = control.observe_action(
+        marker,
+        observation_window_ms,
+        response_timeout,
+        ActionOperationEvidence {
+            active,
+            release,
+            neutral,
+        },
+        neutral_snapshot,
+    )?;
+    result["operator_observations"]
+        .as_array_mut()
+        .expect("operator observations are an array")
+        .push(observation);
+    Ok(outcome)
+}
+
 fn exercise_action_for_command(
     harness: &Harness,
     label: &str,
     action: ControllerAction,
     output: &mut Value,
-) -> Result<(), CommandFailure> {
+) -> Result<Value, CommandFailure> {
     let operation = harness
         .controller
         .direct(action)
@@ -3229,8 +3667,8 @@ fn exercise_action_for_command(
     output
         .as_array_mut()
         .expect("action output is an array")
-        .push(json!({"label": label, "operation": operation}));
-    Ok(())
+        .push(json!({"label": label, "operation": operation.clone()}));
+    Ok(operation)
 }
 
 fn exercise_smoke_action(
@@ -3341,10 +3779,6 @@ fn validate_home_wake(attempts: usize, interval_seconds: u64) -> Result<(), Stri
         return Err("--interval-seconds must be in 1..=60".to_owned());
     }
     Ok(())
-}
-
-fn home_attempt_marker(attempt: usize) -> String {
-    attempt.to_string()
 }
 
 #[cfg(test)]
@@ -3836,8 +4270,8 @@ fn print_help() {
     println!(
         "Usage:\n  easycon-hardware-qualification discover [--samples N]\n  \
          easycon-hardware-qualification handshake --port COMx --expected-identity ID\n  \
-         easycon-hardware-qualification smoke --port COMx --expected-identity ID [--full] [--wake-left-stick] [--wake-home --post-home-neutral-delay-ms N] [--hold-ms N]\n  \
-         easycon-hardware-qualification home-wake --port COMx --expected-identity ID [--attempts 20] [--interval-seconds 3]\n  \
+         easycon-hardware-qualification smoke --port COMx --expected-identity ID [--full] [--wake-left-stick] [--wake-home --post-home-neutral-delay-ms N] [--hold-ms N | --observation-window-ms N] [--operator-timeout-seconds N]\n  \
+         easycon-hardware-qualification home-wake --port COMx --expected-identity ID [--attempts 20] [--interval-seconds 3] [--observation-window-ms N] [--operator-timeout-seconds N]\n  \
          easycon-hardware-qualification faults --port COMx --expected-identity ID\n  \
          easycon-hardware-qualification hotplug --port COMx --expected-identity ID [--timeout-seconds N]\n  \
          easycon-hardware-qualification lifecycle --port COMx --expected-identity ID [--cycles 100]\n  \
@@ -3879,6 +4313,40 @@ mod tests {
     impl Drop for TestDirectory {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct ScriptedOperatorPort {
+        outcomes: VecDeque<OperatorOutcome>,
+        announced: Vec<ActionMarker>,
+        observed: Vec<ObservationRequest>,
+    }
+
+    impl ScriptedOperatorPort {
+        fn new(outcomes: impl IntoIterator<Item = OperatorOutcome>) -> Self {
+            Self {
+                outcomes: outcomes.into_iter().collect(),
+                announced: Vec::new(),
+                observed: Vec::new(),
+            }
+        }
+    }
+
+    impl OperatorPort for ScriptedOperatorPort {
+        fn announce(&mut self, marker: &ActionMarker) -> Result<(), String> {
+            self.announced.push(marker.clone());
+            Ok(())
+        }
+
+        fn observe(
+            &mut self,
+            request: &ObservationRequest,
+            _interrupt: &InterruptToken,
+        ) -> Result<OperatorOutcome, String> {
+            self.observed.push(request.clone());
+            self.outcomes
+                .pop_front()
+                .ok_or_else(|| "scripted operator response exhausted".to_owned())
         }
     }
 
@@ -4380,11 +4848,12 @@ mod tests {
                 ]),
                 calls,
             }),
-            move |payload| {
+            &mut (),
+            move |(), payload| {
                 recorder_trace.lock().expect("trace").push(payload);
                 Ok(())
             },
-            move |_, _| {
+            move |_, _, ()| {
                 assert_eq!(runner_trace.lock().expect("trace").len(), 1);
                 Ok(json!({"runner": "called"}))
             },
@@ -4419,6 +4888,144 @@ mod tests {
         assert_eq!(normalized[6], "1");
         let text = serde_json::to_string(&normalized).expect("normalized arguments");
         assert!(!text.contains("private"));
+    }
+
+    fn scripted_smoke_observation(
+        outcome: OperatorOutcome,
+    ) -> (Value, Vec<Value>, ScriptedOperatorPort, Vec<Duration>) {
+        let directory = TestDirectory::new(outcome.as_str());
+        let mut reservation = ArtifactReservation::begin_journaled(
+            "smoke",
+            &directory.0,
+            RunStartMetadata {
+                normalized_arguments: json!(["smoke"]),
+                provenance: json!({"trusted": true}),
+            },
+        )
+        .expect("journaled reservation");
+        let mut port = ScriptedOperatorPort::new([outcome]);
+        let harness = observed_harness(Box::new(NoopTransport), "OPERATOR");
+        harness
+            .connect(ConnectOptions::default())
+            .expect("synthetic connect");
+        let expected_stable_id = harness.descriptor.stable_id().to_owned();
+        let specs = smoke_observation_specs(false);
+        let mut result = json!({
+            "command": "smoke",
+            "stage": "a_only",
+            "device_target": {"expected_stable_id": expected_stable_id},
+            "identity_admission": {
+                "status": "admitted",
+                "observed_expected": {"stable_id": expected_stable_id},
+            },
+            "required_operator_action_ids": ["button.A"],
+            "operator_observations": [],
+            "actions": [],
+            "resources": {"primary": {"created": true}},
+        });
+        let delay = FakeDelay::default();
+        {
+            let mut control =
+                RunControl::new(&mut reservation, &mut port, InterruptToken::default());
+            let actual = exercise_observed_action_unit(
+                &harness,
+                &mut control,
+                "smoke",
+                &expected_stable_id,
+                &expected_stable_id,
+                &specs[0],
+                100,
+                Duration::from_secs(7),
+                &mut result,
+                &delay,
+            )
+            .unwrap_or_else(|failure| {
+                panic!(
+                    "scripted observation unit: {}: {}",
+                    failure.stage, failure.message
+                )
+            });
+            assert_eq!(actual, outcome);
+        }
+        result["operator_terminal_outcome"] = json!(if outcome == OperatorOutcome::Yes {
+            "all_yes"
+        } else {
+            outcome.as_str()
+        });
+        result["final_snapshot"] = snapshot_json(&harness.controller);
+        result["cleanup"] = harness.close();
+        let journal = fs::read(directory.0.join(journal::JOURNAL_FILE_NAME)).expect("journal");
+        let events = journal::parse_journal(&journal).expect("journal events");
+        let waits = delay
+            .waits
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        (result, events, port, waits)
+    }
+
+    #[test]
+    fn operator_outcomes_map_to_exact_status_and_durable_events() {
+        for (outcome, execution, qualification, exit_code) in [
+            (OperatorOutcome::Yes, "completed", "passed", 0),
+            (OperatorOutcome::No, "completed", "failed", 1),
+            (OperatorOutcome::Eof, "completed", "unverified", 2),
+            (OperatorOutcome::Timeout, "completed", "unverified", 2),
+            (OperatorOutcome::Ambiguous, "completed", "unverified", 2),
+            (OperatorOutcome::Interrupted, "cancelled", "unverified", 130),
+        ] {
+            let (result, events, port, waits) = scripted_smoke_observation(outcome);
+            assert_eq!(port.announced.len(), 1);
+            assert_eq!(port.observed.len(), 1);
+            assert_eq!(port.announced[0].action_id, "button.A");
+            assert_eq!(waits, [Duration::from_millis(100)]);
+            assert_eq!(result["actions"].as_array().map(Vec::len), Some(3));
+            assert_eq!(
+                result["operator_observations"][0]["response_timeout_ms"],
+                7_000
+            );
+            let event_names = events
+                .iter()
+                .map(|event| event["event"].as_str().expect("event"))
+                .collect::<Vec<_>>();
+            if outcome == OperatorOutcome::Interrupted {
+                assert_eq!(
+                    &event_names[1..],
+                    [
+                        "interrupt_requested",
+                        "operator_observation",
+                        "cancellation_terminal",
+                    ]
+                );
+            } else {
+                assert_eq!(&event_names[1..], ["operator_observation"]);
+            }
+            let (document, _) = finalize_result("smoke", Ok(result));
+            assert_eq!(document["execution_status"], execution);
+            assert_eq!(document["qualification_status"], qualification);
+            assert_eq!(document_exit_code(&document), exit_code);
+        }
+    }
+
+    #[test]
+    fn observation_plan_rejects_blanket_and_misbound_evidence() {
+        let arguments = vec!["smoke".to_owned(), "--yes".to_owned()];
+        assert!(operator_timing(&arguments, None).is_err());
+
+        let full = smoke_observation_specs(true);
+        let unique = full
+            .iter()
+            .map(|spec| spec.action_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(unique.len(), full.len());
+        assert!(full.len() > Button::ALL.len());
+
+        let (mut result, _, _, _) = scripted_smoke_observation(OperatorOutcome::Yes);
+        result["operator_observations"][0]["action_id"] = json!("button.B");
+        let (document, _) = finalize_result("smoke", Ok(result));
+        assert_eq!(document["execution_status"], "completed");
+        assert_eq!(document["qualification_status"], "failed");
+        assert_eq!(document_exit_code(&document), 1);
     }
 
     #[test]
@@ -6242,12 +6849,6 @@ mod tests {
         assert!(validate_home_wake(101, 3).is_err());
         assert!(validate_home_wake(20, 0).is_err());
         assert!(validate_home_wake(20, 61).is_err());
-    }
-
-    #[test]
-    fn home_attempt_marker_is_the_one_based_number_only() {
-        assert_eq!(home_attempt_marker(1), "1");
-        assert_eq!(home_attempt_marker(20), "20");
     }
 
     #[test]
