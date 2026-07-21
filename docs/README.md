@@ -33,6 +33,10 @@
     expected stable identity、open 前后复核、hotplug 重绑定和 diagnostic prelude 的非 capability 边界。
 13. [Phase 2B 普通命令 runner 所有权与失败证据设计](development/phase2b-command-runner-ownership.md)：
     非 faults 命令的单 owner、operation 失败收口和动态 partial-cleanup contract。
+14. [Phase 2B durable evidence transaction 设计](development/phase2b-durable-evidence-transaction.md)：
+    build/runtime provenance、append-only journal、manifest、completion marker 和磁盘分类。
+15. [Phase 2B 操作员、取消与观察设计](development/phase2b-operator-cancellation-observation.md)：
+    单 owner OperatorPort、Ctrl+C cooperative cancellation、逐动作 observation 和终态顺序。
 
 ## 决策记录
 
