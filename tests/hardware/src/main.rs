@@ -327,6 +327,7 @@ impl Harness {
         })
     }
 
+    #[cfg(test)]
     fn connect(&self, options: ConnectOptions) -> Result<Value, String> {
         let operation = self
             .controller
@@ -378,6 +379,176 @@ impl Harness {
     }
 }
 
+struct CommandFailure {
+    stage: &'static str,
+    message: String,
+    operation: Option<Operation>,
+}
+
+impl CommandFailure {
+    fn new(stage: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            stage,
+            message: message.into(),
+            operation: None,
+        }
+    }
+
+    fn with_operation(
+        stage: &'static str,
+        message: impl Into<String>,
+        operation: Operation,
+    ) -> Self {
+        Self {
+            stage,
+            message: message.into(),
+            operation: Some(operation),
+        }
+    }
+}
+
+fn finish_harness_phase(
+    harness: Harness,
+    mut result: Value,
+    cleanup_field: &'static str,
+    evidence_field: &'static str,
+    close_stage: &'static str,
+    execute: impl FnOnce(&Harness, &mut Value) -> Result<(), CommandFailure>,
+) -> Value {
+    let mut failure = execute(&harness, &mut result).err();
+    if let Some(operation) = failure
+        .as_ref()
+        .and_then(|failure| failure.operation.as_ref())
+    {
+        result["failed_operation_at_failure"] = operation_json(operation);
+        if !operation.snapshot().state.is_terminal() {
+            let cancel_outcome = operation.cancel();
+            result["recovery_cancel_outcome"] = json!(format!("{cancel_outcome:?}"));
+            if let Err(error) = wait_terminal(operation, OPERATION_TIMEOUT) {
+                result["recovery_settle_error"] = json!(error);
+            }
+        }
+    }
+
+    result[evidence_field] = harness_evidence_json(&harness);
+    let cleanup = harness.close();
+    if let Some(operation) = failure
+        .as_ref()
+        .and_then(|failure| failure.operation.as_ref())
+    {
+        result["failed_operation_post_close"] = operation_json(operation);
+    }
+    let cleanup_complete = cleanup_succeeded(&cleanup);
+    result[cleanup_field] = cleanup;
+
+    if !cleanup_complete {
+        let close_failure =
+            CommandFailure::new(close_stage, format!("{cleanup_field} did not complete"));
+        if failure.is_some() {
+            append_cleanup_error(&mut result, &close_failure);
+        } else {
+            failure = Some(close_failure);
+        }
+    }
+    if let Some(failure) = failure {
+        result["execution_error"] = json!({
+            "stage": failure.stage,
+            "message": failure.message,
+        });
+    }
+    result
+}
+
+fn append_cleanup_error(result: &mut Value, failure: &CommandFailure) {
+    let entry = json!({
+        "stage": failure.stage,
+        "message": failure.message,
+    });
+    match result.get_mut("cleanup_errors") {
+        Some(Value::Array(errors)) => errors.push(entry),
+        _ => result["cleanup_errors"] = json!([entry]),
+    }
+}
+
+fn set_command_failure(result: &mut Value, failure: CommandFailure) {
+    result["execution_error"] = json!({
+        "stage": failure.stage,
+        "message": failure.message,
+    });
+}
+
+fn harness_evidence_json(harness: &Harness) -> Value {
+    json!({
+        "port": port_json(&harness.descriptor),
+        "actual_baud": harness.actual_baud(),
+        "handshake_attempts": handshake_json(&harness.telemetry),
+        "native_open_attempts": harness.native_open_attempts(),
+        "pre_cleanup_snapshot": snapshot_json(&harness.controller),
+    })
+}
+
+fn connect_for_command(
+    harness: &Harness,
+    options: ConnectOptions,
+    admit_stage: &'static str,
+    wait_stage: &'static str,
+    terminal_stage: &'static str,
+) -> Result<Value, CommandFailure> {
+    let operation = harness
+        .controller
+        .connect(options)
+        .map_err(|error| CommandFailure::new(admit_stage, error.to_string()))?;
+    wait_for_command_success(operation, OPERATION_TIMEOUT, wait_stage, terminal_stage)
+}
+
+fn wait_for_command_success(
+    operation: Operation,
+    timeout: Duration,
+    wait_stage: &'static str,
+    terminal_stage: &'static str,
+) -> Result<Value, CommandFailure> {
+    let (operation, state) = wait_for_command_terminal(operation, timeout, wait_stage)?;
+    if state == OperationState::Succeeded {
+        Ok(operation_json(&operation))
+    } else {
+        let message = operation_failure(&operation);
+        Err(CommandFailure::with_operation(
+            terminal_stage,
+            message,
+            operation,
+        ))
+    }
+}
+
+fn wait_for_command_terminal(
+    operation: Operation,
+    timeout: Duration,
+    wait_stage: &'static str,
+) -> Result<(Operation, OperationState), CommandFailure> {
+    let snapshot = match operation.wait(WaitTimeout::For(timeout)) {
+        WaitResult::Completed(snapshot) => snapshot,
+        WaitResult::Timeout => {
+            return Err(CommandFailure::with_operation(
+                wait_stage,
+                format!("operation {} wait timed out", operation.id().get()),
+                operation,
+            ));
+        }
+    };
+    if !snapshot.state.is_terminal() {
+        return Err(CommandFailure::with_operation(
+            wait_stage,
+            format!(
+                "operation {} wait returned nonterminal state {:?}",
+                operation.id().get(),
+                snapshot.state
+            ),
+            operation,
+        ));
+    }
+    Ok((operation, snapshot.state))
+}
+
 fn main() {
     let exit_code = match real_main() {
         Ok(exit_code) => exit_code,
@@ -418,7 +589,7 @@ fn real_main() -> Result<i32, String> {
         "hotplug" => run_hotplug(&arguments),
         "lifecycle" => run_lifecycle(&arguments),
         "sequence" => run_sequence(&arguments).map(|(result, timings)| {
-            sequence_timings = Some(timings);
+            sequence_timings = timings;
             result
         }),
         "amiibo" => run_amiibo(&arguments),
@@ -933,8 +1104,16 @@ const FAULT_CLEANUP_ROLES: [(&str, &str); 4] = [
 const FAULT_SCENARIOS: [&str; 3] = ["port_occupied", "cancel", "deadline"];
 
 fn cleanup_contract_succeeded(command: &str, result: &Value) -> bool {
-    if command == "faults" && result.get("execution_error").is_some() {
-        return partial_fault_cleanup_contract_succeeded(result);
+    if result.get("execution_error").is_some() {
+        return match command {
+            "faults" => partial_fault_cleanup_contract_succeeded(result),
+            "hotplug" => partial_hotplug_cleanup_contract_succeeded(result),
+            "lifecycle" => partial_lifecycle_cleanup_contract_succeeded(result),
+            "handshake" | "smoke" | "home-wake" | "sequence" | "amiibo" => {
+                partial_single_harness_cleanup_contract_succeeded(result)
+            }
+            _ => false,
+        };
     }
 
     let expected_count = match command {
@@ -975,6 +1154,153 @@ fn cleanup_contract_succeeded(command: &str, result: &Value) -> bool {
         "discover" | "amiibo" => true,
         _ => true,
     }
+}
+
+fn partial_single_harness_cleanup_contract_succeeded(result: &Value) -> bool {
+    primary_resource_was_created(result)
+        && cleanup_slot_count(result) == 1
+        && runtime_cleanup_count(result) == 1
+        && cleanup_succeeded(&result["cleanup"])
+}
+
+fn primary_resource_was_created(result: &Value) -> bool {
+    result
+        .get("resources")
+        .and_then(Value::as_object)
+        .is_some_and(|resources| {
+            resources.len() == 1
+                && resources
+                    .get("primary")
+                    .and_then(Value::as_object)
+                    .is_some_and(|primary| {
+                        primary.len() == 1
+                            && primary.get("created").and_then(Value::as_bool) == Some(true)
+                    })
+        })
+}
+
+fn partial_hotplug_cleanup_contract_succeeded(result: &Value) -> bool {
+    let Some(resources) = result.get("resources").and_then(Value::as_object) else {
+        return false;
+    };
+    if resources.len() != 2 {
+        return false;
+    }
+    let created = |role: &str| {
+        resources
+            .get(role)
+            .and_then(Value::as_object)
+            .and_then(|role| {
+                (role.len() == 1)
+                    .then(|| role.get("created").and_then(Value::as_bool))
+                    .flatten()
+            })
+    };
+    let initial_created = created("initial");
+    let reconnected_created = created("reconnected");
+    if initial_created != Some(true) || reconnected_created.is_none() {
+        return false;
+    }
+    let reconnected_created = reconnected_created == Some(true);
+    let Some(stage) = result["execution_error"]["stage"].as_str() else {
+        return false;
+    };
+    let stage_requires_reconnected = match stage {
+        "hotplug_initial_connect_admit"
+        | "hotplug_initial_connect_wait"
+        | "hotplug_initial_connect_terminal"
+        | "hotplug_unplug_marker_flush"
+        | "hotplug_wait_absent"
+        | "hotplug_disconnect_admit"
+        | "hotplug_disconnect_wait"
+        | "hotplug_initial_close"
+        | "hotplug_reconnect_marker_flush"
+        | "hotplug_wait_return"
+        | "hotplug_reconnected_create" => false,
+        "hotplug_reconnect_admit"
+        | "hotplug_reconnect_wait"
+        | "hotplug_reconnect_terminal"
+        | "hotplug_reconnected_close" => true,
+        _ => return false,
+    };
+    if reconnected_created != stage_requires_reconnected {
+        return false;
+    }
+    let result_object = result
+        .as_object()
+        .expect("resources require an object result");
+    if !result_object.contains_key("disconnect_cleanup")
+        || result_object.contains_key("cleanup") != reconnected_created
+    {
+        return false;
+    }
+    let expected = 1 + usize::from(reconnected_created);
+    cleanup_slot_count(result) == expected
+        && runtime_cleanup_count(result) == expected
+        && cleanup_succeeded(&result["disconnect_cleanup"])
+        && (!reconnected_created || cleanup_succeeded(&result["cleanup"]))
+}
+
+fn partial_lifecycle_cleanup_contract_succeeded(result: &Value) -> bool {
+    let Some(resources) = result.get("resources").and_then(Value::as_object) else {
+        return false;
+    };
+    let Some(records) = result.get("records").and_then(Value::as_array) else {
+        return false;
+    };
+    let created_cycles = resources
+        .get("created_cycles")
+        .and_then(Value::as_u64)
+        .and_then(|cycles| usize::try_from(cycles).ok());
+    let requested_cycles = result
+        .get("cycles")
+        .and_then(Value::as_u64)
+        .and_then(|cycles| usize::try_from(cycles).ok());
+    if resources.len() != 1
+        || created_cycles != Some(records.len())
+        || requested_cycles.is_none_or(|cycles| cycles == 0 || records.len() > cycles)
+    {
+        return false;
+    }
+    let records_are_structurally_valid = records.iter().enumerate().all(|(index, record)| {
+        record.get("cycle").and_then(Value::as_u64) == u64::try_from(index + 1).ok()
+            && primary_resource_was_created(record)
+            && cleanup_succeeded(&record["cleanup"])
+    });
+    if !records_are_structurally_valid {
+        return false;
+    }
+    let Some(stage) = result["execution_error"]["stage"].as_str() else {
+        return false;
+    };
+    let statuses: Vec<_> = records
+        .iter()
+        .map(|record| record.get("status").and_then(Value::as_str))
+        .collect();
+    let all_completed = statuses.iter().all(|status| *status == Some("completed"));
+    let completed_then_failed = statuses.last() == Some(&Some("failed"))
+        && statuses[..statuses.len().saturating_sub(1)]
+            .iter()
+            .all(|status| *status == Some("completed"));
+    let failed_cycle = result
+        .get("failed_cycle")
+        .and_then(Value::as_u64)
+        .and_then(|cycle| usize::try_from(cycle).ok());
+    let stage_layout_is_valid = match stage {
+        "lifecycle_create" => all_completed && failed_cycle == Some(records.len() + 1),
+        "lifecycle_connect_admit"
+        | "lifecycle_connect_wait"
+        | "lifecycle_connect_terminal"
+        | "lifecycle_close"
+        | "lifecycle_metrics" => completed_then_failed && failed_cycle == Some(records.len()),
+        "lifecycle_final_metrics" => {
+            all_completed && records.len() == requested_cycles.expect("validated cycles")
+        }
+        _ => false,
+    };
+    stage_layout_is_valid
+        && cleanup_slot_count(result) == records.len()
+        && runtime_cleanup_count(result) == records.len()
 }
 
 fn complete_fault_projection_succeeded(result: &Value) -> bool {
@@ -1396,16 +1722,30 @@ fn run_discover(arguments: &[String]) -> Result<Value, String> {
 fn run_handshake(arguments: &[String]) -> Result<Value, String> {
     let port: String = required_value(arguments, "--port")?;
     let harness = Harness::new(&port, ControllerOptions::default())?;
-    let operation = harness.connect(ConnectOptions::default())?;
     let result = json!({
         "command": "handshake",
         "port": port_json(&harness.descriptor),
-        "operation": operation,
-        "actual_baud": harness.actual_baud(),
-        "attempts": handshake_json(&harness.telemetry),
+        "resources": {"primary": {"created": true}},
     });
-    let cleanup = harness.close();
-    Ok(with_cleanup(result, cleanup))
+    Ok(finish_harness_phase(
+        harness,
+        result,
+        "cleanup",
+        "harness_evidence",
+        "handshake_close",
+        |harness, result| {
+            result["operation"] = connect_for_command(
+                harness,
+                ConnectOptions::default(),
+                "handshake_connect_admit",
+                "handshake_connect_wait",
+                "handshake_connect_terminal",
+            )?;
+            result["actual_baud"] = json!(harness.actual_baud());
+            result["attempts"] = handshake_json(&harness.telemetry);
+            Ok(())
+        },
+    ))
 }
 
 fn run_smoke(arguments: &[String]) -> Result<Value, String> {
@@ -1418,102 +1758,6 @@ fn run_smoke(arguments: &[String]) -> Result<Value, String> {
     let hold_ms = value_or(arguments, "--hold-ms", 0_u64)?;
     validate_hold_ms(hold_ms)?;
     let harness = Harness::new(&port, ControllerOptions::default())?;
-    harness.connect(ConnectOptions::default())?;
-    let mut actions = Vec::new();
-    if wake_home {
-        for (label, action) in home_wake_actions() {
-            exercise_action(&harness, label, action, &mut actions)?;
-        }
-        thread::sleep(Duration::from_secs(3));
-    }
-    if wake_left_stick {
-        for (label, action) in left_stick_wake_actions() {
-            exercise_action(&harness, label, action, &mut actions)?;
-        }
-    }
-    exercise_action(
-        &harness,
-        "button.A.down",
-        ControllerAction::ButtonDown(Button::A),
-        &mut actions,
-    )?;
-    if hold_ms != 0 {
-        thread::sleep(Duration::from_millis(hold_ms));
-    }
-    exercise_action(
-        &harness,
-        "button.A.up",
-        ControllerAction::ButtonUp(Button::A),
-        &mut actions,
-    )?;
-    exercise_action(&harness, "neutral", ControllerAction::Reset, &mut actions)?;
-
-    if full {
-        for button in Button::ALL {
-            if button != Button::A {
-                exercise_action(
-                    &harness,
-                    &format!("button.{button:?}.down"),
-                    ControllerAction::ButtonDown(button),
-                    &mut actions,
-                )?;
-                exercise_action(
-                    &harness,
-                    &format!("button.{button:?}.up"),
-                    ControllerAction::ButtonUp(button),
-                    &mut actions,
-                )?;
-                exercise_action(&harness, "neutral", ControllerAction::Reset, &mut actions)?;
-            }
-        }
-        for hat in Hat::ALL.into_iter().filter(|hat| *hat != Hat::Center) {
-            exercise_action(
-                &harness,
-                &format!("hat.{hat:?}"),
-                ControllerAction::Hat(hat),
-                &mut actions,
-            )?;
-            exercise_action(
-                &harness,
-                "hat.Center",
-                ControllerAction::Hat(Hat::Center),
-                &mut actions,
-            )?;
-            exercise_action(&harness, "neutral", ControllerAction::Reset, &mut actions)?;
-        }
-        let boundaries = [
-            StickPosition::new(0, 0),
-            StickPosition::new(0, 255),
-            StickPosition::new(255, 0),
-            StickPosition::new(255, 255),
-        ];
-        for (side, constructor) in [
-            (
-                "left",
-                ControllerAction::LeftStick as fn(StickPosition) -> ControllerAction,
-            ),
-            (
-                "right",
-                ControllerAction::RightStick as fn(StickPosition) -> ControllerAction,
-            ),
-        ] {
-            for position in boundaries {
-                exercise_action(
-                    &harness,
-                    &format!("stick.{side}.{},{}", position.x, position.y),
-                    constructor(position),
-                    &mut actions,
-                )?;
-                exercise_action(
-                    &harness,
-                    &format!("stick.{side}.center"),
-                    constructor(StickPosition::CENTER),
-                    &mut actions,
-                )?;
-                exercise_action(&harness, "neutral", ControllerAction::Reset, &mut actions)?;
-            }
-        }
-    }
     let result = json!({
         "command": "smoke",
         "stage": if full { "full" } else { "a_only" },
@@ -1522,14 +1766,144 @@ fn run_smoke(arguments: &[String]) -> Result<Value, String> {
         "wake_home_to_a_delay_ms": wake_home.then_some(3_000),
         "a_hold_ms": hold_ms,
         "port": port_json(&harness.descriptor),
-        "actual_baud": harness.actual_baud(),
-        "actions": actions,
-        "final_snapshot": snapshot_json(&harness.controller),
-        "latency": latency_json(&harness.telemetry, harness.actual_baud()),
+        "actions": [],
         "switch_observation": "requires operator confirmation",
+        "resources": {"primary": {"created": true}},
     });
-    let cleanup = harness.close();
-    Ok(with_cleanup(result, cleanup))
+    Ok(finish_harness_phase(
+        harness,
+        result,
+        "cleanup",
+        "harness_evidence",
+        "smoke_close",
+        |harness, result| {
+            result["connect_operation"] = connect_for_command(
+                harness,
+                ConnectOptions::default(),
+                "smoke_connect_admit",
+                "smoke_connect_wait",
+                "smoke_connect_terminal",
+            )?;
+            if wake_home {
+                for (label, action) in home_wake_actions() {
+                    exercise_action_for_command(harness, label, action, &mut result["actions"])?;
+                }
+                thread::sleep(Duration::from_secs(3));
+            }
+            if wake_left_stick {
+                for (label, action) in left_stick_wake_actions() {
+                    exercise_action_for_command(harness, label, action, &mut result["actions"])?;
+                }
+            }
+            exercise_action_for_command(
+                harness,
+                "button.A.down",
+                ControllerAction::ButtonDown(Button::A),
+                &mut result["actions"],
+            )?;
+            if hold_ms != 0 {
+                thread::sleep(Duration::from_millis(hold_ms));
+            }
+            exercise_action_for_command(
+                harness,
+                "button.A.up",
+                ControllerAction::ButtonUp(Button::A),
+                &mut result["actions"],
+            )?;
+            exercise_action_for_command(
+                harness,
+                "neutral",
+                ControllerAction::Reset,
+                &mut result["actions"],
+            )?;
+
+            if full {
+                for button in Button::ALL {
+                    if button != Button::A {
+                        exercise_action_for_command(
+                            harness,
+                            &format!("button.{button:?}.down"),
+                            ControllerAction::ButtonDown(button),
+                            &mut result["actions"],
+                        )?;
+                        exercise_action_for_command(
+                            harness,
+                            &format!("button.{button:?}.up"),
+                            ControllerAction::ButtonUp(button),
+                            &mut result["actions"],
+                        )?;
+                        exercise_action_for_command(
+                            harness,
+                            "neutral",
+                            ControllerAction::Reset,
+                            &mut result["actions"],
+                        )?;
+                    }
+                }
+                for hat in Hat::ALL.into_iter().filter(|hat| *hat != Hat::Center) {
+                    exercise_action_for_command(
+                        harness,
+                        &format!("hat.{hat:?}"),
+                        ControllerAction::Hat(hat),
+                        &mut result["actions"],
+                    )?;
+                    exercise_action_for_command(
+                        harness,
+                        "hat.Center",
+                        ControllerAction::Hat(Hat::Center),
+                        &mut result["actions"],
+                    )?;
+                    exercise_action_for_command(
+                        harness,
+                        "neutral",
+                        ControllerAction::Reset,
+                        &mut result["actions"],
+                    )?;
+                }
+                let boundaries = [
+                    StickPosition::new(0, 0),
+                    StickPosition::new(0, 255),
+                    StickPosition::new(255, 0),
+                    StickPosition::new(255, 255),
+                ];
+                for (side, constructor) in [
+                    (
+                        "left",
+                        ControllerAction::LeftStick as fn(StickPosition) -> ControllerAction,
+                    ),
+                    (
+                        "right",
+                        ControllerAction::RightStick as fn(StickPosition) -> ControllerAction,
+                    ),
+                ] {
+                    for position in boundaries {
+                        exercise_action_for_command(
+                            harness,
+                            &format!("stick.{side}.{},{}", position.x, position.y),
+                            constructor(position),
+                            &mut result["actions"],
+                        )?;
+                        exercise_action_for_command(
+                            harness,
+                            &format!("stick.{side}.center"),
+                            constructor(StickPosition::CENTER),
+                            &mut result["actions"],
+                        )?;
+                        exercise_action_for_command(
+                            harness,
+                            "neutral",
+                            ControllerAction::Reset,
+                            &mut result["actions"],
+                        )?;
+                    }
+                }
+            }
+            result["actual_baud"] = json!(harness.actual_baud());
+            result["final_snapshot"] = snapshot_json(&harness.controller);
+            result["latency"] = latency_json(&harness.telemetry, harness.actual_baud());
+            Ok(())
+        },
+    ))
 }
 
 fn run_home_wake(arguments: &[String]) -> Result<Value, String> {
@@ -1538,56 +1912,85 @@ fn run_home_wake(arguments: &[String]) -> Result<Value, String> {
     let interval_seconds = value_or(arguments, "--interval-seconds", 3_u64)?;
     validate_home_wake(attempts, interval_seconds)?;
     let harness = Harness::new(&port, ControllerOptions::default())?;
-    harness.connect(ConnectOptions::default())?;
-    let started = Instant::now();
-    let mut records = Vec::with_capacity(attempts);
-    for attempt in 0..attempts {
-        let target = Duration::from_secs(
-            u64::try_from(attempt)
-                .expect("bounded attempt index fits u64")
-                .saturating_mul(interval_seconds),
-        );
-        if let Some(remaining) = target.checked_sub(started.elapsed()) {
-            thread::sleep(remaining);
-        }
-        let attempt_started_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let mut actions = Vec::with_capacity(3);
-        exercise_action(
-            &harness,
-            "button.Home.down",
-            ControllerAction::ButtonDown(Button::Home),
-            &mut actions,
-        )?;
-        println!("{}", home_attempt_marker(attempt + 1));
-        std::io::stdout()
-            .flush()
-            .map_err(|error| error.to_string())?;
-        exercise_action(
-            &harness,
-            "button.Home.up",
-            ControllerAction::ButtonUp(Button::Home),
-            &mut actions,
-        )?;
-        exercise_action(&harness, "neutral", ControllerAction::Reset, &mut actions)?;
-        records.push(json!({
-            "attempt": attempt + 1,
-            "started_after_ms": attempt_started_ms,
-            "actions": actions,
-        }));
-    }
     let result = json!({
         "command": "home-wake",
         "attempts": attempts,
         "interval_seconds": interval_seconds,
-        "actual_baud": harness.actual_baud(),
         "port": port_json(&harness.descriptor),
-        "records": records,
-        "final_snapshot": snapshot_json(&harness.controller),
-        "latency": latency_json(&harness.telemetry, harness.actual_baud()),
+        "records": [],
         "switch_observation": "requires operator confirmation",
+        "resources": {"primary": {"created": true}},
     });
-    let cleanup = harness.close();
-    Ok(with_cleanup(result, cleanup))
+    Ok(finish_harness_phase(
+        harness,
+        result,
+        "cleanup",
+        "harness_evidence",
+        "home_wake_close",
+        |harness, result| {
+            result["connect_operation"] = connect_for_command(
+                harness,
+                ConnectOptions::default(),
+                "home_wake_connect_admit",
+                "home_wake_connect_wait",
+                "home_wake_connect_terminal",
+            )?;
+            let started = Instant::now();
+            for attempt in 0..attempts {
+                let target = Duration::from_secs(
+                    u64::try_from(attempt)
+                        .expect("bounded attempt index fits u64")
+                        .saturating_mul(interval_seconds),
+                );
+                if let Some(remaining) = target.checked_sub(started.elapsed()) {
+                    thread::sleep(remaining);
+                }
+                let attempt_started_ms =
+                    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                result["records"]
+                    .as_array_mut()
+                    .expect("home-wake records are an array")
+                    .push(json!({
+                        "attempt": attempt + 1,
+                        "started_after_ms": attempt_started_ms,
+                        "status": "running",
+                        "actions": [],
+                    }));
+                let record = result["records"]
+                    .as_array_mut()
+                    .expect("home-wake records are an array")
+                    .last_mut()
+                    .expect("current home-wake record exists");
+                exercise_action_for_command(
+                    harness,
+                    "button.Home.down",
+                    ControllerAction::ButtonDown(Button::Home),
+                    &mut record["actions"],
+                )?;
+                println!("{}", home_attempt_marker(attempt + 1));
+                std::io::stdout().flush().map_err(|error| {
+                    CommandFailure::new("home_wake_marker_flush", error.to_string())
+                })?;
+                exercise_action_for_command(
+                    harness,
+                    "button.Home.up",
+                    ControllerAction::ButtonUp(Button::Home),
+                    &mut record["actions"],
+                )?;
+                exercise_action_for_command(
+                    harness,
+                    "neutral",
+                    ControllerAction::Reset,
+                    &mut record["actions"],
+                )?;
+                record["status"] = json!("completed");
+            }
+            result["actual_baud"] = json!(harness.actual_baud());
+            result["final_snapshot"] = snapshot_json(&harness.controller);
+            result["latency"] = latency_json(&harness.telemetry, harness.actual_baud());
+            Ok(())
+        },
+    ))
 }
 
 fn run_faults(arguments: &[String]) -> Result<Value, String> {
@@ -1598,39 +2001,98 @@ fn run_hotplug(arguments: &[String]) -> Result<Value, String> {
     let port: String = required_value(arguments, "--port")?;
     let timeout_seconds = value_or(arguments, "--timeout-seconds", 180_u64)?;
     let harness = Harness::new(&port, ControllerOptions::default())?;
-    harness.connect(ConnectOptions::default())?;
     let stable_id = harness.descriptor.stable_id().to_owned();
-    println!("HOTPLUG_READY: unplug {port} now");
-    std::io::stdout()
-        .flush()
-        .map_err(|error| error.to_string())?;
-    wait_for_presence(&stable_id, false, Duration::from_secs(timeout_seconds))?;
-    let disconnected = harness
-        .controller
-        .reset()
-        .map_err(|error| error.to_string())?;
-    wait_terminal(&disconnected, OPERATION_TIMEOUT)?;
-    let disconnect_cleanup = harness.close();
-
-    println!("HOTPLUG_DISCONNECTED: reconnect the same device now");
-    std::io::stdout()
-        .flush()
-        .map_err(|error| error.to_string())?;
-    wait_for_presence(&stable_id, true, Duration::from_secs(timeout_seconds))?;
-    let reconnected = Harness::new(&port, ControllerOptions::default())?;
-    let reconnect_operation = reconnected.connect(ConnectOptions::default())?;
     let result = json!({
         "command": "hotplug",
         "stable_id": stable_id,
-        "disconnect_operation": operation_json(&disconnected),
-        "disconnect_detected": disconnected.snapshot().state == OperationState::Failed,
-        "disconnect_cleanup": disconnect_cleanup,
-        "reconnect_operation": reconnect_operation,
-        "reconnect_baud": reconnected.actual_baud(),
-        "reconnected_identity": port_json(&reconnected.descriptor),
+        "initial_port": port_json(&harness.descriptor),
+        "resources": {
+            "initial": {"created": true},
+            "reconnected": {"created": false},
+        },
     });
-    let cleanup = reconnected.close();
-    Ok(with_cleanup(result, cleanup))
+    let mut result = finish_harness_phase(
+        harness,
+        result,
+        "disconnect_cleanup",
+        "initial_harness_evidence",
+        "hotplug_initial_close",
+        |harness, result| {
+            result["initial_connect_operation"] = connect_for_command(
+                harness,
+                ConnectOptions::default(),
+                "hotplug_initial_connect_admit",
+                "hotplug_initial_connect_wait",
+                "hotplug_initial_connect_terminal",
+            )?;
+            println!("HOTPLUG_READY: unplug {port} now");
+            std::io::stdout().flush().map_err(|error| {
+                CommandFailure::new("hotplug_unplug_marker_flush", error.to_string())
+            })?;
+            wait_for_presence(&stable_id, false, Duration::from_secs(timeout_seconds))
+                .map_err(|error| CommandFailure::new("hotplug_wait_absent", error))?;
+            let disconnected = harness.controller.reset().map_err(|error| {
+                CommandFailure::new("hotplug_disconnect_admit", error.to_string())
+            })?;
+            let (disconnected, state) = wait_for_command_terminal(
+                disconnected,
+                OPERATION_TIMEOUT,
+                "hotplug_disconnect_wait",
+            )?;
+            result["disconnect_operation"] = operation_json(&disconnected);
+            result["disconnect_detected"] = json!(state == OperationState::Failed);
+            Ok(())
+        },
+    );
+    if result.get("execution_error").is_some() {
+        return Ok(result);
+    }
+
+    println!("HOTPLUG_DISCONNECTED: reconnect the same device now");
+    if let Err(error) = std::io::stdout().flush() {
+        set_command_failure(
+            &mut result,
+            CommandFailure::new("hotplug_reconnect_marker_flush", error.to_string()),
+        );
+        return Ok(result);
+    }
+    if let Err(error) = wait_for_presence(&stable_id, true, Duration::from_secs(timeout_seconds)) {
+        set_command_failure(
+            &mut result,
+            CommandFailure::new("hotplug_wait_return", error),
+        );
+        return Ok(result);
+    }
+    let reconnected = match Harness::new(&port, ControllerOptions::default()) {
+        Ok(harness) => harness,
+        Err(error) => {
+            set_command_failure(
+                &mut result,
+                CommandFailure::new("hotplug_reconnected_create", error),
+            );
+            return Ok(result);
+        }
+    };
+    result["resources"]["reconnected"]["created"] = json!(true);
+    result["reconnected_identity"] = port_json(&reconnected.descriptor);
+    Ok(finish_harness_phase(
+        reconnected,
+        result,
+        "cleanup",
+        "reconnected_harness_evidence",
+        "hotplug_reconnected_close",
+        |harness, result| {
+            result["reconnect_operation"] = connect_for_command(
+                harness,
+                ConnectOptions::default(),
+                "hotplug_reconnect_admit",
+                "hotplug_reconnect_wait",
+                "hotplug_reconnect_terminal",
+            )?;
+            result["reconnect_baud"] = json!(harness.actual_baud());
+            Ok(())
+        },
+    ))
 }
 
 fn run_lifecycle(arguments: &[String]) -> Result<Value, String> {
@@ -1640,99 +2102,199 @@ fn run_lifecycle(arguments: &[String]) -> Result<Value, String> {
         return Err("--cycles must be non-zero".to_owned());
     }
     let before = process_metrics()?;
-    let mut records = Vec::with_capacity(cycles);
-    for cycle in 1..=cycles {
-        let harness = Harness::new(&port, ControllerOptions::default())?;
-        harness.connect(ConnectOptions::default())?;
-        let baud = harness.actual_baud();
-        let cleanup = harness.close();
-        let metrics = process_metrics()?;
-        records.push(json!({
-            "cycle": cycle,
-            "baud": baud,
-            "cleanup": cleanup,
-            "process": metrics,
-            "port_present": find_port(&port).is_ok(),
-        }));
-    }
-    let after = process_metrics()?;
-    let handle_delta = after["handles"].as_i64().unwrap_or_default()
-        - before["handles"].as_i64().unwrap_or_default();
-    let thread_delta = after["threads"].as_i64().unwrap_or_default()
-        - before["threads"].as_i64().unwrap_or_default();
-    Ok(json!({
+    let mut result = json!({
         "command": "lifecycle",
         "cycles": cycles,
         "before": before,
-        "after": after,
-        "handle_delta": handle_delta,
-        "thread_delta": thread_delta,
-        "no_positive_growth": handle_delta <= 0 && thread_delta <= 0,
-        "records": records,
-    }))
+        "records": [],
+        "resources": {"created_cycles": 0},
+    });
+    for cycle in 1..=cycles {
+        let harness = match Harness::new(&port, ControllerOptions::default()) {
+            Ok(harness) => harness,
+            Err(error) => {
+                set_command_failure(&mut result, CommandFailure::new("lifecycle_create", error));
+                result["failed_cycle"] = json!(cycle);
+                return Ok(result);
+            }
+        };
+        result["resources"]["created_cycles"] = json!(cycle);
+        let record = json!({
+            "cycle": cycle,
+            "status": "running",
+            "resources": {"primary": {"created": true}},
+        });
+        let mut record = finish_harness_phase(
+            harness,
+            record,
+            "cleanup",
+            "harness_evidence",
+            "lifecycle_close",
+            |harness, record| {
+                record["connect_operation"] = connect_for_command(
+                    harness,
+                    ConnectOptions::default(),
+                    "lifecycle_connect_admit",
+                    "lifecycle_connect_wait",
+                    "lifecycle_connect_terminal",
+                )?;
+                record["baud"] = json!(harness.actual_baud());
+                Ok(())
+            },
+        );
+        if record.get("execution_error").is_some() {
+            record["status"] = json!("failed");
+            result["execution_error"] = record["execution_error"].clone();
+            result["failed_cycle"] = json!(cycle);
+            result["records"]
+                .as_array_mut()
+                .expect("lifecycle records are an array")
+                .push(record);
+            return Ok(result);
+        }
+        let metrics = match process_metrics() {
+            Ok(metrics) => metrics,
+            Err(error) => {
+                record["status"] = json!("failed");
+                record["execution_error"] = json!({
+                    "stage": "lifecycle_metrics",
+                    "message": error,
+                });
+                result["execution_error"] = record["execution_error"].clone();
+                result["failed_cycle"] = json!(cycle);
+                result["records"]
+                    .as_array_mut()
+                    .expect("lifecycle records are an array")
+                    .push(record);
+                return Ok(result);
+            }
+        };
+        record["status"] = json!("completed");
+        record["process"] = metrics;
+        record["port_present"] = json!(find_port(&port).is_ok());
+        result["records"]
+            .as_array_mut()
+            .expect("lifecycle records are an array")
+            .push(record);
+    }
+    let after = match process_metrics() {
+        Ok(after) => after,
+        Err(error) => {
+            set_command_failure(
+                &mut result,
+                CommandFailure::new("lifecycle_final_metrics", error),
+            );
+            return Ok(result);
+        }
+    };
+    let handle_delta = after["handles"].as_i64().unwrap_or_default()
+        - result["before"]["handles"].as_i64().unwrap_or_default();
+    let thread_delta = after["threads"].as_i64().unwrap_or_default()
+        - result["before"]["threads"].as_i64().unwrap_or_default();
+    result["after"] = after;
+    result["handle_delta"] = json!(handle_delta);
+    result["thread_delta"] = json!(thread_delta);
+    result["no_positive_growth"] = json!(handle_delta <= 0 && thread_delta <= 0);
+    Ok(result)
 }
 
-fn run_sequence(arguments: &[String]) -> Result<(Value, Vec<u8>), String> {
+fn run_sequence(arguments: &[String]) -> Result<(Value, Option<Vec<u8>>), String> {
     let port: String = required_value(arguments, "--port")?;
     let steps = value_or(arguments, "--steps", 10_000_usize)?;
     if !(1..=10_000).contains(&steps) {
         return Err("--steps must be in 1..=10000".to_owned());
     }
     let harness = Harness::new(&port, ControllerOptions::default())?;
-    harness.connect(ConnectOptions::default())?;
-    let sequence_steps: Vec<_> = (0..steps)
-        .map(|index| {
-            let offset = u64::try_from(index)
-                .expect("step index fits u64")
-                .saturating_mul(MINIMUM_REPORT_INTERVAL_NS);
-            let action = if index.is_multiple_of(2) {
-                ControllerAction::ButtonDown(Button::A)
-            } else {
-                ControllerAction::ButtonUp(Button::A)
-            };
-            SequenceStep::new(offset, action)
-        })
-        .collect();
-    let sequence = PreciseSequence::new(sequence_steps).map_err(|error| error.to_string())?;
-    let started = harness.now_ns();
-    let operation = harness
-        .controller
-        .precise_sequence(sequence)
-        .map_err(|error| error.to_string())?;
-    let expected_seconds = u64::try_from(steps)
-        .expect("step count fits u64")
-        .saturating_mul(30)
-        .div_ceil(1_000)
-        .saturating_add(60);
-    wait_terminal(&operation, Duration::from_secs(expected_seconds))?;
-    let ended = harness.now_ns();
-    let reset = harness
-        .controller
-        .reset()
-        .map_err(|error| error.to_string())?;
-    wait_succeeded(&reset, OPERATION_TIMEOUT)?;
-    let timing_csv = timing_csv_bytes(&harness.telemetry)?;
-    let timing_count = harness
-        .telemetry
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .timings
-        .len();
     let result = json!({
         "command": "sequence",
         "requested_steps": steps,
-        "operation": operation_json(&operation),
-        "functional_success": operation.snapshot().state == OperationState::Succeeded,
-        "accepted_report_count_before_final_reset": harness.controller.snapshot().accepted_report_count.saturating_sub(1),
-        "recorded_complete_writes": timing_count,
-        "elapsed_ns": ended.saturating_sub(started),
-        "actual_baud": harness.actual_baud(),
-        "latency": latency_json(&harness.telemetry, harness.actual_baud()),
         "timing_csv": SEQUENCE_TIMINGS_FILE_NAME,
         "physical_order_evidence": "open: no logic analyzer or firmware trace",
+        "resources": {"primary": {"created": true}},
     });
-    let cleanup = harness.close();
-    Ok((with_cleanup(result, cleanup), timing_csv))
+    let mut timing_csv = None;
+    let result = finish_harness_phase(
+        harness,
+        result,
+        "cleanup",
+        "harness_evidence",
+        "sequence_close",
+        |harness, result| {
+            result["connect_operation"] = connect_for_command(
+                harness,
+                ConnectOptions::default(),
+                "sequence_connect_admit",
+                "sequence_connect_wait",
+                "sequence_connect_terminal",
+            )?;
+            let sequence_steps: Vec<_> = (0..steps)
+                .map(|index| {
+                    let offset = u64::try_from(index)
+                        .expect("step index fits u64")
+                        .saturating_mul(MINIMUM_REPORT_INTERVAL_NS);
+                    let action = if index.is_multiple_of(2) {
+                        ControllerAction::ButtonDown(Button::A)
+                    } else {
+                        ControllerAction::ButtonUp(Button::A)
+                    };
+                    SequenceStep::new(offset, action)
+                })
+                .collect();
+            let sequence = PreciseSequence::new(sequence_steps)
+                .map_err(|error| CommandFailure::new("sequence_build", error.to_string()))?;
+            let started = harness.now_ns();
+            let operation = harness
+                .controller
+                .precise_sequence(sequence)
+                .map_err(|error| CommandFailure::new("sequence_admit", error.to_string()))?;
+            let expected_seconds = u64::try_from(steps)
+                .expect("step count fits u64")
+                .saturating_mul(30)
+                .div_ceil(1_000)
+                .saturating_add(60);
+            let (operation, state) = wait_for_command_terminal(
+                operation,
+                Duration::from_secs(expected_seconds),
+                "sequence_terminal_wait",
+            )?;
+            let ended = harness.now_ns();
+            result["operation"] = operation_json(&operation);
+            result["functional_success"] = json!(state == OperationState::Succeeded);
+            let reset = harness
+                .controller
+                .reset()
+                .map_err(|error| CommandFailure::new("sequence_reset_admit", error.to_string()))?;
+            result["reset_operation"] = wait_for_command_success(
+                reset,
+                OPERATION_TIMEOUT,
+                "sequence_reset_wait",
+                "sequence_reset_terminal",
+            )?;
+            timing_csv = Some(
+                timing_csv_bytes(&harness.telemetry)
+                    .map_err(|error| CommandFailure::new("sequence_timing_render", error))?,
+            );
+            let timing_count = harness
+                .telemetry
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .timings
+                .len();
+            result["accepted_report_count_before_final_reset"] = json!(
+                harness
+                    .controller
+                    .snapshot()
+                    .accepted_report_count
+                    .saturating_sub(1)
+            );
+            result["recorded_complete_writes"] = json!(timing_count);
+            result["elapsed_ns"] = json!(ended.saturating_sub(started));
+            result["actual_baud"] = json!(harness.actual_baud());
+            result["latency"] = latency_json(&harness.telemetry, harness.actual_baud());
+            Ok(())
+        },
+    );
+    Ok((result, timing_csv))
 }
 
 fn run_amiibo(arguments: &[String]) -> Result<Value, String> {
@@ -1771,43 +2333,78 @@ fn run_amiibo(arguments: &[String]) -> Result<Value, String> {
             ..ControllerOptions::default()
         },
     )?;
-    harness.connect(ConnectOptions::default())?;
-    let save = harness
-        .controller
-        .save_amiibo(slot, data, AmiiboSaveOptions::default())
-        .map_err(|error| error.to_string())?;
-    wait_succeeded(&save, Duration::from_secs(60))?;
-    let select = harness
-        .controller
-        .select_amiibo(slot, AmiiboSelectOptions::default())
-        .map_err(|error| error.to_string())?;
-    wait_succeeded(&select, OPERATION_TIMEOUT)?;
     let result = json!({
         "command": "amiibo",
-        "write_performed": true,
+        "write_attempted": false,
+        "write_performed": false,
         "slot": slot,
         "slot_count": slot_count,
         "maximum_data_len": maximum_data_len,
         "data_path": data_path,
-        "save": operation_json(&save),
-        "select": operation_json(&select),
+        "actual_payload_len": data.len(),
+        "resources": {"primary": {"created": true}},
     });
-    let cleanup = harness.close();
-    Ok(with_cleanup(result, cleanup))
+    Ok(finish_harness_phase(
+        harness,
+        result,
+        "cleanup",
+        "harness_evidence",
+        "amiibo_close",
+        move |harness, result| {
+            result["connect_operation"] = connect_for_command(
+                harness,
+                ConnectOptions::default(),
+                "amiibo_connect_admit",
+                "amiibo_connect_wait",
+                "amiibo_connect_terminal",
+            )?;
+            result["write_attempted"] = json!(true);
+            let save = harness
+                .controller
+                .save_amiibo(slot, data, AmiiboSaveOptions::default())
+                .map_err(|error| CommandFailure::new("amiibo_save_admit", error.to_string()))?;
+            result["save"] = wait_for_command_success(
+                save,
+                Duration::from_secs(60),
+                "amiibo_save_wait",
+                "amiibo_save_terminal",
+            )?;
+            result["write_performed"] = json!(true);
+            let select = harness
+                .controller
+                .select_amiibo(slot, AmiiboSelectOptions::default())
+                .map_err(|error| CommandFailure::new("amiibo_select_admit", error.to_string()))?;
+            result["select"] = wait_for_command_success(
+                select,
+                OPERATION_TIMEOUT,
+                "amiibo_select_wait",
+                "amiibo_select_terminal",
+            )?;
+            Ok(())
+        },
+    ))
 }
 
-fn exercise_action(
+fn exercise_action_for_command(
     harness: &Harness,
     label: &str,
     action: ControllerAction,
-    output: &mut Vec<Value>,
-) -> Result<(), String> {
+    output: &mut Value,
+) -> Result<(), CommandFailure> {
     let operation = harness
         .controller
         .direct(action)
-        .map_err(|error| error.to_string())?;
-    wait_succeeded(&operation, OPERATION_TIMEOUT)?;
-    output.push(json!({"label": label, "operation": operation_json(&operation)}));
+        .map_err(|error| CommandFailure::new("action_admit", format!("{label}: {error}")))?;
+    let operation = wait_for_command_success(
+        operation,
+        OPERATION_TIMEOUT,
+        "action_wait",
+        "action_terminal",
+    )?;
+    output
+        .as_array_mut()
+        .expect("action output is an array")
+        .push(json!({"label": label, "operation": operation}));
     Ok(())
 }
 
@@ -1885,6 +2482,7 @@ fn wait_for_presence(stable_id: &str, present: bool, timeout: Duration) -> Resul
     ))
 }
 
+#[cfg(test)]
 fn wait_succeeded(operation: &Operation, timeout: Duration) -> Result<(), String> {
     let snapshot = wait_terminal(operation, timeout)?;
     if snapshot.state == OperationState::Succeeded {
@@ -2129,11 +2727,6 @@ fn counts_json(counts: RuntimeCounts) -> Value {
         "active_resources": counts.active_resources,
         "active_tasks": counts.active_tasks,
     })
-}
-
-fn with_cleanup(mut value: Value, cleanup: Value) -> Value {
-    value["cleanup"] = cleanup;
-    value
 }
 
 fn harness_cleanup_json(controller: Value, runtime: Value) -> Value {
@@ -2545,6 +3138,62 @@ mod tests {
         fn close(&mut self) {}
     }
 
+    struct HandshakeFailureTransport;
+
+    impl ControllerTransport for HandshakeFailureTransport {
+        fn handshake(&mut self, _request: HandshakeRequest) -> Result<(), TransportError> {
+            Err(TransportError::new(
+                TransportErrorKind::Protocol,
+                "injected handshake failure",
+            ))
+        }
+
+        fn write(&mut self, request: WriteRequest<'_>) -> Result<usize, TransportError> {
+            Ok(request.bytes.len())
+        }
+
+        fn wait_for_ack(&mut self, _request: AckRequest) -> Result<AckFrame, TransportError> {
+            Err(TransportError::new(
+                TransportErrorKind::Protocol,
+                "no ACK in handshake failure test",
+            ))
+        }
+
+        fn close(&mut self) {}
+    }
+
+    struct FailSecondReportTransport {
+        accepted_reports: usize,
+    }
+
+    impl ControllerTransport for FailSecondReportTransport {
+        fn handshake(&mut self, _request: HandshakeRequest) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn write(&mut self, request: WriteRequest<'_>) -> Result<usize, TransportError> {
+            if request.context.kind == WriteKind::Report {
+                self.accepted_reports += 1;
+                if self.accepted_reports == 2 {
+                    return Err(TransportError::new(
+                        TransportErrorKind::Io,
+                        "injected second report failure",
+                    ));
+                }
+            }
+            Ok(request.bytes.len())
+        }
+
+        fn wait_for_ack(&mut self, _request: AckRequest) -> Result<AckFrame, TransportError> {
+            Err(TransportError::new(
+                TransportErrorKind::Protocol,
+                "no ACK in action failure test",
+            ))
+        }
+
+        fn close(&mut self) {}
+    }
+
     struct FinalNeutralFailureTransport;
 
     impl ControllerTransport for FinalNeutralFailureTransport {
@@ -2663,6 +3312,198 @@ mod tests {
         assert_eq!(document["command"], "handshake");
         assert_eq!(document["error"], "protocol timeout");
         assert_eq!(error.as_deref(), Some("protocol timeout"));
+    }
+
+    #[test]
+    fn failed_connect_still_records_operation_and_explicit_cleanup() {
+        let harness = observed_harness(Box::new(HandshakeFailureTransport), "CONNECT-FAILURE");
+        let result = json!({
+            "command": "handshake",
+            "resources": {"primary": {"created": true}},
+        });
+        let result = finish_harness_phase(
+            harness,
+            result,
+            "cleanup",
+            "harness_evidence",
+            "handshake_close",
+            |harness, result| {
+                result["operation"] = connect_for_command(
+                    harness,
+                    ConnectOptions::default(),
+                    "handshake_connect_admit",
+                    "handshake_connect_wait",
+                    "handshake_connect_terminal",
+                )?;
+                Ok(())
+            },
+        );
+
+        assert_eq!(
+            result["execution_error"]["stage"],
+            "handshake_connect_terminal"
+        );
+        assert_eq!(result["failed_operation_at_failure"]["state"], "Failed");
+        assert_eq!(result["failed_operation_post_close"]["state"], "Failed");
+        assert!(cleanup_succeeded(&result["cleanup"]));
+        assert!(cleanup_contract_succeeded("handshake", &result));
+        assert_eq!(
+            result["harness_evidence"]["pre_cleanup_snapshot"]["state"],
+            "Disconnected"
+        );
+        let (document, _) = finalize_result("handshake", Ok(result));
+        assert_eq!(document["execution_status"], "failed");
+        assert_eq!(document["qualification_status"], "failed");
+        assert_eq!(document_exit_code(&document), 1);
+    }
+
+    #[test]
+    fn action_failure_preserves_the_completed_prefix_and_cleanup() {
+        let harness = observed_harness(
+            Box::new(FailSecondReportTransport {
+                accepted_reports: 0,
+            }),
+            "ACTION-FAILURE",
+        );
+        let result = json!({
+            "command": "smoke",
+            "actions": [],
+            "resources": {"primary": {"created": true}},
+        });
+        let result = finish_harness_phase(
+            harness,
+            result,
+            "cleanup",
+            "harness_evidence",
+            "smoke_close",
+            |harness, result| {
+                result["connect_operation"] = connect_for_command(
+                    harness,
+                    ConnectOptions::default(),
+                    "smoke_connect_admit",
+                    "smoke_connect_wait",
+                    "smoke_connect_terminal",
+                )?;
+                exercise_action_for_command(
+                    harness,
+                    "button.A.down",
+                    ControllerAction::ButtonDown(Button::A),
+                    &mut result["actions"],
+                )?;
+                exercise_action_for_command(
+                    harness,
+                    "button.A.up",
+                    ControllerAction::ButtonUp(Button::A),
+                    &mut result["actions"],
+                )?;
+                Ok(())
+            },
+        );
+
+        assert_eq!(result["execution_error"]["stage"], "action_terminal");
+        assert_eq!(result["actions"].as_array().map(Vec::len), Some(1));
+        assert_eq!(result["actions"][0]["label"], "button.A.down");
+        assert!(cleanup_succeeded(&result["cleanup"]));
+        assert!(cleanup_contract_succeeded("smoke", &result));
+        assert_eq!(result["failed_operation_post_close"]["state"], "Failed");
+    }
+
+    #[test]
+    fn cleanup_failure_is_appended_without_overwriting_the_first_error() {
+        let harness = observed_harness(Box::new(FinalNeutralFailureTransport), "COMBINED-FAILURE");
+        let result = json!({
+            "command": "smoke",
+            "resources": {"primary": {"created": true}},
+        });
+        let result = finish_harness_phase(
+            harness,
+            result,
+            "cleanup",
+            "harness_evidence",
+            "smoke_close",
+            |harness, result| {
+                result["connect_operation"] = connect_for_command(
+                    harness,
+                    ConnectOptions::default(),
+                    "smoke_connect_admit",
+                    "smoke_connect_wait",
+                    "smoke_connect_terminal",
+                )?;
+                Err(CommandFailure::new(
+                    "operator_marker",
+                    "injected execution failure",
+                ))
+            },
+        );
+
+        assert_eq!(result["execution_error"]["stage"], "operator_marker");
+        assert_eq!(result["cleanup_errors"][0]["stage"], "smoke_close");
+        assert!(!cleanup_succeeded(&result["cleanup"]));
+        assert!(!cleanup_contract_succeeded("smoke", &result));
+        let (document, _) = finalize_result("smoke", Ok(result));
+        assert_eq!(
+            document["error"],
+            "operator_marker: injected execution failure"
+        );
+        assert_eq!(document["checks"][1]["status"], "incomplete_or_failed");
+    }
+
+    #[test]
+    fn ordinary_partial_cleanup_contracts_require_exact_created_roles() {
+        let failure = json!({"stage": "injected", "message": "injected failure"});
+        let single = json!({
+            "execution_error": failure,
+            "resources": {"primary": {"created": true}},
+            "cleanup": successful_cleanup(),
+        });
+        assert!(cleanup_contract_succeeded("handshake", &single));
+        let mut single_without_cleanup = single.clone();
+        single_without_cleanup
+            .as_object_mut()
+            .expect("single result")
+            .remove("cleanup");
+        assert!(!cleanup_contract_succeeded(
+            "handshake",
+            &single_without_cleanup
+        ));
+
+        let hotplug = json!({
+            "execution_error": {"stage": "hotplug_wait_return", "message": "injected failure"},
+            "resources": {
+                "initial": {"created": true},
+                "reconnected": {"created": false},
+            },
+            "disconnect_cleanup": successful_cleanup(),
+        });
+        assert!(cleanup_contract_succeeded("hotplug", &hotplug));
+        let mut forged_reconnected = hotplug.clone();
+        forged_reconnected["resources"]["reconnected"]["created"] = json!(true);
+        assert!(!cleanup_contract_succeeded("hotplug", &forged_reconnected));
+
+        let lifecycle = json!({
+            "execution_error": {"stage": "lifecycle_metrics", "message": "injected failure"},
+            "cycles": 2,
+            "failed_cycle": 2,
+            "resources": {"created_cycles": 2},
+            "records": [
+                {
+                    "cycle": 1,
+                    "status": "completed",
+                    "resources": {"primary": {"created": true}},
+                    "cleanup": successful_cleanup()
+                },
+                {
+                    "cycle": 2,
+                    "status": "failed",
+                    "resources": {"primary": {"created": true}},
+                    "cleanup": successful_cleanup()
+                },
+            ],
+        });
+        assert!(cleanup_contract_succeeded("lifecycle", &lifecycle));
+        let mut wrong_cycle_count = lifecycle;
+        wrong_cycle_count["resources"]["created_cycles"] = json!(1);
+        assert!(!cleanup_contract_succeeded("lifecycle", &wrong_cycle_count));
     }
 
     #[test]
