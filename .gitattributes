@@ -32,3 +32,7 @@ Cargo.lock text eol=lf
 *.jpg binary
 *.jpeg binary
 *.png binary
+
+spec/fixtures/vision/labels/**/*.IL binary
+spec/fixtures/vision/labels/**/*.ILX binary
+spec/fixtures/vision/labels/**/*.seed binary

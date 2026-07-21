@@ -4,6 +4,7 @@
 mod color;
 mod error;
 mod image;
+mod label;
 mod matching;
 mod ocr;
 mod pool;
@@ -11,6 +12,12 @@ mod pool;
 pub use color::{ColorStatistics, HsvRange};
 pub use error::{VisionError, VisionErrorKind};
 pub use image::{Frame, Image, ImageError, ImageErrorKind, PixelFormat, Roi, VisionLimits};
+pub use label::{
+    Label, LabelDiagnostic, LabelDiagnosticCode, LabelDiagnosticSeverity, LabelEvaluation,
+    LabelEvaluator, LabelMethod, LabelParseReport, LabelRegistry, LabelRegistryReport, LabelSource,
+    LabelTarget, MAX_LABEL_DIAGNOSTICS_PER_SOURCE, MAX_LABEL_JSON_BYTES, MAX_LABEL_SOURCES,
+    build_legacy_label_registry, parse_legacy_il,
+};
 pub use matching::{
     EdgeMethod, MatchResult, TemplateMethod, match_edge, match_template, preprocess_edge,
 };

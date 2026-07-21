@@ -1,0 +1,1 @@
+{"searchMethod":3,"ImgBase64":"iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAGUlEQVR4AQEOAPH/AP8AAAD/AAAAAP////8f7gX73t3sKwAAAABJRU5ErkJggg==","RangeX":0,"RangeY":0,"RangeWidth":4,"RangeHeight":4,"TargetX":1,"TargetY":1,"TargetWidth":2,"TargetHeight":2,"FutureField":{"nested":[1,2,3]}}

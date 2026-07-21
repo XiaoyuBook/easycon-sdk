@@ -958,6 +958,12 @@ def validate_vision_ocr_fixtures(runner=subprocess.run):
     )
 
 
+def validate_vision_label_fixtures(runner=subprocess.run):
+    validate_generated_vision_fixtures(
+        "generate_vision_label_fixtures.py", "vision label", runner
+    )
+
+
 def validate_vision_model_provisioner_regressions():
     import provision_vision_test_model as model
 
@@ -1048,6 +1054,7 @@ def validate_vision_fixture_validator_regressions():
         (validate_vision_codec_fixtures, "codec"),
         (validate_vision_operation_fixtures, "operation"),
         (validate_vision_ocr_fixtures, "OCR"),
+        (validate_vision_label_fixtures, "label"),
     ):
         try:
             validator(runner=failing_runner)
@@ -1070,11 +1077,13 @@ def main():
     validate_vision_codec_fixtures()
     validate_vision_operation_fixtures()
     validate_vision_ocr_fixtures()
+    validate_vision_label_fixtures()
     validate_vision_model_provisioner_regressions()
     test_count = validate_conformance()
     print(
         "validated 5 schemas, 1 behavior spec, 3 controller fixtures, "
-        "15 vision binary fixtures, 9 conformance scenarios, and {} exact Rust tests".format(
+        "15 vision binary fixtures, 24 label corpus entries, 9 conformance scenarios, "
+        "and {} exact Rust tests".format(
             test_count
         )
     )

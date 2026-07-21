@@ -383,3 +383,82 @@ final source passed:
 Node D makes no capture-device, hardware timing, performance, packaged OCR model, or Chinese OCR
 accuracy claim. It adds no traineddata, EasyCon source, public C ABI, installed header, language
 binding, or package artifact.
+
+## Node E: legacy `.IL` and immutable Label evaluation
+
+### Test-first and implementation evidence
+
+The first parser and evaluator contract build failed with unresolved imports for every Label API.
+That RED baseline fixed the 24-entry generated legacy corpus, registry behavior, one-Frame
+evaluation, actual OCR scoring, and resource convergence before production implementation existed.
+
+The completed node provides:
+
+- an exact-case structured JSON visitor that detects duplicate known and unknown top-level keys,
+  reports unknown fields as stable warnings, rejects invalid UTF-8/types/numbers/extensions, and
+  applies the source-exact missing `searchMethod` default of numeric `5`;
+- strict canonical padded Base64 validation with alphabet, padding, trailing-bit, decoded-size, and
+  checked-arithmetic preflight before actual OpenCV BMP/PNG decode;
+- immutable `Label`, `LabelTarget`, parse report, diagnostics, and registry types with hard JSON,
+  source-count, per-source diagnostic, name, text-scalar, and edit-cell ceilings;
+- absolute Range/Target ROI validation, Target-in-Range containment, decoded target dimension
+  equality, and no `.ILX` entry;
+- UTF-8 byte-order source sorting, explicit diagnostics for every conflicting source, and no
+  partial registry publication after any error;
+- an error-prioritized per-source diagnostic budget implemented with indexed `BTreeMap` state, so
+  warning saturation and repeated identical source strings remain bounded without quadratic merge;
+- image evaluation against exactly one caller-owned `Arc<Frame>`, preserving its sequence and
+  monotonic timestamp while returning an absolute match location and normalized `0.0..1.0` score;
+- OCR evaluation of only the absolute Target ROI through the Rust-owned engine pool, preserving raw
+  bounded text and computing case-sensitive Unicode-scalar Levenshtein similarity times confidence;
+- cancellation checks before, during, and immediately before committing text similarity, with
+  rolling two-row storage and a checked edit-cell ceiling;
+- deterministic parser fuzz seeds and bounded invalid/deep/random-input coverage.
+
+The generated corpus is GPL-3.0-only and reuses only repository-owned synthetic codec bytes. Its
+manifest records every path, byte count, SHA-256, expected outcome, generator, provenance, active
+legacy method, score range, and `.ILX` exclusion. `.IL`, `.ILX`, and `.seed` paths are marked binary
+so a Windows checkout cannot rewrite corpus bytes. No EasyCon file or model byte is copied.
+
+### Independent review
+
+The latest Node E working tree received an independent read-only review against ADR-0011, the Phase
+3 design, and the EasyCon `ImgLabel`, `Search`, and `MatchFacts` facts. Reproducible findings were
+first fixed by regressions:
+
+- warning saturation could hide a later schema error and reach an internal `expect`;
+- duplicate-name diagnostics could exceed the per-source cap, including repeated identical source
+  strings;
+- merging each parse diagnostic by scanning the global vector produced quadratic work at the legal
+  `4096 * 32` ceiling;
+- invalid Base64 could be misclassified as a decoded-size limit under small image limits;
+- OCR Range validation and native crop ran before the frozen Target-only/configuration checks;
+- empty-string and final-chunk text comparison could commit success after cancellation.
+
+The final implementation prioritizes errors over warnings within the same fixed budget, uses
+per-source indexed budget state, validates Base64 syntax before size, validates the OCR pool before
+native admission, and checks cancellation at the text-comparison entry and final commit. The
+reviewer reran all directed checks on the latest files and reported zero open finding.
+
+### Workspace and repository gates
+
+Node E changes no C++ source, private ABI, CMake, triplet, or dependency manifest, so no standalone
+native preset was reopened. Cargo tests still linked the actual frozen OpenCV/Tesseract bridge and
+ran the provisioned independent English OCR success asset without skipping.
+
+| Command | Final result |
+| --- | --- |
+| `cargo fmt --all --check` | passed |
+| `cargo check --workspace --all-targets` | passed |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | passed |
+| `cargo test --workspace --all-features` | passed, 207 tests plus 1 compile-fail doctest |
+| `cargo test -p easycon-vision --all-features` | passed, 44 tests |
+| `python tools/run_runtime_models.py` | passed, 6 Loom models |
+| `python tools/validate_specs.py` | passed, including 15 Vision binary fixtures and 24 label corpus entries |
+| `python tools/check_markdown_links.py` | passed, 123 references |
+| `python tools/check_repository_guards.py` | passed |
+| `git diff --check` | passed |
+
+Node E makes no capture-device, hardware profile/FPS, packaged OCR model, Chinese OCR accuracy, ECS
+integer-rounding, or Phase 4 claim. It adds no traineddata, EasyCon source, public C ABI, installed
+header, language binding, or package artifact.
