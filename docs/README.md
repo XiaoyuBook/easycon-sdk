@@ -77,6 +77,11 @@ system serial leaf、可注入 byte I/O、CH32 模拟器、Amiibo save/select、
 
 Phase 2B 的资格软件候选已按 [ADR-0011](decisions/0011-phase-2b-qualification-software-candidate-freeze.md) 冻结，
 包括设备身份接纳、持久 evidence transaction、operator/Ctrl+C、Amiibo 写前安全、telemetry 投影和五类 checkpoint。
+复审后的精确实现基线为 `bbebaf458a0f2c0d60f3de6169f0eecfe8ef9fd0`，tree 为
+`020635276554be62d77ef26f8ab9f5bb8237e8ca`；旧候选 `10742b6f28ed17ab429c7e365d520a5f54cff543`
+已被取代。新独立 reviewer 的 13/13 软件门禁通过，根 workspace 157 个测试、hardware workspace 164 个纯软件
+测试通过，且没有新的直接相关、可复现且 in-scope 的 P0/P1/P2。根门禁中的一次 Windows SetupAPI discovery
+只是 ADR-0009 固定的只读 OS conformance，不打开或写入串口，也不构成硬件资格证据。
 当前仍明确标记 `Hardware Unverified`：没有冻结任何具体板型/固件、Amiibo 容量、UART/USB/Switch 时序或完整
 物理中立化能力；O-01、O-02、O-04 保持开放，完整 Phase 2 未完成，也没有创建完整 Phase 2 冻结 ADR。
 

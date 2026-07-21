@@ -6,8 +6,8 @@
 仓库当前已经按 [ADR-0007](../decisions/0007-phase-1-freeze.md) 冻结 Phase 1 Runtime，并完成一段无硬件
 Phase 2A Controller/Serial Candidate，详见 [实现说明](../development/runtime-controller-vertical-slice.md)。
 Phase 2B 资格软件已按 [ADR-0011](../decisions/0011-phase-2b-qualification-software-candidate-freeze.md) 冻结为
-候选，但只经过 fake/synthetic 验证，仍是 `Hardware Unverified`；它不表示物理 characterization、
-O-01/O-02/O-04 或完整 Phase 2 已完成。
+候选；复审后的实现基线为 `bbebaf458a0f2c0d60f3de6169f0eecfe8ef9fd0`，旧候选 `10742b6` 已被取代。
+它仍是 `Hardware Unverified`，不表示物理 characterization、O-01/O-02/O-04 或完整 Phase 2 已完成。
 
 ```text
 easycon sdk/
@@ -138,9 +138,12 @@ easycon sdk/
 当前状态：ADR-0010 要求的资格 CLI 软件能力已经实现并按 ADR-0011 冻结，包括 stable identity 写前接纳、
 可持久恢复的 journal 与不可覆盖 artifact transaction、单 owner operator/Ctrl+C 收口、Amiibo 一次性写入授权、
 logical-report telemetry
-以及从磁盘 evidence 生成五类 `Hardware Unverified` checkpoint。Phase 2B 新增回归全部使用 fake/synthetic
-discovery、I/O、failpoint 和临时目录；本候选冻结没有运行资格 CLI 的真实 discover/open/action 命令，没有执行
-Amiibo 写入，也没有形成硬件资格结论。
+以及从磁盘 evidence 生成五类 `Hardware Unverified` checkpoint。新独立 reviewer 对实现
+`bbebaf458a0f2c0d60f3de6169f0eecfe8ef9fd0` 完成 13/13 软件门禁：根 workspace 157 个测试、hardware workspace
+164 个纯软件测试通过，未发现新的直接相关、可复现且 in-scope 的 P0/P1/P2。Phase 2B 新增回归全部使用
+fake/synthetic discovery、I/O、failpoint 和临时目录；根门禁另包含 ADR-0009 固定的一次只读 Windows SetupAPI
+discovery，它不打开或写入串口，也不构成硬件资格证据。本候选冻结没有运行资格 CLI 的真实
+discover/open/action 命令，没有执行 Amiibo 写入，也没有形成硬件资格结论。
 
 交付：
 
