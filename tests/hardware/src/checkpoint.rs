@@ -325,7 +325,7 @@ fn classify_completed_run(
 ) -> Result<EvidenceRecord, CheckpointBuildError> {
     let document = &completed.document;
     let outcome = DocumentOutcome::parse(document);
-    let provenance_trusted = document["provenance"]["trusted"].as_bool();
+    let provenance_trusted = parse_provenance_trust(&document["provenance"]);
     let identity_valid = document["command"].as_str() == Some(completed.command.as_str())
         && document["run"]["lease_id"].as_str() == Some(completed.lease_id.as_str())
         && provenance_trusted.is_some();
@@ -352,14 +352,14 @@ fn classify_completed_run(
         "bytes": completed.completion_bytes,
         "sha256": completed.completion_sha256,
     });
-    if let Some(outcome) = outcome {
+    if let (Some(outcome), Some(provenance_trusted)) = (outcome, provenance_trusted) {
         common["document_outcome"] = json!({
             "execution_status": document["execution_status"],
             "qualification_status": document["qualification_status"],
             "exit_code": document["exit_code"],
             "provenance_trusted": provenance_trusted,
         });
-        if outcome == DocumentOutcome::Passed && provenance_trusted != Some(true) {
+        if outcome == DocumentOutcome::Passed && !provenance_trusted {
             return Ok(failed_completed_record(
                 common,
                 "passed_provenance_untrusted",
@@ -378,6 +378,102 @@ fn classify_completed_run(
         common,
         "run_directory",
     ))
+}
+
+fn parse_provenance_trust(value: &Value) -> Option<bool> {
+    let object = value.as_object()?;
+    let required = ["build", "runtime", "trusted"];
+    if object.len() != required.len() || required.iter().any(|field| !object.contains_key(*field)) {
+        return None;
+    }
+    let trusted = value["trusted"].as_bool()?;
+
+    let build = value["build"].as_object()?;
+    let build_required = [
+        "schema_version",
+        "package_version",
+        "git_commit",
+        "git_tree",
+        "tracked_dirty",
+        "untracked_present",
+        "tracked_source_sha256",
+        "cargo_lock_sha256",
+        "trusted",
+    ];
+    if build.len() != build_required.len()
+        || build_required
+            .iter()
+            .any(|field| !build.contains_key(*field))
+        || build["schema_version"].as_u64() != Some(1)
+        || build["package_version"]
+            .as_str()
+            .is_none_or(|version| version.trim().is_empty())
+    {
+        return None;
+    }
+    let git_commit = optional_string(&build["git_commit"])?;
+    let git_tree = optional_string(&build["git_tree"])?;
+    let tracked_dirty = optional_bool(&build["tracked_dirty"])?;
+    let untracked_present = optional_bool(&build["untracked_present"])?;
+    let tracked_source_sha256 = optional_string(&build["tracked_source_sha256"])?;
+    let cargo_lock_sha256 = optional_string(&build["cargo_lock_sha256"])?;
+    if git_commit.is_some_and(|commit| !valid_hex(commit, 40))
+        || git_tree.is_some_and(|tree| !valid_hex(tree, 40))
+        || tracked_source_sha256.is_some_and(|hash| !valid_sha256(hash))
+        || cargo_lock_sha256.is_some_and(|hash| !valid_sha256(hash))
+    {
+        return None;
+    }
+    let build_trusted = build["trusted"].as_bool()?;
+    let build_fields_are_trustworthy = git_commit.is_some()
+        && git_tree.is_some()
+        && tracked_dirty.is_some()
+        && untracked_present == Some(false)
+        && tracked_source_sha256.is_some()
+        && cargo_lock_sha256.is_some();
+    if build_trusted && !build_fields_are_trustworthy {
+        return None;
+    }
+
+    let runtime = value["runtime"].as_object()?;
+    let runtime_required = ["executable_sha256", "executable_hash_error"];
+    if runtime.len() != runtime_required.len()
+        || runtime_required
+            .iter()
+            .any(|field| !runtime.contains_key(*field))
+    {
+        return None;
+    }
+    let executable_sha256 = optional_string(&runtime["executable_sha256"])?;
+    let executable_hash_error = optional_string(&runtime["executable_hash_error"])?;
+    if executable_sha256.is_some_and(|hash| !valid_sha256(hash))
+        || executable_hash_error.is_some_and(|error| error.trim().is_empty())
+        || executable_sha256.is_some() == executable_hash_error.is_some()
+        || trusted != (build_trusted && executable_sha256.is_some())
+    {
+        return None;
+    }
+    Some(trusted)
+}
+
+fn optional_string(value: &Value) -> Option<Option<&str>> {
+    if value.is_null() {
+        Some(None)
+    } else {
+        value.as_str().map(Some)
+    }
+}
+
+fn optional_bool(value: &Value) -> Option<Option<bool>> {
+    if value.is_null() {
+        Some(None)
+    } else {
+        value.as_bool().map(Some)
+    }
+}
+
+fn valid_hex(value: &str, length: usize) -> bool {
+    value.len() == length && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn scan_attestations(
@@ -1048,6 +1144,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::artifact::{ArtifactReservation, RunStartMetadata};
+    use crate::provenance::RuntimeProvenance;
 
     use super::*;
 
@@ -1082,13 +1179,22 @@ mod tests {
     }
 
     fn completed_run(directory: &Path, outcome: DocumentOutcome, trusted: bool) {
+        let provenance = RuntimeProvenance::synthetic_with_trust(trusted).to_json();
+        completed_run_with_provenance(directory, outcome, provenance);
+    }
+
+    fn completed_run_with_provenance(
+        directory: &Path,
+        outcome: DocumentOutcome,
+        provenance: Value,
+    ) {
         fs::create_dir(directory).expect("run directory");
         let mut reservation = ArtifactReservation::begin_journaled(
             "handshake",
             directory,
             RunStartMetadata {
                 normalized_arguments: json!(["handshake"]),
-                provenance: json!({"trusted": trusted}),
+                provenance: provenance.clone(),
             },
         )
         .expect("reservation");
@@ -1112,7 +1218,7 @@ mod tests {
                 "qualification_status": qualification,
                 "exit_code": exit_code,
                 "checks": [],
-                "provenance": {"trusted": trusted},
+                "provenance": provenance,
                 "run": {"lease_id": lease_id},
                 "auxiliary_artifacts": [],
             }))
@@ -1300,5 +1406,30 @@ mod tests {
                 .as_str()
                 .is_some_and(valid_sha256)
         );
+    }
+
+    #[test]
+    fn incomplete_pass_provenance_is_failed_instead_of_observed() {
+        let root = TestDirectory::new("incomplete-provenance");
+        let runs = root.0.join("runs");
+        fs::create_dir(&runs).expect("runs root");
+        completed_run_with_provenance(
+            &runs.join("missing-build-runtime"),
+            DocumentOutcome::Passed,
+            json!({"trusted": true}),
+        );
+
+        let checkpoint = build_checkpoint(&inputs(runs, None), || Ok(()))
+            .unwrap_or_else(|_| panic!("checkpoint build failed"));
+
+        assert!(projection_is_valid(&checkpoint));
+        assert_eq!(
+            checkpoint["evidence"]["Observed"].as_array().map(Vec::len),
+            Some(0)
+        );
+        let failed = &checkpoint["evidence"]["Failed"][0];
+        assert_eq!(failed["source_id"], "missing-build-runtime");
+        assert_eq!(failed["validation_reason"], "completed_document_invalid");
+        assert!(failed.get("document_outcome").is_none());
     }
 }
