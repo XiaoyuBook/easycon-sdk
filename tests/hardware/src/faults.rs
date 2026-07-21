@@ -10,9 +10,9 @@ use std::time::{Duration, Instant};
 
 use super::{
     CancelSnapshotReadiness, Harness, OPERATION_TIMEOUT, cancel_snapshot_readiness,
-    cleanup_succeeded, controller_snapshot_json, operation_failure, operation_json, required_value,
-    wait_terminal,
+    cleanup_succeeded, controller_snapshot_json, operation_failure, operation_json, wait_terminal,
 };
+use crate::device::AdmittedDevice;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FaultRole {
@@ -110,7 +110,8 @@ trait FaultHarness: Sized {
 trait FaultHarnessFactory {
     type Harness: FaultHarness;
 
-    fn create(&mut self, role: FaultRole, port: &str) -> Result<Self::Harness, String>;
+    fn create(&mut self, role: FaultRole, target: &AdmittedDevice)
+    -> Result<Self::Harness, String>;
 }
 
 trait FaultWaiter {
@@ -139,8 +140,12 @@ struct ProductionFactory;
 impl FaultHarnessFactory for ProductionFactory {
     type Harness = Harness;
 
-    fn create(&mut self, _role: FaultRole, port: &str) -> Result<Self::Harness, String> {
-        Harness::new(port, ControllerOptions::default())
+    fn create(
+        &mut self,
+        _role: FaultRole,
+        target: &AdmittedDevice,
+    ) -> Result<Self::Harness, String> {
+        Harness::new(target, ControllerOptions::default())
     }
 }
 
@@ -497,7 +502,7 @@ fn create_and_install<F: FaultHarnessFactory>(
     run: &mut FaultRun<F::Harness>,
     factory: &mut F,
     role: FaultRole,
-    port: &str,
+    target: &AdmittedDevice,
 ) -> Result<(), FaultFailure> {
     let stage = match role {
         FaultRole::Occupier => "occupier_create",
@@ -506,7 +511,7 @@ fn create_and_install<F: FaultHarnessFactory>(
         FaultRole::Deadline => "deadline_create",
     };
     let harness = factory
-        .create(role, port)
+        .create(role, target)
         .map_err(|error| FaultFailure::new(stage, error))?;
     run.install(role, harness);
     Ok(())
@@ -532,7 +537,7 @@ fn execute<F, W, B>(
     factory: &mut F,
     waiter: &mut W,
     sequence_builder: &mut B,
-    port: &str,
+    target: &AdmittedDevice,
 ) -> Result<(), FaultFailure>
 where
     F: FaultHarnessFactory,
@@ -540,7 +545,7 @@ where
     B: FaultSequenceBuilder,
 {
     run.begin_scenario("port_occupied");
-    create_and_install(run, factory, FaultRole::Occupier, port)?;
+    create_and_install(run, factory, FaultRole::Occupier, target)?;
     admit_connect(
         run,
         FaultRole::Occupier,
@@ -565,7 +570,7 @@ where
         ));
     }
 
-    create_and_install(run, factory, FaultRole::OccupiedProbe, port)?;
+    create_and_install(run, factory, FaultRole::OccupiedProbe, target)?;
     admit_connect(
         run,
         FaultRole::OccupiedProbe,
@@ -594,7 +599,7 @@ where
     run.complete_scenario("port_occupied");
 
     run.begin_scenario("cancel");
-    create_and_install(run, factory, FaultRole::Cancel, port)?;
+    create_and_install(run, factory, FaultRole::Cancel, target)?;
     admit_connect(
         run,
         FaultRole::Cancel,
@@ -662,7 +667,7 @@ where
     run.complete_scenario("cancel");
 
     run.begin_scenario("deadline");
-    create_and_install(run, factory, FaultRole::Deadline, port)?;
+    create_and_install(run, factory, FaultRole::Deadline, target)?;
     let deadline_ns = run.harness(FaultRole::Deadline).now_ns();
     admit_connect(
         run,
@@ -692,28 +697,27 @@ where
     Ok(())
 }
 
-fn run_with<F, W, B>(port: &str, factory: &mut F, waiter: &mut W, sequence_builder: &mut B) -> Value
+fn run_with<F, W, B>(
+    target: &AdmittedDevice,
+    factory: &mut F,
+    waiter: &mut W,
+    sequence_builder: &mut B,
+) -> Value
 where
     F: FaultHarnessFactory,
     W: FaultWaiter,
     B: FaultSequenceBuilder,
 {
     let mut run = FaultRun::new();
-    let execution = execute(&mut run, factory, waiter, sequence_builder, port);
+    let execution = execute(&mut run, factory, waiter, sequence_builder, target);
     run.finish(execution, waiter)
 }
 
-pub(super) fn run(arguments: &[String]) -> Result<Value, String> {
-    let port: String = required_value(arguments, "--port")?;
+pub(super) fn run(target: AdmittedDevice) -> Value {
     let mut factory = ProductionFactory;
     let mut waiter = ProductionWaiter;
     let mut sequence_builder = ProductionSequenceBuilder;
-    Ok(run_with(
-        &port,
-        &mut factory,
-        &mut waiter,
-        &mut sequence_builder,
-    ))
+    run_with(&target, &mut factory, &mut waiter, &mut sequence_builder)
 }
 
 #[cfg(test)]
@@ -730,6 +734,7 @@ mod tests {
     use easycon_serial::SerialPortDescriptor;
 
     use super::*;
+    use crate::device::{AdmissionDecision, DeviceTargetRequest, select_device};
     use crate::{
         ObservedTransport, Telemetry, cleanup_contract_succeeded, controller_cleanup_json,
         document_exit_code, finalize_result, harness_cleanup_json, qualification_check,
@@ -808,7 +813,11 @@ mod tests {
     impl FaultHarnessFactory for FakeFactory {
         type Harness = FakeHarness;
 
-        fn create(&mut self, role: FaultRole, _port: &str) -> Result<Self::Harness, String> {
+        fn create(
+            &mut self,
+            role: FaultRole,
+            _target: &AdmittedDevice,
+        ) -> Result<Self::Harness, String> {
             self.trace
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
@@ -1108,12 +1117,23 @@ mod tests {
         };
         let mut waiter = FakeWaiter { script };
         let mut builder = FakeSequenceBuilder { script };
-        let result = run_with("COM-FAKE", &mut factory, &mut waiter, &mut builder);
+        let target = fake_target();
+        let result = run_with(&target, &mut factory, &mut waiter, &mut builder);
         let observed = trace
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clone();
         (result, observed)
+    }
+
+    fn fake_target() -> AdmittedDevice {
+        let request =
+            DeviceTargetRequest::new("TEST\\FAULT", "COM1").expect("fault target request");
+        let descriptor = SerialPortDescriptor::new("TEST\\FAULT", "COM1").expect("descriptor");
+        let AdmissionDecision::Admitted(target) = select_device(request, vec![descriptor]) else {
+            panic!("fault target must be admitted");
+        };
+        target
     }
 
     fn assert_closed_once(trace: &Trace, created: &[FaultRole]) {

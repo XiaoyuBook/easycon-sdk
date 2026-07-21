@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod artifact;
+mod device;
 mod faults;
 
 use std::env;
@@ -15,6 +16,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(test)]
 use artifact::RESERVATION_FILE_NAME;
 use artifact::{ArtifactReservation, AuxiliaryKind, SEQUENCE_TIMINGS_FILE_NAME};
+use device::{
+    AdmissionDecision, AdmissionEvidence, AdmittedDevice, DeviceDiscovery, DeviceTargetRequest,
+    SystemDeviceDiscovery, admit_device,
+};
 use easycon_controller::{
     AUTO_BAUD_RATES, AckFrame, AckRequest, AmiiboLimits, AmiiboSaveOptions, AmiiboSelectOptions,
     ConnectOptions, ControllerAction, ControllerLeaseState, ControllerOptions, ControllerSession,
@@ -297,8 +302,8 @@ struct Harness {
 }
 
 impl Harness {
-    fn new(port_name: &str, options: ControllerOptions) -> Result<Self, String> {
-        let descriptor = find_port(port_name)?;
+    fn new(target: &AdmittedDevice, options: ControllerOptions) -> Result<Self, String> {
+        let descriptor = target.descriptor().clone();
         let clock: Arc<dyn Clock> = Arc::new(SystemClock::default());
         let telemetry = Arc::new(Mutex::new(Telemetry::default()));
         let observed_factory = ObservedByteIoFactory {
@@ -549,6 +554,127 @@ fn wait_for_command_terminal(
     Ok((operation, snapshot.state))
 }
 
+fn run_with_device_admission(
+    command: &'static str,
+    arguments: &[String],
+    runner: impl FnOnce(AdmittedDevice, Arc<dyn DeviceDiscovery>) -> Result<Value, String>,
+) -> Result<Value, String> {
+    run_with_device_admission_using(command, arguments, Arc::new(SystemDeviceDiscovery), runner)
+}
+
+fn run_with_device_admission_using(
+    command: &'static str,
+    arguments: &[String],
+    discovery: Arc<dyn DeviceDiscovery>,
+    runner: impl FnOnce(AdmittedDevice, Arc<dyn DeviceDiscovery>) -> Result<Value, String>,
+) -> Result<Value, String> {
+    let request = device_target_request(arguments)?;
+    match admit_device(discovery.as_ref(), request.clone()) {
+        Ok(AdmissionDecision::Admitted(target)) => {
+            let evidence = target.evidence().clone();
+            match runner(target, discovery) {
+                Ok(result) => Ok(attach_admission_evidence(result, &evidence, "admitted")),
+                Err(error) => Ok(attach_admission_evidence(
+                    json!({
+                        "command": command,
+                        "execution_error": {
+                            "stage": "admitted_runner_failure",
+                            "message": error,
+                        },
+                    }),
+                    &evidence,
+                    "admitted",
+                )),
+            }
+        }
+        Ok(AdmissionDecision::Rejected(evidence)) => Ok(json!({
+            "command": command,
+            "device_target": device_target_json(evidence.request()),
+            "identity_admission": admission_evidence_json(&evidence, "rejected"),
+            "capability_inference": "none",
+        })),
+        Ok(AdmissionDecision::Ambiguous(evidence)) => Ok(json!({
+            "command": command,
+            "device_target": device_target_json(evidence.request()),
+            "identity_admission": admission_evidence_json(&evidence, "ambiguous"),
+            "capability_inference": "none",
+            "execution_error": {
+                "stage": "identity_admission",
+                "message": "system discovery returned an ambiguous serial snapshot",
+            },
+        })),
+        Err(error) => Ok(json!({
+            "command": command,
+            "device_target": device_target_json(&request),
+            "identity_admission": {
+                "status": "discovery_error",
+                "reason": "discovery_error",
+                "snapshot": [],
+                "observed_expected": null,
+                "observed_hint": null,
+                "structured_error": serial_error_json(&error),
+            },
+            "capability_inference": "none",
+            "execution_error": {
+                "stage": "identity_admission_discovery",
+                "message": error.message(),
+            },
+        })),
+    }
+}
+
+fn device_target_request(arguments: &[String]) -> Result<DeviceTargetRequest, String> {
+    let expected_identity = required_non_option_string(arguments, "--expected-identity")?;
+    let port = required_non_option_string(arguments, "--port")?;
+    DeviceTargetRequest::new(expected_identity, port)
+}
+
+fn required_non_option_string(arguments: &[String], option: &str) -> Result<String, String> {
+    let value = option_value(arguments, option)?
+        .ok_or_else(|| format!("missing required option {option}"))?;
+    if value.starts_with('-') {
+        return Err(format!("missing value for {option}"));
+    }
+    Ok(value.to_owned())
+}
+
+fn attach_admission_evidence(
+    mut result: Value,
+    evidence: &AdmissionEvidence,
+    status: &str,
+) -> Value {
+    result["device_target"] = device_target_json(evidence.request());
+    result["identity_admission"] = admission_evidence_json(evidence, status);
+    result["capability_inference"] = json!("none");
+    result
+}
+
+fn device_target_json(request: &DeviceTargetRequest) -> Value {
+    json!({
+        "expected_stable_id": request.expected_stable_id(),
+        "initial_port_hint": request.initial_port_hint(),
+    })
+}
+
+fn admission_evidence_json(evidence: &AdmissionEvidence, status: &str) -> Value {
+    json!({
+        "status": status,
+        "reason": evidence.reason().map(|reason| reason.as_str()),
+        "snapshot": evidence.snapshot().iter().map(port_json).collect::<Vec<_>>(),
+        "observed_expected": evidence.expected().map(port_json),
+        "observed_hint": evidence.hint().map(port_json),
+        "structured_error": null,
+    })
+}
+
+fn serial_error_json(error: &SerialError) -> Value {
+    json!({
+        "kind": format!("{:?}", error.kind()),
+        "os_code": error.os_code(),
+        "message": error.message(),
+    })
+}
+
 fn main() {
     let exit_code = match real_main() {
         Ok(exit_code) => exit_code,
@@ -582,17 +708,34 @@ fn real_main() -> Result<i32, String> {
     let mut sequence_timings = None;
     let execution = match command {
         "discover" => run_discover(&arguments),
-        "handshake" => run_handshake(&arguments),
-        "smoke" => run_smoke(&arguments),
-        "home-wake" => run_home_wake(&arguments),
-        "faults" => run_faults(&arguments),
-        "hotplug" => run_hotplug(&arguments),
-        "lifecycle" => run_lifecycle(&arguments),
-        "sequence" => run_sequence(&arguments).map(|(result, timings)| {
-            sequence_timings = timings;
-            result
+        "handshake" => run_with_device_admission("handshake", &arguments, |target, _| {
+            run_handshake(&arguments, target)
         }),
-        "amiibo" => run_amiibo(&arguments),
+        "smoke" => run_with_device_admission("smoke", &arguments, |target, _| {
+            run_smoke(&arguments, target)
+        }),
+        "home-wake" => run_with_device_admission("home-wake", &arguments, |target, _| {
+            run_home_wake(&arguments, target)
+        }),
+        "faults" => run_with_device_admission("faults", &arguments, |target, _| run_faults(target)),
+        "hotplug" => run_with_device_admission("hotplug", &arguments, |target, discovery| {
+            run_hotplug(&arguments, target, discovery)
+        }),
+        "lifecycle" => run_with_device_admission("lifecycle", &arguments, |target, discovery| {
+            run_lifecycle(&arguments, target, discovery)
+        }),
+        "sequence" => run_with_device_admission("sequence", &arguments, |target, _| {
+            run_sequence(&arguments, target).map(|(result, timings)| {
+                sequence_timings = timings;
+                result
+            })
+        }),
+        "amiibo" if amiibo_write_authorized(&arguments) => {
+            run_with_device_admission("amiibo", &arguments, |target, _| {
+                run_amiibo(&arguments, target)
+            })
+        }
+        "amiibo" => run_unauthorized_amiibo(),
         _ => Err(format!("unknown command: {command}")),
     };
     let (document, failure) = finalize_result(command, execution);
@@ -725,6 +868,13 @@ fn execution_error(result: &Value) -> Option<String> {
 }
 
 fn qualification_decision(command: &str, result: &Value) -> QualificationDecision {
+    if result["identity_admission"]["status"] == "rejected" {
+        return QualificationDecision {
+            status: QualificationStatus::NotRun,
+            checks: vec![qualification_check("identity_admission", "not_run")],
+            failure: None,
+        };
+    }
     match command {
         "discover" => discovery_qualification(result),
         "handshake" => required_checks(&[
@@ -1104,6 +1254,22 @@ const FAULT_CLEANUP_ROLES: [(&str, &str); 4] = [
 const FAULT_SCENARIOS: [&str; 3] = ["port_occupied", "cancel", "deadline"];
 
 fn cleanup_contract_succeeded(command: &str, result: &Value) -> bool {
+    if result["identity_admission"]["status"] == "rejected" {
+        return pre_harness_admission_contract_succeeded(result, "rejected");
+    }
+    if result.get("execution_error").is_some()
+        && matches!(
+            result["identity_admission"]["status"].as_str(),
+            Some("ambiguous" | "discovery_error")
+        )
+    {
+        return pre_harness_admission_contract_succeeded(
+            result,
+            result["identity_admission"]["status"]
+                .as_str()
+                .expect("matched admission status"),
+        );
+    }
     if result.get("execution_error").is_some() {
         return match command {
             "faults" => partial_fault_cleanup_contract_succeeded(result),
@@ -1154,6 +1320,43 @@ fn cleanup_contract_succeeded(command: &str, result: &Value) -> bool {
         "discover" | "amiibo" => true,
         _ => true,
     }
+}
+
+fn pre_harness_admission_contract_succeeded(result: &Value, expected_status: &str) -> bool {
+    let Some(target) = result.get("device_target").and_then(Value::as_object) else {
+        return false;
+    };
+    let Some(admission) = result.get("identity_admission").and_then(Value::as_object) else {
+        return false;
+    };
+    target.len() == 2
+        && target
+            .get("expected_stable_id")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+        && target
+            .get("initial_port_hint")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+        && admission.get("status").and_then(Value::as_str) == Some(expected_status)
+        && admission
+            .get("reason")
+            .and_then(Value::as_str)
+            .is_some_and(|reason| {
+                matches!(
+                    (expected_status, reason),
+                    (
+                        "rejected",
+                        "expected_absent"
+                            | "expected_at_different_port"
+                            | "hint_owned_by_different_identity"
+                    ) | ("ambiguous", "ambiguous_snapshot")
+                        | ("discovery_error", "discovery_error")
+                )
+            })
+        && admission.get("snapshot").is_some_and(Value::is_array)
+        && cleanup_slot_count(result) == 0
+        && runtime_cleanup_count(result) == 0
 }
 
 fn partial_single_harness_cleanup_contract_succeeded(result: &Value) -> bool {
@@ -1292,7 +1495,11 @@ fn partial_lifecycle_cleanup_contract_succeeded(result: &Value) -> bool {
         | "lifecycle_connect_wait"
         | "lifecycle_connect_terminal"
         | "lifecycle_close"
-        | "lifecycle_metrics" => completed_then_failed && failed_cycle == Some(records.len()),
+        | "lifecycle_metrics"
+        | "lifecycle_post_cycle_ambiguous"
+        | "lifecycle_post_cycle_discovery" => {
+            completed_then_failed && failed_cycle == Some(records.len())
+        }
         "lifecycle_final_metrics" => {
             all_completed && records.len() == requested_cycles.expect("validated cycles")
         }
@@ -1719,9 +1926,8 @@ fn run_discover(arguments: &[String]) -> Result<Value, String> {
     }))
 }
 
-fn run_handshake(arguments: &[String]) -> Result<Value, String> {
-    let port: String = required_value(arguments, "--port")?;
-    let harness = Harness::new(&port, ControllerOptions::default())?;
+fn run_handshake(_arguments: &[String], target: AdmittedDevice) -> Result<Value, String> {
+    let harness = Harness::new(&target, ControllerOptions::default())?;
     let result = json!({
         "command": "handshake",
         "port": port_json(&harness.descriptor),
@@ -1748,8 +1954,7 @@ fn run_handshake(arguments: &[String]) -> Result<Value, String> {
     ))
 }
 
-fn run_smoke(arguments: &[String]) -> Result<Value, String> {
-    let port: String = required_value(arguments, "--port")?;
+fn run_smoke(arguments: &[String], target: AdmittedDevice) -> Result<Value, String> {
     let full = arguments.iter().any(|argument| argument == "--full");
     let wake_left_stick = arguments
         .iter()
@@ -1757,7 +1962,7 @@ fn run_smoke(arguments: &[String]) -> Result<Value, String> {
     let wake_home = arguments.iter().any(|argument| argument == "--wake-home");
     let hold_ms = value_or(arguments, "--hold-ms", 0_u64)?;
     validate_hold_ms(hold_ms)?;
-    let harness = Harness::new(&port, ControllerOptions::default())?;
+    let harness = Harness::new(&target, ControllerOptions::default())?;
     let result = json!({
         "command": "smoke",
         "stage": if full { "full" } else { "a_only" },
@@ -1906,12 +2111,11 @@ fn run_smoke(arguments: &[String]) -> Result<Value, String> {
     ))
 }
 
-fn run_home_wake(arguments: &[String]) -> Result<Value, String> {
-    let port: String = required_value(arguments, "--port")?;
+fn run_home_wake(arguments: &[String], target: AdmittedDevice) -> Result<Value, String> {
     let attempts = value_or(arguments, "--attempts", 20_usize)?;
     let interval_seconds = value_or(arguments, "--interval-seconds", 3_u64)?;
     validate_home_wake(attempts, interval_seconds)?;
-    let harness = Harness::new(&port, ControllerOptions::default())?;
+    let harness = Harness::new(&target, ControllerOptions::default())?;
     let result = json!({
         "command": "home-wake",
         "attempts": attempts,
@@ -1993,14 +2197,18 @@ fn run_home_wake(arguments: &[String]) -> Result<Value, String> {
     ))
 }
 
-fn run_faults(arguments: &[String]) -> Result<Value, String> {
-    faults::run(arguments)
+fn run_faults(target: AdmittedDevice) -> Result<Value, String> {
+    Ok(faults::run(target))
 }
 
-fn run_hotplug(arguments: &[String]) -> Result<Value, String> {
-    let port: String = required_value(arguments, "--port")?;
+fn run_hotplug(
+    arguments: &[String],
+    target: AdmittedDevice,
+    _discovery: Arc<dyn DeviceDiscovery>,
+) -> Result<Value, String> {
     let timeout_seconds = value_or(arguments, "--timeout-seconds", 180_u64)?;
-    let harness = Harness::new(&port, ControllerOptions::default())?;
+    let port = target.descriptor().port_name().to_owned();
+    let harness = Harness::new(&target, ControllerOptions::default())?;
     let stable_id = harness.descriptor.stable_id().to_owned();
     let result = json!({
         "command": "hotplug",
@@ -2063,7 +2271,7 @@ fn run_hotplug(arguments: &[String]) -> Result<Value, String> {
         );
         return Ok(result);
     }
-    let reconnected = match Harness::new(&port, ControllerOptions::default()) {
+    let reconnected = match Harness::new(&target, ControllerOptions::default()) {
         Ok(harness) => harness,
         Err(error) => {
             set_command_failure(
@@ -2095,12 +2303,17 @@ fn run_hotplug(arguments: &[String]) -> Result<Value, String> {
     ))
 }
 
-fn run_lifecycle(arguments: &[String]) -> Result<Value, String> {
-    let port: String = required_value(arguments, "--port")?;
+fn run_lifecycle(
+    arguments: &[String],
+    initial_target: AdmittedDevice,
+    discovery: Arc<dyn DeviceDiscovery>,
+) -> Result<Value, String> {
     let cycles = value_or(arguments, "--cycles", 100_usize)?;
     if cycles == 0 {
         return Err("--cycles must be non-zero".to_owned());
     }
+    let request = initial_target.request().clone();
+    let mut next_target = Some(initial_target);
     let before = process_metrics()?;
     let mut result = json!({
         "command": "lifecycle",
@@ -2110,7 +2323,11 @@ fn run_lifecycle(arguments: &[String]) -> Result<Value, String> {
         "resources": {"created_cycles": 0},
     });
     for cycle in 1..=cycles {
-        let harness = match Harness::new(&port, ControllerOptions::default()) {
+        let target = next_target
+            .take()
+            .expect("a successful prior admission provides the next lifecycle target");
+        let cycle_admission = admission_evidence_json(target.evidence(), "admitted");
+        let harness = match Harness::new(&target, ControllerOptions::default()) {
             Ok(harness) => harness,
             Err(error) => {
                 set_command_failure(&mut result, CommandFailure::new("lifecycle_create", error));
@@ -2122,6 +2339,7 @@ fn run_lifecycle(arguments: &[String]) -> Result<Value, String> {
         let record = json!({
             "cycle": cycle,
             "status": "running",
+            "identity_admission": cycle_admission,
             "resources": {"primary": {"created": true}},
         });
         let mut record = finish_harness_phase(
@@ -2171,11 +2389,62 @@ fn run_lifecycle(arguments: &[String]) -> Result<Value, String> {
         };
         record["status"] = json!("completed");
         record["process"] = metrics;
-        record["port_present"] = json!(find_port(&port).is_ok());
+        match admit_device(discovery.as_ref(), request.clone()) {
+            Ok(AdmissionDecision::Admitted(admitted)) => {
+                record["port_present"] = json!(true);
+                record["post_cycle_identity_admission"] =
+                    admission_evidence_json(admitted.evidence(), "admitted");
+                next_target = Some(admitted);
+            }
+            Ok(AdmissionDecision::Rejected(evidence)) => {
+                record["port_present"] = json!(false);
+                record["post_cycle_identity_admission"] =
+                    admission_evidence_json(&evidence, "rejected");
+                result["identity_admission_stop"] = json!({
+                    "cycle": cycle,
+                    "reason": evidence.reason().map(|reason| reason.as_str()),
+                });
+            }
+            Ok(AdmissionDecision::Ambiguous(evidence)) => {
+                record["status"] = json!("failed");
+                record["port_present"] = json!(false);
+                record["post_cycle_identity_admission"] =
+                    admission_evidence_json(&evidence, "ambiguous");
+                record["execution_error"] = json!({
+                    "stage": "lifecycle_post_cycle_ambiguous",
+                    "message": "system discovery returned an ambiguous serial snapshot",
+                });
+                result["execution_error"] = record["execution_error"].clone();
+                result["failed_cycle"] = json!(cycle);
+            }
+            Err(error) => {
+                record["status"] = json!("failed");
+                record["port_present"] = json!(false);
+                record["post_cycle_identity_admission"] = json!({
+                    "status": "discovery_error",
+                    "reason": "discovery_error",
+                    "snapshot": [],
+                    "observed_expected": null,
+                    "observed_hint": null,
+                    "structured_error": serial_error_json(&error),
+                });
+                record["execution_error"] = json!({
+                    "stage": "lifecycle_post_cycle_discovery",
+                    "message": error.message(),
+                });
+                result["execution_error"] = record["execution_error"].clone();
+                result["failed_cycle"] = json!(cycle);
+            }
+        }
         result["records"]
             .as_array_mut()
             .expect("lifecycle records are an array")
             .push(record);
+        if result.get("execution_error").is_some()
+            || result.get("identity_admission_stop").is_some()
+        {
+            return Ok(result);
+        }
     }
     let after = match process_metrics() {
         Ok(after) => after,
@@ -2198,13 +2467,15 @@ fn run_lifecycle(arguments: &[String]) -> Result<Value, String> {
     Ok(result)
 }
 
-fn run_sequence(arguments: &[String]) -> Result<(Value, Option<Vec<u8>>), String> {
-    let port: String = required_value(arguments, "--port")?;
+fn run_sequence(
+    arguments: &[String],
+    target: AdmittedDevice,
+) -> Result<(Value, Option<Vec<u8>>), String> {
     let steps = value_or(arguments, "--steps", 10_000_usize)?;
     if !(1..=10_000).contains(&steps) {
         return Err("--steps must be in 1..=10000".to_owned());
     }
-    let harness = Harness::new(&port, ControllerOptions::default())?;
+    let harness = Harness::new(&target, ControllerOptions::default())?;
     let result = json!({
         "command": "sequence",
         "requested_steps": steps,
@@ -2297,25 +2568,28 @@ fn run_sequence(arguments: &[String]) -> Result<(Value, Option<Vec<u8>>), String
     Ok((result, timing_csv))
 }
 
-fn run_amiibo(arguments: &[String]) -> Result<Value, String> {
-    if !arguments
+fn amiibo_write_authorized(arguments: &[String]) -> bool {
+    arguments
         .iter()
         .any(|argument| argument == "--authorize-write")
-    {
-        return Ok(json!({
-            "command": "amiibo",
-            "capability": "unknown",
-            "write_performed": false,
-            "reason": "the v1 protocol has no safe capacity query; explicit limits and write authorization are required",
-        }));
-    }
+}
+
+fn run_unauthorized_amiibo() -> Result<Value, String> {
+    Ok(json!({
+        "command": "amiibo",
+        "capability": "unknown",
+        "write_performed": false,
+        "reason": "the v1 protocol has no safe capacity query; explicit limits and write authorization are required",
+    }))
+}
+
+fn run_amiibo(arguments: &[String], target: AdmittedDevice) -> Result<Value, String> {
     if !arguments
         .iter()
         .any(|argument| argument == "--confirm-disposable")
     {
         return Err("Amiibo write also requires --confirm-disposable".to_owned());
     }
-    let port: String = required_value(arguments, "--port")?;
     let slot: u8 = required_value(arguments, "--slot")?;
     let slot_count: u16 = required_value(arguments, "--slot-count")?;
     let maximum_data_len: usize = required_value(arguments, "--maximum-data-len")?;
@@ -2327,7 +2601,7 @@ fn run_amiibo(arguments: &[String]) -> Result<Value, String> {
     let limits =
         AmiiboLimits::new(slot_count, maximum_data_len).map_err(|error| error.to_string())?;
     let harness = Harness::new(
-        &port,
+        &target,
         ControllerOptions {
             amiibo_limits: Some(limits),
             ..ControllerOptions::default()
@@ -2454,14 +2728,6 @@ fn validate_home_wake(attempts: usize, interval_seconds: u64) -> Result<(), Stri
 
 fn home_attempt_marker(attempt: usize) -> String {
     attempt.to_string()
-}
-
-fn find_port(port_name: &str) -> Result<SerialPortDescriptor, String> {
-    discover_system_ports()
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .find(|port| port.port_name().eq_ignore_ascii_case(port_name))
-        .ok_or_else(|| format!("system discovery did not report {port_name}"))
 }
 
 fn wait_for_presence(stable_id: &str, present: bool, timeout: Duration) -> Result<(), String> {
@@ -2934,14 +3200,14 @@ fn artifact_dir(arguments: &[String]) -> Result<PathBuf, String> {
 fn print_help() {
     println!(
         "Usage:\n  easycon-hardware-qualification discover [--samples N]\n  \
-         easycon-hardware-qualification handshake --port COMx\n  \
-         easycon-hardware-qualification smoke --port COMx [--full] [--wake-left-stick] [--wake-home] [--hold-ms N]\n  \
-         easycon-hardware-qualification home-wake --port COMx [--attempts 20] [--interval-seconds 3]\n  \
-         easycon-hardware-qualification faults --port COMx\n  \
-         easycon-hardware-qualification hotplug --port COMx [--timeout-seconds N]\n  \
-         easycon-hardware-qualification lifecycle --port COMx [--cycles 100]\n  \
-         easycon-hardware-qualification sequence --port COMx [--steps 10000]\n  \
-         easycon-hardware-qualification amiibo [--port COMx --slot N --slot-count N \
+         easycon-hardware-qualification handshake --port COMx --expected-identity ID\n  \
+         easycon-hardware-qualification smoke --port COMx --expected-identity ID [--full] [--wake-left-stick] [--wake-home] [--hold-ms N]\n  \
+         easycon-hardware-qualification home-wake --port COMx --expected-identity ID [--attempts 20] [--interval-seconds 3]\n  \
+         easycon-hardware-qualification faults --port COMx --expected-identity ID\n  \
+         easycon-hardware-qualification hotplug --port COMx --expected-identity ID [--timeout-seconds N]\n  \
+         easycon-hardware-qualification lifecycle --port COMx --expected-identity ID [--cycles 100]\n  \
+         easycon-hardware-qualification sequence --port COMx --expected-identity ID [--steps 10000]\n  \
+         easycon-hardware-qualification amiibo [--port COMx --expected-identity ID --slot N --slot-count N \
          --maximum-data-len N --data FILE --authorize-write --confirm-disposable]\n\n  \
          Every command accepts --output-dir PATH."
     );
@@ -2951,6 +3217,7 @@ fn print_help() {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use easycon_controller::TransportErrorKind;
     use easycon_model::{EasyConError, ErrorCode, ErrorDomain};
@@ -3294,6 +3561,18 @@ mod tests {
         errors: VecDeque<SerialError>,
     }
 
+    struct ScriptedDeviceDiscovery {
+        result: Result<Vec<SerialPortDescriptor>, SerialError>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl DeviceDiscovery for ScriptedDeviceDiscovery {
+        fn discover(&self) -> Result<Vec<SerialPortDescriptor>, SerialError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.result.clone()
+        }
+    }
+
     impl ByteIoFactory for ScriptedOpenFactory {
         fn open(
             &mut self,
@@ -3312,6 +3591,126 @@ mod tests {
         assert_eq!(document["command"], "handshake");
         assert_eq!(document["error"], "protocol timeout");
         assert_eq!(error.as_deref(), Some("protocol timeout"));
+    }
+
+    #[test]
+    fn rejected_identity_is_not_run_and_never_constructs_a_harness() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let runner_calls = Arc::new(AtomicUsize::new(0));
+        let discovery = Arc::new(ScriptedDeviceDiscovery {
+            result: Ok(vec![
+                SerialPortDescriptor::new("DEVICE\\OTHER", "COM8").expect("other descriptor"),
+                SerialPortDescriptor::new("DEVICE\\EXPECTED", "COM11")
+                    .expect("expected descriptor"),
+            ]),
+            calls: Arc::clone(&calls),
+        });
+        let arguments = vec![
+            "handshake".to_owned(),
+            "--port".to_owned(),
+            "COM8".to_owned(),
+            "--expected-identity".to_owned(),
+            "DEVICE\\EXPECTED".to_owned(),
+        ];
+        let observed_runner_calls = Arc::clone(&runner_calls);
+        let result =
+            run_with_device_admission_using("handshake", &arguments, discovery, move |_, _| {
+                observed_runner_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(json!({"unexpected": true}))
+            })
+            .expect("rejected admission result");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(runner_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            result["identity_admission"]["reason"],
+            "expected_at_different_port"
+        );
+        assert!(cleanup_contract_succeeded("handshake", &result));
+        let (document, _) = finalize_result("handshake", Ok(result));
+        assert_eq!(document["execution_status"], "completed");
+        assert_eq!(document["qualification_status"], "not_run");
+        assert_eq!(document_exit_code(&document), 2);
+    }
+
+    #[test]
+    fn unsafe_discovery_results_fail_before_the_runner() {
+        let arguments = vec![
+            "handshake".to_owned(),
+            "--port".to_owned(),
+            "COM8".to_owned(),
+            "--expected-identity".to_owned(),
+            "DEVICE\\EXPECTED".to_owned(),
+        ];
+        let cases = [
+            Ok(vec![
+                SerialPortDescriptor::new("DEVICE\\EXPECTED", "COM8").expect("descriptor"),
+                SerialPortDescriptor::new("DEVICE\\OTHER", "com8").expect("duplicate port"),
+            ]),
+            Err(SerialError::with_os_code(
+                easycon_serial::SerialErrorKind::Io,
+                "injected discovery failure",
+                5,
+            )),
+        ];
+
+        for discovery_result in cases {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let runner_calls = Arc::new(AtomicUsize::new(0));
+            let observed_runner_calls = Arc::clone(&runner_calls);
+            let result = run_with_device_admission_using(
+                "handshake",
+                &arguments,
+                Arc::new(ScriptedDeviceDiscovery {
+                    result: discovery_result,
+                    calls: Arc::clone(&calls),
+                }),
+                move |_, _| {
+                    observed_runner_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(json!({"unexpected": true}))
+                },
+            )
+            .expect("fail-closed admission result");
+
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(runner_calls.load(Ordering::SeqCst), 0);
+            assert!(result.get("execution_error").is_some());
+            assert!(cleanup_contract_succeeded("handshake", &result));
+            let (document, _) = finalize_result("handshake", Ok(result));
+            assert_eq!(document["execution_status"], "failed");
+            assert_eq!(document["qualification_status"], "failed");
+            assert_eq!(document_exit_code(&document), 1);
+        }
+    }
+
+    #[test]
+    fn missing_identity_is_rejected_without_discovery() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        for arguments in [
+            vec![
+                "handshake".to_owned(),
+                "--port".to_owned(),
+                "COM8".to_owned(),
+            ],
+            vec![
+                "handshake".to_owned(),
+                "--expected-identity".to_owned(),
+                "--port".to_owned(),
+                "COM8".to_owned(),
+            ],
+        ] {
+            let result = run_with_device_admission_using(
+                "handshake",
+                &arguments,
+                Arc::new(ScriptedDeviceDiscovery {
+                    result: Ok(Vec::new()),
+                    calls: Arc::clone(&calls),
+                }),
+                |_, _| Ok(json!({"unexpected": true})),
+            );
+            assert!(result.is_err());
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
