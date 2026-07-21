@@ -37,6 +37,8 @@
     build/runtime provenance、append-only journal、manifest、completion marker 和磁盘分类。
 15. [Phase 2B 操作员、取消与观察设计](development/phase2b-operator-cancellation-observation.md)：
     单 owner OperatorPort、Ctrl+C cooperative cancellation、逐动作 observation 和终态顺序。
+16. [Phase 2B Amiibo 资格写入安全设计](development/phase2b-amiibo-qualification-safety.md)：
+    一次性写入授权、外部 limits 来源、payload hash、chunk write-ahead journal 和 synthetic failpoint 边界。
 
 ## 决策记录
 
