@@ -155,7 +155,6 @@ impl RuntimeProvenance {
     }
 }
 
-#[cfg(test)]
 pub(crate) fn sha256_bytes(bytes: &[u8]) -> String {
     hex_upper(&Sha256::digest(bytes))
 }

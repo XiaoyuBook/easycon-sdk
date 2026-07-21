@@ -208,6 +208,10 @@ impl EvidenceJournal {
     }
 
     pub(crate) fn verify(&mut self) -> Result<(), String> {
+        self.readback().map(|_| ())
+    }
+
+    pub(crate) fn readback(&mut self) -> Result<Vec<u8>, String> {
         if let Some(error) = &self.poisoned {
             return Err(format!("evidence journal is poisoned: {error}"));
         }
@@ -228,7 +232,7 @@ impl EvidenceJournal {
         self.file
             .seek(SeekFrom::End(0))
             .map_err(|error| format!("cannot seek journal end {}: {error}", self.path.display()))?;
-        Ok(())
+        Ok(actual)
     }
 
     pub(crate) fn projection_json(&self) -> Value {
@@ -435,6 +439,18 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn retained_journal_handle_blocks_delete_and_external_write() {
+        let directory = TestDirectory::new("retained-handle");
+        let path = directory.0.join(JOURNAL_FILE_NAME);
+        let journal = EvidenceJournal::create(path.clone(), start()).expect("journal");
+
+        assert!(std::fs::remove_file(&path).is_err());
+        assert!(std::fs::write(&path, b"replacement").is_err());
+        drop(journal);
+        std::fs::write(&path, b"control replacement").expect("control mutation after close");
     }
 
     #[test]

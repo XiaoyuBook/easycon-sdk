@@ -42,7 +42,7 @@ use easycon_serial::{
 use serde_json::{Value, json};
 
 use journal::JournalEventKind;
-use provenance::RuntimeProvenance;
+use provenance::{RuntimeProvenance, sha256_bytes};
 
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
 const MINIMUM_REPORT_INTERVAL_NS: u64 = 30_000_000;
@@ -855,6 +855,19 @@ fn real_main() -> Result<i32, String> {
     apply_provenance_policy(&mut document, &provenance);
     let ended_unix_ns = current_unix_ns()?;
     document["run"] = reservation.run_identity_json(ended_unix_ns);
+    document["auxiliary_artifacts"] = json!([]);
+    if let Some(timings) = sequence_timings.take() {
+        let bytes = u64::try_from(timings.len())
+            .map_err(|_| "sequence timing CSV length does not fit u64".to_owned())?;
+        let sha256 = sha256_bytes(&timings);
+        reservation.stage_auxiliary(AuxiliaryKind::SequenceTimingsCsv, timings)?;
+        document["auxiliary_artifacts"] = json!([{
+            "kind": "sequence_timings_csv",
+            "relative_path": SEQUENCE_TIMINGS_FILE_NAME,
+            "bytes": bytes,
+            "sha256": sha256,
+        }]);
+    }
     reservation.record_event(
         JournalEventKind::RunProjectionFinalized,
         json!({
@@ -867,9 +880,6 @@ fn real_main() -> Result<i32, String> {
     }))?;
     document["run"]["journal_projection"] = reservation.journal_projection()?;
     let exit_code = document_exit_code(&document);
-    if let Some(timings) = sequence_timings {
-        reservation.stage_auxiliary(AuxiliaryKind::SequenceTimingsCsv, timings)?;
-    }
     let output = reservation.commit(&document)?;
     println!(
         "{}",
