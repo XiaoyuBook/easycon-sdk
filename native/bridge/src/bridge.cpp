@@ -66,6 +66,14 @@ void release_bytes(void* data) noexcept {
     live_allocations.fetch_sub(1, std::memory_order_relaxed);
 }
 
+void track_handle_created() noexcept {
+    live_handles.fetch_add(1, std::memory_order_relaxed);
+}
+
+void track_handle_destroyed() noexcept {
+    live_handles.fetch_sub(1, std::memory_order_relaxed);
+}
+
 }  // namespace easycon::native::detail
 
 extern "C" void EASYCON_NATIVE_CALL easycon_native_error_release(
@@ -120,7 +128,7 @@ extern "C" easycon_native_status EASYCON_NATIVE_CALL easycon_native_debug_handle
         *out_handle = nullptr;
         // The enclosing guard maps std::bad_alloc before it can cross the ABI.
         auto* handle = new easycon_native_debug_handle{debug_handle_marker};  // NOLINT(bugprone-unhandled-exception-at-new)
-        live_handles.fetch_add(1, std::memory_order_relaxed);
+        easycon::native::detail::track_handle_created();
         *out_handle = handle;
         return EASYCON_NATIVE_STATUS_OK;
     });
@@ -147,7 +155,7 @@ extern "C" easycon_native_status EASYCON_NATIVE_CALL easycon_native_debug_handle
         }
         delete *inout_handle;
         *inout_handle = nullptr;
-        live_handles.fetch_sub(1, std::memory_order_relaxed);
+        easycon::native::detail::track_handle_destroyed();
         return EASYCON_NATIVE_STATUS_OK;
     });
 }

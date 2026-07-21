@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "license": "GPL-3.0-only",
+  "generator": "tools/generate_vision_ocr_fixtures.py",
+  "provenance": "Synthetic 5x7 glyph pixels authored for EasyCon SDK Phase 3; no external font or EasyCon asset is used.",
+  "text": "EASCON",
+  "image": {
+    "path": "easycon-gray.hex",
+    "format": "Gray8",
+    "width": 273,
+    "height": 77,
+    "stride": 273,
+    "decoded_bytes": 21021,
+    "decoded_sha256": "3632beecb9edbc101a6834425b55e5063af0eb8d786b7890f6bf37c4dd1e2fc0"
+  }
+}

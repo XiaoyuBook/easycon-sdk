@@ -47,6 +47,14 @@ typedef int32_t easycon_native_status;
 #define EASYCON_NATIVE_EDGE_XY UINT32_C(1)
 #define EASYCON_NATIVE_EDGE_LAPLACIAN UINT32_C(2)
 
+#define EASYCON_NATIVE_OCR_ENGINE_DEFAULT UINT32_C(1)
+#define EASYCON_NATIVE_OCR_ENGINE_LSTM_ONLY UINT32_C(2)
+
+#define EASYCON_NATIVE_OCR_PSM_AUTO UINT32_C(1)
+#define EASYCON_NATIVE_OCR_PSM_SINGLE_BLOCK UINT32_C(2)
+#define EASYCON_NATIVE_OCR_PSM_SINGLE_LINE UINT32_C(3)
+#define EASYCON_NATIVE_OCR_PSM_SINGLE_WORD UINT32_C(4)
+
 typedef struct easycon_native_error {
     int32_t code;
     char* data;
@@ -118,6 +126,7 @@ typedef struct easycon_native_counts {
 } easycon_native_counts;
 
 typedef struct easycon_native_debug_handle easycon_native_debug_handle;
+typedef struct easycon_native_ocr_engine easycon_native_ocr_engine;
 
 void EASYCON_NATIVE_CALL easycon_native_error_release(
     easycon_native_error* error) EASYCON_NATIVE_NOEXCEPT;
@@ -177,6 +186,26 @@ easycon_native_status EASYCON_NATIVE_CALL easycon_native_hsv_count(
     easycon_native_color_result* out_result,
     easycon_native_error* out_error) EASYCON_NATIVE_NOEXCEPT;
 
+easycon_native_status EASYCON_NATIVE_CALL easycon_native_ocr_engine_create(
+    const uint8_t* model_root_utf8,
+    uint64_t model_root_length,
+    const uint8_t* language_utf8,
+    uint64_t language_length,
+    uint32_t engine_mode,
+    easycon_native_ocr_engine** out_engine,
+    easycon_native_error* out_error) EASYCON_NATIVE_NOEXCEPT;
+easycon_native_status EASYCON_NATIVE_CALL easycon_native_ocr_engine_process(
+    easycon_native_ocr_engine* engine,
+    const easycon_native_image_view* image,
+    uint32_t page_segmentation,
+    uint64_t max_output_bytes,
+    easycon_native_buffer* out_text,
+    double* out_confidence,
+    easycon_native_error* out_error) EASYCON_NATIVE_NOEXCEPT;
+easycon_native_status EASYCON_NATIVE_CALL easycon_native_ocr_engine_destroy(
+    easycon_native_ocr_engine** inout_engine,
+    easycon_native_error* out_error) EASYCON_NATIVE_NOEXCEPT;
+
 easycon_native_status EASYCON_NATIVE_CALL easycon_native_debug_counts(
     easycon_native_counts* out_counts,
     easycon_native_error* out_error) EASYCON_NATIVE_NOEXCEPT;
@@ -191,9 +220,33 @@ easycon_native_status EASYCON_NATIVE_CALL easycon_native_debug_handle_destroy(
 #define EASYCON_NATIVE_TEST_RAISE_CV INT32_C(0)
 #define EASYCON_NATIVE_TEST_RAISE_STD INT32_C(1)
 #define EASYCON_NATIVE_TEST_RAISE_UNKNOWN INT32_C(2)
+#define EASYCON_NATIVE_TEST_OCR_FAIL_MODEL_CHECK_BAD_ALLOC INT32_C(0)
+#define EASYCON_NATIVE_TEST_OCR_FAIL_CONFIDENCE_STD INT32_C(1)
+#define EASYCON_NATIVE_TEST_OCR_FAIL_DESTROY_UNKNOWN INT32_C(2)
+
+typedef struct easycon_native_ocr_test_counts {
+    uint64_t created;
+    uint64_t destroyed;
+    uint64_t process_calls;
+    uint64_t clear_calls;
+    uint64_t teardown_exceptions;
+} easycon_native_ocr_test_counts;
 
 easycon_native_status EASYCON_NATIVE_CALL easycon_native_test_raise(
     int32_t kind,
+    easycon_native_error* out_error) EASYCON_NATIVE_NOEXCEPT;
+easycon_native_status EASYCON_NATIVE_CALL easycon_native_test_ocr_raise(
+    easycon_native_ocr_engine* engine,
+    int32_t kind,
+    easycon_native_error* out_error) EASYCON_NATIVE_NOEXCEPT;
+easycon_native_status EASYCON_NATIVE_CALL easycon_native_test_ocr_counts(
+    easycon_native_ocr_test_counts* out_counts,
+    easycon_native_error* out_error) EASYCON_NATIVE_NOEXCEPT;
+easycon_native_status EASYCON_NATIVE_CALL easycon_native_test_ocr_fail_next(
+    int32_t failpoint,
+    easycon_native_error* out_error) EASYCON_NATIVE_NOEXCEPT;
+easycon_native_status EASYCON_NATIVE_CALL easycon_native_test_ocr_invalidate(
+    easycon_native_ocr_engine* engine,
     easycon_native_error* out_error) EASYCON_NATIVE_NOEXCEPT;
 #endif
 
@@ -262,6 +315,15 @@ static_assert(sizeof(easycon_native_counts) == 16);
 static_assert(alignof(easycon_native_counts) == 8);
 static_assert(offsetof(easycon_native_counts, live_handles) == 0);
 static_assert(offsetof(easycon_native_counts, live_allocations) == 8);
+#if defined(EASYCON_NATIVE_TESTING)
+static_assert(sizeof(easycon_native_ocr_test_counts) == 40);
+static_assert(alignof(easycon_native_ocr_test_counts) == 8);
+static_assert(offsetof(easycon_native_ocr_test_counts, created) == 0);
+static_assert(offsetof(easycon_native_ocr_test_counts, destroyed) == 8);
+static_assert(offsetof(easycon_native_ocr_test_counts, process_calls) == 16);
+static_assert(offsetof(easycon_native_ocr_test_counts, clear_calls) == 24);
+static_assert(offsetof(easycon_native_ocr_test_counts, teardown_exceptions) == 32);
+#endif
 #endif
 
 #endif

@@ -3,8 +3,9 @@ use std::sync::Arc;
 
 use easycon_native_sys::NativeErrorKind;
 use easycon_native_sys::codec as native;
+use easycon_runtime::CancellationToken;
 
-use crate::NativeBridgeError;
+use crate::{NativeBridgeError, NativePool, VisionError};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PixelFormat {
@@ -168,6 +169,10 @@ impl ImageError {
     pub fn message(&self) -> &str {
         &self.message
     }
+
+    pub(crate) fn into_native(self) -> Option<NativeBridgeError> {
+        self.native
+    }
 }
 
 impl fmt::Display for ImageError {
@@ -260,7 +265,7 @@ impl Image {
         })
     }
 
-    pub fn decode(encoded: &[u8], limits: &VisionLimits) -> Result<Self, ImageError> {
+    pub(crate) fn decode_direct(encoded: &[u8], limits: &VisionLimits) -> Result<Self, ImageError> {
         if encoded.is_empty() {
             return Err(ImageError::new(
                 ImageErrorKind::InvalidArgument,
@@ -277,11 +282,11 @@ impl Image {
         Self::from_native(output, limits)
     }
 
-    pub fn encode_png(&self, limits: &VisionLimits) -> Result<Vec<u8>, ImageError> {
+    pub(crate) fn encode_png_direct(&self, limits: &VisionLimits) -> Result<Vec<u8>, ImageError> {
         native::encode_png(self.native_view(limits)?, limits.image).map_err(ImageError::from_native)
     }
 
-    pub fn convert(
+    pub(crate) fn convert_direct(
         &self,
         output_format: PixelFormat,
         limits: &VisionLimits,
@@ -295,7 +300,7 @@ impl Image {
         Self::from_native(output, limits)
     }
 
-    pub fn crop(&self, roi: Roi, limits: &VisionLimits) -> Result<Self, ImageError> {
+    pub(crate) fn crop_direct(&self, roi: Roi, limits: &VisionLimits) -> Result<Self, ImageError> {
         let right = roi
             .x
             .checked_add(roi.width)
@@ -433,8 +438,14 @@ impl Frame {
         self.timestamp_ns
     }
 
-    pub fn crop(&self, roi: Roi, limits: &VisionLimits) -> Result<Image, ImageError> {
-        self.image.crop(roi, limits)
+    pub fn crop(
+        &self,
+        pool: &NativePool,
+        cancellation: &CancellationToken,
+        roi: Roi,
+        limits: &VisionLimits,
+    ) -> Result<Image, VisionError> {
+        pool.crop(&self.image, roi, limits, cancellation)
     }
 }
 

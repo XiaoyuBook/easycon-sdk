@@ -1,9 +1,42 @@
 use std::sync::Arc;
 
+use easycon_native_sys::NativeErrorKind;
+use easycon_runtime::{CancellationToken, CloseOutcome, Runtime, VirtualClock};
 use easycon_vision::{
-    EdgeMethod, HsvRange, Image, ImageErrorKind, PixelFormat, Roi, TemplateMethod, VisionLimits,
-    match_edge, match_template, native_resource_counts, preprocess_edge,
+    EdgeMethod, HsvRange, Image, ImageErrorKind, NativePool, NativePoolOptions, PixelFormat, Roi,
+    TemplateMethod, VisionErrorKind, VisionLimits, match_edge, match_template,
+    native_resource_counts, preprocess_edge,
 };
+
+struct TestNative {
+    runtime: Runtime,
+    pool: NativePool,
+    cancellation: CancellationToken,
+}
+
+impl TestNative {
+    fn new() -> Self {
+        let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+        let pool = NativePool::new(
+            &runtime,
+            NativePoolOptions::new(2, 8).expect("native pool options"),
+        )
+        .expect("native pool");
+        let cancellation = runtime.child_cancellation_token();
+        Self {
+            runtime,
+            pool,
+            cancellation,
+        }
+    }
+}
+
+impl Drop for TestNative {
+    fn drop(&mut self) {
+        self.pool.close().expect("native pool close");
+        assert_eq!(self.runtime.close(), Ok(CloseOutcome::Closed));
+    }
+}
 
 fn decode_hex(text: &str) -> Vec<u8> {
     let text = text.trim();
@@ -88,6 +121,7 @@ fn assert_close(actual: f32, expected: f32) {
 
 #[test]
 fn normalized_template_modes_keep_location_and_frozen_score_mapping() {
+    let native = TestNative::new();
     let search = gray_image("template-search", 6, 5);
     let target = gray_image("template-target", 3, 3);
     let cases = [
@@ -97,7 +131,15 @@ fn normalized_template_modes_keep_location_and_frozen_score_mapping() {
     ];
 
     for (method, expected_raw, expected_score) in cases {
-        let result = match_template(&search, &target, method, &limits()).expect("template match");
+        let result = match_template(
+            &native.pool,
+            &native.cancellation,
+            &search,
+            &target,
+            method,
+            &limits(),
+        )
+        .expect("template match");
         assert_eq!((result.x(), result.y()), (2, 1));
         assert_close(result.raw(), expected_raw);
         assert_close(result.score(), expected_score);
@@ -106,6 +148,7 @@ fn normalized_template_modes_keep_location_and_frozen_score_mapping() {
 
 #[test]
 fn edge_preprocess_pixels_and_final_match_are_independently_fixed() {
+    let native = TestNative::new();
     let search = bgr_from_gray("edge-search", 18, 17);
     let target = bgr_from_gray("edge-target", 11, 11);
     let cases = [
@@ -118,14 +161,36 @@ fn edge_preprocess_pixels_and_final_match_are_independently_fixed() {
     ];
 
     for (method, expected_search, expected_target) in cases {
-        let search_edge = preprocess_edge(&search, method, &limits()).expect("search edge");
-        let target_edge = preprocess_edge(&target, method, &limits()).expect("target edge");
+        let search_edge = preprocess_edge(
+            &native.pool,
+            &native.cancellation,
+            &search,
+            method,
+            &limits(),
+        )
+        .expect("search edge");
+        let target_edge = preprocess_edge(
+            &native.pool,
+            &native.cancellation,
+            &target,
+            method,
+            &limits(),
+        )
+        .expect("target edge");
         assert_eq!(search_edge.format(), PixelFormat::Gray8);
         assert_eq!(target_edge.format(), PixelFormat::Gray8);
         assert_eq!(search_edge.pixels(), fixture(expected_search));
         assert_eq!(target_edge.pixels(), fixture(expected_target));
 
-        let result = match_edge(&search, &target, method, &limits()).expect("edge match");
+        let result = match_edge(
+            &native.pool,
+            &native.cancellation,
+            &search,
+            &target,
+            method,
+            &limits(),
+        )
+        .expect("edge match");
         assert_eq!((result.x(), result.y()), (4, 3));
         assert_close(result.raw(), 1.0);
         assert_close(result.score(), 1.0);
@@ -134,6 +199,7 @@ fn edge_preprocess_pixels_and_final_match_are_independently_fixed() {
 
 #[test]
 fn hsv_normal_wrap_full_none_ratio_threshold_and_absolute_bbox_are_exact() {
+    let native = TestNative::new();
     let image = Image::new(
         Arc::from(fixture("hsv")),
         5,
@@ -147,6 +213,8 @@ fn hsv_normal_wrap_full_none_ratio_threshold_and_absolute_bbox_are_exact() {
 
     let normal = image
         .hsv_statistics(
+            &native.pool,
+            &native.cancellation,
             roi,
             HsvRange::new(20, 100, 200, 255, 200, 255).expect("normal range"),
             &limits(),
@@ -160,6 +228,8 @@ fn hsv_normal_wrap_full_none_ratio_threshold_and_absolute_bbox_are_exact() {
 
     let wrap = image
         .hsv_statistics(
+            &native.pool,
+            &native.cancellation,
             roi,
             HsvRange::new(170, 10, 100, 255, 100, 255).expect("wrap range"),
             &limits(),
@@ -171,6 +241,8 @@ fn hsv_normal_wrap_full_none_ratio_threshold_and_absolute_bbox_are_exact() {
 
     let full = image
         .hsv_statistics(
+            &native.pool,
+            &native.cancellation,
             roi,
             HsvRange::new(0, 179, 0, 255, 0, 255).expect("full range"),
             &limits(),
@@ -182,6 +254,8 @@ fn hsv_normal_wrap_full_none_ratio_threshold_and_absolute_bbox_are_exact() {
 
     let none = image
         .hsv_statistics(
+            &native.pool,
+            &native.cancellation,
             roi,
             HsvRange::new(101, 110, 200, 255, 200, 255).expect("empty range"),
             &limits(),
@@ -194,23 +268,39 @@ fn hsv_normal_wrap_full_none_ratio_threshold_and_absolute_bbox_are_exact() {
 
 #[test]
 fn matching_and_color_validation_are_deterministic_and_leak_free() {
+    let native = TestNative::new();
     let baseline = native_resource_counts().expect("baseline");
     let search = gray_image("template-search", 6, 5);
     let target = gray_image("template-target", 3, 3);
-    let bgr_target = target
-        .convert(PixelFormat::Bgr8, &limits())
+    let bgr_target = native
+        .pool
+        .convert(&target, PixelFormat::Bgr8, &limits(), &native.cancellation)
         .expect("BGR target");
     assert_eq!(
-        match_template(&search, &bgr_target, TemplateMethod::CCorrNormed, &limits(),)
-            .expect_err("formats differ")
-            .kind(),
-        ImageErrorKind::InvalidArgument
+        match_template(
+            &native.pool,
+            &native.cancellation,
+            &search,
+            &bgr_target,
+            TemplateMethod::CCorrNormed,
+            &limits(),
+        )
+        .expect_err("formats differ")
+        .kind(),
+        VisionErrorKind::Validation
     );
     assert_eq!(
-        match_template(&target, &search, TemplateMethod::CCorrNormed, &limits(),)
-            .expect_err("target exceeds search")
-            .kind(),
-        ImageErrorKind::OutOfRange
+        match_template(
+            &native.pool,
+            &native.cancellation,
+            &target,
+            &search,
+            TemplateMethod::CCorrNormed,
+            &limits(),
+        )
+        .expect_err("target exceeds search")
+        .kind(),
+        VisionErrorKind::Limit
     );
 
     let constant = Image::new(
@@ -222,16 +312,21 @@ fn matching_and_color_validation_are_deterministic_and_leak_free() {
         &limits(),
     )
     .expect("constant image");
+    let error = match_template(
+        &native.pool,
+        &native.cancellation,
+        &constant,
+        &constant,
+        TemplateMethod::CCoeffNormed,
+        &limits(),
+    )
+    .expect_err("undefined normalized coefficient");
+    assert_eq!(error.kind(), VisionErrorKind::Native);
+    let native_error = error.native().expect("native diagnostic is preserved");
+    assert_eq!(native_error.kind(), NativeErrorKind::Backend);
     assert_eq!(
-        match_template(
-            &constant,
-            &constant,
-            TemplateMethod::CCoeffNormed,
-            &limits(),
-        )
-        .expect_err("undefined normalized coefficient")
-        .kind(),
-        ImageErrorKind::Native
+        native_error.message(),
+        "normalized template denominator is zero"
     );
 
     assert_eq!(
@@ -258,16 +353,20 @@ fn matching_and_color_validation_are_deterministic_and_leak_free() {
     assert_eq!(
         image
             .hsv_statistics(
+                &native.pool,
+                &native.cancellation,
                 Roi::new(4, 2, 2, 1).expect("nonempty ROI"),
                 HsvRange::new(0, 179, 0, 255, 0, 255).expect("full range"),
                 &limits(),
             )
             .expect_err("ROI outside image")
             .kind(),
-        ImageErrorKind::OutOfRange
+        VisionErrorKind::Limit
     );
     let stats = image
         .hsv_statistics(
+            &native.pool,
+            &native.cancellation,
             Roi::new(0, 0, 1, 1).expect("single pixel"),
             HsvRange::new(0, 179, 0, 255, 0, 255).expect("full range"),
             &limits(),

@@ -2,14 +2,20 @@
 //! Rust-owned Vision types and lifecycle coordination.
 
 mod color;
+mod error;
 mod image;
 mod matching;
+mod ocr;
+mod pool;
 
 pub use color::{ColorStatistics, HsvRange};
+pub use error::{VisionError, VisionErrorKind};
 pub use image::{Frame, Image, ImageError, ImageErrorKind, PixelFormat, Roi, VisionLimits};
 pub use matching::{
     EdgeMethod, MatchResult, TemplateMethod, match_edge, match_template, preprocess_edge,
 };
+pub use ocr::{OcrConfig, OcrEngineMode, OcrOutput, OcrPageSegmentation, OcrPool, OcrPoolCounts};
+pub use pool::{NativePool, NativePoolCounts, NativePoolOptions};
 
 pub use easycon_native_sys::NativeError as NativeBridgeError;
 

@@ -952,6 +952,89 @@ def validate_vision_operation_fixtures(runner=subprocess.run):
     )
 
 
+def validate_vision_ocr_fixtures(runner=subprocess.run):
+    validate_generated_vision_fixtures(
+        "generate_vision_ocr_fixtures.py", "vision OCR", runner
+    )
+
+
+def validate_vision_model_provisioner_regressions():
+    import provision_vision_test_model as model
+
+    manifest = model.load_manifest(model.EXPECTED_MANIFEST)
+    attempted_downloads = []
+    original_download = model.download
+    model.download = lambda entry, destination: attempted_downloads.append(destination)
+    try:
+        try:
+            model.provision(manifest, ROOT)
+        except model.ProvisionError:
+            pass
+    finally:
+        model.download = original_download
+    require(
+        not attempted_downloads,
+        "OCR provisioner must reject output outside ignored .tools/vision-models before writing",
+    )
+
+    require(
+        hasattr(model, "FrozenRedirectHandler"),
+        "OCR provisioner must validate every HTTP redirect hop",
+    )
+    handler = model.FrozenRedirectHandler()
+    request = model.urllib.request.Request(model.FROZEN_MODEL["url"])
+    try:
+        handler.redirect_request(
+            request,
+            None,
+            302,
+            "Found",
+            {},
+            "https://example.com/intermediate",
+        )
+    except model.ProvisionError:
+        pass
+    else:
+        require(False, "OCR provisioner accepted an off-host intermediate redirect")
+
+
+def validate_vision_ocr_model_manifest():
+    manifest = load_json("fixtures/vision/ocr-model.json")
+    require(manifest.get("version") == 1, "OCR model manifest version must be 1")
+    require(
+        manifest.get("model")
+        == {
+            "language": "eng",
+            "path": "eng.traineddata",
+            "url": (
+                "https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/"
+                "refs/tags/4.1.0/eng.traineddata"
+            ),
+            "bytes": 4113088,
+            "sha256": (
+                "7d4322bd2a7749724879683fc3912cb542f19906c83bcc1a52132556427170b2"
+            ),
+        },
+        "OCR test model source, size, or hash changed",
+    )
+    require(
+        manifest.get("license")
+        == {
+            "spdx": "Apache-2.0",
+            "path": "LICENSE",
+            "url": (
+                "https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/"
+                "refs/tags/4.1.0/LICENSE"
+            ),
+            "bytes": 11358,
+            "sha256": (
+                "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+            ),
+        },
+        "OCR test model license, size, or hash changed",
+    )
+
+
 def validate_vision_fixture_validator_regressions():
     class FailedResult:
         returncode = 1
@@ -964,6 +1047,7 @@ def validate_vision_fixture_validator_regressions():
     for validator, label in (
         (validate_vision_codec_fixtures, "codec"),
         (validate_vision_operation_fixtures, "operation"),
+        (validate_vision_ocr_fixtures, "OCR"),
     ):
         try:
             validator(runner=failing_runner)
@@ -982,12 +1066,15 @@ def main():
     validate_traces()
     validate_latency_result()
     validate_vision_fixture_validator_regressions()
+    validate_vision_ocr_model_manifest()
     validate_vision_codec_fixtures()
     validate_vision_operation_fixtures()
+    validate_vision_ocr_fixtures()
+    validate_vision_model_provisioner_regressions()
     test_count = validate_conformance()
     print(
         "validated 5 schemas, 1 behavior spec, 3 controller fixtures, "
-        "14 vision binary fixtures, 9 conformance scenarios, and {} exact Rust tests".format(
+        "15 vision binary fixtures, 9 conformance scenarios, and {} exact Rust tests".format(
             test_count
         )
     )

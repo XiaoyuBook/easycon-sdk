@@ -1,6 +1,7 @@
 use easycon_native_sys::operations as native;
+use easycon_runtime::CancellationToken;
 
-use crate::{Image, ImageError, ImageErrorKind, Roi, VisionLimits};
+use crate::{Image, ImageError, ImageErrorKind, NativePool, Roi, VisionError, VisionLimits};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HsvRange {
@@ -64,6 +65,17 @@ impl ColorStatistics {
 
 impl Image {
     pub fn hsv_statistics(
+        &self,
+        pool: &NativePool,
+        cancellation: &CancellationToken,
+        roi: Roi,
+        range: HsvRange,
+        limits: &VisionLimits,
+    ) -> Result<ColorStatistics, VisionError> {
+        pool.hsv_statistics(self, roi, range, limits, cancellation)
+    }
+
+    pub(crate) fn hsv_statistics_direct(
         &self,
         roi: Roi,
         range: HsvRange,

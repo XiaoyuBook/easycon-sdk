@@ -1,6 +1,7 @@
 use easycon_native_sys::operations as native;
+use easycon_runtime::CancellationToken;
 
-use crate::{Image, ImageError, ImageErrorKind, VisionLimits};
+use crate::{Image, ImageError, ImageErrorKind, NativePool, VisionError, VisionLimits};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TemplateMethod {
@@ -65,6 +66,17 @@ impl MatchResult {
 }
 
 pub fn match_template(
+    pool: &NativePool,
+    cancellation: &CancellationToken,
+    search: &Image,
+    target: &Image,
+    method: TemplateMethod,
+    limits: &VisionLimits,
+) -> Result<MatchResult, VisionError> {
+    pool.match_template(search, target, method, limits, cancellation)
+}
+
+pub(crate) fn match_template_direct(
     search: &Image,
     target: &Image,
     method: TemplateMethod,
@@ -93,6 +105,16 @@ pub fn match_template(
 }
 
 pub fn preprocess_edge(
+    pool: &NativePool,
+    cancellation: &CancellationToken,
+    image: &Image,
+    method: EdgeMethod,
+    limits: &VisionLimits,
+) -> Result<Image, VisionError> {
+    pool.preprocess_edge(image, method, limits, cancellation)
+}
+
+pub(crate) fn preprocess_edge_direct(
     image: &Image,
     method: EdgeMethod,
     limits: &VisionLimits,
@@ -107,14 +129,25 @@ pub fn preprocess_edge(
 }
 
 pub fn match_edge(
+    pool: &NativePool,
+    cancellation: &CancellationToken,
+    search: &Image,
+    target: &Image,
+    method: EdgeMethod,
+    limits: &VisionLimits,
+) -> Result<MatchResult, VisionError> {
+    pool.match_edge(search, target, method, limits, cancellation)
+}
+
+pub(crate) fn match_edge_direct(
     search: &Image,
     target: &Image,
     method: EdgeMethod,
     limits: &VisionLimits,
 ) -> Result<MatchResult, ImageError> {
-    let search_edge = preprocess_edge(search, method, limits)?;
-    let target_edge = preprocess_edge(target, method, limits)?;
-    match_template(
+    let search_edge = preprocess_edge_direct(search, method, limits)?;
+    let target_edge = preprocess_edge_direct(target, method, limits)?;
+    match_template_direct(
         &search_edge,
         &target_edge,
         TemplateMethod::CCoeffNormed,

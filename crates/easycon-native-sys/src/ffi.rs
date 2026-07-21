@@ -28,6 +28,14 @@ pub(crate) const TEMPLATE_CCOEFF_NORMED: u32 = 3;
 pub(crate) const EDGE_XY: u32 = 1;
 pub(crate) const EDGE_LAPLACIAN: u32 = 2;
 
+pub(crate) const OCR_ENGINE_DEFAULT: u32 = 1;
+pub(crate) const OCR_ENGINE_LSTM_ONLY: u32 = 2;
+
+pub(crate) const OCR_PSM_AUTO: u32 = 1;
+pub(crate) const OCR_PSM_SINGLE_BLOCK: u32 = 2;
+pub(crate) const OCR_PSM_SINGLE_LINE: u32 = 3;
+pub(crate) const OCR_PSM_SINGLE_WORD: u32 = 4;
+
 #[repr(C)]
 #[derive(Default)]
 pub(crate) struct Error {
@@ -117,6 +125,7 @@ pub(crate) struct ColorResult {
 }
 
 pub(crate) type DebugHandle = c_void;
+pub(crate) type OcrEngine = c_void;
 
 unsafe extern "C" {
     pub(crate) fn easycon_native_error_release(error: *mut Error);
@@ -176,6 +185,28 @@ unsafe extern "C" {
         range: *const HsvRange,
         limits: *const ImageLimits,
         out_result: *mut ColorResult,
+        out_error: *mut Error,
+    ) -> i32;
+    pub(crate) fn easycon_native_ocr_engine_create(
+        model_root_utf8: *const u8,
+        model_root_length: u64,
+        language_utf8: *const u8,
+        language_length: u64,
+        engine_mode: u32,
+        out_engine: *mut *mut OcrEngine,
+        out_error: *mut Error,
+    ) -> i32;
+    pub(crate) fn easycon_native_ocr_engine_process(
+        engine: *mut OcrEngine,
+        image: *const ImageView,
+        page_segmentation: u32,
+        max_output_bytes: u64,
+        out_text: *mut Buffer,
+        out_confidence: *mut f64,
+        out_error: *mut Error,
+    ) -> i32;
+    pub(crate) fn easycon_native_ocr_engine_destroy(
+        inout_engine: *mut *mut OcrEngine,
         out_error: *mut Error,
     ) -> i32;
     pub(crate) fn easycon_native_debug_counts(

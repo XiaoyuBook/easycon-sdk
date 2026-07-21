@@ -280,3 +280,106 @@ next node but Node C neither calls nor links OCR APIs.
 
 Node C makes no OCR-model, capture-device, hardware timing, or performance claim. It adds no
 traineddata, EasyCon source, public C ABI, installed header, language binding, or package artifact.
+
+## Node D: OCR and Rust-owned native pools
+
+### Test-first and implementation evidence
+
+The first OCR component, safe-wrapper, and pool tests failed because no Tesseract bridge,
+`OcrEngine`, `NativePool`, or `OcrPool` existed. The tests fixed explicit model configuration,
+exclusive engine access, FIFO admission, cancellation, poison discard, close ordering, and native
+resource convergence before the implementations were added.
+
+The completed node provides:
+
+- private Tesseract 5.5.2 / Leptonica 1.87.0 create, process, reuse, and destroy entries with an
+  explicit UTF-8 model root, language, engine mode, page segmentation mode, and output ceiling;
+- `easycon-native-sys::ocr::OcrEngine` as the unique RAII owner: it is proven `Send`, intentionally
+  not `Sync`, and requires exclusive mutable access for every recognition;
+- a Runtime-supervised `NativePool` with a fixed worker count, bounded FIFO queue, queued and
+  in-flight cancellation semantics, panic isolation, close/join, self-retention, and resource
+  registration convergence;
+- a bounded FIFO `OcrPool` that creates engines outside its state lock, reuses healthy engines,
+  discards backend-poisoned engines, serializes cancellation notify with the wait predicate mutex,
+  and waits for creating and borrowed owners during close;
+- actual OCR through `Clear`, `SetPageSegMode`, `SetImage`, `Recognize`, `GetUTF8Text`, and
+  `MeanTextConf`, with bounded UTF-8 output and confidence normalized to `0.0..1.0`;
+- one generated Gray8 `EASCON` fixture with exact dimensions, bytes, hash, provenance, and an exact
+  normalized recognition assertion;
+- a test-only English model manifest and provisioner restricted to ignored
+  `.tools/vision-models`, with every redirect hop, final URL, byte count, SHA-256, and license
+  verified before use; no model byte is tracked;
+- OCR validation calls in the ABI fuzzer and per-call handle/allocation convergence.
+
+The test-only model is `tesseract-ocr/tessdata_fast` tag `4.1.0`, Apache-2.0. The ignored local
+cache was revalidated as follows:
+
+| File | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `eng.traineddata` | 4,113,088 | `7D4322BD2A7749724879683FC3912CB542F19906C83BCC1A52132556427170B2` |
+| `LICENSE` | 11,358 | `CFC7749B96F63BD31C3C42B5C471BF756814053E847C10F3EB003417BC523D30` |
+
+This English test asset does not close O-03. The EasyCon-compatible `chi_sim` source, license, and
+redistribution decision remain open, so neither the model nor OCR success asset is packaged.
+
+### Independent review
+
+The fixed Node D baseline received an independent read-only review. It found five reproducible
+issues:
+
+- a throwing filesystem/string model check was incorrectly marked `noexcept`;
+- destroy could reject an engine-invalid poison state without consuming the Rust owner;
+- a confidence exception after text allocation could return a failed call with nonzero output;
+- conversion from `ImageError` to `VisionError` dropped the native kind/message owner;
+- the provisioner allowed output outside the ignored model cache and checked only the final
+  redirect URL.
+
+Failpoints and sentinel regressions reproduced the native issues before the fixes. Model checking
+now runs inside the entry guard; confidence is obtained and validated before committing the text
+buffer; destroy clears the caller owner before teardown and always consumes a handle created by
+the bridge; `VisionError` retains the complete native diagnostic; and the provisioner validates
+cache containment before any directory or download action and rejects an off-host intermediate
+redirect.
+
+The review also confirmed that cancellation notify must hold the same mutex as the wait predicate
+to close the check-to-wait lost-wakeup interval, and that Tesseract `Backend` process failures must
+poison the engine while preflight, limit, allocation, and ordinary text mismatch paths do not.
+
+The first final clang-tidy run then rejected an otherwise isolated empty catch in destroy. A
+test-only `DESTROY_UNKNOWN` failpoint and `teardown_exceptions` counter now make that policy
+observable: the component test combines an invalid marker with a teardown exception and proves
+pointer consumption, exception count increment, created/destroyed symmetry, and handle/allocation
+return to baseline. A directed final re-review reported zero open finding and cleared Node D.
+
+### Native gate details
+
+Every component CTest re-verifies the model and license hashes through the tracked runner. The
+final source passed:
+
+| Gate | Final result |
+| --- | --- |
+| MSVC Debug fresh configure/build and CTest | passed, 2/2 |
+| MSVC Release fresh configure/build and CTest | passed, 2/2 |
+| clang-cl ASan fresh configure/build and CTest | passed, 2/2 |
+| clang-cl UBSan trap fresh configure/build and CTest | passed, 2/2 |
+| clang-tidy warnings-as-errors | passed for all bridge, support, component, and fuzz translation units |
+| MSVC `/analyze /analyze:external- /WX` | passed for bridge and both component executables |
+| clang-cl libFuzzer full CTest | passed, 3/3 including OCR success and 128-run seed replay |
+
+### Workspace and repository gates
+
+| Command | Final result |
+| --- | --- |
+| `cargo fmt --all --check` | passed |
+| `cargo check --workspace --all-targets` | passed |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | passed |
+| `cargo test --workspace --all-features` | passed, 192 tests plus 1 compile-fail doctest |
+| `python tools/run_runtime_models.py` | passed, 6 Loom models |
+| `python tools/validate_specs.py` | passed, including 15 Vision binary fixtures and provisioner regressions |
+| `python tools/check_markdown_links.py` | passed, 123 references |
+| `python tools/check_repository_guards.py` | passed |
+| `git diff --check` | passed |
+
+Node D makes no capture-device, hardware timing, performance, packaged OCR model, or Chinese OCR
+accuracy claim. It adds no traineddata, EasyCon source, public C ABI, installed header, language
+binding, or package artifact.

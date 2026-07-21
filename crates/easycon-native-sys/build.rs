@@ -74,6 +74,21 @@ fn main() {
     );
     println!("cargo:rustc-link-lib=static=easycon_native_bridge");
     for library in [
+        "tesseract55",
+        "archive",
+        "bz2",
+        "lz4",
+        "lzma",
+        "zstd",
+        "libcrypto",
+        "libcurl",
+        "leptonica-1.87.0",
+        "gif",
+        "openjp2",
+        "tiff",
+        "libwebpmux",
+        "libwebp",
+        "libsharpyuv",
         "opencv_imgcodecs4",
         "jpeg",
         "libpng16",
@@ -86,8 +101,24 @@ fn main() {
     println!("cargo:rustc-link-lib=dylib=msvcprt");
 
     for library in [
-        "advapi32", "comctl32", "comdlg32", "gdi32", "ole32", "oleaut32", "shell32", "user32",
-        "uuid", "winspool",
+        "advapi32",
+        "bcrypt",
+        "comctl32",
+        "comdlg32",
+        "crypt32",
+        "gdi32",
+        "iphlpapi",
+        "ole32",
+        "oleaut32",
+        "secur32",
+        "shell32",
+        "shlwapi",
+        "user32",
+        "uuid",
+        "windowscodecs",
+        "winspool",
+        "ws2_32",
+        "xmllite",
     ] {
         println!("cargo:rustc-link-lib=dylib={library}");
     }
@@ -102,6 +133,7 @@ fn main() {
         "native/bridge/src/bridge.cpp",
         "native/bridge/src/bridge_internal.hpp",
         "native/bridge/src/image_codec.cpp",
+        "native/bridge/src/ocr.cpp",
         "native/bridge/src/vision_ops.cpp",
     ] {
         println!(

@@ -1,6 +1,7 @@
 set(EASYCON_NATIVE_BRIDGE_SOURCES
   src/bridge.cpp
   src/image_codec.cpp
+  src/ocr.cpp
   src/vision_ops.cpp
 )
 
@@ -12,7 +13,13 @@ target_include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_include_directories(easycon_native_bridge SYSTEM PRIVATE ${OpenCV_INCLUDE_DIRS})
-target_link_libraries(easycon_native_bridge PRIVATE ${OpenCV_LIBS} ZLIB::ZLIB)
+target_link_libraries(
+  easycon_native_bridge
+  PRIVATE
+    ${OpenCV_LIBS}
+    Tesseract::libtesseract
+    ZLIB::ZLIB
+)
 set_target_properties(
   easycon_native_bridge
   PROPERTIES
@@ -23,10 +30,12 @@ easycon_native_configure_owned_target(easycon_native_bridge)
 set(EASYCON_NATIVE_ANALYSIS_SOURCES
   ${CMAKE_CURRENT_SOURCE_DIR}/src/bridge.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/image_codec.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/ocr.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/vision_ops.cpp
 )
 
 if(EASYCON_BUILD_COMPONENT_TESTS OR EASYCON_BUILD_FUZZERS)
+  target_compile_definitions(easycon_native_bridge PRIVATE EASYCON_NATIVE_TESTING=1)
   add_library(easycon_native_bridge_test_support STATIC src/test_support.cpp)
   target_compile_definitions(easycon_native_bridge_test_support PRIVATE EASYCON_NATIVE_TESTING=1)
   target_include_directories(
@@ -42,6 +51,7 @@ if(EASYCON_BUILD_COMPONENT_TESTS OR EASYCON_BUILD_FUZZERS)
 endif()
 
 if(EASYCON_BUILD_COMPONENT_TESTS)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
   foreach(
     fixture
     IN ITEMS
@@ -57,6 +67,12 @@ if(EASYCON_BUILD_COMPONENT_TESTS)
       COPYONLY
     )
   endforeach()
+
+  configure_file(
+    ${PROJECT_SOURCE_DIR}/spec/fixtures/vision/ocr/easycon-gray.hex
+    ${CMAKE_CURRENT_BINARY_DIR}/fixtures/ocr/easycon-gray.hex
+    COPYONLY
+  )
 
   foreach(
     fixture
@@ -95,6 +111,38 @@ if(EASYCON_BUILD_COMPONENT_TESTS)
   add_test(NAME easycon_native_bridge_components COMMAND easycon_native_bridge_tests)
   set_tests_properties(easycon_native_bridge_components PROPERTIES TIMEOUT 30)
   list(APPEND EASYCON_NATIVE_ANALYSIS_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/tests/bridge_component_tests.cpp)
+
+  add_executable(easycon_native_ocr_tests tests/ocr_component_tests.cpp)
+  target_compile_definitions(easycon_native_ocr_tests PRIVATE EASYCON_NATIVE_TESTING=1)
+  target_include_directories(
+    easycon_native_ocr_tests
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+  target_link_libraries(
+    easycon_native_ocr_tests
+    PRIVATE
+      easycon_native_bridge_test_support
+      easycon_native_bridge
+  )
+  easycon_native_configure_owned_target(easycon_native_ocr_tests)
+  add_test(
+    NAME easycon_native_ocr_components
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${PROJECT_SOURCE_DIR}/tools/run_vision_ocr_component.py
+      --manifest
+      ${PROJECT_SOURCE_DIR}/spec/fixtures/vision/ocr-model.json
+      --executable
+      $<TARGET_FILE:easycon_native_ocr_tests>
+  )
+  set_tests_properties(
+    easycon_native_ocr_components
+    PROPERTIES
+      LABELS ocr-success
+      TIMEOUT 60
+  )
+  list(APPEND EASYCON_NATIVE_ANALYSIS_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/tests/ocr_component_tests.cpp)
 endif()
 
 if(EASYCON_BUILD_FUZZERS)
@@ -107,6 +155,7 @@ if(EASYCON_BUILD_FUZZERS)
     SHARED
       src/bridge.cpp
       src/image_codec.cpp
+      src/ocr.cpp
       src/vision_ops.cpp
       src/test_support.cpp
       fuzz/fuzz_target.def
@@ -131,6 +180,7 @@ if(EASYCON_BUILD_FUZZERS)
     easycon_native_bridge_fuzz_target
     PRIVATE
       ${OpenCV_LIBS}
+      Tesseract::libtesseract
       ZLIB::ZLIB
   )
   easycon_native_configure_owned_target(easycon_native_bridge_fuzz_target)

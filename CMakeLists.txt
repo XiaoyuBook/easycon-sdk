@@ -21,6 +21,7 @@ if(NOT MSVC)
 endif()
 
 find_package(OpenCV 4.12.0 EXACT CONFIG REQUIRED COMPONENTS core imgcodecs imgproc)
+find_package(Tesseract CONFIG REQUIRED)
 find_package(ZLIB REQUIRED)
 
 function(easycon_native_find_compiler_runtime output_name runtime_name)

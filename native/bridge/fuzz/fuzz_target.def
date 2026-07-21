@@ -13,4 +13,7 @@ EXPORTS
     easycon_native_match_template
     easycon_native_edge_preprocess
     easycon_native_hsv_count
+    easycon_native_ocr_engine_create
+    easycon_native_ocr_engine_destroy
+    easycon_native_ocr_engine_process
     easycon_native_test_raise

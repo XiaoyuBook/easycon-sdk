@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "purpose": "EasyCon SDK Phase 3 OCR component tests only",
+  "redistribution": "not packaged or tracked; provisioned into ignored .tools storage",
+  "model": {
+    "language": "eng",
+    "path": "eng.traineddata",
+    "url": "https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/refs/tags/4.1.0/eng.traineddata",
+    "bytes": 4113088,
+    "sha256": "7d4322bd2a7749724879683fc3912cb542f19906c83bcc1a52132556427170b2"
+  },
+  "license": {
+    "spdx": "Apache-2.0",
+    "path": "LICENSE",
+    "url": "https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/refs/tags/4.1.0/LICENSE",
+    "bytes": 11358,
+    "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+  }
+}

@@ -6,6 +6,7 @@ mod call;
 pub mod codec;
 #[allow(unsafe_code)]
 mod ffi;
+pub mod ocr;
 pub mod operations;
 
 use std::fmt;

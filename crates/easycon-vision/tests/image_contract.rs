@@ -1,8 +1,40 @@
 use std::sync::Arc;
 
+use easycon_runtime::{CancellationToken, CloseOutcome, Runtime, VirtualClock};
 use easycon_vision::{
-    Frame, Image, ImageErrorKind, PixelFormat, Roi, VisionLimits, native_resource_counts,
+    Frame, Image, ImageErrorKind, NativePool, NativePoolOptions, PixelFormat, Roi, VisionErrorKind,
+    VisionLimits, native_resource_counts,
 };
+
+struct TestNative {
+    runtime: Runtime,
+    pool: NativePool,
+    cancellation: CancellationToken,
+}
+
+impl TestNative {
+    fn new() -> Self {
+        let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+        let pool = NativePool::new(
+            &runtime,
+            NativePoolOptions::new(2, 8).expect("native pool options"),
+        )
+        .expect("native pool");
+        let cancellation = runtime.child_cancellation_token();
+        Self {
+            runtime,
+            pool,
+            cancellation,
+        }
+    }
+}
+
+impl Drop for TestNative {
+    fn drop(&mut self) {
+        self.pool.close().expect("native pool close");
+        assert_eq!(self.runtime.close(), Ok(CloseOutcome::Closed));
+    }
+}
 
 fn decode_hex(text: &str) -> Vec<u8> {
     let text = text.trim();
@@ -34,6 +66,7 @@ fn limits() -> VisionLimits {
 
 #[test]
 fn image_validates_layout_limits_and_immutable_rows() {
+    let native = TestNative::new();
     let limits = limits();
     let padded: Arc<[u8]> = vec![0, 0, 255, 0, 255, 0, 9, 9, 255, 0, 0, 255, 255, 255, 8, 8].into();
     let image = Image::new(padded, 2, 2, 8, PixelFormat::Bgr8, &limits).expect("padded image");
@@ -46,11 +79,17 @@ fn image_validates_layout_limits_and_immutable_rows() {
         image.rows().collect::<Vec<_>>(),
         vec![&image.pixels()[0..6], &image.pixels()[8..14]]
     );
-    let padded_round_trip = Image::decode(
-        &image.encode_png(&limits).expect("padded PNG encode"),
-        &limits,
-    )
-    .expect("padded PNG decode");
+    let padded_round_trip = native
+        .pool
+        .decode(
+            &native
+                .pool
+                .encode_png(&image, &limits, &native.cancellation)
+                .expect("padded PNG encode"),
+            &limits,
+            &native.cancellation,
+        )
+        .expect("padded PNG decode");
     assert_eq!(padded_round_trip.stride(), 6);
     assert_eq!(
         padded_round_trip.pixels(),
@@ -78,6 +117,7 @@ fn image_validates_layout_limits_and_immutable_rows() {
 
 #[test]
 fn frame_and_crop_keep_owned_pixels_after_the_source_is_dropped() {
+    let native = TestNative::new();
     let limits = limits();
     let image = Image::new(fixture("bgr").into(), 2, 2, 6, PixelFormat::Bgr8, &limits)
         .expect("fixture image");
@@ -89,7 +129,12 @@ fn frame_and_crop_keep_owned_pixels_after_the_source_is_dropped() {
     assert_eq!(frame.sequence(), 7);
     assert_eq!(frame.timestamp_ns(), 42);
     let crop = frame
-        .crop(Roi::new(1, 0, 1, 2).expect("ROI"), &limits)
+        .crop(
+            &native.pool,
+            &native.cancellation,
+            Roi::new(1, 0, 1, 2).expect("ROI"),
+            &limits,
+        )
         .expect("crop");
     assert_eq!(crop.stride(), 3);
     assert_eq!(crop.pixels(), &[0, 255, 0, 255, 255, 255]);
@@ -99,66 +144,120 @@ fn frame_and_crop_keep_owned_pixels_after_the_source_is_dropped() {
     );
     assert_eq!(
         frame
-            .crop(Roi::new(2, 0, 1, 1).expect("bounded coordinates"), &limits)
+            .crop(
+                &native.pool,
+                &native.cancellation,
+                Roi::new(2, 0, 1, 1).expect("bounded coordinates"),
+                &limits,
+            )
             .expect_err("out-of-bounds ROI")
             .kind(),
-        ImageErrorKind::OutOfRange
+        VisionErrorKind::Limit
     );
 }
 
 #[test]
 fn actual_opencv_codec_and_all_format_conversions_are_lossless_where_required() {
+    let native = TestNative::new();
     let limits = limits();
     let expected = fixture("bgr");
-    let bmp = Image::decode(&fixture("bmp"), &limits).expect("BMP decode");
-    let png = Image::decode(&fixture("png"), &limits).expect("PNG decode");
+    let bmp = native
+        .pool
+        .decode(&fixture("bmp"), &limits, &native.cancellation)
+        .expect("BMP decode");
+    let png = native
+        .pool
+        .decode(&fixture("png"), &limits, &native.cancellation)
+        .expect("PNG decode");
 
     assert_eq!(bmp.pixels(), expected);
     assert_eq!(png.pixels(), expected);
     assert_eq!(bmp.format(), PixelFormat::Bgr8);
 
-    let encoded = bmp.encode_png(&limits).expect("PNG encode");
-    let round_trip = Image::decode(&encoded, &limits).expect("PNG round trip");
+    let encoded = native
+        .pool
+        .encode_png(&bmp, &limits, &native.cancellation)
+        .expect("PNG encode");
+    let round_trip = native
+        .pool
+        .decode(&encoded, &limits, &native.cancellation)
+        .expect("PNG round trip");
     assert_eq!(round_trip.pixels(), expected);
 
-    let bgra = bmp.convert(PixelFormat::Bgra8, &limits).expect("BGRA");
+    let bgra = native
+        .pool
+        .convert(&bmp, PixelFormat::Bgra8, &limits, &native.cancellation)
+        .expect("BGRA");
     assert!(bgra.pixels().chunks_exact(4).all(|pixel| pixel[3] == 255));
-    let bgra_round_trip =
-        Image::decode(&bgra.encode_png(&limits).expect("BGRA PNG encode"), &limits)
-            .expect("BGRA PNG decode");
+    let bgra_encoded = native
+        .pool
+        .encode_png(&bgra, &limits, &native.cancellation)
+        .expect("BGRA PNG encode");
+    let bgra_round_trip = native
+        .pool
+        .decode(&bgra_encoded, &limits, &native.cancellation)
+        .expect("BGRA PNG decode");
     assert_eq!(bgra_round_trip, bgra);
     assert_eq!(
-        bgra.crop(Roi::new(1, 0, 1, 2).expect("BGRA ROI"), &limits)
+        native
+            .pool
+            .crop(
+                &bgra,
+                Roi::new(1, 0, 1, 2).expect("BGRA ROI"),
+                &limits,
+                &native.cancellation,
+            )
             .expect("BGRA crop")
             .pixels(),
         &[0, 255, 0, 255, 255, 255, 255, 255]
     );
     assert_eq!(
-        bgra.convert(PixelFormat::Bgr8, &limits)
+        native
+            .pool
+            .convert(&bgra, PixelFormat::Bgr8, &limits, &native.cancellation)
             .expect("BGR")
             .pixels(),
         expected
     );
-    let gray = bmp.convert(PixelFormat::Gray8, &limits).expect("Gray");
+    let gray = native
+        .pool
+        .convert(&bmp, PixelFormat::Gray8, &limits, &native.cancellation)
+        .expect("Gray");
     assert_eq!(gray.pixels(), &[76, 150, 29, 255]);
-    let gray_round_trip =
-        Image::decode(&gray.encode_png(&limits).expect("Gray PNG encode"), &limits)
-            .expect("Gray PNG decode");
+    let gray_encoded = native
+        .pool
+        .encode_png(&gray, &limits, &native.cancellation)
+        .expect("Gray PNG encode");
+    let gray_round_trip = native
+        .pool
+        .decode(&gray_encoded, &limits, &native.cancellation)
+        .expect("Gray PNG decode");
     assert_eq!(gray_round_trip, gray);
     assert_eq!(
-        gray.crop(Roi::new(1, 0, 1, 2).expect("Gray ROI"), &limits)
+        native
+            .pool
+            .crop(
+                &gray,
+                Roi::new(1, 0, 1, 2).expect("Gray ROI"),
+                &limits,
+                &native.cancellation,
+            )
             .expect("Gray crop")
             .pixels(),
         &[150, 255]
     );
     assert_eq!(
-        gray.convert(PixelFormat::Bgr8, &limits)
+        native
+            .pool
+            .convert(&gray, PixelFormat::Bgr8, &limits, &native.cancellation)
             .expect("Gray BGR")
             .pixels(),
         &[76, 76, 76, 150, 150, 150, 29, 29, 29, 255, 255, 255]
     );
     assert!(
-        gray.convert(PixelFormat::Bgra8, &limits)
+        native
+            .pool
+            .convert(&gray, PixelFormat::Bgra8, &limits, &native.cancellation)
             .expect("Gray BGRA")
             .pixels()
             .chunks_exact(4)
@@ -168,42 +267,56 @@ fn actual_opencv_codec_and_all_format_conversions_are_lossless_where_required() 
 
 #[test]
 fn invalid_truncated_and_oversized_encoded_inputs_are_bounded_and_leak_free() {
+    let native = TestNative::new();
     let baseline = native_resource_counts().expect("baseline");
     let limits = limits();
     assert_eq!(
-        Image::decode(&[], &limits).expect_err("empty").kind(),
-        ImageErrorKind::InvalidArgument
+        native
+            .pool
+            .decode(&[], &limits, &native.cancellation)
+            .expect_err("empty")
+            .kind(),
+        VisionErrorKind::Validation
     );
 
     let png = fixture("png");
     assert_eq!(
-        Image::decode(&png[..20], &limits)
+        native
+            .pool
+            .decode(&png[..20], &limits, &native.cancellation)
             .expect_err("truncated")
             .kind(),
-        ImageErrorKind::InvalidImage
+        VisionErrorKind::InvalidImage
     );
     let mut oversized = png;
     oversized[16..20].copy_from_slice(&65_536_u32.to_be_bytes());
     assert_eq!(
-        Image::decode(&oversized, &limits)
+        native
+            .pool
+            .decode(&oversized, &limits, &native.cancellation)
             .expect_err("oversized")
             .kind(),
-        ImageErrorKind::OutOfRange
+        VisionErrorKind::Limit
     );
     assert_eq!(native_resource_counts().expect("final"), baseline);
 }
 
 #[test]
 fn header_preflight_uses_the_encoded_color_channels() {
+    let native = TestNative::new();
     let exact = VisionLimits::try_for_images(4096, 64, 64, 4096, 12, 6).expect("exact BGR limits");
     assert_eq!(
-        Image::decode(&fixture("bmp"), &exact)
+        native
+            .pool
+            .decode(&fixture("bmp"), &exact, &native.cancellation)
             .expect("24-bit BMP fits twelve bytes")
             .pixels(),
         fixture("bgr")
     );
     assert_eq!(
-        Image::decode(&fixture("png"), &exact)
+        native
+            .pool
+            .decode(&fixture("png"), &exact, &native.cancellation)
             .expect("RGB PNG fits twelve bytes")
             .pixels(),
         fixture("bgr")
@@ -212,6 +325,7 @@ fn header_preflight_uses_the_encoded_color_channels() {
 
 #[test]
 fn hard_ceilings_roi_overflow_and_png_output_bound_are_explicit() {
+    let native = TestNative::new();
     assert_eq!(
         VisionLimits::try_for_images(usize::MAX, 1, 1, 1, 1, 1)
             .expect_err("hard encoded ceiling")
@@ -237,11 +351,12 @@ fn hard_ceilings_roi_overflow_and_png_output_bound_are_explicit() {
     )
     .expect("raw image");
     assert_eq!(
-        image
-            .encode_png(&output_limited)
+        native
+            .pool
+            .encode_png(&image, &output_limited, &native.cancellation)
             .expect_err("conservative output bound")
             .kind(),
-        ImageErrorKind::OutOfRange
+        VisionErrorKind::Limit
     );
     assert_eq!(
         Frame::new(image, 0, 0).expect_err("zero sequence").kind(),

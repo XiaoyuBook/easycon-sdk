@@ -65,6 +65,44 @@ void exercise_vision(const uint8_t* data, size_t size, easycon_native_error& err
     release_error(error);
 }
 
+void exercise_ocr_validation(const uint8_t* data, size_t size, easycon_native_error& error) {
+    constexpr char missing_root[] = "Z:/easycon-fuzz-missing-tessdata";
+    constexpr char default_language[] = "eng";
+    const auto* language = reinterpret_cast<const uint8_t*>(default_language);
+    auto language_length = uint64_t{3};
+    if (size > 1) {
+        language = data + 1;
+        language_length = static_cast<uint64_t>((std::min)(size - 1, size_t{32}));
+    }
+    easycon_native_ocr_engine* engine = nullptr;
+    (void)easycon_native_ocr_engine_create(
+        reinterpret_cast<const uint8_t*>(missing_root),
+        sizeof(missing_root) - 1,
+        language,
+        language_length,
+        UINT32_C(1) + (data[0] % UINT8_C(3)),
+        &engine,
+        &error);
+    release_error(error);
+    if (engine != nullptr) {
+        (void)easycon_native_ocr_engine_destroy(&engine, &error);
+        release_error(error);
+    }
+
+    easycon_native_buffer text{};
+    double confidence = 0.0;
+    (void)easycon_native_ocr_engine_process(
+        nullptr,
+        nullptr,
+        UINT32_C(1) + (data[0] % UINT8_C(5)),
+        static_cast<uint64_t>(data[0]),
+        &text,
+        &confidence,
+        &error);
+    easycon_native_buffer_release(&text);
+    release_error(error);
+}
+
 }  // namespace
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
@@ -88,6 +126,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         (void)easycon_native_test_raise(kind, &error);
         easycon_native_error_release(&error);
         exercise_vision(data, size, error);
+        exercise_ocr_validation(data, size, error);
     }
 
     easycon_native_counts final_counts{};
