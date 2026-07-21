@@ -5,6 +5,7 @@ use easycon_controller::{
 use easycon_model::Button;
 use easycon_runtime::{Operation, OperationSnapshot, OperationState};
 use serde_json::{Value, json};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -12,7 +13,7 @@ use super::{
     CancelSnapshotReadiness, Harness, OPERATION_TIMEOUT, cancel_snapshot_readiness,
     cleanup_succeeded, controller_snapshot_json, operation_failure, operation_json, wait_terminal,
 };
-use crate::device::AdmittedDevice;
+use crate::device::{AdmittedDevice, DeviceDiscovery};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FaultRole {
@@ -58,6 +59,15 @@ impl FaultRole {
         }
     }
 
+    const fn identity_attempts_field(self) -> &'static str {
+        match self {
+            Self::Occupier => "occupier_identity_open_attempts",
+            Self::OccupiedProbe => "occupied_probe_identity_open_attempts",
+            Self::Cancel => "cancel_identity_open_attempts",
+            Self::Deadline => "deadline_identity_open_attempts",
+        }
+    }
+
     const fn close_stage(self) -> &'static str {
         match self {
             Self::Occupier => "occupier_close",
@@ -96,6 +106,7 @@ struct FaultCloseEvidence {
     cleanup: Value,
     post_controller_snapshot: ControllerSnapshot,
     native_open_attempts: Value,
+    identity_open_attempts: Value,
 }
 
 trait FaultHarness: Sized {
@@ -104,6 +115,7 @@ trait FaultHarness: Sized {
     fn controller_snapshot(&self) -> ControllerSnapshot;
     fn now_ns(&self) -> u64;
     fn native_open_attempts(&self) -> Value;
+    fn identity_open_attempts(&self) -> Value;
     fn close(self) -> FaultCloseEvidence;
 }
 
@@ -135,7 +147,9 @@ trait FaultSequenceBuilder {
     fn build(&mut self) -> Result<PreciseSequence, String>;
 }
 
-struct ProductionFactory;
+struct ProductionFactory {
+    discovery: Arc<dyn DeviceDiscovery>,
+}
 
 impl FaultHarnessFactory for ProductionFactory {
     type Harness = Harness;
@@ -145,7 +159,7 @@ impl FaultHarnessFactory for ProductionFactory {
         _role: FaultRole,
         target: &AdmittedDevice,
     ) -> Result<Self::Harness, String> {
-        Harness::new(target, ControllerOptions::default())
+        Harness::new(target, self.discovery.clone(), ControllerOptions::default())
     }
 }
 
@@ -237,13 +251,19 @@ impl FaultHarness for Harness {
         Harness::native_open_attempts(self)
     }
 
+    fn identity_open_attempts(&self) -> Value {
+        Harness::identity_open_attempts(self)
+    }
+
     fn close(self) -> FaultCloseEvidence {
         let cleanup = Harness::close(&self);
         let native_open_attempts = Harness::native_open_attempts(&self);
+        let identity_open_attempts = Harness::identity_open_attempts(&self);
         FaultCloseEvidence {
             cleanup,
             post_controller_snapshot: self.controller.snapshot(),
             native_open_attempts,
+            identity_open_attempts,
         }
     }
 }
@@ -362,6 +382,7 @@ impl<H: FaultHarness> FaultRun<H> {
         if let Some(field) = role.native_attempts_field() {
             self.result[field] = evidence.native_open_attempts;
         }
+        self.result[role.identity_attempts_field()] = evidence.identity_open_attempts;
         self.capture_active_after_close(role);
         if succeeded {
             Ok(())
@@ -387,17 +408,27 @@ impl<H: FaultHarness> FaultRun<H> {
     }
 
     fn capture_partial_harness_evidence(&mut self) {
+        if let Some(occupier) = self.occupier.as_ref() {
+            self.result[FaultRole::Occupier.identity_attempts_field()] =
+                occupier.identity_open_attempts();
+        }
         if let Some(probe) = self.occupied_probe.as_ref() {
             self.result["port_occupied_native_open_attempts"] = probe.native_open_attempts();
+            self.result[FaultRole::OccupiedProbe.identity_attempts_field()] =
+                probe.identity_open_attempts();
             self.result["occupied_probe_failure_snapshot"] =
                 controller_snapshot_json(probe.controller_snapshot());
         }
         if let Some(cancel) = self.cancel.as_ref() {
+            self.result[FaultRole::Cancel.identity_attempts_field()] =
+                cancel.identity_open_attempts();
             self.result["cancel_failure_snapshot"] =
                 controller_snapshot_json(cancel.controller_snapshot());
         }
         if let Some(deadline) = self.deadline.as_ref() {
             self.result["deadline_native_open_attempts"] = deadline.native_open_attempts();
+            self.result[FaultRole::Deadline.identity_attempts_field()] =
+                deadline.identity_open_attempts();
             self.result["deadline_failure_snapshot"] =
                 controller_snapshot_json(deadline.controller_snapshot());
         }
@@ -713,8 +744,8 @@ where
     run.finish(execution, waiter)
 }
 
-pub(super) fn run(target: AdmittedDevice) -> Value {
-    let mut factory = ProductionFactory;
+pub(super) fn run(target: AdmittedDevice, discovery: Arc<dyn DeviceDiscovery>) -> Value {
+    let mut factory = ProductionFactory { discovery };
     let mut waiter = ProductionWaiter;
     let mut sequence_builder = ProductionSequenceBuilder;
     run_with(&target, &mut factory, &mut waiter, &mut sequence_builder)
@@ -986,6 +1017,10 @@ mod tests {
             }
         }
 
+        fn identity_open_attempts(&self) -> Value {
+            json!([{"role": self.role.resource_name()}])
+        }
+
         fn close(self) -> FaultCloseEvidence {
             self.trace
                 .lock()
@@ -1033,6 +1068,7 @@ mod tests {
                     ..ControllerSnapshot::default()
                 },
                 native_open_attempts: self.native_open_attempts(),
+                identity_open_attempts: self.identity_open_attempts(),
             }
         }
     }
@@ -1216,6 +1252,7 @@ mod tests {
             clock,
             controller,
             telemetry,
+            identity_open_recorder: crate::device::IdentityOpenRecorder::default(),
             descriptor: SerialPortDescriptor::new(format!("DEVICE\\{label}"), "COM1")
                 .expect("descriptor"),
         }
@@ -1268,6 +1305,7 @@ mod tests {
             ControllerLeaseState::Available
         );
         assert_eq!(evidence.native_open_attempts, json!([]));
+        assert_eq!(evidence.identity_open_attempts, json!([]));
     }
 
     #[test]
@@ -1528,6 +1566,14 @@ mod tests {
                     result["port_occupied_native_open_attempts"].is_array(),
                     "{:?}",
                     case.point
+                );
+            }
+            for role in case.created {
+                assert!(
+                    result[role.identity_attempts_field()].is_array(),
+                    "{:?} lost {}",
+                    case.point,
+                    role.identity_attempts_field()
                 );
             }
 

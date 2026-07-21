@@ -18,6 +18,7 @@ use artifact::RESERVATION_FILE_NAME;
 use artifact::{ArtifactReservation, AuxiliaryKind, SEQUENCE_TIMINGS_FILE_NAME};
 use device::{
     AdmissionDecision, AdmissionEvidence, AdmittedDevice, DeviceDiscovery, DeviceTargetRequest,
+    IdentityGuardedByteIoFactory, IdentityOpenRecorder, InnerOpenOutcome, OpenGuardCheck,
     SystemDeviceDiscovery, admit_device,
 };
 use easycon_controller::{
@@ -298,16 +299,28 @@ struct Harness {
     clock: Arc<dyn Clock>,
     controller: ControllerSession,
     telemetry: Arc<Mutex<Telemetry>>,
+    identity_open_recorder: IdentityOpenRecorder,
     descriptor: SerialPortDescriptor,
 }
 
 impl Harness {
-    fn new(target: &AdmittedDevice, options: ControllerOptions) -> Result<Self, String> {
+    fn new(
+        target: &AdmittedDevice,
+        discovery: Arc<dyn DeviceDiscovery>,
+        options: ControllerOptions,
+    ) -> Result<Self, String> {
         let descriptor = target.descriptor().clone();
         let clock: Arc<dyn Clock> = Arc::new(SystemClock::default());
         let telemetry = Arc::new(Mutex::new(Telemetry::default()));
+        let identity_open_recorder = IdentityOpenRecorder::default();
+        let guarded_factory = IdentityGuardedByteIoFactory::new(
+            Box::new(WindowsByteIoFactory),
+            discovery,
+            target.clone(),
+            identity_open_recorder.clone(),
+        );
         let observed_factory = ObservedByteIoFactory {
-            inner: Box::new(WindowsByteIoFactory),
+            inner: Box::new(guarded_factory),
             telemetry: telemetry.clone(),
         };
         let serial = SerialControllerTransport::new(
@@ -328,6 +341,7 @@ impl Harness {
             clock,
             controller,
             telemetry,
+            identity_open_recorder,
             descriptor,
         })
     }
@@ -381,6 +395,10 @@ impl Harness {
 
     fn native_open_attempts(&self) -> Value {
         native_open_attempts_json(&self.telemetry)
+    }
+
+    fn identity_open_attempts(&self) -> Value {
+        identity_open_attempts_json(&self.identity_open_recorder)
     }
 }
 
@@ -488,6 +506,7 @@ fn harness_evidence_json(harness: &Harness) -> Value {
         "actual_baud": harness.actual_baud(),
         "handshake_attempts": handshake_json(&harness.telemetry),
         "native_open_attempts": harness.native_open_attempts(),
+        "identity_open_attempts": harness.identity_open_attempts(),
         "pre_cleanup_snapshot": snapshot_json(&harness.controller),
     })
 }
@@ -708,31 +727,33 @@ fn real_main() -> Result<i32, String> {
     let mut sequence_timings = None;
     let execution = match command {
         "discover" => run_discover(&arguments),
-        "handshake" => run_with_device_admission("handshake", &arguments, |target, _| {
-            run_handshake(&arguments, target)
+        "handshake" => run_with_device_admission("handshake", &arguments, |target, discovery| {
+            run_handshake(&arguments, target, discovery)
         }),
-        "smoke" => run_with_device_admission("smoke", &arguments, |target, _| {
-            run_smoke(&arguments, target)
+        "smoke" => run_with_device_admission("smoke", &arguments, |target, discovery| {
+            run_smoke(&arguments, target, discovery)
         }),
-        "home-wake" => run_with_device_admission("home-wake", &arguments, |target, _| {
-            run_home_wake(&arguments, target)
+        "home-wake" => run_with_device_admission("home-wake", &arguments, |target, discovery| {
+            run_home_wake(&arguments, target, discovery)
         }),
-        "faults" => run_with_device_admission("faults", &arguments, |target, _| run_faults(target)),
+        "faults" => run_with_device_admission("faults", &arguments, |target, discovery| {
+            run_faults(target, discovery)
+        }),
         "hotplug" => run_with_device_admission("hotplug", &arguments, |target, discovery| {
             run_hotplug(&arguments, target, discovery)
         }),
         "lifecycle" => run_with_device_admission("lifecycle", &arguments, |target, discovery| {
             run_lifecycle(&arguments, target, discovery)
         }),
-        "sequence" => run_with_device_admission("sequence", &arguments, |target, _| {
-            run_sequence(&arguments, target).map(|(result, timings)| {
+        "sequence" => run_with_device_admission("sequence", &arguments, |target, discovery| {
+            run_sequence(&arguments, target, discovery).map(|(result, timings)| {
                 sequence_timings = timings;
                 result
             })
         }),
         "amiibo" if amiibo_write_authorized(&arguments) => {
-            run_with_device_admission("amiibo", &arguments, |target, _| {
-                run_amiibo(&arguments, target)
+            run_with_device_admission("amiibo", &arguments, |target, discovery| {
+                run_amiibo(&arguments, target, discovery)
             })
         }
         "amiibo" => run_unauthorized_amiibo(),
@@ -1926,8 +1947,12 @@ fn run_discover(arguments: &[String]) -> Result<Value, String> {
     }))
 }
 
-fn run_handshake(_arguments: &[String], target: AdmittedDevice) -> Result<Value, String> {
-    let harness = Harness::new(&target, ControllerOptions::default())?;
+fn run_handshake(
+    _arguments: &[String],
+    target: AdmittedDevice,
+    discovery: Arc<dyn DeviceDiscovery>,
+) -> Result<Value, String> {
+    let harness = Harness::new(&target, discovery, ControllerOptions::default())?;
     let result = json!({
         "command": "handshake",
         "port": port_json(&harness.descriptor),
@@ -1954,7 +1979,11 @@ fn run_handshake(_arguments: &[String], target: AdmittedDevice) -> Result<Value,
     ))
 }
 
-fn run_smoke(arguments: &[String], target: AdmittedDevice) -> Result<Value, String> {
+fn run_smoke(
+    arguments: &[String],
+    target: AdmittedDevice,
+    discovery: Arc<dyn DeviceDiscovery>,
+) -> Result<Value, String> {
     let full = arguments.iter().any(|argument| argument == "--full");
     let wake_left_stick = arguments
         .iter()
@@ -1962,7 +1991,7 @@ fn run_smoke(arguments: &[String], target: AdmittedDevice) -> Result<Value, Stri
     let wake_home = arguments.iter().any(|argument| argument == "--wake-home");
     let hold_ms = value_or(arguments, "--hold-ms", 0_u64)?;
     validate_hold_ms(hold_ms)?;
-    let harness = Harness::new(&target, ControllerOptions::default())?;
+    let harness = Harness::new(&target, discovery, ControllerOptions::default())?;
     let result = json!({
         "command": "smoke",
         "stage": if full { "full" } else { "a_only" },
@@ -2111,11 +2140,15 @@ fn run_smoke(arguments: &[String], target: AdmittedDevice) -> Result<Value, Stri
     ))
 }
 
-fn run_home_wake(arguments: &[String], target: AdmittedDevice) -> Result<Value, String> {
+fn run_home_wake(
+    arguments: &[String],
+    target: AdmittedDevice,
+    discovery: Arc<dyn DeviceDiscovery>,
+) -> Result<Value, String> {
     let attempts = value_or(arguments, "--attempts", 20_usize)?;
     let interval_seconds = value_or(arguments, "--interval-seconds", 3_u64)?;
     validate_home_wake(attempts, interval_seconds)?;
-    let harness = Harness::new(&target, ControllerOptions::default())?;
+    let harness = Harness::new(&target, discovery, ControllerOptions::default())?;
     let result = json!({
         "command": "home-wake",
         "attempts": attempts,
@@ -2197,18 +2230,21 @@ fn run_home_wake(arguments: &[String], target: AdmittedDevice) -> Result<Value, 
     ))
 }
 
-fn run_faults(target: AdmittedDevice) -> Result<Value, String> {
-    Ok(faults::run(target))
+fn run_faults(
+    target: AdmittedDevice,
+    discovery: Arc<dyn DeviceDiscovery>,
+) -> Result<Value, String> {
+    Ok(faults::run(target, discovery))
 }
 
 fn run_hotplug(
     arguments: &[String],
     target: AdmittedDevice,
-    _discovery: Arc<dyn DeviceDiscovery>,
+    discovery: Arc<dyn DeviceDiscovery>,
 ) -> Result<Value, String> {
     let timeout_seconds = value_or(arguments, "--timeout-seconds", 180_u64)?;
     let port = target.descriptor().port_name().to_owned();
-    let harness = Harness::new(&target, ControllerOptions::default())?;
+    let harness = Harness::new(&target, discovery.clone(), ControllerOptions::default())?;
     let stable_id = harness.descriptor.stable_id().to_owned();
     let result = json!({
         "command": "hotplug",
@@ -2271,7 +2307,7 @@ fn run_hotplug(
         );
         return Ok(result);
     }
-    let reconnected = match Harness::new(&target, ControllerOptions::default()) {
+    let reconnected = match Harness::new(&target, discovery, ControllerOptions::default()) {
         Ok(harness) => harness,
         Err(error) => {
             set_command_failure(
@@ -2327,7 +2363,7 @@ fn run_lifecycle(
             .take()
             .expect("a successful prior admission provides the next lifecycle target");
         let cycle_admission = admission_evidence_json(target.evidence(), "admitted");
-        let harness = match Harness::new(&target, ControllerOptions::default()) {
+        let harness = match Harness::new(&target, discovery.clone(), ControllerOptions::default()) {
             Ok(harness) => harness,
             Err(error) => {
                 set_command_failure(&mut result, CommandFailure::new("lifecycle_create", error));
@@ -2470,12 +2506,13 @@ fn run_lifecycle(
 fn run_sequence(
     arguments: &[String],
     target: AdmittedDevice,
+    discovery: Arc<dyn DeviceDiscovery>,
 ) -> Result<(Value, Option<Vec<u8>>), String> {
     let steps = value_or(arguments, "--steps", 10_000_usize)?;
     if !(1..=10_000).contains(&steps) {
         return Err("--steps must be in 1..=10000".to_owned());
     }
-    let harness = Harness::new(&target, ControllerOptions::default())?;
+    let harness = Harness::new(&target, discovery, ControllerOptions::default())?;
     let result = json!({
         "command": "sequence",
         "requested_steps": steps,
@@ -2583,7 +2620,11 @@ fn run_unauthorized_amiibo() -> Result<Value, String> {
     }))
 }
 
-fn run_amiibo(arguments: &[String], target: AdmittedDevice) -> Result<Value, String> {
+fn run_amiibo(
+    arguments: &[String],
+    target: AdmittedDevice,
+    discovery: Arc<dyn DeviceDiscovery>,
+) -> Result<Value, String> {
     if !arguments
         .iter()
         .any(|argument| argument == "--confirm-disposable")
@@ -2602,6 +2643,7 @@ fn run_amiibo(arguments: &[String], target: AdmittedDevice) -> Result<Value, Str
         AmiiboLimits::new(slot_count, maximum_data_len).map_err(|error| error.to_string())?;
     let harness = Harness::new(
         &target,
+        discovery,
         ControllerOptions {
             amiibo_limits: Some(limits),
             ..ControllerOptions::default()
@@ -2931,6 +2973,42 @@ fn native_open_attempts_json(telemetry: &Arc<Mutex<Telemetry>>) -> Value {
             })
             .collect(),
     )
+}
+
+fn identity_open_attempts_json(recorder: &IdentityOpenRecorder) -> Value {
+    Value::Array(
+        recorder
+            .attempts()
+            .iter()
+            .map(|attempt| {
+                let inner_open = match &attempt.inner_open {
+                    InnerOpenOutcome::NotAttempted => json!({"status": "not_attempted"}),
+                    InnerOpenOutcome::Opened => json!({"status": "opened"}),
+                    InnerOpenOutcome::Failed(error) => json!({
+                        "status": "failed",
+                        "structured_error": serial_error_json(error),
+                    }),
+                };
+                json!({
+                    "baud": attempt.baud,
+                    "pre_open": open_guard_check_json(&attempt.pre_open),
+                    "inner_open": inner_open,
+                    "post_open": attempt.post_open.as_ref().map(open_guard_check_json),
+                    "stream_returned": attempt.stream_returned,
+                })
+            })
+            .collect(),
+    )
+}
+
+fn open_guard_check_json(check: &OpenGuardCheck) -> Value {
+    json!({
+        "status": check.status.as_str(),
+        "snapshot": check.snapshot.iter().map(port_json).collect::<Vec<_>>(),
+        "observed_expected": check.expected.as_ref().map(port_json),
+        "observed_hint": check.hint.as_ref().map(port_json),
+        "structured_error": check.error.as_ref().map(serial_error_json),
+    })
 }
 
 fn latency_json(telemetry: &Arc<Mutex<Telemetry>>, baud: Option<u32>) -> Value {
@@ -3544,6 +3622,7 @@ mod tests {
             clock,
             controller,
             telemetry,
+            identity_open_recorder: IdentityOpenRecorder::default(),
             descriptor: SerialPortDescriptor::new(format!("TEST\\{label}"), "COM1")
                 .expect("descriptor"),
         }
@@ -4819,6 +4898,7 @@ mod tests {
             clock,
             controller,
             telemetry: Arc::new(Mutex::new(Telemetry::default())),
+            identity_open_recorder: IdentityOpenRecorder::default(),
             descriptor: SerialPortDescriptor::new("TEST\\CLOSE-FAILURE", "COM1")
                 .expect("descriptor"),
         };
