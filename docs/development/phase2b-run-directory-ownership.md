@@ -207,9 +207,12 @@ system leaf 取代。该 leaf 的 public surface 只有“从 borrowed `File` �
 `VolumeSerialNumber` 与 128-bit identifier。它不提供 path overload、low-resolution fallback、handle ownership
 transfer、open、close、write 或 delete。
 
-主 qualification package 和其 tests 继续 `unsafe_code = "forbid"`；native leaf 使用
-`deny(unsafe_op_in_unsafe_fn)`、逐调用 safety comment 和独立 unit test。provider 或 volume 不支持 `FILE_ID_INFO`
-时保守失败。该依赖边界不改变 no-follow guard、allowlist、share mode、publication 顺序或 error policy。
+主 qualification package 和其 tests 继续 `unsafe_code = "forbid"`。native leaf 在 crate root 使用
+`deny(unsafe_code)` 与 `deny(unsafe_op_in_unsafe_fn)`，只在一个短小、私有的 handle-query 函数上局部
+`allow(unsafe_code)`；public safe wrapper、类型转换和所有其他函数不能出现 `unsafe`。该私有函数只含初始化
+`FILE_ID_INFO` buffer、一次 Win32 调用、返回值检查和复制结果，并附逐调用 safety comment 与独立 unit test。
+provider 或 volume 不支持 `FILE_ID_INFO` 时保守失败。该依赖边界不改变 no-follow guard、allowlist、share mode、
+publication 顺序或 error policy。
 
 begin、stage 或 commit 不扫描并删除 stale file。当前 lease 以 `create_new` 建立的 staging 也不删除；create_new
 失败时绝不删除同名文件。final publish 后出现的失败不删除 final。
@@ -254,8 +257,10 @@ owner 内存在当前 lease 的 `OwnedAuxiliary` 才能发布，固定文件名�
 C ABI、binding 或 package。CLI 已在 `real_main` 拒绝非 Windows 平台；Windows runner 使用安全的
 `std::os::windows::fs::OpenOptionsExt::share_mode` 和 `windows-sys 0.61.2` 常量。workspace 新增同样
 `publish = false` 的 `easycon-hardware-file-id` private member，隔离上述单一 Win32 identity FFI；它不成为 SDK
-crate 或发布依赖。删除不再满足对象契约的 `file-id 0.2.3` 依赖。Windows-only test dependency
-`junction 2.0.0`（MIT）只用于确定性 ancestor-junction retarget regression，不进入 binary runtime path。
+crate 或发布依赖。删除不再满足对象契约的 `file-id 0.2.3` 依赖。Windows-only test dependency 使用
+`junction = { version = "2.0.0", default-features = false }`（MIT），只用于确定性 ancestor-junction retarget
+regression，不进入 binary runtime path，也不启用其尝试 `SE_RESTORE_NAME`/`SE_BACKUP_NAME` 的
+`unstable_admin` feature。
 若未来需要非 Windows hardware runner，必须先设计等价的 retained-object/no-replace/identity primitive；不得
 静默使用只按路径复查的弱化 fallback。测试只运行 unknown command、未授权 Amiibo 或直接调用 reservation API，
 不枚举/打开串口。
