@@ -3,6 +3,7 @@
 mod artifact;
 mod device;
 mod faults;
+mod provenance;
 
 use std::env;
 use std::fs;
@@ -38,6 +39,8 @@ use easycon_serial::{
     SerialPortDescriptor, WindowsByteIoFactory, discover_system_ports,
 };
 use serde_json::{Value, json};
+
+use provenance::RuntimeProvenance;
 
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
 const MINIMUM_REPORT_INTERVAL_NS: u64 = 30_000_000;
@@ -734,6 +737,7 @@ fn real_main() -> Result<i32, String> {
         return Ok(0);
     }
     ArtifactReservation::validate_command(command)?;
+    let provenance = RuntimeProvenance::capture();
     let artifact_dir = artifact_dir(&arguments)?;
     fs::create_dir_all(&artifact_dir).map_err(|error| error.to_string())?;
     let mut reservation = ArtifactReservation::begin(command, &artifact_dir)?;
@@ -772,7 +776,8 @@ fn real_main() -> Result<i32, String> {
         "amiibo" => run_unauthorized_amiibo(),
         _ => Err(format!("unknown command: {command}")),
     };
-    let (document, failure) = finalize_result(command, execution);
+    let (mut document, failure) = finalize_result(command, execution);
+    apply_provenance_policy(&mut document, &provenance);
     let exit_code = document_exit_code(&document);
     if let Some(timings) = sequence_timings {
         reservation.stage_auxiliary(AuxiliaryKind::SequenceTimingsCsv, timings)?;
@@ -2016,6 +2021,21 @@ fn document_exit_code(document: &Value) -> i32 {
         Some("passed") => 0,
         Some("unverified" | "not_run") => 2,
         Some("failed") | None | Some(_) => 1,
+    }
+}
+
+fn apply_provenance_policy(document: &mut Value, provenance: &RuntimeProvenance) {
+    let trusted = provenance.trusted();
+    document["provenance"] = provenance.to_json();
+    if let Some(checks) = document.get_mut("checks").and_then(Value::as_array_mut) {
+        checks.push(qualification_check(
+            "build_and_executable_provenance",
+            if trusted { "passed" } else { "unverified" },
+        ));
+    }
+    if document["qualification_status"] == "passed" && !trusted {
+        document["status"] = json!("unverified");
+        document["qualification_status"] = json!("unverified");
     }
 }
 
@@ -4101,6 +4121,47 @@ mod tests {
         assert_eq!(document["command"], "handshake");
         assert_eq!(document["error"], "protocol timeout");
         assert_eq!(error.as_deref(), Some("protocol timeout"));
+    }
+
+    #[test]
+    fn untrusted_binary_provenance_cannot_remain_passed() {
+        let mut document = json!({
+            "status": "passed",
+            "execution_status": "completed",
+            "qualification_status": "passed",
+            "checks": [],
+        });
+        apply_provenance_policy(
+            &mut document,
+            &RuntimeProvenance::synthetic_with_trust(false),
+        );
+
+        assert_eq!(document["execution_status"], "completed");
+        assert_eq!(document["qualification_status"], "unverified");
+        assert_eq!(document_exit_code(&document), 2);
+        assert_eq!(
+            document["checks"][0],
+            qualification_check("build_and_executable_provenance", "unverified")
+        );
+        assert_eq!(document["provenance"]["trusted"], false);
+    }
+
+    #[test]
+    fn trusted_binary_provenance_preserves_the_command_decision() {
+        let mut document = json!({
+            "status": "passed",
+            "execution_status": "completed",
+            "qualification_status": "passed",
+            "checks": [],
+        });
+        apply_provenance_policy(
+            &mut document,
+            &RuntimeProvenance::synthetic_with_trust(true),
+        );
+
+        assert_eq!(document["qualification_status"], "passed");
+        assert_eq!(document_exit_code(&document), 0);
+        assert_eq!(document["provenance"]["trusted"], true);
     }
 
     #[test]
