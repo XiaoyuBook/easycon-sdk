@@ -921,9 +921,10 @@ def validate_conformance():
     return len(tests)
 
 
-def validate_vision_codec_fixtures():
-    generator = ROOT / "tools" / "generate_vision_codec_fixtures.py"
-    completed = subprocess.run(
+def validate_generated_vision_fixtures(generator_name, label,
+                                       runner=subprocess.run):
+    generator = ROOT / "tools" / generator_name
+    completed = runner(
         [sys.executable, str(generator), "--check"],
         cwd=ROOT,
         stdout=subprocess.PIPE,
@@ -933,10 +934,44 @@ def validate_vision_codec_fixtures():
     )
     require(
         completed.returncode == 0,
-        "vision codec fixture validation failed:\n{}".format(
-            completed.stderr.strip() or completed.stdout.strip()
+        "{} fixture validation failed:\n{}".format(
+            label, completed.stderr.strip() or completed.stdout.strip()
         ),
     )
+
+
+def validate_vision_codec_fixtures(runner=subprocess.run):
+    validate_generated_vision_fixtures(
+        "generate_vision_codec_fixtures.py", "vision codec", runner
+    )
+
+
+def validate_vision_operation_fixtures(runner=subprocess.run):
+    validate_generated_vision_fixtures(
+        "generate_vision_operation_fixtures.py", "vision operation", runner
+    )
+
+
+def validate_vision_fixture_validator_regressions():
+    class FailedResult:
+        returncode = 1
+        stdout = ""
+        stderr = "synthetic generator failure"
+
+    def failing_runner(*_args, **_kwargs):
+        return FailedResult()
+
+    for validator, label in (
+        (validate_vision_codec_fixtures, "codec"),
+        (validate_vision_operation_fixtures, "operation"),
+    ):
+        try:
+            validator(runner=failing_runner)
+        except ValidationError:
+            continue
+        raise ValidationError(
+            "{} fixture validator accepted a failed generator".format(label)
+        )
 
 
 def main():
@@ -946,11 +981,13 @@ def main():
     validate_controller_fixture()
     validate_traces()
     validate_latency_result()
+    validate_vision_fixture_validator_regressions()
     validate_vision_codec_fixtures()
+    validate_vision_operation_fixtures()
     test_count = validate_conformance()
     print(
         "validated 5 schemas, 1 behavior spec, 3 controller fixtures, "
-        "5 vision codec fixtures, 9 conformance scenarios, and {} exact Rust tests".format(
+        "14 vision binary fixtures, 9 conformance scenarios, and {} exact Rust tests".format(
             test_count
         )
     )

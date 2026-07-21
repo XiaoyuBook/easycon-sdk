@@ -102,6 +102,7 @@ fn main() {
         "native/bridge/src/bridge.cpp",
         "native/bridge/src/bridge_internal.hpp",
         "native/bridge/src/image_codec.cpp",
+        "native/bridge/src/vision_ops.cpp",
     ] {
         println!(
             "cargo:rerun-if-changed={}",

@@ -363,6 +363,32 @@ int conversion_code(uint32_t input, uint32_t output) noexcept {
 
 }  // namespace
 
+namespace easycon::native::detail {
+
+easycon_native_status validate_image_limits(
+    const easycon_native_image_limits* limits,
+    easycon_native_error* error) noexcept {
+    return validate_limits(limits, error);
+}
+
+easycon_native_status make_image_view(
+    const easycon_native_image_view* image,
+    const easycon_native_image_limits& limits,
+    cv::Mat& out_mat,
+    easycon_native_error* error) {
+    return validate_view(image, limits, out_mat, error);
+}
+
+easycon_native_status copy_image_mat(
+    const cv::Mat& mat,
+    const easycon_native_image_limits& limits,
+    easycon_native_image* output,
+    easycon_native_error* error) noexcept {
+    return copy_mat(mat, limits, output, error);
+}
+
+}  // namespace easycon::native::detail
+
 extern "C" void EASYCON_NATIVE_CALL easycon_native_image_release(
     easycon_native_image* image) noexcept {
     if (image == nullptr) {

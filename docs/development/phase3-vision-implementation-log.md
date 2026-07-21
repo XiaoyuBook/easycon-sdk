@@ -190,3 +190,93 @@ changes.
 
 Node B makes no capture-device, OCR model, OCR accuracy, hardware profile, or performance claim.
 It adds no traineddata, EasyCon source, public C ABI, installed header, or package artifact.
+
+## Node C: normalized template, edge, and HSV color
+
+### Test-first evidence
+
+Before production symbols were added, the new fixture-backed Rust contract test was compiled
+directly against the last Node B `easycon_vision` rlib. Rust failed with `E0432` for exactly the
+six absent Node C entries: `EdgeMethod`, `HsvRange`, `TemplateMethod`, `match_edge`,
+`match_template`, and `preprocess_edge`. A concurrent first native configure exceeded the command
+wrapper timeout while the isolated vcpkg install root compiled locked OpenCV 4.12.0, so that
+timeout is not counted as RED evidence. The generated corpus and tests were retained unchanged
+before production implementation began.
+
+The completed node provides:
+
+- all three normalized OpenCV template modes with native min/max extrema and Rust-owned legacy
+  location/score mapping: `1-min`, `max`, and `(max+1)/2`, followed by a finite-only clamp;
+- deterministic rejection of zero normalized denominators and non-finite native extrema;
+- exact Gray8 XY preprocessing using Scharr through `Sobel(..., CV_16S, ..., -1)` and weighted
+  X/Y gradients, plus the frozen Gaussian/Laplacian/absolute/threshold pipeline;
+- Rust-owned edge composition that preprocesses search and target once and always performs final
+  `CCoeffNormed` matching;
+- bounded HSV statistics for BGR8, BGRA8, and Gray8, including hue wrap, count, ROI-relative native
+  bounding boxes, checked absolute Rust bounding boxes, ratio, and caller-side threshold policy;
+- transactional private outputs, complete x64 size/alignment/offset assertions on both sides of
+  the FFI, and no new handle, thread, `Send`, or `Sync` implementation;
+- nine generated synthetic operation fixtures with GPL-3.0-only provenance, OpenCV 4.12.0
+  reference version, exact pixel hashes, explicit floating tolerance, and exact-file-set checks;
+- fuzz calls for every template/edge mode and bounded HSV inputs, with error/image release and
+  per-input native resource convergence.
+
+The first fixed Laplacian pixels were captured with a host OpenCV 4.5 reference and failed exactly
+against the locked OpenCV 4.12.0 implementation while XY, template, HSV, and final locations
+passed. The tracked generator was corrected to the 4.12.0 exact Gray8 bytes and now rejects any
+reference vector whose decoded dimensions differ before writing files. No tolerance was applied
+to edge pixels.
+
+### Independent review
+
+The first independent read-only review found two reproducible in-scope defects:
+
+- insertion of the operation validator had displaced the codec generator `returncode` check, so a
+  broken Node B codec fixture could be silently accepted;
+- the three new FFI structs fixed size and selected offsets but omitted alignment and complete
+  field offsets required by the frozen x64 layout contract.
+
+The validator now uses one injectable helper, separately binds codec and operation generators,
+and executes failure-injection regressions for both paths before the real checks. C++ and Rust now
+assert size, alignment, and every field offset for every non-opaque private value struct, including
+the pre-existing error, buffer, image, limits, and resource-count structs. Directed re-review
+marked both findings Closed and reported zero open finding. Reviewer backlog only, not a Node C
+blocker: add selective rather than full-range BGRA/Gray HSV cases, explicit SqDiff/CCorr zero
+normalizer cases, and padded-stride Node C cases.
+
+Clang-tidy then found two narrowing/widening diagnostics in component-test failure reporting. The
+iterator offset was replaced with an explicit bounded `size_t` loop and the BGRA reserve product
+now starts in `size_t`; the full warnings-as-errors target passed after those fixes.
+
+### Native gate details
+
+All official presets were regenerated from the final reviewed source with the locked vcpkg
+registry. OpenCV was `4.12.0#5`; Tesseract `5.5.2` and Leptonica `1.87.0` were installed for the
+next node but Node C neither calls nor links OCR APIs.
+
+| Gate | Final result |
+| --- | --- |
+| MSVC Debug configure/build and CTest | passed, 1/1 |
+| MSVC Release configure/build and CTest | passed, 1/1 |
+| clang-cl ASan configure/build and CTest | passed, 1/1 |
+| clang-cl UBSan trap configure/build and CTest | passed, 1/1 |
+| clang-tidy warnings-as-errors build and CTest | passed, 2/2 including seed replay |
+| MSVC `/analyze /analyze:external- /WX` build and CTest | passed, 1/1 |
+| clang-cl libFuzzer build and CTest | passed, 2/2 including 128-run seed replay |
+
+### Workspace and repository gates
+
+| Command | Final result |
+| --- | --- |
+| `cargo fmt --all --check` | passed |
+| `cargo check --workspace --all-targets` | passed |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | passed |
+| `cargo test --workspace --all-features` | passed, 171 tests |
+| `python tools/run_runtime_models.py` | passed, 6 Loom models |
+| `python tools/validate_specs.py` | passed, including 14 Vision binary fixtures and both failure regressions |
+| `python tools/check_markdown_links.py` | passed, 123 references |
+| `python tools/check_repository_guards.py` | passed |
+| `git diff --check` | passed |
+
+Node C makes no OCR-model, capture-device, hardware timing, or performance claim. It adds no
+traineddata, EasyCon source, public C ABI, installed header, language binding, or package artifact.

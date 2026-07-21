@@ -20,6 +20,20 @@ easycon_native_status set_error(
 std::byte* allocate_bytes(size_t length) noexcept;
 void release_bytes(void* data) noexcept;
 
+easycon_native_status validate_image_limits(
+    const easycon_native_image_limits* limits,
+    easycon_native_error* error) noexcept;
+easycon_native_status make_image_view(
+    const easycon_native_image_view* image,
+    const easycon_native_image_limits& limits,
+    cv::Mat& out_mat,
+    easycon_native_error* error);
+easycon_native_status copy_image_mat(
+    const cv::Mat& mat,
+    const easycon_native_image_limits& limits,
+    easycon_native_image* output,
+    easycon_native_error* error) noexcept;
+
 template <typename Function>
 easycon_native_status guard(easycon_native_error* out_error, Function&& function) noexcept {
     if (out_error == nullptr) {

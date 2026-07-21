@@ -1,6 +1,7 @@
 #include "internal/easycon_native_bridge.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
@@ -40,8 +41,9 @@ int hex_digit(char value) {
     return -1;
 }
 
-std::vector<uint8_t> read_hex(std::string_view name) {
-    std::ifstream input(std::string("fixtures/codec/") + std::string(name));
+std::vector<uint8_t> read_hex_at(std::string_view directory, std::string_view name) {
+    std::ifstream input(
+        std::string("fixtures/") + std::string(directory) + "/" + std::string(name));
     expect(input.good(), "codec fixture opens");
     std::string text;
     input >> text;
@@ -59,6 +61,14 @@ std::vector<uint8_t> read_hex(std::string_view name) {
         bytes.push_back(static_cast<uint8_t>((high << 4) | low));
     }
     return bytes;
+}
+
+std::vector<uint8_t> read_hex(std::string_view name) {
+    return read_hex_at("codec", name);
+}
+
+std::vector<uint8_t> read_operation_hex(std::string_view name) {
+    return read_hex_at("operations", name);
 }
 
 easycon_native_image_limits image_limits() {
@@ -92,12 +102,36 @@ bool is_zero(const easycon_native_buffer& buffer) {
     return buffer.data == nullptr && buffer.length == 0;
 }
 
+bool is_zero(const easycon_native_match_extrema& result) {
+    return result.min_value == 0.0 && result.max_value == 0.0 && result.min_x == 0 &&
+           result.min_y == 0 && result.max_x == 0 && result.max_y == 0;
+}
+
+bool is_zero(const easycon_native_color_result& result) {
+    return result.count == 0 && result.bbox_x == 0 && result.bbox_y == 0 &&
+           result.bbox_width == 0 && result.bbox_height == 0 && result.has_bbox == 0;
+}
+
 void expect_pixels(
     const easycon_native_image& image,
     const std::vector<uint8_t>& expected,
     std::string_view label) {
     const auto same = image.length == expected.size() &&
                       std::equal(expected.begin(), expected.end(), image.data);
+    if (!same) {
+        const auto compared = (std::min)(static_cast<size_t>(image.length), expected.size());
+        size_t index = 0;
+        while (index < compared && expected[index] == image.data[index]) {
+            ++index;
+        }
+        std::cerr << label << " lengths actual=" << image.length << " expected=" << expected.size();
+        if (index < compared) {
+            std::cerr << " first mismatch at " << index << " actual="
+                      << static_cast<unsigned>(image.data[index]) << " expected="
+                      << static_cast<unsigned>(expected[index]);
+        }
+        std::cerr << '\n';
+    }
     expect(same, label);
 }
 
@@ -506,6 +540,266 @@ void test_codec_zeroes_outputs_before_requiring_error_storage() {
     expect(is_zero(cropped), "crop zeroes output before validating error storage");
 }
 
+easycon_native_image_view gray_view(
+    const std::vector<uint8_t>& pixels,
+    uint32_t width,
+    uint32_t height) {
+    return easycon_native_image_view{
+        pixels.data(),
+        pixels.size(),
+        width,
+        height,
+        width,
+        EASYCON_NATIVE_PIXEL_FORMAT_GRAY8,
+    };
+}
+
+std::vector<uint8_t> replicate_bgr(const std::vector<uint8_t>& gray) {
+    std::vector<uint8_t> bgr;
+    bgr.reserve(gray.size() * 3);
+    for (const auto value : gray) {
+        bgr.insert(bgr.end(), {value, value, value});
+    }
+    return bgr;
+}
+
+void test_normalized_template_extrema() {
+    const auto search = read_operation_hex("template-search-gray.hex");
+    const auto target = read_operation_hex("template-target-gray.hex");
+    const auto search_view = gray_view(search, 6, 5);
+    const auto target_view = gray_view(target, 3, 3);
+    const auto limits = image_limits();
+    easycon_native_error error{};
+    const struct {
+        uint32_t method;
+        double raw;
+        bool use_min;
+    } cases[] = {
+        {EASYCON_NATIVE_TEMPLATE_SQDIFF_NORMED, 0.005045493599027395, true},
+        {EASYCON_NATIVE_TEMPLATE_CCORR_NORMED, 0.9981008172035217, false},
+        {EASYCON_NATIVE_TEMPLATE_CCOEFF_NORMED, 0.9942602515220642, false},
+    };
+    for (const auto& item : cases) {
+        easycon_native_match_extrema result{};
+        expect(
+            easycon_native_match_template(
+                &search_view,
+                &target_view,
+                item.method,
+                &limits,
+                &result,
+                &error) == EASYCON_NATIVE_STATUS_OK,
+            "normalized template match succeeds");
+        const auto raw = item.use_min ? result.min_value : result.max_value;
+        const auto x = item.use_min ? result.min_x : result.max_x;
+        const auto y = item.use_min ? result.min_y : result.max_y;
+        expect(std::abs(raw - item.raw) <= 0.00001, "template raw extremum matches fixture");
+        expect(x == 2 && y == 1, "template extremum location matches fixture");
+    }
+
+    easycon_native_match_extrema output{};
+    const auto constant = std::vector<uint8_t>(16, 7);
+    const auto constant_view = gray_view(constant, 4, 4);
+    expect(
+        easycon_native_match_template(
+            &constant_view,
+            &constant_view,
+            EASYCON_NATIVE_TEMPLATE_CCOEFF_NORMED,
+            &limits,
+            &output,
+            &error) == EASYCON_NATIVE_STATUS_BACKEND_ERROR,
+        "undefined constant normalized coefficient is rejected");
+    easycon_native_error_release(&error);
+}
+
+void test_edge_preprocess_and_match_fixtures() {
+    const auto search_gray = read_operation_hex("edge-search-gray.hex");
+    const auto target_gray = read_operation_hex("edge-target-gray.hex");
+    const auto search = replicate_bgr(search_gray);
+    const auto target = replicate_bgr(target_gray);
+    const easycon_native_image_view search_view{
+        search.data(), search.size(), 18, 17, 54, EASYCON_NATIVE_PIXEL_FORMAT_BGR8};
+    const easycon_native_image_view target_view{
+        target.data(), target.size(), 11, 11, 33, EASYCON_NATIVE_PIXEL_FORMAT_BGR8};
+    const auto limits = image_limits();
+    easycon_native_error error{};
+    const struct {
+        uint32_t method;
+        std::string_view search_expected;
+        std::string_view target_expected;
+    } cases[] = {
+        {EASYCON_NATIVE_EDGE_XY, "edge-search-xy-gray.hex", "edge-target-xy-gray.hex"},
+        {EASYCON_NATIVE_EDGE_LAPLACIAN,
+         "edge-search-laplacian-gray.hex",
+         "edge-target-laplacian-gray.hex"},
+    };
+    for (const auto& item : cases) {
+        easycon_native_image search_edge{};
+        easycon_native_image target_edge{};
+        expect(
+            easycon_native_edge_preprocess(
+                &search_view, item.method, &limits, &search_edge, &error) ==
+                EASYCON_NATIVE_STATUS_OK,
+            "search edge preprocess succeeds");
+        expect(
+            easycon_native_edge_preprocess(
+                &target_view, item.method, &limits, &target_edge, &error) ==
+                EASYCON_NATIVE_STATUS_OK,
+            "target edge preprocess succeeds");
+        expect_pixels(
+            search_edge,
+            read_operation_hex(item.search_expected),
+            item.method == EASYCON_NATIVE_EDGE_XY
+                ? "XY search edge pixels match independent fixture"
+                : "Laplacian search edge pixels match independent fixture");
+        expect_pixels(
+            target_edge,
+            read_operation_hex(item.target_expected),
+            item.method == EASYCON_NATIVE_EDGE_XY
+                ? "XY target edge pixels match independent fixture"
+                : "Laplacian target edge pixels match independent fixture");
+
+        const auto search_edge_view = view_of(search_edge);
+        const auto target_edge_view = view_of(target_edge);
+        easycon_native_match_extrema result{};
+        expect(
+            easycon_native_match_template(
+                &search_edge_view,
+                &target_edge_view,
+                EASYCON_NATIVE_TEMPLATE_CCOEFF_NORMED,
+                &limits,
+                &result,
+                &error) == EASYCON_NATIVE_STATUS_OK,
+            "edge template match succeeds");
+        expect(result.max_x == 4 && result.max_y == 3, "edge match location is exact");
+        expect(std::abs(result.max_value - 1.0) <= 0.00001, "edge raw match is exact");
+        easycon_native_image_release(&search_edge);
+        easycon_native_image_release(&target_edge);
+    }
+}
+
+void test_hsv_count_wrap_and_bbox() {
+    const auto bgr = read_operation_hex("hsv-bgr-5x3.hex");
+    const easycon_native_image_view image{
+        bgr.data(), bgr.size(), 5, 3, 15, EASYCON_NATIVE_PIXEL_FORMAT_BGR8};
+    const auto limits = image_limits();
+    easycon_native_error error{};
+    const struct {
+        easycon_native_hsv_range range;
+        uint64_t count;
+        uint32_t x;
+        uint32_t y;
+        uint32_t width;
+        uint32_t height;
+        uint32_t has_bbox;
+    } cases[] = {
+        {{20, 100, 200, 255, 200, 255}, 3, 1, 0, 3, 1, 1},
+        {{170, 10, 100, 255, 100, 255}, 5, 1, 1, 3, 2, 1},
+        {{0, 179, 0, 255, 0, 255}, 12, 0, 0, 4, 3, 1},
+        {{101, 110, 200, 255, 200, 255}, 0, 0, 0, 0, 0, 0},
+    };
+    for (const auto& item : cases) {
+        easycon_native_color_result result{};
+        expect(
+            easycon_native_hsv_count(
+                &image, 1, 0, 4, 3, &item.range, &limits, &result, &error) ==
+                EASYCON_NATIVE_STATUS_OK,
+            "HSV statistics succeed");
+        expect(result.count == item.count, "HSV count matches fixture");
+        expect(
+            result.has_bbox == item.has_bbox && result.bbox_x == item.x &&
+                result.bbox_y == item.y && result.bbox_width == item.width &&
+                result.bbox_height == item.height,
+            "HSV relative bounding box matches fixture");
+    }
+
+    easycon_native_color_result result{};
+    const easycon_native_hsv_range reversed{0, 179, 200, 100, 0, 255};
+    expect(
+        easycon_native_hsv_count(
+            &image, 1, 0, 4, 3, &reversed, &limits, &result, &error) ==
+            EASYCON_NATIVE_STATUS_INVALID_ARGUMENT,
+        "reversed saturation range is rejected");
+    easycon_native_error_release(&error);
+    expect(
+        easycon_native_hsv_count(
+            &image, 1, 0, 0, 3, &cases[0].range, &limits, &result, &error) ==
+            EASYCON_NATIVE_STATUS_OUT_OF_RANGE,
+        "empty HSV ROI is rejected");
+    easycon_native_error_release(&error);
+}
+
+void test_vision_ops_formats_validation_and_output_zeroing() {
+    const auto bgr = read_operation_hex("hsv-bgr-5x3.hex");
+    std::vector<uint8_t> bgra;
+    bgra.reserve(size_t{5} * 3 * 4);
+    for (size_t index = 0; index < bgr.size(); index += 3) {
+        bgra.insert(bgra.end(), {bgr[index], bgr[index + 1], bgr[index + 2], UINT8_C(77)});
+    }
+    const easycon_native_image_view bgra_view{
+        bgra.data(), bgra.size(), 5, 3, 20, EASYCON_NATIVE_PIXEL_FORMAT_BGRA8};
+    const auto gray = read_operation_hex("template-search-gray.hex");
+    const auto gray_image = gray_view(gray, 6, 5);
+    const auto limits = image_limits();
+    const easycon_native_hsv_range full{0, 179, 0, 255, 0, 255};
+    easycon_native_error error{};
+    easycon_native_color_result color{};
+    expect(
+        easycon_native_hsv_count(
+            &bgra_view, 0, 0, 5, 3, &full, &limits, &color, &error) ==
+            EASYCON_NATIVE_STATUS_OK,
+        "BGRA converts to BGR before HSV");
+    expect(color.count == 15, "BGRA full HSV range counts every pixel");
+    expect(
+        easycon_native_hsv_count(
+            &gray_image, 0, 0, 6, 5, &full, &limits, &color, &error) ==
+            EASYCON_NATIVE_STATUS_OK,
+        "Gray converts to BGR before HSV");
+    expect(color.count == 30, "Gray full HSV range counts every pixel");
+
+    const auto search = read_operation_hex("template-search-gray.hex");
+    const auto target = read_operation_hex("template-target-gray.hex");
+    const auto search_view = gray_view(search, 6, 5);
+    const auto target_view = gray_view(target, 3, 3);
+    easycon_native_match_extrema extrema{};
+    expect(
+        easycon_native_match_template(
+            &search_view, &target_view, 99, &limits, &extrema, &error) ==
+            EASYCON_NATIVE_STATUS_INVALID_ARGUMENT,
+        "unknown template mode is rejected");
+    expect(is_zero(extrema), "unknown template mode leaves result zero");
+    easycon_native_error_release(&error);
+
+    auto* const sentinel = reinterpret_cast<uint8_t*>(UINTPTR_MAX);
+    extrema = easycon_native_match_extrema{1.0, 1.0, 1, 1, 1, 1};
+    expect(
+        easycon_native_match_template(
+            &search_view,
+            &target_view,
+            EASYCON_NATIVE_TEMPLATE_CCORR_NORMED,
+            &limits,
+            &extrema,
+            nullptr) == EASYCON_NATIVE_STATUS_INVALID_ARGUMENT,
+        "template match requires error storage");
+    expect(is_zero(extrema), "template match zeroes output before error storage validation");
+
+    easycon_native_image edge{sentinel, 1, 1, 1, 1, 1};
+    expect(
+        easycon_native_edge_preprocess(
+            &search_view, EASYCON_NATIVE_EDGE_XY, &limits, &edge, nullptr) ==
+            EASYCON_NATIVE_STATUS_INVALID_ARGUMENT,
+        "edge preprocess requires error storage");
+    expect(is_zero(edge), "edge preprocess zeroes output before error storage validation");
+
+    color = easycon_native_color_result{1, 1, 1, 1, 1, 1};
+    expect(
+        easycon_native_hsv_count(
+            &bgra_view, 0, 0, 5, 3, &full, &limits, &color, nullptr) ==
+            EASYCON_NATIVE_STATUS_INVALID_ARGUMENT,
+        "HSV count requires error storage");
+    expect(is_zero(color), "HSV count zeroes output before error storage validation");
+}
+
 }  // namespace
 
 int main() {
@@ -528,6 +822,10 @@ int main() {
     test_codec_round_trip_conversion_and_roi();
     test_codec_rejects_invalid_truncated_and_oversized_input();
     test_codec_zeroes_outputs_before_requiring_error_storage();
+    test_normalized_template_extrema();
+    test_edge_preprocess_and_match_fixtures();
+    test_hsv_count_wrap_and_bbox();
+    test_vision_ops_formats_validation_and_output_zeroing();
 
     const auto final_counts = counts();
     expect(final_counts.live_handles == 0, "all native handles are released");

@@ -76,7 +76,7 @@ pub(crate) fn crop(
     })
 }
 
-fn call_image(
+pub(super) fn call_image(
     call: impl FnOnce(*mut ffi::Image, *mut ffi::Error) -> i32,
 ) -> Result<OwnedImage, NativeError> {
     let mut output = ImageOwner::default();
@@ -86,7 +86,7 @@ fn call_image(
     output.copy_tight()
 }
 
-fn raw_view(image: ImageView<'_>) -> Result<ffi::ImageView, NativeError> {
+pub(super) fn raw_view(image: ImageView<'_>) -> Result<ffi::ImageView, NativeError> {
     Ok(ffi::ImageView {
         data: image.pixels().as_ptr(),
         length: u64::try_from(image.pixels().len())
@@ -99,7 +99,7 @@ fn raw_view(image: ImageView<'_>) -> Result<ffi::ImageView, NativeError> {
     })
 }
 
-fn raw_limits(limits: ImageLimits) -> Result<ffi::ImageLimits, NativeError> {
+pub(super) fn raw_limits(limits: ImageLimits) -> Result<ffi::ImageLimits, NativeError> {
     Ok(ffi::ImageLimits {
         max_encoded_bytes: u64::try_from(limits.max_encoded_bytes)
             .map_err(|_| NativeError::overflow("encoded limit does not fit u64"))?,

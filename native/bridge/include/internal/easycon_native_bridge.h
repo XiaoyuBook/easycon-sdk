@@ -40,6 +40,13 @@ typedef int32_t easycon_native_status;
 #define EASYCON_NATIVE_PIXEL_FORMAT_BGRA8 UINT32_C(2)
 #define EASYCON_NATIVE_PIXEL_FORMAT_GRAY8 UINT32_C(3)
 
+#define EASYCON_NATIVE_TEMPLATE_SQDIFF_NORMED UINT32_C(1)
+#define EASYCON_NATIVE_TEMPLATE_CCORR_NORMED UINT32_C(2)
+#define EASYCON_NATIVE_TEMPLATE_CCOEFF_NORMED UINT32_C(3)
+
+#define EASYCON_NATIVE_EDGE_XY UINT32_C(1)
+#define EASYCON_NATIVE_EDGE_LAPLACIAN UINT32_C(2)
+
 typedef struct easycon_native_error {
     int32_t code;
     char* data;
@@ -77,6 +84,33 @@ typedef struct easycon_native_image_limits {
     uint64_t max_decoded_bytes;
     uint64_t max_stride;
 } easycon_native_image_limits;
+
+typedef struct easycon_native_match_extrema {
+    double min_value;
+    double max_value;
+    int32_t min_x;
+    int32_t min_y;
+    int32_t max_x;
+    int32_t max_y;
+} easycon_native_match_extrema;
+
+typedef struct easycon_native_hsv_range {
+    uint32_t h_min;
+    uint32_t h_max;
+    uint32_t s_min;
+    uint32_t s_max;
+    uint32_t v_min;
+    uint32_t v_max;
+} easycon_native_hsv_range;
+
+typedef struct easycon_native_color_result {
+    uint64_t count;
+    uint32_t bbox_x;
+    uint32_t bbox_y;
+    uint32_t bbox_width;
+    uint32_t bbox_height;
+    uint32_t has_bbox;
+} easycon_native_color_result;
 
 typedef struct easycon_native_counts {
     uint64_t live_handles;
@@ -119,6 +153,30 @@ easycon_native_status EASYCON_NATIVE_CALL easycon_native_image_crop(
     easycon_native_image* out_image,
     easycon_native_error* out_error) EASYCON_NATIVE_NOEXCEPT;
 
+easycon_native_status EASYCON_NATIVE_CALL easycon_native_match_template(
+    const easycon_native_image_view* search,
+    const easycon_native_image_view* target,
+    uint32_t method,
+    const easycon_native_image_limits* limits,
+    easycon_native_match_extrema* out_result,
+    easycon_native_error* out_error) EASYCON_NATIVE_NOEXCEPT;
+easycon_native_status EASYCON_NATIVE_CALL easycon_native_edge_preprocess(
+    const easycon_native_image_view* image,
+    uint32_t method,
+    const easycon_native_image_limits* limits,
+    easycon_native_image* out_image,
+    easycon_native_error* out_error) EASYCON_NATIVE_NOEXCEPT;
+easycon_native_status EASYCON_NATIVE_CALL easycon_native_hsv_count(
+    const easycon_native_image_view* image,
+    uint32_t roi_x,
+    uint32_t roi_y,
+    uint32_t roi_width,
+    uint32_t roi_height,
+    const easycon_native_hsv_range* range,
+    const easycon_native_image_limits* limits,
+    easycon_native_color_result* out_result,
+    easycon_native_error* out_error) EASYCON_NATIVE_NOEXCEPT;
+
 easycon_native_status EASYCON_NATIVE_CALL easycon_native_debug_counts(
     easycon_native_counts* out_counts,
     easycon_native_error* out_error) EASYCON_NATIVE_NOEXCEPT;
@@ -144,13 +202,16 @@ easycon_native_status EASYCON_NATIVE_CALL easycon_native_test_raise(
 
 static_assert(sizeof(void*) == 8, "Phase 3 native bridge is x64-only");
 static_assert(sizeof(easycon_native_error) == 24);
+static_assert(alignof(easycon_native_error) == 8);
 static_assert(offsetof(easycon_native_error, code) == 0);
 static_assert(offsetof(easycon_native_error, data) == 8);
 static_assert(offsetof(easycon_native_error, length) == 16);
 static_assert(sizeof(easycon_native_buffer) == 16);
+static_assert(alignof(easycon_native_buffer) == 8);
 static_assert(offsetof(easycon_native_buffer, data) == 0);
 static_assert(offsetof(easycon_native_buffer, length) == 8);
 static_assert(sizeof(easycon_native_image_view) == 40);
+static_assert(alignof(easycon_native_image_view) == 8);
 static_assert(offsetof(easycon_native_image_view, data) == 0);
 static_assert(offsetof(easycon_native_image_view, length) == 8);
 static_assert(offsetof(easycon_native_image_view, width) == 16);
@@ -158,6 +219,7 @@ static_assert(offsetof(easycon_native_image_view, height) == 20);
 static_assert(offsetof(easycon_native_image_view, stride) == 24);
 static_assert(offsetof(easycon_native_image_view, pixel_format) == 32);
 static_assert(sizeof(easycon_native_image) == 40);
+static_assert(alignof(easycon_native_image) == 8);
 static_assert(offsetof(easycon_native_image, data) == 0);
 static_assert(offsetof(easycon_native_image, length) == 8);
 static_assert(offsetof(easycon_native_image, width) == 16);
@@ -165,12 +227,41 @@ static_assert(offsetof(easycon_native_image, height) == 20);
 static_assert(offsetof(easycon_native_image, stride) == 24);
 static_assert(offsetof(easycon_native_image, pixel_format) == 32);
 static_assert(sizeof(easycon_native_image_limits) == 40);
+static_assert(alignof(easycon_native_image_limits) == 8);
 static_assert(offsetof(easycon_native_image_limits, max_encoded_bytes) == 0);
 static_assert(offsetof(easycon_native_image_limits, max_width) == 8);
 static_assert(offsetof(easycon_native_image_limits, max_height) == 12);
 static_assert(offsetof(easycon_native_image_limits, max_pixels) == 16);
 static_assert(offsetof(easycon_native_image_limits, max_decoded_bytes) == 24);
 static_assert(offsetof(easycon_native_image_limits, max_stride) == 32);
+static_assert(sizeof(easycon_native_match_extrema) == 32);
+static_assert(alignof(easycon_native_match_extrema) == 8);
+static_assert(offsetof(easycon_native_match_extrema, min_value) == 0);
+static_assert(offsetof(easycon_native_match_extrema, max_value) == 8);
+static_assert(offsetof(easycon_native_match_extrema, min_x) == 16);
+static_assert(offsetof(easycon_native_match_extrema, min_y) == 20);
+static_assert(offsetof(easycon_native_match_extrema, max_x) == 24);
+static_assert(offsetof(easycon_native_match_extrema, max_y) == 28);
+static_assert(sizeof(easycon_native_hsv_range) == 24);
+static_assert(alignof(easycon_native_hsv_range) == 4);
+static_assert(offsetof(easycon_native_hsv_range, h_min) == 0);
+static_assert(offsetof(easycon_native_hsv_range, h_max) == 4);
+static_assert(offsetof(easycon_native_hsv_range, s_min) == 8);
+static_assert(offsetof(easycon_native_hsv_range, s_max) == 12);
+static_assert(offsetof(easycon_native_hsv_range, v_min) == 16);
+static_assert(offsetof(easycon_native_hsv_range, v_max) == 20);
+static_assert(sizeof(easycon_native_color_result) == 32);
+static_assert(alignof(easycon_native_color_result) == 8);
+static_assert(offsetof(easycon_native_color_result, count) == 0);
+static_assert(offsetof(easycon_native_color_result, bbox_x) == 8);
+static_assert(offsetof(easycon_native_color_result, bbox_y) == 12);
+static_assert(offsetof(easycon_native_color_result, bbox_width) == 16);
+static_assert(offsetof(easycon_native_color_result, bbox_height) == 20);
+static_assert(offsetof(easycon_native_color_result, has_bbox) == 24);
+static_assert(sizeof(easycon_native_counts) == 16);
+static_assert(alignof(easycon_native_counts) == 8);
+static_assert(offsetof(easycon_native_counts, live_handles) == 0);
+static_assert(offsetof(easycon_native_counts, live_allocations) == 8);
 #endif
 
 #endif

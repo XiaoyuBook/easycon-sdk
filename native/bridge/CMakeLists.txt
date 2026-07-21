@@ -1,6 +1,7 @@
 set(EASYCON_NATIVE_BRIDGE_SOURCES
   src/bridge.cpp
   src/image_codec.cpp
+  src/vision_ops.cpp
 )
 
 add_library(easycon_native_bridge STATIC ${EASYCON_NATIVE_BRIDGE_SOURCES})
@@ -22,6 +23,7 @@ easycon_native_configure_owned_target(easycon_native_bridge)
 set(EASYCON_NATIVE_ANALYSIS_SOURCES
   ${CMAKE_CURRENT_SOURCE_DIR}/src/bridge.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/image_codec.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/vision_ops.cpp
 )
 
 if(EASYCON_BUILD_COMPONENT_TESTS OR EASYCON_BUILD_FUZZERS)
@@ -56,6 +58,26 @@ if(EASYCON_BUILD_COMPONENT_TESTS)
     )
   endforeach()
 
+  foreach(
+    fixture
+    IN ITEMS
+      template-search-gray.hex
+      template-target-gray.hex
+      edge-search-gray.hex
+      edge-target-gray.hex
+      edge-search-xy-gray.hex
+      edge-target-xy-gray.hex
+      edge-search-laplacian-gray.hex
+      edge-target-laplacian-gray.hex
+      hsv-bgr-5x3.hex
+  )
+    configure_file(
+      ${PROJECT_SOURCE_DIR}/spec/fixtures/vision/operations/${fixture}
+      ${CMAKE_CURRENT_BINARY_DIR}/fixtures/operations/${fixture}
+      COPYONLY
+    )
+  endforeach()
+
   add_executable(easycon_native_bridge_tests tests/bridge_component_tests.cpp)
   target_compile_definitions(easycon_native_bridge_tests PRIVATE EASYCON_NATIVE_TESTING=1)
   target_include_directories(
@@ -85,6 +107,7 @@ if(EASYCON_BUILD_FUZZERS)
     SHARED
       src/bridge.cpp
       src/image_codec.cpp
+      src/vision_ops.cpp
       src/test_support.cpp
       fuzz/fuzz_target.def
   )

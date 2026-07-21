@@ -4,6 +4,7 @@ use crate::ffi;
 use crate::{NativeError, NativeErrorKind, NativeResourceCounts};
 
 pub(super) mod image;
+pub(super) mod vision;
 
 pub(crate) fn counts() -> Result<NativeResourceCounts, NativeError> {
     let mut counts = ffi::Counts::default();

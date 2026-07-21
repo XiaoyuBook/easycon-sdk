@@ -23,7 +23,7 @@ impl PixelFormat {
         }
     }
 
-    const fn into_native(self) -> native::PixelFormat {
+    pub(crate) const fn into_native(self) -> native::PixelFormat {
         match self {
             Self::Bgr8 => native::PixelFormat::Bgr8,
             Self::Bgra8 => native::PixelFormat::Bgra8,
@@ -95,6 +95,10 @@ impl VisionLimits {
     pub const fn max_stride(self) -> usize {
         self.image.max_stride
     }
+
+    pub(crate) const fn native_limits(self) -> native::ImageLimits {
+        self.image
+    }
 }
 
 impl Default for VisionLimits {
@@ -130,7 +134,7 @@ pub struct ImageError {
 }
 
 impl ImageError {
-    fn new(kind: ImageErrorKind, message: impl Into<String>) -> Self {
+    pub(crate) fn new(kind: ImageErrorKind, message: impl Into<String>) -> Self {
         Self {
             kind,
             message: message.into(),
@@ -138,7 +142,7 @@ impl ImageError {
         }
     }
 
-    fn from_native(error: NativeBridgeError) -> Self {
+    pub(crate) fn from_native(error: NativeBridgeError) -> Self {
         let kind = match error.kind() {
             NativeErrorKind::InvalidArgument => ImageErrorKind::InvalidArgument,
             NativeErrorKind::OutOfRange => ImageErrorKind::OutOfRange,
@@ -362,7 +366,10 @@ impl Image {
         })
     }
 
-    fn native_view(&self, limits: &VisionLimits) -> Result<native::ImageView<'_>, ImageError> {
+    pub(crate) fn native_view(
+        &self,
+        limits: &VisionLimits,
+    ) -> Result<native::ImageView<'_>, ImageError> {
         native::ImageView::new(
             &self.pixels,
             self.width,
@@ -374,7 +381,10 @@ impl Image {
         .map_err(ImageError::from_native)
     }
 
-    fn from_native(output: native::OwnedImage, limits: &VisionLimits) -> Result<Self, ImageError> {
+    pub(crate) fn from_native(
+        output: native::OwnedImage,
+        limits: &VisionLimits,
+    ) -> Result<Self, ImageError> {
         Self::new(
             Arc::from(output.pixels()),
             output.width(),

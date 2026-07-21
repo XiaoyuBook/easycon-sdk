@@ -10,4 +10,7 @@ EXPORTS
     easycon_native_image_decode
     easycon_native_image_encode_png
     easycon_native_image_release
+    easycon_native_match_template
+    easycon_native_edge_preprocess
+    easycon_native_hsv_count
     easycon_native_test_raise

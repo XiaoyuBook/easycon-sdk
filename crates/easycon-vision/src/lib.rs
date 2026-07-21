@@ -1,9 +1,15 @@
 #![forbid(unsafe_code)]
 //! Rust-owned Vision types and lifecycle coordination.
 
+mod color;
 mod image;
+mod matching;
 
+pub use color::{ColorStatistics, HsvRange};
 pub use image::{Frame, Image, ImageError, ImageErrorKind, PixelFormat, Roi, VisionLimits};
+pub use matching::{
+    EdgeMethod, MatchResult, TemplateMethod, match_edge, match_template, preprocess_edge,
+};
 
 pub use easycon_native_sys::NativeError as NativeBridgeError;
 
