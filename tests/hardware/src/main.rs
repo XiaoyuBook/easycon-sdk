@@ -3,6 +3,7 @@
 mod artifact;
 mod device;
 mod faults;
+mod journal;
 mod provenance;
 
 use std::env;
@@ -16,7 +17,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
 use artifact::RESERVATION_FILE_NAME;
-use artifact::{ArtifactReservation, AuxiliaryKind, SEQUENCE_TIMINGS_FILE_NAME};
+use artifact::{ArtifactReservation, AuxiliaryKind, RunStartMetadata, SEQUENCE_TIMINGS_FILE_NAME};
 use device::{
     AdmissionDecision, AdmissionEvidence, AdmittedDevice, DeviceDiscovery, DeviceTargetRequest,
     IdentityGuardedByteIoFactory, IdentityOpenRecorder, InnerOpenOutcome, OpenGuardCheck,
@@ -40,6 +41,7 @@ use easycon_serial::{
 };
 use serde_json::{Value, json};
 
+use journal::JournalEventKind;
 use provenance::RuntimeProvenance;
 
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -592,21 +594,44 @@ fn wait_for_command_terminal(
 fn run_with_device_admission(
     command: &'static str,
     arguments: &[String],
+    reservation: &mut ArtifactReservation,
     runner: impl FnOnce(AdmittedDevice, Arc<dyn DeviceDiscovery>) -> Result<Value, String>,
 ) -> Result<Value, String> {
-    run_with_device_admission_using(command, arguments, Arc::new(SystemDeviceDiscovery), runner)
+    run_with_device_admission_core(
+        command,
+        arguments,
+        Arc::new(SystemDeviceDiscovery),
+        |payload| reservation.record_event(JournalEventKind::IdentityAdmission, payload),
+        runner,
+    )
 }
 
+#[cfg(test)]
 fn run_with_device_admission_using(
     command: &'static str,
     arguments: &[String],
     discovery: Arc<dyn DeviceDiscovery>,
     runner: impl FnOnce(AdmittedDevice, Arc<dyn DeviceDiscovery>) -> Result<Value, String>,
 ) -> Result<Value, String> {
+    run_with_device_admission_core(command, arguments, discovery, |_| Ok(()), runner)
+}
+
+fn run_with_device_admission_core(
+    command: &'static str,
+    arguments: &[String],
+    discovery: Arc<dyn DeviceDiscovery>,
+    mut record_admission: impl FnMut(Value) -> Result<(), String>,
+    runner: impl FnOnce(AdmittedDevice, Arc<dyn DeviceDiscovery>) -> Result<Value, String>,
+) -> Result<Value, String> {
     let request = device_target_request(arguments)?;
     match admit_device(discovery.as_ref(), request.clone()) {
         Ok(AdmissionDecision::Admitted(target)) => {
             let evidence = target.evidence().clone();
+            record_admission(json!({
+                "command": command,
+                "device_target": device_target_json(evidence.request()),
+                "identity_admission": admission_evidence_json(&evidence, "admitted"),
+            }))?;
             match runner(target, discovery) {
                 Ok(result) => Ok(attach_admission_evidence(result, &evidence, "admitted")),
                 Err(error) => Ok(attach_admission_evidence(
@@ -622,39 +647,51 @@ fn run_with_device_admission_using(
                 )),
             }
         }
-        Ok(AdmissionDecision::Rejected(evidence)) => Ok(json!({
-            "command": command,
-            "device_target": device_target_json(evidence.request()),
-            "identity_admission": admission_evidence_json(&evidence, "rejected"),
-            "capability_inference": "none",
-        })),
-        Ok(AdmissionDecision::Ambiguous(evidence)) => Ok(json!({
-            "command": command,
-            "device_target": device_target_json(evidence.request()),
-            "identity_admission": admission_evidence_json(&evidence, "ambiguous"),
-            "capability_inference": "none",
-            "execution_error": {
-                "stage": "identity_admission",
-                "message": "system discovery returned an ambiguous serial snapshot",
-            },
-        })),
-        Err(error) => Ok(json!({
-            "command": command,
-            "device_target": device_target_json(&request),
-            "identity_admission": {
-                "status": "discovery_error",
-                "reason": "discovery_error",
-                "snapshot": [],
-                "observed_expected": null,
-                "observed_hint": null,
-                "structured_error": serial_error_json(&error),
-            },
-            "capability_inference": "none",
-            "execution_error": {
-                "stage": "identity_admission_discovery",
-                "message": error.message(),
-            },
-        })),
+        Ok(AdmissionDecision::Rejected(evidence)) => {
+            let result = json!({
+                "command": command,
+                "device_target": device_target_json(evidence.request()),
+                "identity_admission": admission_evidence_json(&evidence, "rejected"),
+                "capability_inference": "none",
+            });
+            record_admission(result.clone())?;
+            Ok(result)
+        }
+        Ok(AdmissionDecision::Ambiguous(evidence)) => {
+            let result = json!({
+                "command": command,
+                "device_target": device_target_json(evidence.request()),
+                "identity_admission": admission_evidence_json(&evidence, "ambiguous"),
+                "capability_inference": "none",
+                "execution_error": {
+                    "stage": "identity_admission",
+                    "message": "system discovery returned an ambiguous serial snapshot",
+                },
+            });
+            record_admission(result.clone())?;
+            Ok(result)
+        }
+        Err(error) => {
+            let result = json!({
+                "command": command,
+                "device_target": device_target_json(&request),
+                "identity_admission": {
+                    "status": "discovery_error",
+                    "reason": "discovery_error",
+                    "snapshot": [],
+                    "observed_expected": null,
+                    "observed_hint": null,
+                    "structured_error": serial_error_json(&error),
+                },
+                "capability_inference": "none",
+                "execution_error": {
+                    "stage": "identity_admission_discovery",
+                    "message": error.message(),
+                },
+            });
+            record_admission(result.clone())?;
+            Ok(result)
+        }
     }
 }
 
@@ -740,44 +777,95 @@ fn real_main() -> Result<i32, String> {
     let provenance = RuntimeProvenance::capture();
     let artifact_dir = artifact_dir(&arguments)?;
     fs::create_dir_all(&artifact_dir).map_err(|error| error.to_string())?;
-    let mut reservation = ArtifactReservation::begin(command, &artifact_dir)?;
+    let mut reservation = ArtifactReservation::begin_journaled(
+        command,
+        &artifact_dir,
+        RunStartMetadata {
+            normalized_arguments: normalized_arguments(&arguments),
+            provenance: provenance.to_json(),
+        },
+    )?;
+    reservation.record_event(
+        JournalEventKind::CommandDispatchStarted,
+        json!({"command": command}),
+    )?;
     let mut sequence_timings = None;
     let execution = match command {
         "discover" => run_discover(&arguments),
-        "handshake" => run_with_device_admission("handshake", &arguments, |target, discovery| {
-            run_handshake(&arguments, target, discovery)
-        }),
-        "smoke" => run_with_device_admission("smoke", &arguments, |target, discovery| {
-            run_smoke(&arguments, target, discovery)
-        }),
-        "home-wake" => run_with_device_admission("home-wake", &arguments, |target, discovery| {
-            run_home_wake(&arguments, target, discovery)
-        }),
-        "faults" => run_with_device_admission("faults", &arguments, |target, discovery| {
-            run_faults(target, discovery)
-        }),
-        "hotplug" => run_with_device_admission("hotplug", &arguments, |target, discovery| {
-            run_hotplug(&arguments, target, discovery)
-        }),
-        "lifecycle" => run_with_device_admission("lifecycle", &arguments, |target, discovery| {
-            run_lifecycle(&arguments, target, discovery)
-        }),
-        "sequence" => run_with_device_admission("sequence", &arguments, |target, discovery| {
-            run_sequence(&arguments, target, discovery).map(|(result, timings)| {
-                sequence_timings = timings;
-                result
-            })
-        }),
-        "amiibo" if amiibo_write_authorized(&arguments) => {
-            run_with_device_admission("amiibo", &arguments, |target, discovery| {
-                run_amiibo(&arguments, target, discovery)
-            })
-        }
+        "handshake" => run_with_device_admission(
+            "handshake",
+            &arguments,
+            &mut reservation,
+            |target, discovery| run_handshake(&arguments, target, discovery),
+        ),
+        "smoke" => run_with_device_admission(
+            "smoke",
+            &arguments,
+            &mut reservation,
+            |target, discovery| run_smoke(&arguments, target, discovery),
+        ),
+        "home-wake" => run_with_device_admission(
+            "home-wake",
+            &arguments,
+            &mut reservation,
+            |target, discovery| run_home_wake(&arguments, target, discovery),
+        ),
+        "faults" => run_with_device_admission("faults", &arguments, &mut reservation, run_faults),
+        "hotplug" => run_with_device_admission(
+            "hotplug",
+            &arguments,
+            &mut reservation,
+            |target, discovery| run_hotplug(&arguments, target, discovery),
+        ),
+        "lifecycle" => run_with_device_admission(
+            "lifecycle",
+            &arguments,
+            &mut reservation,
+            |target, discovery| run_lifecycle(&arguments, target, discovery),
+        ),
+        "sequence" => run_with_device_admission(
+            "sequence",
+            &arguments,
+            &mut reservation,
+            |target, discovery| {
+                run_sequence(&arguments, target, discovery).map(|(result, timings)| {
+                    sequence_timings = timings;
+                    result
+                })
+            },
+        ),
+        "amiibo" if amiibo_write_authorized(&arguments) => run_with_device_admission(
+            "amiibo",
+            &arguments,
+            &mut reservation,
+            |target, discovery| run_amiibo(&arguments, target, discovery),
+        ),
         "amiibo" => run_unauthorized_amiibo(),
         _ => Err(format!("unknown command: {command}")),
     };
+    reservation.record_event(
+        JournalEventKind::OperationTerminal,
+        execution_journal_payload(command, &execution),
+    )?;
+    reservation.record_event(
+        JournalEventKind::CleanupTerminal,
+        cleanup_journal_payload(command, &execution),
+    )?;
     let (mut document, failure) = finalize_result(command, execution);
     apply_provenance_policy(&mut document, &provenance);
+    let ended_unix_ns = current_unix_ns()?;
+    document["run"] = reservation.run_identity_json(ended_unix_ns);
+    reservation.record_event(
+        JournalEventKind::RunProjectionFinalized,
+        json!({
+            "ended_unix_ns": ended_unix_ns,
+            "document": document.clone(),
+        }),
+    )?;
+    reservation.seal_journal(json!({
+        "primary_artifact": format!("{command}.json"),
+    }))?;
+    document["run"]["journal_projection"] = reservation.journal_projection()?;
     let exit_code = document_exit_code(&document);
     if let Some(timings) = sequence_timings {
         reservation.stage_auxiliary(AuxiliaryKind::SequenceTimingsCsv, timings)?;
@@ -795,6 +883,61 @@ fn real_main() -> Result<i32, String> {
         eprintln!("hardware qualification failed: {error}");
     }
     Ok(exit_code)
+}
+
+fn execution_journal_payload(command: &str, execution: &Result<Value, String>) -> Value {
+    match execution {
+        Ok(result) => json!({
+            "command": command,
+            "runner_outcome": "returned",
+            "result": result,
+        }),
+        Err(error) => json!({
+            "command": command,
+            "runner_outcome": "error",
+            "error": error,
+        }),
+    }
+}
+
+fn cleanup_journal_payload(command: &str, execution: &Result<Value, String>) -> Value {
+    match execution {
+        Ok(result) => json!({
+            "command": command,
+            "cleanup_contract_succeeded": cleanup_contract_succeeded(command, result),
+            "result": result,
+        }),
+        Err(error) => json!({
+            "command": command,
+            "cleanup_contract_succeeded": false,
+            "runner_error": error,
+        }),
+    }
+}
+
+fn normalized_arguments(arguments: &[String]) -> Value {
+    let mut normalized = Vec::with_capacity(arguments.len());
+    let mut redact_next = false;
+    for argument in arguments {
+        if redact_next {
+            normalized.push(json!("<redacted-path>"));
+            redact_next = false;
+            continue;
+        }
+        normalized.push(json!(argument));
+        redact_next = matches!(argument.as_str(), "--output-dir" | "--data");
+    }
+    Value::Array(normalized)
+}
+
+fn current_unix_ns() -> Result<u64, String> {
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| format!("system clock is before Unix epoch: {error}"))?
+            .as_nanos(),
+    )
+    .map_err(|_| "current Unix time does not fit u64 nanoseconds".to_owned())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4202,6 +4345,131 @@ mod tests {
         assert_eq!(document["execution_status"], "completed");
         assert_eq!(document["qualification_status"], "not_run");
         assert_eq!(document_exit_code(&document), 2);
+    }
+
+    #[test]
+    fn admitted_identity_is_durable_before_the_runner_is_called() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let trace = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let recorder_trace = Arc::clone(&trace);
+        let runner_trace = Arc::clone(&trace);
+        let arguments = vec![
+            "handshake".to_owned(),
+            "--port".to_owned(),
+            "COM8".to_owned(),
+            "--expected-identity".to_owned(),
+            "DEVICE\\EXPECTED".to_owned(),
+        ];
+
+        let result = run_with_device_admission_core(
+            "handshake",
+            &arguments,
+            Arc::new(ScriptedDeviceDiscovery {
+                result: Ok(vec![
+                    SerialPortDescriptor::new("DEVICE\\EXPECTED", "COM8").expect("descriptor"),
+                ]),
+                calls,
+            }),
+            move |payload| {
+                recorder_trace.lock().expect("trace").push(payload);
+                Ok(())
+            },
+            move |_, _| {
+                assert_eq!(runner_trace.lock().expect("trace").len(), 1);
+                Ok(json!({"runner": "called"}))
+            },
+        )
+        .expect("journaled admission");
+
+        assert_eq!(result["runner"], "called");
+        let trace = trace.lock().expect("trace");
+        assert_eq!(trace[0]["identity_admission"]["status"], "admitted");
+        assert_eq!(
+            trace[0]["device_target"]["expected_stable_id"],
+            "DEVICE\\EXPECTED"
+        );
+    }
+
+    #[test]
+    fn normalized_journal_arguments_do_not_retain_machine_paths() {
+        let arguments = vec![
+            "amiibo".to_owned(),
+            "--data".to_owned(),
+            r"C:\private\payload.bin".to_owned(),
+            "--output-dir".to_owned(),
+            r"D:\private\run".to_owned(),
+            "--slot".to_owned(),
+            "1".to_owned(),
+        ];
+
+        let normalized = normalized_arguments(&arguments);
+
+        assert_eq!(normalized[2], "<redacted-path>");
+        assert_eq!(normalized[4], "<redacted-path>");
+        assert_eq!(normalized[6], "1");
+        let text = serde_json::to_string(&normalized).expect("normalized arguments");
+        assert!(!text.contains("private"));
+    }
+
+    #[test]
+    fn durable_terminal_events_preserve_failure_cancellation_and_cleanup() {
+        let directory = TestDirectory::new("durable-terminal-events");
+        let mut cleanup = successful_cleanup();
+        cleanup["succeeded"] = json!(false);
+        cleanup["runtime"]["succeeded"] = json!(false);
+        cleanup["runtime"]["outcome"] = json!("Failed");
+        let execution = Ok(json!({
+            "command": "handshake",
+            "execution_error": {
+                "stage": "action_terminal",
+                "message": "injected action failure",
+            },
+            "cancelled_operation": {
+                "state": "Cancelled",
+                "cancellation_reason": "Requested",
+            },
+            "resources": {"primary": {"created": true}},
+            "cleanup": cleanup,
+        }));
+        let mut reservation = ArtifactReservation::begin_journaled(
+            "handshake",
+            &directory.0,
+            RunStartMetadata {
+                normalized_arguments: json!(["handshake"]),
+                provenance: json!({"trusted": true}),
+            },
+        )
+        .expect("journaled reservation");
+        reservation
+            .record_event(
+                JournalEventKind::OperationTerminal,
+                execution_journal_payload("handshake", &execution),
+            )
+            .expect("operation terminal");
+        reservation
+            .record_event(
+                JournalEventKind::CleanupTerminal,
+                cleanup_journal_payload("handshake", &execution),
+            )
+            .expect("cleanup terminal");
+
+        let bytes = fs::read(directory.0.join(journal::JOURNAL_FILE_NAME)).expect("journal");
+        let events = journal::parse_journal(&bytes).expect("events");
+        assert_eq!(events[1]["event"], "operation_terminal");
+        assert_eq!(
+            events[1]["payload"]["result"]["execution_error"]["stage"],
+            "action_terminal"
+        );
+        assert_eq!(
+            events[1]["payload"]["result"]["cancelled_operation"]["cancellation_reason"],
+            "Requested"
+        );
+        assert_eq!(events[2]["event"], "cleanup_terminal");
+        assert_eq!(events[2]["payload"]["cleanup_contract_succeeded"], false);
+        assert_eq!(
+            events[2]["payload"]["result"]["cleanup"]["runtime"]["outcome"],
+            "Failed"
+        );
     }
 
     #[test]

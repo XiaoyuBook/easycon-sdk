@@ -15,8 +15,15 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
 };
 
+use crate::journal::{EvidenceJournal, JOURNAL_FILE_NAME, JournalEventKind, JournalStart};
+
 pub(crate) const RESERVATION_FILE_NAME: &str = ".easycon-hardware-run.reservation.json";
 pub(crate) const SEQUENCE_TIMINGS_FILE_NAME: &str = "sequence-timings.csv";
+
+pub(crate) struct RunStartMetadata {
+    pub(crate) normalized_arguments: Value,
+    pub(crate) provenance: Value,
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum AuxiliaryKind {
@@ -210,7 +217,10 @@ struct OwnedAuxiliary {
 pub(crate) struct ArtifactReservation {
     directory: PathBuf,
     command: String,
+    lease_id: String,
+    created_unix_ns: u64,
     tombstone: OwnedFile,
+    journal: Option<EvidenceJournal>,
     primary: ArtifactPlan,
     planned_auxiliaries: Vec<AuxiliaryPlan>,
     owned_auxiliaries: Vec<OwnedAuxiliary>,
@@ -305,11 +315,76 @@ impl ArtifactReservation {
         Ok(Self {
             directory: directory.to_path_buf(),
             command: command.to_owned(),
+            lease_id,
+            created_unix_ns,
             tombstone,
+            journal: None,
             primary,
             planned_auxiliaries,
             owned_auxiliaries: Vec::new(),
             poisoned: None,
+        })
+    }
+
+    pub(crate) fn begin_journaled(
+        command: &str,
+        directory: &Path,
+        metadata: RunStartMetadata,
+    ) -> Result<Self, String> {
+        let mut reservation = Self::begin(command, directory)?;
+        let journal = EvidenceJournal::create(
+            directory.join(JOURNAL_FILE_NAME),
+            JournalStart {
+                lease_id: reservation.lease_id.clone(),
+                command: reservation.command.clone(),
+                process_id: std::process::id(),
+                started_unix_ns: reservation.created_unix_ns,
+                normalized_arguments: metadata.normalized_arguments,
+                provenance: metadata.provenance,
+            },
+        )?;
+        reservation.journal = Some(journal);
+        validate_directory_entries(directory, &reservation.pre_primary_entries())?;
+        reservation.tombstone.verify()?;
+        reservation
+            .journal
+            .as_mut()
+            .expect("journal was installed")
+            .verify()?;
+        Ok(reservation)
+    }
+
+    pub(crate) fn record_event(
+        &mut self,
+        kind: JournalEventKind,
+        payload: Value,
+    ) -> Result<(), String> {
+        self.journal
+            .as_mut()
+            .ok_or_else(|| "artifact reservation has no evidence journal".to_owned())?
+            .append(kind, payload)
+    }
+
+    pub(crate) fn seal_journal(&mut self, payload: Value) -> Result<(), String> {
+        self.journal
+            .as_mut()
+            .ok_or_else(|| "artifact reservation has no evidence journal".to_owned())?
+            .seal(payload)
+    }
+
+    pub(crate) fn journal_projection(&self) -> Result<Value, String> {
+        self.journal
+            .as_ref()
+            .map(EvidenceJournal::projection_json)
+            .ok_or_else(|| "artifact reservation has no evidence journal".to_owned())
+    }
+
+    pub(crate) fn run_identity_json(&self, ended_unix_ns: u64) -> Value {
+        json!({
+            "lease_id": self.lease_id,
+            "started_unix_ns": self.created_unix_ns,
+            "ended_unix_ns": ended_unix_ns,
+            "journal": JOURNAL_FILE_NAME,
         })
     }
 
@@ -402,6 +477,12 @@ impl ArtifactReservation {
         if let Some(error) = &self.poisoned {
             return Err(format!("artifact reservation is poisoned: {error}"));
         }
+        if let Some(journal) = &mut self.journal {
+            if !journal.is_sealed() {
+                return Err("evidence journal must be sealed before artifact commit".to_owned());
+            }
+            journal.verify()?;
+        }
         self.tombstone.verify()?;
         validate_directory_entries(&self.directory, &self.pre_primary_entries())?;
 
@@ -415,6 +496,9 @@ impl ArtifactReservation {
         )?;
 
         self.tombstone.verify()?;
+        if let Some(journal) = &mut self.journal {
+            journal.verify()?;
+        }
         for auxiliary in &mut self.owned_auxiliaries {
             auxiliary.staging.verify()?;
         }
@@ -451,6 +535,9 @@ impl ArtifactReservation {
 
         validate_directory_entries(&self.directory, &self.published_entries())?;
         self.tombstone.verify()?;
+        if let Some(journal) = &mut self.journal {
+            journal.verify()?;
+        }
         for (auxiliary, published) in self
             .owned_auxiliaries
             .iter_mut()
@@ -467,6 +554,9 @@ impl ArtifactReservation {
     fn pre_primary_entries(&self) -> BTreeSet<OsString> {
         let mut entries = BTreeSet::new();
         entries.insert(OsString::from(RESERVATION_FILE_NAME));
+        if self.journal.is_some() {
+            entries.insert(OsString::from(JOURNAL_FILE_NAME));
+        }
         for auxiliary in &self.owned_auxiliaries {
             entries.insert(OsString::from(&auxiliary.plan.artifact.staging_name));
         }
@@ -722,6 +812,58 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn journal_metadata() -> RunStartMetadata {
+        RunStartMetadata {
+            normalized_arguments: json!(["handshake", "--port", "COM8"]),
+            provenance: json!({"trusted": true}),
+        }
+    }
+
+    #[test]
+    fn journaled_reservation_requires_a_sealed_durable_prefix() {
+        let incomplete_directory = TestDirectory::new("journal-unsealed");
+        let reservation = ArtifactReservation::begin_journaled(
+            "handshake",
+            &incomplete_directory.0,
+            journal_metadata(),
+        )
+        .expect("journaled reservation");
+        assert!(reservation.commit(&json!({"status": "failed"})).is_err());
+        assert!(incomplete_directory.0.join(JOURNAL_FILE_NAME).is_file());
+        assert!(!incomplete_directory.0.join("handshake.json").exists());
+
+        let directory = TestDirectory::new("journal-sealed");
+        let mut reservation =
+            ArtifactReservation::begin_journaled("handshake", &directory.0, journal_metadata())
+                .expect("journaled reservation");
+        reservation
+            .record_event(
+                JournalEventKind::CommandDispatchStarted,
+                json!({"command": "handshake"}),
+            )
+            .expect("dispatch event");
+        reservation
+            .record_event(
+                JournalEventKind::RunProjectionFinalized,
+                json!({"status": "failed"}),
+            )
+            .expect("projection event");
+        reservation
+            .seal_journal(json!({"primary_artifact": "handshake.json"}))
+            .expect("seal journal");
+        let projection = reservation.journal_projection().expect("projection");
+
+        reservation
+            .commit(&json!({"status": "failed", "journal_projection": projection}))
+            .expect("publish journaled result");
+
+        let journal = fs::read(directory.0.join(JOURNAL_FILE_NAME)).expect("journal bytes");
+        let events = crate::journal::parse_journal(&journal).expect("durable journal");
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0]["event"], "run_started");
+        assert_eq!(events[3]["event"], "artifact_finalization_started");
     }
 
     #[derive(Default)]
