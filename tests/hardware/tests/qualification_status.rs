@@ -46,6 +46,8 @@ fn unauthorized_amiibo_is_not_run_and_exits_two() {
     .expect("parse Amiibo result artifact");
     assert_eq!(document["execution_status"], "completed");
     assert_eq!(document["qualification_status"], "not_run");
+    assert_eq!(document["exit_code"], 2);
+    assert!(document.get("status").is_none());
     assert_eq!(document["result"]["write_performed"], false);
     assert_eq!(document["run"]["journal"], "evidence.journal.jsonl");
     let started = document["run"]["started_unix_ns"]

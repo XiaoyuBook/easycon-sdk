@@ -1,0 +1,92 @@
+{
+  "schema_version": 1,
+  "classification": "Phase 2B Qualification Software Candidate; Hardware Unverified",
+  "outcomes": [
+    { "name": "Passed", "execution_status": "completed", "qualification_status": "passed", "exit_code": 0 },
+    { "name": "QualificationFailed", "execution_status": "completed", "qualification_status": "failed", "exit_code": 1 },
+    { "name": "ExecutionFailed", "execution_status": "failed", "qualification_status": "failed", "exit_code": 1 },
+    { "name": "NotRun", "execution_status": "completed", "qualification_status": "not_run", "exit_code": 2 },
+    { "name": "Unverified", "execution_status": "completed", "qualification_status": "unverified", "exit_code": 2 },
+    { "name": "Cancelled", "execution_status": "cancelled", "qualification_status": "unverified", "exit_code": 130 }
+  ],
+  "invalid_status_pairs": [
+    { "execution_status": "cancelled", "qualification_status": "failed", "exit_code": 130 },
+    { "execution_status": "failed", "qualification_status": "unverified", "exit_code": 2 },
+    { "execution_status": "completed", "qualification_status": "passed", "exit_code": 2 },
+    { "execution_status": "completed", "qualification_status": "unknown", "exit_code": 0 },
+    { "execution_status": "unknown", "qualification_status": "failed", "exit_code": 1 }
+  ],
+  "csv_header": [
+    "write_sequence",
+    "operation_id",
+    "resource_id",
+    "command_admitted_ns",
+    "lane_wake_ns",
+    "dispatch_ns",
+    "first_write_entered_ns",
+    "transport_accepted_ns",
+    "last_returned_ns",
+    "partial_count",
+    "total_bytes",
+    "accepted_bytes",
+    "outcome",
+    "transport_error_kind",
+    "transport_error_message",
+    "native_error_kind",
+    "native_os_code",
+    "native_error_message",
+    "contradiction_code",
+    "contradiction_message"
+  ],
+  "logical_report_cases": [
+    {
+      "name": "single_8",
+      "first_write_entered_ns": 100,
+      "transport_accepted_ns": 110,
+      "partial_count": 1,
+      "accepted_bytes": 8,
+      "outcome": "accepted"
+    },
+    {
+      "name": "partial_3_5",
+      "first_write_entered_ns": 100,
+      "transport_accepted_ns": 130,
+      "partial_count": 2,
+      "accepted_bytes": 8,
+      "outcome": "accepted"
+    },
+    {
+      "name": "partial_3_native_failure",
+      "first_write_entered_ns": 100,
+      "transport_accepted_ns": null,
+      "partial_count": 1,
+      "accepted_bytes": 3,
+      "outcome": "failed",
+      "transport_error_kind": "Disconnected",
+      "native_error_kind": "Io",
+      "native_os_code": 995
+    },
+    {
+      "name": "time_reversal",
+      "first_write_entered_ns": 89,
+      "transport_accepted_ns": null,
+      "partial_count": 0,
+      "accepted_bytes": 0,
+      "outcome": "contradiction",
+      "contradiction_code": "dispatch_after_write_entry"
+    }
+  ],
+  "physical_boundaries": {
+    "uart_complete_frame": { "classification": "theoretical", "measured": false },
+    "usb_hid": {
+      "qualification_status": "unverified",
+      "measured": false,
+      "reason": "USB analyzer or auditable firmware trace unavailable"
+    },
+    "switch_physical_order": {
+      "qualification_status": "unverified",
+      "measured": false,
+      "reason": "analyzer or firmware trace correlated with physical observation unavailable"
+    }
+  }
+}

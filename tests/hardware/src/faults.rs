@@ -69,6 +69,15 @@ impl FaultRole {
         }
     }
 
+    const fn report_telemetry_field(self) -> &'static str {
+        match self {
+            Self::Occupier => "occupier_report_telemetry",
+            Self::OccupiedProbe => "occupied_probe_report_telemetry",
+            Self::Cancel => "cancel_report_telemetry",
+            Self::Deadline => "deadline_report_telemetry",
+        }
+    }
+
     const fn close_stage(self) -> &'static str {
         match self {
             Self::Occupier => "occupier_close",
@@ -139,6 +148,7 @@ struct FaultCloseEvidence {
     post_controller_snapshot: ControllerSnapshot,
     native_open_attempts: Value,
     identity_open_attempts: Value,
+    report_telemetry: Value,
 }
 
 trait FaultHarness: Sized {
@@ -352,11 +362,13 @@ impl FaultHarness for Harness {
         let cleanup = Harness::close(&self);
         let native_open_attempts = Harness::native_open_attempts(&self);
         let identity_open_attempts = Harness::identity_open_attempts(&self);
+        let report_telemetry = Harness::logical_report_telemetry(&self);
         FaultCloseEvidence {
             cleanup,
             post_controller_snapshot: self.controller.snapshot(),
             native_open_attempts,
             identity_open_attempts,
+            report_telemetry,
         }
     }
 }
@@ -476,6 +488,7 @@ impl<H: FaultHarness> FaultRun<H> {
             self.result[field] = evidence.native_open_attempts;
         }
         self.result[role.identity_attempts_field()] = evidence.identity_open_attempts;
+        self.result[role.report_telemetry_field()] = evidence.report_telemetry;
         self.capture_active_after_close(role);
         if succeeded {
             Ok(())
@@ -1199,6 +1212,33 @@ mod tests {
                 },
                 native_open_attempts: self.native_open_attempts(),
                 identity_open_attempts: self.identity_open_attempts(),
+                report_telemetry: json!({
+                    "integrity": {"status": "passed", "errors": []},
+                    "logical_reports": {
+                        "attempt_count": 0,
+                        "accepted_count": 0,
+                        "failed_count": 0,
+                        "pending_count": 0,
+                        "contradiction_count": 0,
+                        "detail": {"kind": "inline", "rows": []},
+                    },
+                    "sample_count": 0,
+                    "direct_sample_count": 0,
+                    "command_admitted_to_write_entered_ns": null,
+                    "dispatch_to_write_entered_ns": null,
+                    "write_entered_to_os_acceptance_ns": null,
+                    "uart_complete_frame": null,
+                    "usb_hid": {
+                        "qualification_status": "unverified",
+                        "measured": false,
+                        "reason": "synthetic fault harness has no USB analyzer",
+                    },
+                    "switch_physical_order": {
+                        "qualification_status": "unverified",
+                        "measured": false,
+                        "reason": "synthetic fault harness has no physical order evidence",
+                    },
+                }),
             }
         }
     }
@@ -1798,7 +1838,6 @@ mod tests {
             );
             let (document, failure) = finalize_result("faults", Ok(result));
             assert!(failure.is_some(), "{:?}", case.point);
-            assert_eq!(document["status"], "failed", "{:?}", case.point);
             assert_eq!(document["execution_status"], "failed", "{:?}", case.point);
             assert_eq!(
                 document["qualification_status"], "failed",
@@ -1865,7 +1904,6 @@ mod tests {
             failure.as_deref(),
             Some("cancel_terminal_wait: injected cancel_terminal_wait")
         );
-        assert_eq!(document["status"], "failed");
         assert_eq!(document["execution_status"], "failed");
         assert_eq!(document["qualification_status"], "failed");
         assert_eq!(document_exit_code(&document), 1);

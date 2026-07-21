@@ -305,6 +305,22 @@ cargo run --release -p easycon-test-support --bin controller_latency -- --sample
 环境、六段完整分位数、目标判断和 raw CSV 哈希见
 [Phase 2A latency fixture](../../spec/fixtures/controller/phase2a-latency-result-v1.json)。
 
+### Phase 2B qualification telemetry 软件证据
+
+Phase 2B 的不可发布 hardware CLI 按
+[telemetry 与资格投影设计](../development/phase2b-telemetry-qualification-projection.md) 聚合每个 logical report。
+`write_entered_ns` 固定为第一次 partial transport entry，`transport_accepted_ns` 只在最后一段完整接受后存在；
+failed row、partial count、operation/write sequence、mapped transport error 和 lossy mapping 前的 native serial
+kind/OS code 全部保留。任何 context、prefix 或时间逆序都成为显式 qualification failure，不能以饱和算术隐藏。
+
+sequence 的成功、失败、取消和 cleanup failure 都从同一内存 projection 生成 `sequence-timings.csv`。该 CSV 和
+最终 JSON 的字段、六种合法 execution/qualification/exit 三元组由
+`tests/hardware/fixtures/phase2b-qualification-projection-v1.json` 固定，并由独立 hardware workspace 的 synthetic
+conformance test 读取。fixture 不改变 Phase 2A memory-transport measurement，也不包含物理硬件结论。
+
+OS write acceptance 不是 UART complete frame。UART 值始终标记为 theoretical 且 `measured = false`；没有 analyzer
+或可审计 firmware trace 时，USB HID 和 Switch physical order 明确为 `unverified`。这些软件证据不能关闭 O-04。
+
 ### 矩阵登记
 
 O-01 关闭时建立 `hardware/matrix.yaml`（只记录 SDK 自有测试配置，不记录 EasyCon 源码锁）：

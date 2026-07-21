@@ -7,6 +7,7 @@ mod faults;
 mod journal;
 mod operator;
 mod provenance;
+mod telemetry;
 
 use std::env;
 use std::fs;
@@ -34,14 +35,14 @@ use easycon_controller::{
     ControllerSnapshot, ControllerState, ControllerTransport, HandshakeRequest, PreciseSequence,
     SequenceStep, TransportError, WriteContext, WriteKind, WriteRequest,
 };
-use easycon_hardware_qualification::{distribution, option_value, required_value, value_or};
+use easycon_hardware_qualification::{option_value, required_value, value_or};
 use easycon_model::{Button, Hat, ResourceId, StickPosition};
 use easycon_runtime::{
     Clock, CloseOutcome, CloseRejection, Operation, OperationState, Runtime, RuntimeCounts,
     SystemClock, TransitionOutcome, WaitResult, WaitTimeout,
 };
 use easycon_serial::{
-    ByteIo, ByteIoFactory, ByteIoRequest, SerialControllerTransport, SerialError,
+    ByteIo, ByteIoFactory, ByteIoOperation, ByteIoRequest, SerialControllerTransport, SerialError,
     SerialPortDescriptor, WindowsByteIoFactory, discover_system_ports,
 };
 use serde_json::{Value, json};
@@ -52,6 +53,7 @@ use operator::{
     OperatorPort, install_console_interrupt_handler,
 };
 use provenance::{RuntimeProvenance, sha256_bytes};
+use telemetry::LogicalReportTelemetry;
 
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
 const MINIMUM_REPORT_INTERVAL_NS: u64 = 30_000_000;
@@ -357,16 +359,6 @@ struct HandshakeAttempt {
     error: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct TimingSample {
-    sequence: u64,
-    command_admitted_ns: Option<u64>,
-    lane_wake_ns: Option<u64>,
-    dispatch_ns: u64,
-    write_entered_ns: u64,
-    transport_accepted_ns: u64,
-}
-
 #[derive(Clone, Debug)]
 struct NativeOpenAttempt {
     baud: u32,
@@ -394,7 +386,7 @@ struct Telemetry {
     actual_baud: Option<u32>,
     handshake_attempts: Vec<HandshakeAttempt>,
     native_open_attempts: Vec<NativeOpenAttempt>,
-    timings: Vec<TimingSample>,
+    logical_reports: LogicalReportTelemetry,
     neutralization_attempts: Vec<NeutralizationAttempt>,
 }
 
@@ -502,6 +494,38 @@ struct ObservedByteIoFactory {
     telemetry: Arc<Mutex<Telemetry>>,
 }
 
+struct ObservedByteIo {
+    inner: Box<dyn ByteIo>,
+    telemetry: Arc<Mutex<Telemetry>>,
+}
+
+impl ByteIo for ObservedByteIo {
+    fn read(&mut self, buffer: &mut [u8], request: ByteIoRequest) -> Result<usize, SerialError> {
+        self.inner.read(buffer, request)
+    }
+
+    fn write(&mut self, buffer: &[u8], request: ByteIoRequest) -> Result<usize, SerialError> {
+        let operation = request.operation;
+        let result = self.inner.write(buffer, request);
+        if let (ByteIoOperation::ControllerWrite(context), Err(error)) = (operation, &result) {
+            self.telemetry
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .logical_reports
+                .record_native_error(context, error);
+        }
+        result
+    }
+
+    fn discard_input(&mut self, request: ByteIoRequest) -> Result<(), SerialError> {
+        self.inner.discard_input(request)
+    }
+
+    fn close(&mut self) {
+        self.inner.close();
+    }
+}
+
 impl ByteIoFactory for ObservedByteIoFactory {
     fn open(
         &mut self,
@@ -518,7 +542,12 @@ impl ByteIoFactory for ObservedByteIoFactory {
                 baud: baud_rate,
                 error: result.as_ref().err().cloned(),
             });
-        result
+        result.map(|inner| {
+            Box::new(ObservedByteIo {
+                inner,
+                telemetry: self.telemetry.clone(),
+            }) as Box<dyn ByteIo>
+        })
     }
 }
 
@@ -551,6 +580,13 @@ impl ControllerTransport for ObservedTransport {
         let context = request.context;
         let remaining = request.bytes.len();
         let entered = self.clock.now_ns();
+        if context.kind == WriteKind::Report {
+            self.telemetry
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .logical_reports
+                .begin(context, remaining, entered);
+        }
         if context.kind == WriteKind::Neutralize {
             self.telemetry
                 .lock()
@@ -559,36 +595,18 @@ impl ControllerTransport for ObservedTransport {
         }
         let result = self.inner.write(request);
         let accepted_at = self.clock.now_ns();
+        if context.kind == WriteKind::Report {
+            self.telemetry
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .logical_reports
+                .finish(context, remaining, accepted_at, &result);
+        }
         if context.kind == WriteKind::Neutralize {
             self.telemetry
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .finish_neutralization(context, remaining, &result);
-        }
-        if let Ok(written) = result
-            && context.kind == WriteKind::Report
-            && context
-                .total_len
-                .saturating_sub(remaining)
-                .saturating_add(written)
-                == context.total_len
-        {
-            let (command_admitted_ns, lane_wake_ns) =
-                context.direct_timing.map_or((None, None), |timing| {
-                    (Some(timing.command_admitted_ns), Some(timing.lane_wake_ns))
-                });
-            self.telemetry
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .timings
-                .push(TimingSample {
-                    sequence: context.sequence,
-                    command_admitted_ns,
-                    lane_wake_ns,
-                    dispatch_ns: context.timestamp_ns,
-                    write_entered_ns: entered,
-                    transport_accepted_ns: accepted_at,
-                });
         }
         result
     }
@@ -725,6 +743,17 @@ impl Harness {
 
     fn identity_open_attempts(&self) -> Value {
         identity_open_attempts_json(&self.identity_open_recorder)
+    }
+
+    fn logical_report_telemetry(&self) -> Value {
+        let csv_path = {
+            let telemetry = self
+                .telemetry
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            (telemetry.logical_reports.attempt_count() > 512).then_some(SEQUENCE_TIMINGS_FILE_NAME)
+        };
+        latency_json(&self.telemetry, self.actual_baud(), csv_path)
     }
 }
 
@@ -897,6 +926,7 @@ fn harness_evidence_json(harness: &Harness) -> Value {
         "handshake_attempts": handshake_json(&harness.telemetry),
         "native_open_attempts": harness.native_open_attempts(),
         "identity_open_attempts": harness.identity_open_attempts(),
+        "logical_report_telemetry": harness.logical_report_telemetry(),
         "pre_cleanup_snapshot": snapshot_json(&harness.controller),
     })
 }
@@ -1372,7 +1402,11 @@ fn real_main() -> Result<i32, String> {
         JournalEventKind::CommandDispatchStarted,
         json!({"command": command}),
     )?;
-    let mut sequence_timings = None;
+    let mut sequence_timings = if command == "sequence" {
+        Some(LogicalReportTelemetry::default().csv_bytes()?)
+    } else {
+        None
+    };
     let mut operator = ConsoleOperatorPort::new();
     let interrupt = InterruptToken::default();
     let handler_install = install_console_interrupt_handler(&interrupt);
@@ -1573,21 +1607,108 @@ enum QualificationStatus {
     NotRun,
 }
 
-impl QualificationStatus {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Passed => "passed",
-            Self::Failed => "failed",
-            Self::Unverified => "unverified",
-            Self::NotRun => "not_run",
-        }
-    }
-}
-
 struct QualificationDecision {
     status: QualificationStatus,
     checks: Vec<Value>,
     failure: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RunOutcome {
+    Passed,
+    QualificationFailed,
+    ExecutionFailed,
+    NotRun,
+    Unverified,
+    Cancelled,
+}
+
+impl RunOutcome {
+    const fn execution_status(self) -> &'static str {
+        match self {
+            Self::Passed | Self::QualificationFailed | Self::NotRun | Self::Unverified => {
+                "completed"
+            }
+            Self::ExecutionFailed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    const fn qualification_status(self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::QualificationFailed | Self::ExecutionFailed => "failed",
+            Self::NotRun => "not_run",
+            Self::Unverified | Self::Cancelled => "unverified",
+        }
+    }
+
+    const fn exit_code(self) -> i32 {
+        match self {
+            Self::Passed => 0,
+            Self::QualificationFailed | Self::ExecutionFailed => 1,
+            Self::NotRun | Self::Unverified => 2,
+            Self::Cancelled => 130,
+        }
+    }
+
+    fn from_document(document: &Value) -> Option<Self> {
+        let outcome = match (
+            document["execution_status"].as_str(),
+            document["qualification_status"].as_str(),
+        ) {
+            (Some("completed"), Some("passed")) => Self::Passed,
+            (Some("completed"), Some("failed")) => Self::QualificationFailed,
+            (Some("failed"), Some("failed")) => Self::ExecutionFailed,
+            (Some("completed"), Some("not_run")) => Self::NotRun,
+            (Some("completed"), Some("unverified")) => Self::Unverified,
+            (Some("cancelled"), Some("unverified")) => Self::Cancelled,
+            _ => return None,
+        };
+        (document["exit_code"].as_i64() == Some(i64::from(outcome.exit_code()))).then_some(outcome)
+    }
+}
+
+impl From<QualificationStatus> for RunOutcome {
+    fn from(status: QualificationStatus) -> Self {
+        match status {
+            QualificationStatus::Passed => Self::Passed,
+            QualificationStatus::Failed => Self::QualificationFailed,
+            QualificationStatus::Unverified => Self::Unverified,
+            QualificationStatus::NotRun => Self::NotRun,
+        }
+    }
+}
+
+fn apply_run_outcome(document: &mut Value, outcome: RunOutcome) {
+    document["execution_status"] = json!(outcome.execution_status());
+    document["qualification_status"] = json!(outcome.qualification_status());
+    document["exit_code"] = json!(outcome.exit_code());
+}
+
+fn final_document(
+    command: &str,
+    outcome: RunOutcome,
+    checks: Vec<Value>,
+    error: Option<&str>,
+    result: Option<Value>,
+) -> Value {
+    let mut document = json!({
+        "schema_version": 2,
+        "command": command,
+        "execution_status": null,
+        "qualification_status": null,
+        "exit_code": null,
+        "checks": checks,
+    });
+    apply_run_outcome(&mut document, outcome);
+    if let Some(error) = error {
+        document["error"] = json!(error);
+    }
+    if let Some(result) = result {
+        document["result"] = result;
+    }
+    document
 }
 
 fn finalize_result(command: &str, execution: Result<Value, String>) -> (Value, Option<String>) {
@@ -1599,82 +1720,64 @@ fn finalize_result(command: &str, execution: Result<Value, String>) -> (Value, O
             } else {
                 "incomplete_or_failed"
             };
-            (
-                json!({
-                    "schema_version": 1,
-                    "command": command,
-                    "status": "failed",
-                    "execution_status": "failed",
-                    "qualification_status": "failed",
-                    "checks": [
-                        qualification_check("execution", "failed"),
-                        qualification_check("cleanup_evidence", cleanup_status),
-                    ],
-                    "error": error.clone(),
-                    "result": result,
-                }),
-                Some(error),
-            )
+            let checks = vec![
+                qualification_check("execution", "failed"),
+                qualification_check("cleanup_evidence", cleanup_status),
+            ];
+            let document = final_document(
+                command,
+                RunOutcome::ExecutionFailed,
+                checks,
+                Some(&error),
+                Some(result),
+            );
+            (document, Some(error))
         }
         Ok(result) if !cleanup_contract_succeeded(command, &result) => {
             let error = "deterministic cleanup did not complete".to_owned();
-            (
-                json!({
-                    "schema_version": 1,
-                    "command": command,
-                    "status": "failed",
-                    "execution_status": "failed",
-                    "qualification_status": "failed",
-                    "checks": [qualification_check("cleanup", "failed")],
-                    "error": error,
-                    "result": result,
-                }),
-                Some(error),
-            )
+            let document = final_document(
+                command,
+                RunOutcome::ExecutionFailed,
+                vec![qualification_check("cleanup", "failed")],
+                Some(&error),
+                Some(result),
+            );
+            (document, Some(error))
         }
-        Ok(result) if result["operator_terminal_outcome"] == "interrupted" => (
-            json!({
-                "schema_version": 1,
-                "command": command,
-                "status": "unverified",
-                "execution_status": "cancelled",
-                "qualification_status": "unverified",
-                "checks": [
+        Ok(result) if result["operator_terminal_outcome"] == "interrupted" => {
+            let document = final_document(
+                command,
+                RunOutcome::Cancelled,
+                vec![
                     qualification_check("operator_interrupt", "cancelled"),
                     qualification_check("cleanup", "passed"),
                 ],
-                "result": result,
-            }),
-            None,
-        ),
+                None,
+                Some(result),
+            );
+            (document, None)
+        }
         Ok(result) => {
             let decision = qualification_decision(command, &result);
-            let status = decision.status.as_str();
-            (
-                json!({
-                    "schema_version": 1,
-                    "command": command,
-                    "status": status,
-                    "execution_status": "completed",
-                    "qualification_status": status,
-                    "checks": decision.checks,
-                    "result": result,
-                }),
-                decision.failure,
-            )
+            let document = final_document(
+                command,
+                decision.status.into(),
+                decision.checks,
+                decision.failure.as_deref(),
+                Some(result),
+            );
+            (document, decision.failure)
         }
-        Err(error) => (
-            json!({
-                "schema_version": 1,
-                "command": command,
-                "status": "failed",
-                "execution_status": "failed",
-                "qualification_status": "failed",
-                "checks": [],
-                "error": error,
-            }),
-            Some(error),
-        ),
+        Err(error) => {
+            let document = final_document(
+                command,
+                RunOutcome::ExecutionFailed,
+                Vec::new(),
+                Some(&error),
+                None,
+            );
+            (document, Some(error))
+        }
     }
 }
 
@@ -1730,6 +1833,10 @@ fn qualification_decision(command: &str, result: &Value) -> QualificationDecisio
                 result["operation"]["state"] == "Succeeded",
             ),
             ("actual_baud_recorded", result["actual_baud"].is_u64()),
+            (
+                "logical_report_telemetry",
+                harness_report_telemetry_succeeded(&result["harness_evidence"]),
+            ),
         ]),
         "smoke" | "home-wake" => operator_observation_qualification(command, result),
         "faults" => required_checks(&[
@@ -1772,6 +1879,17 @@ fn qualification_decision(command: &str, result: &Value) -> QualificationDecisio
                     .and_then(Value::as_array)
                     .is_some_and(Vec::is_empty),
             ),
+            (
+                "fault_logical_report_telemetry",
+                [
+                    "occupier_report_telemetry",
+                    "occupied_probe_report_telemetry",
+                    "cancel_report_telemetry",
+                    "deadline_report_telemetry",
+                ]
+                .into_iter()
+                .all(|field| telemetry_projection_succeeded(&result[field])),
+            ),
         ]),
         "hotplug" => required_checks(&[
             (
@@ -1798,6 +1916,14 @@ fn qualification_decision(command: &str, result: &Value) -> QualificationDecisio
                 "hotplug_state_machine_closed",
                 hotplug_success_transitions_are_exact(result),
             ),
+            (
+                "initial_logical_report_telemetry",
+                harness_report_telemetry_succeeded(&result["initial_harness_evidence"]),
+            ),
+            (
+                "reconnected_logical_report_telemetry",
+                harness_report_telemetry_succeeded(&result["reconnected_harness_evidence"]),
+            ),
         ]),
         "lifecycle" => {
             let cycles = result["cycles"].as_u64().unwrap_or_default();
@@ -1818,6 +1944,14 @@ fn qualification_decision(command: &str, result: &Value) -> QualificationDecisio
                         records.iter().all(|record| record["port_present"] == true)
                     }),
                 ),
+                (
+                    "logical_report_telemetry",
+                    records.is_some_and(|records| {
+                        records.iter().all(|record| {
+                            harness_report_telemetry_succeeded(&record["harness_evidence"])
+                        })
+                    }),
+                ),
             ])
         }
         "sequence" => {
@@ -1836,6 +1970,7 @@ fn qualification_decision(command: &str, result: &Value) -> QualificationDecisio
                     "complete_write_count_includes_final_reset",
                     result["recorded_complete_writes"].as_u64() == steps.checked_add(1),
                 ),
+                ("telemetry_integrity", telemetry_integrity_succeeded(result)),
             ]);
             if decision.status == QualificationStatus::Passed {
                 decision.status = QualificationStatus::Unverified;
@@ -1923,6 +2058,10 @@ fn amiibo_qualification(result: &Value) -> QualificationDecision {
         ("payload_hash_and_length", hash_valid),
         ("save_select_operations", operation_evidence_valid),
         ("chunk_and_cleanup_journal", protocol_evidence_valid),
+        (
+            "logical_report_telemetry",
+            harness_report_telemetry_succeeded(&result["harness_evidence"]),
+        ),
         ("o_02_remains_open", boundary_valid),
     ];
     if checks.iter().any(|(_, passed)| !passed) {
@@ -2229,6 +2368,13 @@ fn discovery_qualification(result: &Value) -> QualificationDecision {
 }
 
 fn operator_observation_qualification(command: &str, result: &Value) -> QualificationDecision {
+    if !telemetry_integrity_succeeded(result) {
+        return QualificationDecision {
+            status: QualificationStatus::Failed,
+            checks: vec![qualification_check("telemetry_integrity", "failed")],
+            failure: Some("logical report telemetry is incomplete or contradictory".to_owned()),
+        };
+    }
     if result["final_snapshot"]["desired_report_neutral"].as_bool() != Some(true) {
         return required_checks(&[("final_report_neutral", false)]);
     }
@@ -2332,6 +2478,93 @@ fn operator_observation_qualification(command: &str, result: &Value) -> Qualific
         };
     }
     failed_operator_observation_decision("operator observation terminal is inconsistent")
+}
+
+fn telemetry_integrity_succeeded(result: &Value) -> bool {
+    telemetry_projection_succeeded(&result["latency"])
+}
+
+fn harness_report_telemetry_succeeded(evidence: &Value) -> bool {
+    telemetry_projection_succeeded(&evidence["logical_report_telemetry"])
+}
+
+fn telemetry_projection_succeeded(projection: &Value) -> bool {
+    let Some(object) = projection.as_object() else {
+        return false;
+    };
+    for field in [
+        "integrity",
+        "logical_reports",
+        "sample_count",
+        "direct_sample_count",
+        "command_admitted_to_write_entered_ns",
+        "dispatch_to_write_entered_ns",
+        "write_entered_to_os_acceptance_ns",
+        "uart_complete_frame",
+        "usb_hid",
+        "switch_physical_order",
+    ] {
+        if !object.contains_key(field) {
+            return false;
+        }
+    }
+    if projection["integrity"]["status"] != "passed"
+        || projection["integrity"]["errors"]
+            .as_array()
+            .is_none_or(|errors| !errors.is_empty())
+    {
+        return false;
+    }
+    let reports = &projection["logical_reports"];
+    let Some(attempt_count) = reports["attempt_count"].as_u64() else {
+        return false;
+    };
+    let Some(accepted_count) = reports["accepted_count"].as_u64() else {
+        return false;
+    };
+    let Some(failed_count) = reports["failed_count"].as_u64() else {
+        return false;
+    };
+    let Some(pending_count) = reports["pending_count"].as_u64() else {
+        return false;
+    };
+    let Some(contradiction_count) = reports["contradiction_count"].as_u64() else {
+        return false;
+    };
+    if pending_count != 0
+        || contradiction_count != 0
+        || accepted_count
+            .checked_add(failed_count)
+            .and_then(|count| count.checked_add(pending_count))
+            .and_then(|count| count.checked_add(contradiction_count))
+            != Some(attempt_count)
+        || projection["sample_count"].as_u64() != Some(accepted_count)
+        || projection["direct_sample_count"]
+            .as_u64()
+            .is_none_or(|count| count > accepted_count)
+    {
+        return false;
+    }
+    let detail_valid = match reports["detail"]["kind"].as_str() {
+        Some("inline") => {
+            reports["detail"]["rows"]
+                .as_array()
+                .and_then(|rows| u64::try_from(rows.len()).ok())
+                == Some(attempt_count)
+        }
+        Some("csv") => reports["detail"]["relative_path"] == SEQUENCE_TIMINGS_FILE_NAME,
+        Some(_) | None => false,
+    };
+    let uart_valid = projection["uart_complete_frame"].is_null()
+        || (projection["uart_complete_frame"]["classification"] == "theoretical"
+            && projection["uart_complete_frame"]["measured"] == false
+            && projection["uart_complete_frame"]["theoretical_ns"].is_u64());
+    detail_valid
+        && uart_valid
+        && projection["usb_hid"]["qualification_status"] == "unverified"
+        && projection["usb_hid"]["measured"] == false
+        && projection["switch_physical_order"]["qualification_status"] == "unverified"
+        && projection["switch_physical_order"]["measured"] == false
 }
 
 fn expected_operator_action_ids(command: &str, result: &Value) -> Option<Vec<String>> {
@@ -3186,14 +3419,7 @@ fn runtime_cleanup_count(value: &Value) -> usize {
 }
 
 fn document_exit_code(document: &Value) -> i32 {
-    if document["execution_status"] == "cancelled" {
-        return 130;
-    }
-    match document["qualification_status"].as_str() {
-        Some("passed") => 0,
-        Some("unverified" | "not_run") => 2,
-        Some("failed") | None | Some(_) => 1,
-    }
+    RunOutcome::from_document(document).map_or(1, RunOutcome::exit_code)
 }
 
 fn apply_provenance_policy(document: &mut Value, provenance: &RuntimeProvenance) {
@@ -3206,8 +3432,7 @@ fn apply_provenance_policy(document: &mut Value, provenance: &RuntimeProvenance)
         ));
     }
     if document["qualification_status"] == "passed" && !trusted {
-        document["status"] = json!("unverified");
-        document["qualification_status"] = json!("unverified");
+        apply_run_outcome(document, RunOutcome::Unverified);
     }
 }
 
@@ -3302,6 +3527,7 @@ fn run_smoke(
         .map(|spec| spec.action_id.clone())
         .collect::<Vec<_>>();
     let harness = Harness::new(&target, discovery, ControllerOptions::default())?;
+    let telemetry = harness.telemetry.clone();
     let result = json!({
         "command": "smoke",
         "stage": if full { "full" } else { "a_only" },
@@ -3319,7 +3545,7 @@ fn run_smoke(
         "actions": [],
         "resources": {"primary": {"created": true}},
     });
-    Ok(finish_harness_phase(
+    let mut result = finish_harness_phase(
         harness,
         result,
         "cleanup",
@@ -3377,10 +3603,11 @@ fn run_smoke(
             }
             result["actual_baud"] = json!(harness.actual_baud());
             result["final_snapshot"] = snapshot_json(&harness.controller);
-            result["latency"] = latency_json(&harness.telemetry, harness.actual_baud());
             Ok(())
         },
-    ))
+    );
+    result["latency"] = latency_json(&telemetry, telemetry_actual_baud(&telemetry), None);
+    Ok(result)
 }
 
 fn run_home_wake(
@@ -3399,6 +3626,7 @@ fn run_home_wake(
         .map(|attempt| format!("home-wake.attempt.{attempt}"))
         .collect::<Vec<_>>();
     let harness = Harness::new(&target, discovery, ControllerOptions::default())?;
+    let telemetry = harness.telemetry.clone();
     let result = json!({
         "command": "home-wake",
         "attempts": attempts,
@@ -3412,7 +3640,7 @@ fn run_home_wake(
         "operator_terminal_outcome": null,
         "resources": {"primary": {"created": true}},
     });
-    Ok(finish_harness_phase(
+    let mut result = finish_harness_phase(
         harness,
         result,
         "cleanup",
@@ -3491,10 +3719,11 @@ fn run_home_wake(
             }
             result["actual_baud"] = json!(harness.actual_baud());
             result["final_snapshot"] = snapshot_json(&harness.controller);
-            result["latency"] = latency_json(&harness.telemetry, harness.actual_baud());
             Ok(())
         },
-    ))
+    );
+    result["latency"] = latency_json(&telemetry, telemetry_actual_baud(&telemetry), None);
+    Ok(result)
 }
 
 fn run_faults(
@@ -4129,6 +4358,7 @@ fn run_sequence(
         return Err("--steps must be in 1..=10000".to_owned());
     }
     let harness = Harness::new(&target, discovery, ControllerOptions::default())?;
+    let telemetry = harness.telemetry.clone();
     let result = json!({
         "command": "sequence",
         "requested_steps": steps,
@@ -4199,29 +4429,48 @@ fn run_sequence(
                 "sequence_reset_wait",
                 "sequence_reset_terminal",
             )?;
-            timing_csv = Some(
-                timing_csv_bytes(&harness.telemetry)
-                    .map_err(|error| CommandFailure::new("sequence_timing_render", error))?,
-            );
             let timing_count = harness
                 .telemetry
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
-                .timings
-                .len();
+                .logical_reports
+                .accepted_count();
             result["accepted_report_count_before_final_reset"] = json!(
                 harness
                     .controller
                     .snapshot()
                     .accepted_report_count
-                    .saturating_sub(1)
+                    .checked_sub(1)
+                    .ok_or_else(|| CommandFailure::new(
+                        "sequence_report_count",
+                        "final reset was not reflected in the accepted report count",
+                    ))?
             );
             result["recorded_complete_writes"] = json!(timing_count);
-            result["elapsed_ns"] = json!(ended.saturating_sub(started));
+            result["elapsed_ns"] = json!(ended.checked_sub(started).ok_or_else(|| {
+                CommandFailure::new(
+                    "sequence_elapsed_time",
+                    "sequence terminal timestamp preceded its start timestamp",
+                )
+            })?);
             result["actual_baud"] = json!(harness.actual_baud());
-            result["latency"] = latency_json(&harness.telemetry, harness.actual_baud());
             Ok(())
         },
+    );
+    let mut result = result;
+    match timing_csv_bytes(&telemetry) {
+        Ok(bytes) => timing_csv = Some(bytes),
+        Err(error) => {
+            result["execution_error"] = json!({
+                "stage": "sequence_timing_render",
+                "message": error,
+            });
+        }
+    }
+    result["latency"] = latency_json(
+        &telemetry,
+        telemetry_actual_baud(&telemetry),
+        Some(SEQUENCE_TIMINGS_FILE_NAME),
     );
     Ok((result, timing_csv))
 }
@@ -5143,58 +5392,23 @@ fn open_guard_check_json(check: &OpenGuardCheck) -> Value {
     })
 }
 
-fn latency_json(telemetry: &Arc<Mutex<Telemetry>>, baud: Option<u32>) -> Value {
-    let telemetry = telemetry.lock().unwrap_or_else(|error| error.into_inner());
-    let direct: Vec<_> = telemetry
-        .timings
-        .iter()
-        .filter(|sample| sample.command_admitted_ns.is_some())
-        .copied()
-        .collect();
-    let admission_to_write: Vec<_> = direct
-        .iter()
-        .map(|sample| {
-            sample
-                .write_entered_ns
-                .saturating_sub(sample.command_admitted_ns.expect("filtered direct timing"))
-        })
-        .collect();
-    let write_call: Vec<_> = telemetry
-        .timings
-        .iter()
-        .map(|sample| {
-            sample
-                .transport_accepted_ns
-                .saturating_sub(sample.write_entered_ns)
-        })
-        .collect();
-    let dispatch_to_write: Vec<_> = telemetry
-        .timings
-        .iter()
-        .map(|sample| sample.write_entered_ns.saturating_sub(sample.dispatch_ns))
-        .collect();
-    json!({
-        "sample_count": telemetry.timings.len(),
-        "direct_sample_count": direct.len(),
-        "command_admitted_to_write_entered_ns": distribution_json(&admission_to_write),
-        "dispatch_to_write_entered_ns": distribution_json(&dispatch_to_write),
-        "write_entered_to_os_acceptance_ns": distribution_json(&write_call),
-        "uart_complete_frame": baud.map(|value| json!({
-            "baud": value,
-            "bytes": 8,
-            "format": "8N1",
-            "theoretical_ns": 80_000_000_000_u64 / u64::from(value),
-            "measured": false,
-        })),
-        "usb_hid": {"measured": false, "reason": "USB analyzer or auditable firmware trace unavailable"},
-    })
+fn latency_json(
+    telemetry: &Arc<Mutex<Telemetry>>,
+    baud: Option<u32>,
+    csv_path: Option<&str>,
+) -> Value {
+    telemetry
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .logical_reports
+        .projection_json(baud, csv_path)
 }
 
-fn distribution_json(values: &[u64]) -> Value {
-    distribution(values).map_or(
-        Value::Null,
-        |value| json!({"p50": value.p50, "p95": value.p95, "p99": value.p99, "max": value.max}),
-    )
+fn telemetry_actual_baud(telemetry: &Arc<Mutex<Telemetry>>) -> Option<u32> {
+    telemetry
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .actual_baud
 }
 
 fn counts_json(counts: RuntimeCounts) -> Value {
@@ -5364,34 +5578,11 @@ fn process_metrics() -> Result<Value, String> {
 }
 
 fn timing_csv_bytes(telemetry: &Arc<Mutex<Telemetry>>) -> Result<Vec<u8>, String> {
-    let mut writer = Vec::new();
-    writeln!(
-        writer,
-        "sequence,command_admitted_ns,lane_wake_ns,dispatch_ns,write_entered_ns,transport_accepted_ns"
-    )
-    .map_err(|error| error.to_string())?;
-    for sample in &telemetry
+    telemetry
         .lock()
         .unwrap_or_else(|error| error.into_inner())
-        .timings
-    {
-        writeln!(
-            writer,
-            "{},{},{},{},{},{}",
-            sample.sequence,
-            sample
-                .command_admitted_ns
-                .map_or_else(String::new, |value| value.to_string()),
-            sample
-                .lane_wake_ns
-                .map_or_else(String::new, |value| value.to_string()),
-            sample.dispatch_ns,
-            sample.write_entered_ns,
-            sample.transport_accepted_ns,
-        )
-        .map_err(|error| error.to_string())?;
-    }
-    Ok(writer)
+        .logical_reports
+        .csv_bytes()
 }
 
 fn artifact_dir(arguments: &[String]) -> Result<PathBuf, String> {
@@ -5431,9 +5622,12 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc::{Receiver, SyncSender};
 
-    use easycon_controller::TransportErrorKind;
-    use easycon_model::{EasyConError, ErrorCode, ErrorDomain};
-    use easycon_runtime::{CancellationReason, CancellationToken, ManagedResource, OperationValue};
+    use easycon_controller::{DirectWriteTiming, TransportErrorKind};
+    use easycon_model::{EasyConError, ErrorCode, ErrorDomain, OperationId};
+    use easycon_runtime::{
+        CancellationReason, CancellationToken, ClockChangeRegistration, DeadlineId,
+        ManagedResource, OperationValue, VirtualClock,
+    };
     use easycon_serial::{ByteIoOperation, SerialErrorKind};
 
     struct TestDirectory(PathBuf);
@@ -5463,6 +5657,126 @@ mod tests {
         outcomes: VecDeque<OperatorOutcome>,
         announced: Vec<ActionMarker>,
         observed: Vec<ObservationRequest>,
+    }
+
+    struct ScriptedNowClock {
+        times: Mutex<VecDeque<u64>>,
+        fallback: VirtualClock,
+    }
+
+    impl ScriptedNowClock {
+        fn new(times: impl IntoIterator<Item = u64>) -> Self {
+            Self {
+                times: Mutex::new(times.into_iter().collect()),
+                fallback: VirtualClock::default(),
+            }
+        }
+    }
+
+    impl Clock for ScriptedNowClock {
+        fn now_ns(&self) -> u64 {
+            self.times
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .pop_front()
+                .expect("scripted monotonic timestamp")
+        }
+
+        fn on_change(&self, hook: Arc<dyn Fn() + Send + Sync>) -> ClockChangeRegistration {
+            self.fallback.on_change(hook)
+        }
+
+        fn register_deadline(&self, target_ns: u64) -> DeadlineId {
+            self.fallback.register_deadline(target_ns)
+        }
+
+        fn record_dispatch(&self, id: DeadlineId, actual_ns: u64) {
+            self.fallback.record_dispatch(id, actual_ns);
+        }
+
+        fn real_wait_duration(&self, target_ns: u64) -> Option<Duration> {
+            self.fallback.real_wait_duration(target_ns)
+        }
+    }
+
+    #[derive(Default)]
+    struct ThreeThenFiveTransport {
+        calls: usize,
+    }
+
+    struct NativeFailureByteIo {
+        controller_write_calls: usize,
+    }
+
+    impl ByteIo for NativeFailureByteIo {
+        fn read(
+            &mut self,
+            buffer: &mut [u8],
+            _request: ByteIoRequest,
+        ) -> Result<usize, SerialError> {
+            buffer[0] = 0x80;
+            Ok(1)
+        }
+
+        fn write(&mut self, buffer: &[u8], request: ByteIoRequest) -> Result<usize, SerialError> {
+            if matches!(request.operation, ByteIoOperation::ControllerWrite(_)) {
+                self.controller_write_calls += 1;
+                if self.controller_write_calls == 1 {
+                    return Ok(3);
+                }
+                return Err(SerialError::with_os_code(
+                    SerialErrorKind::Io,
+                    "injected native controller write failure",
+                    995,
+                ));
+            }
+            Ok(buffer.len())
+        }
+
+        fn discard_input(&mut self, _request: ByteIoRequest) -> Result<(), SerialError> {
+            Ok(())
+        }
+
+        fn close(&mut self) {}
+    }
+
+    struct NativeFailureFactory;
+
+    impl ByteIoFactory for NativeFailureFactory {
+        fn open(
+            &mut self,
+            _port: &SerialPortDescriptor,
+            _baud_rate: u32,
+            _request: ByteIoRequest,
+        ) -> Result<Box<dyn ByteIo>, SerialError> {
+            Ok(Box::new(NativeFailureByteIo {
+                controller_write_calls: 0,
+            }))
+        }
+    }
+
+    impl ControllerTransport for ThreeThenFiveTransport {
+        fn handshake(&mut self, _request: HandshakeRequest) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn write(&mut self, request: WriteRequest<'_>) -> Result<usize, TransportError> {
+            self.calls += 1;
+            if self.calls == 1 {
+                Ok(3)
+            } else {
+                Ok(request.bytes.len())
+            }
+        }
+
+        fn wait_for_ack(&mut self, _request: AckRequest) -> Result<AckFrame, TransportError> {
+            Err(TransportError::new(
+                TransportErrorKind::Protocol,
+                "ACK is not used by the partial report regression",
+            ))
+        }
+
+        fn close(&mut self) {}
     }
 
     impl ScriptedOperatorPort {
@@ -5517,6 +5831,36 @@ mod tests {
         harness_cleanup_json(controller, runtime)
     }
 
+    fn passing_latency() -> Value {
+        json!({
+            "integrity": {"status": "passed", "errors": []},
+            "logical_reports": {
+                "attempt_count": 0,
+                "accepted_count": 0,
+                "failed_count": 0,
+                "pending_count": 0,
+                "contradiction_count": 0,
+                "detail": {"kind": "inline", "rows": []},
+            },
+            "sample_count": 0,
+            "direct_sample_count": 0,
+            "command_admitted_to_write_entered_ns": null,
+            "dispatch_to_write_entered_ns": null,
+            "write_entered_to_os_acceptance_ns": null,
+            "uart_complete_frame": null,
+            "usb_hid": {
+                "qualification_status": "unverified",
+                "measured": false,
+                "reason": "synthetic fixture has no USB analyzer",
+            },
+            "switch_physical_order": {
+                "qualification_status": "unverified",
+                "measured": false,
+                "reason": "synthetic fixture has no physical order evidence",
+            },
+        })
+    }
+
     fn fault_operation(id: u64, state: &str, domain: &str, code: &str, reason: Value) -> Value {
         json!({
             "id": id,
@@ -5543,7 +5887,7 @@ mod tests {
     }
 
     fn valid_fault_projection() -> Value {
-        json!({
+        let mut result = json!({
             "port_occupied": fault_operation(41, "Failed", "Io", "Transport", Value::Null),
             "port_occupied_native_open_attempts": [
                 port_busy_attempt(115_200),
@@ -5583,7 +5927,16 @@ mod tests {
                 json!("Deadline"),
             ),
             "deadline_native_open_attempts": [],
-        })
+        });
+        for field in [
+            "occupier_report_telemetry",
+            "occupied_probe_report_telemetry",
+            "cancel_report_telemetry",
+            "deadline_report_telemetry",
+        ] {
+            result[field] = passing_latency();
+        }
+        result
     }
 
     fn valid_fault_projection_with_cleanup() -> Value {
@@ -6030,6 +6383,9 @@ mod tests {
             "evidence_errors": [],
             "transport_closed_in_state": "complete",
         });
+        result["harness_evidence"] = json!({
+            "logical_report_telemetry": passing_latency(),
+        });
         result["cleanup"] = successful_cleanup();
         result
     }
@@ -6131,7 +6487,9 @@ mod tests {
     #[test]
     fn failed_command_still_produces_an_artifact_document() {
         let (document, error) = finalize_result("handshake", Err("protocol timeout".to_owned()));
-        assert_eq!(document["status"], "failed");
+        assert_eq!(document["execution_status"], "failed");
+        assert_eq!(document["qualification_status"], "failed");
+        assert_eq!(document["exit_code"], 1);
         assert_eq!(document["command"], "handshake");
         assert_eq!(document["error"], "protocol timeout");
         assert_eq!(error.as_deref(), Some("protocol timeout"));
@@ -6139,12 +6497,7 @@ mod tests {
 
     #[test]
     fn untrusted_binary_provenance_cannot_remain_passed() {
-        let mut document = json!({
-            "status": "passed",
-            "execution_status": "completed",
-            "qualification_status": "passed",
-            "checks": [],
-        });
+        let mut document = final_document("synthetic", RunOutcome::Passed, Vec::new(), None, None);
         apply_provenance_policy(
             &mut document,
             &RuntimeProvenance::synthetic_with_trust(false),
@@ -6162,12 +6515,7 @@ mod tests {
 
     #[test]
     fn trusted_binary_provenance_preserves_the_command_decision() {
-        let mut document = json!({
-            "status": "passed",
-            "execution_status": "completed",
-            "qualification_status": "passed",
-            "checks": [],
-        });
+        let mut document = final_document("synthetic", RunOutcome::Passed, Vec::new(), None, None);
         apply_provenance_policy(
             &mut document,
             &RuntimeProvenance::synthetic_with_trust(true),
@@ -6411,6 +6759,7 @@ mod tests {
             outcome.as_str()
         });
         result["final_snapshot"] = snapshot_json(&harness.controller);
+        result["latency"] = latency_json(&harness.telemetry, harness.actual_baud(), None);
         result["cleanup"] = harness.close();
         let journal = fs::read(directory.0.join(journal::JOURNAL_FILE_NAME)).expect("journal");
         let events = journal::parse_journal(&journal).expect("journal events");
@@ -7416,7 +7765,7 @@ mod tests {
 
         for (command, result) in cases {
             let (document, failure) = finalize_result(command, Ok(result));
-            assert_ne!(document["status"], "passed", "{command}");
+            assert_ne!(document["qualification_status"], "passed", "{command}");
             assert!(failure.is_some(), "{command} must return a non-zero exit");
             assert_eq!(document_exit_code(&document), 1, "{command}");
         }
@@ -8164,10 +8513,11 @@ mod tests {
             Ok(json!({
                 "final_snapshot": {"desired_report_neutral": true},
                 "switch_observation": "requires operator confirmation",
+                "latency": passing_latency(),
                 "cleanup": successful_cleanup(),
             })),
         );
-        assert_eq!(smoke["status"], "unverified");
+        assert_eq!(smoke["qualification_status"], "unverified");
         assert_eq!(document_exit_code(&smoke), 2);
 
         let (home, _) = finalize_result(
@@ -8175,17 +8525,18 @@ mod tests {
             Ok(json!({
                 "final_snapshot": {"desired_report_neutral": true},
                 "switch_observation": "requires operator confirmation",
+                "latency": passing_latency(),
                 "cleanup": successful_cleanup(),
             })),
         );
-        assert_eq!(home["status"], "unverified");
+        assert_eq!(home["qualification_status"], "unverified");
         assert_eq!(document_exit_code(&home), 2);
 
         let (amiibo, _) = finalize_result(
             "amiibo",
             Ok(json!({"write_performed": false, "capability": "unknown"})),
         );
-        assert_eq!(amiibo["status"], "not_run");
+        assert_eq!(amiibo["qualification_status"], "not_run");
         assert_eq!(document_exit_code(&amiibo), 2);
     }
 
@@ -8723,6 +9074,7 @@ mod tests {
                 "accepted_report_count_before_final_reset": 10_000,
                 "recorded_complete_writes": 10_001,
                 "physical_order_evidence": "open: no logic analyzer or firmware trace",
+                "latency": passing_latency(),
                 "cleanup": successful_cleanup(),
             })),
         );
@@ -8731,6 +9083,42 @@ mod tests {
         assert_eq!(document["execution_status"], "completed");
         assert_eq!(document["qualification_status"], "unverified");
         assert_eq!(document_exit_code(&document), 2);
+    }
+
+    #[test]
+    fn telemetry_contradiction_cannot_pass_sequence_qualification() {
+        let mut latency = passing_latency();
+        latency["integrity"] = json!({
+            "status": "failed",
+            "errors": [{
+                "code": "dispatch_after_write_entry",
+                "message": "injected time reversal",
+                "write_sequence": 7,
+            }],
+        });
+        latency["logical_reports"]["attempt_count"] = json!(1);
+        latency["logical_reports"]["contradiction_count"] = json!(1);
+        latency["logical_reports"]["detail"]["rows"] = json!([{
+            "write_sequence": 7,
+            "outcome": "contradiction",
+        }]);
+        let (document, failure) = finalize_result(
+            "sequence",
+            Ok(json!({
+                "requested_steps": 10_000,
+                "functional_success": true,
+                "accepted_report_count_before_final_reset": 10_000,
+                "recorded_complete_writes": 10_001,
+                "physical_order_evidence": "open: no logic analyzer or firmware trace",
+                "latency": latency,
+                "cleanup": successful_cleanup(),
+            })),
+        );
+
+        assert!(failure.is_some());
+        assert_eq!(document["execution_status"], "completed");
+        assert_eq!(document["qualification_status"], "failed");
+        assert_eq!(document["exit_code"], 1);
     }
 
     #[test]
@@ -9148,7 +9536,313 @@ mod tests {
 
         assert_eq!(
             bytes,
-            b"sequence,command_admitted_ns,lane_wake_ns,dispatch_ns,write_entered_ns,transport_accepted_ns\n"
+            format!("{}\n", telemetry::CSV_HEADER.join(",")).into_bytes()
+        );
+    }
+
+    #[test]
+    fn partial_report_keeps_the_first_entry_and_final_acceptance() {
+        let telemetry = Arc::new(Mutex::new(Telemetry::default()));
+        let clock: Arc<dyn Clock> = Arc::new(ScriptedNowClock::new([100, 110, 120, 130]));
+        let mut observed = ObservedTransport {
+            inner: Box::new(ThreeThenFiveTransport::default()),
+            clock,
+            telemetry: telemetry.clone(),
+        };
+        let context = WriteContext {
+            resource_id: ResourceId::new(7),
+            operation_id: Some(OperationId::new(11)),
+            sequence: 13,
+            timestamp_ns: 90,
+            direct_timing: Some(DirectWriteTiming {
+                command_admitted_ns: 70,
+                lane_wake_ns: 80,
+            }),
+            total_len: 8,
+            kind: WriteKind::Report,
+        };
+        let cancellation = CancellationToken::root();
+        let resource_cancellation = CancellationToken::root();
+        let bytes = [0_u8; 8];
+
+        assert_eq!(
+            observed.write(WriteRequest {
+                context,
+                bytes: &bytes,
+                deadline_ns: u64::MAX,
+                cancellation: cancellation.clone(),
+                resource_cancellation: resource_cancellation.clone(),
+            }),
+            Ok(3)
+        );
+        assert_eq!(
+            observed.write(WriteRequest {
+                context,
+                bytes: &bytes[3..],
+                deadline_ns: u64::MAX,
+                cancellation,
+                resource_cancellation,
+            }),
+            Ok(5)
+        );
+
+        let telemetry = telemetry.lock().expect("telemetry");
+        let projection = telemetry.logical_reports.projection_json(None, None);
+        let row = &projection["logical_reports"]["detail"]["rows"][0];
+        assert_eq!(row["first_write_entered_ns"], 100);
+        assert_eq!(row["transport_accepted_ns"], 130);
+        assert_eq!(row["partial_count"], 2);
+        assert_eq!(row["operation_id"], 11);
+        assert_eq!(row["write_sequence"], 13);
+    }
+
+    #[test]
+    fn backwards_telemetry_is_an_explicit_integrity_failure() {
+        let context = WriteContext {
+            resource_id: ResourceId::new(1),
+            operation_id: Some(OperationId::new(1)),
+            sequence: 1,
+            timestamp_ns: 30,
+            direct_timing: Some(DirectWriteTiming {
+                command_admitted_ns: 10,
+                lane_wake_ns: 20,
+            }),
+            total_len: 8,
+            kind: WriteKind::Report,
+        };
+        let mut reports = LogicalReportTelemetry::default();
+        reports.begin(context, 8, 29);
+        reports.finish(context, 8, 28, &Ok(8));
+        let telemetry = Arc::new(Mutex::new(Telemetry {
+            logical_reports: reports,
+            ..Telemetry::default()
+        }));
+
+        let projection = latency_json(&telemetry, Some(115_200), None);
+
+        assert_eq!(projection["integrity"]["status"], "failed");
+    }
+
+    #[test]
+    fn invalid_terminal_status_pair_fails_closed() {
+        let document = json!({
+            "execution_status": "cancelled",
+            "qualification_status": "failed",
+            "exit_code": 130,
+        });
+
+        assert_eq!(document_exit_code(&document), 1);
+    }
+
+    #[test]
+    fn byte_io_decorator_preserves_native_error_before_lossy_mapping() {
+        let telemetry = Arc::new(Mutex::new(Telemetry::default()));
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock::default());
+        let factory = ObservedByteIoFactory {
+            inner: Box::new(NativeFailureFactory),
+            telemetry: telemetry.clone(),
+        };
+        let descriptor = SerialPortDescriptor::new("DEVICE\\NATIVE", "COM1").expect("descriptor");
+        let serial = SerialControllerTransport::new(clock.clone(), descriptor, Box::new(factory));
+        let mut observed = ObservedTransport {
+            inner: Box::new(serial),
+            clock,
+            telemetry: telemetry.clone(),
+        };
+        let cancellation = CancellationToken::root();
+        let resource_cancellation = CancellationToken::root();
+        observed
+            .handshake(HandshakeRequest {
+                operation_id: OperationId::new(1),
+                baud_rate: 115_200,
+                request_bytes: [0xA5, 0xA5, 0x81],
+                expected_reply: 0x80,
+                deadline_ns: u64::MAX,
+                cancellation: cancellation.clone(),
+                resource_cancellation: resource_cancellation.clone(),
+            })
+            .expect("synthetic handshake");
+        let context = WriteContext {
+            resource_id: ResourceId::new(7),
+            operation_id: Some(OperationId::new(11)),
+            sequence: 13,
+            timestamp_ns: 0,
+            direct_timing: None,
+            total_len: 8,
+            kind: WriteKind::Report,
+        };
+        let bytes = [0_u8; 8];
+        assert_eq!(
+            observed.write(WriteRequest {
+                context,
+                bytes: &bytes,
+                deadline_ns: u64::MAX,
+                cancellation: cancellation.clone(),
+                resource_cancellation: resource_cancellation.clone(),
+            }),
+            Ok(3)
+        );
+        let mapped = observed
+            .write(WriteRequest {
+                context,
+                bytes: &bytes[3..],
+                deadline_ns: u64::MAX,
+                cancellation,
+                resource_cancellation,
+            })
+            .expect_err("injected native failure");
+        assert_eq!(mapped.kind(), TransportErrorKind::Disconnected);
+
+        let projection = telemetry
+            .lock()
+            .expect("telemetry")
+            .logical_reports
+            .projection_json(None, None);
+        let row = &projection["logical_reports"]["detail"]["rows"][0];
+        assert_eq!(row["accepted_bytes"], 3);
+        assert_eq!(row["partial_count"], 1);
+        assert_eq!(row["transport_error"]["kind"], "Disconnected");
+        assert_eq!(row["native_error"]["kind"], "Io");
+        assert_eq!(row["native_error"]["os_code"], 995);
+    }
+
+    #[test]
+    fn qualification_projection_fixture_matches_real_code() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../fixtures/phase2b-qualification-projection-v1.json"
+        ))
+        .expect("qualification projection fixture");
+        assert_eq!(fixture["schema_version"], 1);
+
+        for expected in fixture["outcomes"].as_array().expect("outcomes") {
+            let outcome = match expected["name"].as_str().expect("outcome name") {
+                "Passed" => RunOutcome::Passed,
+                "QualificationFailed" => RunOutcome::QualificationFailed,
+                "ExecutionFailed" => RunOutcome::ExecutionFailed,
+                "NotRun" => RunOutcome::NotRun,
+                "Unverified" => RunOutcome::Unverified,
+                "Cancelled" => RunOutcome::Cancelled,
+                other => panic!("unknown fixture outcome {other}"),
+            };
+            let document = final_document("fixture", outcome, Vec::new(), None, None);
+            assert_eq!(document["schema_version"], 2);
+            assert!(document.get("status").is_none());
+            assert_eq!(document["execution_status"], expected["execution_status"]);
+            assert_eq!(
+                document["qualification_status"],
+                expected["qualification_status"]
+            );
+            assert_eq!(document["exit_code"], expected["exit_code"]);
+            assert_eq!(document_exit_code(&document), outcome.exit_code());
+        }
+        for invalid in fixture["invalid_status_pairs"]
+            .as_array()
+            .expect("invalid pairs")
+        {
+            assert_eq!(document_exit_code(invalid), 1);
+        }
+
+        assert_eq!(
+            fixture["csv_header"],
+            json!(telemetry::CSV_HEADER.as_slice())
+        );
+        let context = |dispatch_ns| WriteContext {
+            resource_id: ResourceId::new(7),
+            operation_id: Some(OperationId::new(11)),
+            sequence: 13,
+            timestamp_ns: dispatch_ns,
+            direct_timing: Some(DirectWriteTiming {
+                command_admitted_ns: 70,
+                lane_wake_ns: 80,
+            }),
+            total_len: 8,
+            kind: WriteKind::Report,
+        };
+        for expected in fixture["logical_report_cases"]
+            .as_array()
+            .expect("logical report cases")
+        {
+            let mut reports = LogicalReportTelemetry::default();
+            let name = expected["name"].as_str().expect("case name");
+            let context = context(90);
+            match name {
+                "single_8" => {
+                    reports.begin(context, 8, 100);
+                    reports.finish(context, 8, 110, &Ok(8));
+                }
+                "partial_3_5" => {
+                    reports.begin(context, 8, 100);
+                    reports.finish(context, 8, 110, &Ok(3));
+                    reports.begin(context, 5, 120);
+                    reports.finish(context, 5, 130, &Ok(5));
+                }
+                "partial_3_native_failure" => {
+                    reports.begin(context, 8, 100);
+                    reports.finish(context, 8, 110, &Ok(3));
+                    reports.begin(context, 5, 120);
+                    reports.record_native_error(
+                        context,
+                        &SerialError::with_os_code(
+                            SerialErrorKind::Io,
+                            "fixture native failure",
+                            995,
+                        ),
+                    );
+                    reports.finish(
+                        context,
+                        5,
+                        130,
+                        &Err(TransportError::new(
+                            TransportErrorKind::Disconnected,
+                            "fixture mapped failure",
+                        )),
+                    );
+                }
+                "time_reversal" => {
+                    reports.begin(context, 8, 89);
+                    reports.finish(context, 8, 88, &Ok(8));
+                }
+                other => panic!("unknown fixture telemetry case {other}"),
+            }
+            let projection = reports.projection_json(Some(115_200), None);
+            let row = &projection["logical_reports"]["detail"]["rows"][0];
+            for field in [
+                "first_write_entered_ns",
+                "transport_accepted_ns",
+                "partial_count",
+                "accepted_bytes",
+                "outcome",
+            ] {
+                assert_eq!(row[field], expected[field], "{name} {field}");
+            }
+            if let Some(kind) = expected.get("transport_error_kind") {
+                assert_eq!(row["transport_error"]["kind"], *kind, "{name}");
+            }
+            if let Some(kind) = expected.get("native_error_kind") {
+                assert_eq!(row["native_error"]["kind"], *kind, "{name}");
+                assert_eq!(row["native_error"]["os_code"], expected["native_os_code"]);
+            }
+            if let Some(code) = expected.get("contradiction_code") {
+                assert_eq!(row["contradiction"]["code"], *code, "{name}");
+            }
+        }
+
+        let physical = LogicalReportTelemetry::default().projection_json(Some(115_200), None);
+        assert_eq!(
+            physical["uart_complete_frame"]["measured"],
+            fixture["physical_boundaries"]["uart_complete_frame"]["measured"]
+        );
+        assert_eq!(
+            physical["uart_complete_frame"]["classification"],
+            fixture["physical_boundaries"]["uart_complete_frame"]["classification"]
+        );
+        assert_eq!(
+            physical["usb_hid"],
+            fixture["physical_boundaries"]["usb_hid"]
+        );
+        assert_eq!(
+            physical["switch_physical_order"],
+            fixture["physical_boundaries"]["switch_physical_order"]
         );
     }
 
