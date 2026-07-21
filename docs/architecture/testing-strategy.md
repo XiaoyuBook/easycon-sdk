@@ -400,7 +400,7 @@ SLO 在专用、固定电源策略的测试机测量；O-04 依据首轮数据�
 ## 13. 阶段适用门禁
 
 仓库已经包含 Runtime、Controller 和 test support 功能项目，不再处于只验证架构文档的阶段。验证范围
-以根 [AGENTS.md](../../AGENTS.md) 为准：Rust 源码、Cargo、behavior、schema、fixture 或 conformance
+以当前仓库协作规则为准：Rust 源码、Cargo、behavior、schema、fixture 或 conformance
 变更必须执行完整 workspace、Loom 模型、规范、链接、repository guard 和 diff 门禁；当前完整命令清单见
 [Runtime + Controller fake vertical slice](../development/runtime-controller-vertical-slice.md#本地验证)。
 
