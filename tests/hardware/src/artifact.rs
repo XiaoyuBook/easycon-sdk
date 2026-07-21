@@ -9,8 +9,6 @@ use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[cfg(windows)]
-use file_id::FileId;
 use serde_json::{Value, json};
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{
@@ -87,7 +85,11 @@ struct HighResolutionFileIdentity {
 }
 
 trait FileIdentityProvider {
-    fn high_resolution_identity(&self, path: &Path) -> Result<HighResolutionFileIdentity, String>;
+    fn high_resolution_identity(
+        &self,
+        file: &File,
+        path: &Path,
+    ) -> Result<HighResolutionFileIdentity, String>;
 }
 
 struct SystemFinalGuardOpener;
@@ -594,30 +596,28 @@ fn validate_final_guard_metadata(metadata: FinalGuardMetadata, path: &Path) -> R
 }
 
 impl FileIdentityProvider for SystemFileIdentityProvider {
-    fn high_resolution_identity(&self, path: &Path) -> Result<HighResolutionFileIdentity, String> {
+    fn high_resolution_identity(
+        &self,
+        file: &File,
+        path: &Path,
+    ) -> Result<HighResolutionFileIdentity, String> {
         #[cfg(windows)]
         {
-            match file_id::get_high_res_file_id(path).map_err(|error| {
-                format!(
-                    "cannot read high-resolution file identity for {}: {error}",
-                    path.display()
-                )
-            })? {
-                FileId::HighRes {
-                    volume_serial_number,
-                    file_id,
-                } => Ok(HighResolutionFileIdentity {
-                    volume_serial_number,
-                    file_id,
-                }),
-                _ => Err(format!(
-                    "high-resolution file identity unavailable for {}",
-                    path.display()
-                )),
-            }
+            let identity =
+                easycon_hardware_file_id::high_resolution_file_identity(file).map_err(|error| {
+                    format!(
+                        "cannot read high-resolution file identity for {}: {error}",
+                        path.display()
+                    )
+                })?;
+            Ok(HighResolutionFileIdentity {
+                volume_serial_number: identity.volume_serial_number,
+                file_id: identity.file_id,
+            })
         }
         #[cfg(not(windows))]
         {
+            let _ = file;
             Err(format!(
                 "cannot read high-resolution file identity for {}: guarded publication requires Windows",
                 path.display()
@@ -647,8 +647,9 @@ fn publish_owned_artifact(
     let guard = guard_opener.open(final_path, final_guard_open_spec())?;
     let guard_metadata = guard_metadata_provider.metadata(&guard, final_path)?;
     validate_final_guard_metadata(guard_metadata, final_path)?;
-    let staging_identity = identity_provider.high_resolution_identity(&staging.path)?;
-    let final_identity = identity_provider.high_resolution_identity(final_path)?;
+    let staging_identity =
+        identity_provider.high_resolution_identity(&staging.file, &staging.path)?;
+    let final_identity = identity_provider.high_resolution_identity(&guard, final_path)?;
     if staging_identity != final_identity {
         return Err(format!(
             "published artifact {} does not reference its owned staging object",
@@ -1219,6 +1220,124 @@ mod tests {
         );
     }
 
+    struct JunctionRetargetFixture {
+        root: PathBuf,
+        owned_directory: PathBuf,
+        alternate_directory: PathBuf,
+        run_directory: PathBuf,
+        retired_junction: PathBuf,
+        replacement_junction: PathBuf,
+    }
+
+    impl JunctionRetargetFixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "easycon-hardware-artifact-junction-retarget-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("system clock after epoch")
+                    .as_nanos()
+            ));
+            let owned_directory = root.join("owned");
+            let alternate_directory = root.join("alternate");
+            let run_directory = root.join("run");
+            let retired_junction = root.join("retired-run");
+            let replacement_junction = root.join("replacement-run");
+            fs::create_dir(&root).expect("create junction fixture root");
+            fs::create_dir(&owned_directory).expect("create owned target directory");
+            fs::create_dir(&alternate_directory).expect("create alternate target directory");
+            junction::create(&owned_directory, &run_directory)
+                .expect("create run-directory junction");
+            Self {
+                root,
+                owned_directory,
+                alternate_directory,
+                run_directory,
+                retired_junction,
+                replacement_junction,
+            }
+        }
+    }
+
+    impl Drop for JunctionRetargetFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.run_directory);
+            let _ = fs::remove_dir_all(&self.retired_junction);
+            let _ = fs::remove_dir_all(&self.replacement_junction);
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    struct RetargetAncestorJunctionObserver<'a> {
+        fixture: &'a JunctionRetargetFixture,
+    }
+
+    impl ArtifactObserver for RetargetAncestorJunctionObserver<'_> {
+        fn after_hard_link_created(&self, role: OwnedFileRole, staging: &Path, final_path: &Path) {
+            if role != OwnedFileRole::Primary {
+                return;
+            }
+            let staging_name = staging.file_name().expect("staging file name");
+            let final_name = final_path.file_name().expect("final file name");
+            fs::copy(
+                self.fixture.run_directory.join(RESERVATION_FILE_NAME),
+                self.fixture.alternate_directory.join(RESERVATION_FILE_NAME),
+            )
+            .expect("copy exact reservation to alternate directory");
+            let alternate_staging = self.fixture.alternate_directory.join(staging_name);
+            fs::copy(staging, &alternate_staging)
+                .expect("copy exact staging bytes to alternate directory");
+            fs::hard_link(
+                &alternate_staging,
+                self.fixture.alternate_directory.join(final_name),
+            )
+            .expect("link alternate staging to alternate final");
+
+            junction::create(
+                &self.fixture.alternate_directory,
+                &self.fixture.replacement_junction,
+            )
+            .expect("create replacement junction");
+            fs::rename(&self.fixture.run_directory, &self.fixture.retired_junction)
+                .expect("retire original junction while source handles are retained");
+            fs::rename(
+                &self.fixture.replacement_junction,
+                &self.fixture.run_directory,
+            )
+            .expect("retarget nominal run path to alternate directory");
+        }
+    }
+
+    #[test]
+    fn ancestor_junction_retarget_cannot_replace_the_retained_source_object() {
+        let fixture = JunctionRetargetFixture::new();
+        let reservation = ArtifactReservation::begin("unknown", &fixture.run_directory)
+            .expect("reserve through junction");
+        let document = json!({"status": "failed"});
+        let expected = serde_json::to_vec_pretty(&document).expect("serialize expected document");
+
+        let result = reservation.commit_observed(
+            &document,
+            &RetargetAncestorJunctionObserver { fixture: &fixture },
+        );
+
+        assert!(
+            result
+                .expect_err("alternate object must not publish")
+                .contains("does not reference")
+        );
+        assert_eq!(
+            fs::read(fixture.owned_directory.join("unknown.json")).expect("read owned final link"),
+            expected
+        );
+        assert_eq!(
+            fs::read(fixture.alternate_directory.join("unknown.json"))
+                .expect("read alternate final link"),
+            expected
+        );
+    }
+
     #[derive(Default)]
     struct RecordingGuardOpener {
         specs: RefCell<Vec<FinalGuardOpenSpec>>,
@@ -1303,6 +1422,7 @@ mod tests {
     impl FileIdentityProvider for FailFinalIdentityProvider {
         fn high_resolution_identity(
             &self,
+            file: &File,
             path: &Path,
         ) -> Result<HighResolutionFileIdentity, String> {
             if path.file_name().and_then(|name| name.to_str()) == Some(self.file_name) {
@@ -1311,7 +1431,7 @@ mod tests {
                     path.display()
                 ));
             }
-            SYSTEM_FILE_IDENTITY_PROVIDER.high_resolution_identity(path)
+            SYSTEM_FILE_IDENTITY_PROVIDER.high_resolution_identity(file, path)
         }
     }
 
