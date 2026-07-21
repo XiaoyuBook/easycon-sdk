@@ -74,10 +74,11 @@ system serial leaf、可注入 byte I/O、CH32 模拟器、Amiibo save/select、
 软件热路径 latency harness 均已实现。详细证据和本地命令见
 [Runtime + Controller Phase 2A Candidate](development/runtime-controller-vertical-slice.md)。
 
-Phase 2B 的首轮交接和资格工具审计已开始，工具修复目标见
-[ADR-0010](decisions/0010-phase-2b-qualification-evidence.md)。当前仍明确标记 `Hardware Unverified`：没有
-冻结任何具体板型/固件、Amiibo 容量、UART/USB/Switch 时序或完整物理中立化能力；O-01、O-02、O-04
-保持开放，完整 Phase 2 未完成，也没有创建完整 Phase 2 冻结 ADR。
+Phase 2B 的资格软件候选已按 [ADR-0010](decisions/0010-phase-2b-qualification-evidence.md) 完成实现，包括设备身份
+接纳、持久 evidence transaction、operator/Ctrl+C、Amiibo 写前安全、telemetry 投影和五类 checkpoint；现有验证
+全部使用 fake/synthetic 输入。当前仍明确标记 `Hardware Unverified`：没有冻结任何具体板型/固件、Amiibo 容量、
+UART/USB/Switch 时序或完整物理中立化能力；O-01、O-02、O-04 保持开放，完整 Phase 2 未完成，也没有创建完整
+Phase 2 冻结 ADR。
 
 ## 首发基线
 

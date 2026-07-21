@@ -5,8 +5,9 @@
 本章固定 v1 的目标结构与阶段门槛；目录会随对应阶段逐步创建，不要求当前工作树一次具备全部项目。
 仓库当前已经按 [ADR-0007](../decisions/0007-phase-1-freeze.md) 冻结 Phase 1 Runtime，并完成一段无硬件
 Phase 2A Controller/Serial Candidate，详见 [实现说明](../development/runtime-controller-vertical-slice.md)。
-该候选包含 Windows serial、Amiibo 和无硬件验收，但仍是 `Hardware Unverified`；它不表示 Phase 2B
-characterization、O-01/O-02/O-04 或完整 Phase 2 已完成。
+Phase 2B 资格软件也已按 [ADR-0010](../decisions/0010-phase-2b-qualification-evidence.md) 完成候选实现，但只经过
+fake/synthetic 验证，仍是 `Hardware Unverified`；它不表示物理 characterization、O-01/O-02/O-04 或完整
+Phase 2 已完成。
 
 ```text
 easycon sdk/
@@ -113,8 +114,8 @@ easycon sdk/
 ### Phase 2：Controller vertical slice
 
 目标已按 [ADR-0008](../decisions/0008-phase-2-controller-target.md) 冻结，Phase 2A 实现已按
-[ADR-0009](../decisions/0009-phase-2a-freeze.md) 冻结为 `Hardware Unverified` Candidate；需要实物的 Phase 2B
-尚未开始。
+[ADR-0009](../decisions/0009-phase-2a-freeze.md) 冻结为 `Hardware Unverified` Candidate。Phase 2B 的软件资格
+候选已实现；需要目标设备、操作员和仪器的物理资格仍未执行。
 
 #### Phase 2A：Controller/Serial Candidate（Frozen，Hardware Unverified）
 
@@ -133,6 +134,11 @@ easycon sdk/
 
 #### Phase 2B：Controller Hardware Qualification（有硬件）
 
+当前状态：ADR-0010 要求的资格 CLI 软件能力已经实现，包括 stable identity 写前接纳、可持久恢复的 journal 与
+不可覆盖 artifact transaction、单 owner operator/Ctrl+C 收口、Amiibo 一次性写入授权、logical-report telemetry
+以及从磁盘 evidence 生成五类 `Hardware Unverified` checkpoint。现阶段验证全部使用 fake/synthetic discovery、I/O、
+failpoint 和临时目录；没有在本机枚举或打开真实串口，没有执行 Amiibo 写入，也没有形成硬件资格结论。
+
 交付：
 
 - 首批控制板/固件/VID/PID/baud 支持矩阵和真实发现、连接、拔插、关闭数据。
@@ -140,7 +146,7 @@ easycon sdk/
 - 100 次生命周期、物理 10,000-report/step 和固定测量环境的延迟分布。
 
 退出门槛：O-01、O-02、O-04 关闭，受支持设备通过 ADR-0008 的硬件门槛并经独立 review；不含固件功能。
-Phase 2A 完成不等于完整 Phase 2 完成。
+Phase 2A 和 Phase 2B 软件候选完成都不等于完整 Phase 2 完成。
 
 ### Phase 3：Vision 与私有 bridge
 

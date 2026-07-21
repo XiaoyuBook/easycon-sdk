@@ -14,6 +14,9 @@ latency harness。
 O-01、O-02、O-04 保持开放。当前也未发布稳定公共 API/ABI，不包含 Vision、ECS、语言绑定、固件或 UI；
 完整 Phase 2 必须在 CH32 可用后通过 Phase 2B 硬件资格验证。
 
+[Phase 2B 资格证据目标](docs/decisions/0010-phase-2b-qualification-evidence.md) 所需的软件候选已实现并通过
+fake/synthetic 门禁，但尚未在目标设备上执行资格命令，也没有创建支持矩阵或关闭任何硬件开放项。
+
 此前的实验性共享运行基线已经移除，不再作为本项目的产品架构或兼容性约束。共享核心、C ABI 和各语言绑定将在架构与行为规范固定后重新实现。
 
 完整架构固定在 [docs/README.md](docs/README.md)，包括源码能力映射、Rust/C++/C ABI
