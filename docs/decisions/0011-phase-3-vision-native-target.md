@@ -103,8 +103,8 @@ raw pointer、native status、OpenCV/Tesseract 类型或 bridge handle。
 - OCR engine 是 `Send`、不是 `Sync`，一次只被一个 Rust pool lease 独占；正常返回归还，native exception
   或 engine-invalid status 标记 poisoned 并立即销毁；
 - capture owner handle 是 `Send`，read/open/profile/close 只在一个 Rust read thread；单独的 interrupt token
-  是 `Send + Sync`，只设置 bridge 原子 stop/请求 backend wake；destroy 必须在 read thread join 且全部
-  interrupt token 释放后发生；
+  是 `Send + Sync`，只设置 bridge 原子 stop/请求 backend wake，且不向 caller 暴露；close 撤销 cancellation/
+  deadline hooks、从 worker exit payload 收回内部 clone，并证明全部 token 已释放，随后才 destroy capture handle；
 - bridge-owned buffer/error 不跨线程长期存活，safe wrapper 在同一次调用中复制后释放。
 
 除上述证明外不增加 `unsafe impl Send/Sync`。native debug counters 记录 live handles 和 owned allocations；
@@ -154,19 +154,39 @@ close 顺序固定为：
 3. 唤醒首帧/snapshot waiter；
 4. read worker 完成 backend close，把唯一 closed handle 通过 one-shot channel 交回 owner 并退出；
 5. join 唯一 read thread；
-6. 释放 session 持有的 interrupt token；其他 token 只引用独立 control、不含 handle pointer；随后 destroy
-   closed native handle；
-7. 清空 latest slot，确认 native handle/allocation counts 回到基线，注销 Runtime resource，进入 Closed；
-8. 重复 close 返回同一结果且不重复 native side effect。
+6. 撤销 cancellation/deadline hooks，从 worker payload 收回内部 interrupt clone，seal control 并等待 active
+   request guard 归零，证明全部 token 已释放后销毁 interrupt control；
+7. destroy closed native handle并取得该 handle 的 consumed acknowledgement；
+8. 清空 latest slot；隔离测试另确认 native handle/allocation counts 回到基线；注销 Runtime resource并进入 Closed；
+9. 重复 close 返回同一结果且不重复 native side effect。
 
 显式 `CaptureSession::close` 和 `ManagedResource::close` 才执行上述确定性协议。Capture 最后 owning Drop 只在
 admission gate 内拒绝新工作、请求 resource cancellation/interrupt 并唤醒 waiter；不等待、不 join、不注销、
 不执行 backend callback，也不声称 Closed。
 
-backend close 返回错误但 handle/counters 已确认归零时，session 保存 diagnostic、返回显式 close error 并可
-注销 resource；Runtime 仍可真实 Closed。若 worker join、handle destroy 或计数归零无法确认，registration
-必须保留，使现有 Runtime registry convergence 或 supervised task panic 形成 CloseFailed；禁止通过 panic
-模拟普通错误或忽略失败。若该通道不足，必须先按 ADR-0007 重开 Runtime，不能在 Phase 3 偷改 callback 签名。
+Runtime registry 只持有 `Weak<dyn ManagedResource>`，因此 Capture 使用与 public session 外壳分离的
+`CaptureResource`。登记成功后，它把自己的强 `Arc` 和 `ResourceRegistration` 放入 private retention cell；
+public `CaptureSession` 在 Phase 3 不实现 Clone，caller 需要共享时可使用 `Arc<CaptureSession>`。最后 session
+Drop 只触发上述 fallback，retention 继续使 Runtime 能 upgrade 并执行 `ManagedResource::close`。只有显式 close
+已通过 per-handle consumed acknowledgement 证明 join 和 destroy 完成时才 unregister 并拆除 retention；清理
+不可证明时必须保留二者，不能靠字段 Drop 自动注销。global debug counters 只作隔离测试证据，不参与并发
+production session 的 cleanup 判定。未调用 session/Runtime close 的程序不得声称确定性清理或资源归零。
+
+worker 的 one-shot send 若因 receiver 已被异常路径取走而失败，必须把 `SendError` 中的 closed handle 和 worker
+interrupt token 移入 resource-owned fallback handoff slot；worker 线程绝不析构该 handle。后续 close 在 join 后
+从 channel 或 fallback slot 取回并 destroy。两处都拿不到 owner、token clone 未归还或 destroy 无 consumed ack
+属于 cleanup-unproven，保留 retention/registration 并失败。
+
+construction guard 覆盖 registration、retention、startup Operation、interrupt control、backend owner 和 supervised
+worker handoff。任一步失败都先拒绝 admission/request interrupt；已启动 worker 按同一 join/handoff/destroy 顺序
+回收，startup Operation 进入带原始错误的 terminal 并完成 cleanup，随后 unregister、拆 retention。只有全部字段
+安装且 worker start barrier 通过后才能 commit 并发布 session；每个 failpoint 都验证 Runtime/native counts 回基线。
+
+backend close 返回错误但 per-handle destroy consumed ack 已确认时，session 保存 diagnostic、返回显式 close
+error 并可注销 resource；Runtime 仍可真实 Closed。若 worker join、内部 token 回收或 handle destroy无法确认，
+retention/registration 必须保留，使现有 Runtime registry convergence 或 supervised task panic 形成 CloseFailed；
+禁止通过 panic 模拟普通错误或忽略失败。若该通道不足，必须先按 ADR-0007 重开 Runtime，不能在 Phase 3 偷改
+callback 签名。
 
 synthetic blocking backend 用 barrier/channel 证明 blocked read 可被打断并 join。OpenCV backend 必须实现
 实际 discovery/open/read/interrupt/close，但在具体 capture card/backend/profile 完成物理验证前支持矩阵为空；
@@ -211,6 +231,12 @@ registry 先按 normalized source path/name 的 UTF-8 byte order稳定排序，�
 template/OCR 和结果都借用该 Frame；同次 evaluate 期间即使 latest 更新也不换帧。结果 score 始终 `0.0..1.0`。
 未来 ECS 的 `0..100` 转换属于 Phase 4，本阶段不冻结 rounding。
 
+OCR score 只对 Tesseract actual text 两端执行 Unicode scalar `is_whitespace` trim，expected label text 不 trim。
+两者按 Unicode scalar 计算 Levenshtein distance：双空 similarity 为 1、单空为 0，否则
+`1 - distance / max(actual_len, expected_len)`；先把 finite similarity 与 mean confidence 分别 clamp 到 `0..1`，
+再相乘并最终 clamp。非 finite confidence 是 backend error。返回的 OCR text 保留 bounded raw UTF-8，fixture
+固定尾随 CR/LF、Unicode whitespace、双空、单空、完全匹配和替换路径。
+
 `.ILX` 没有 parser、loader、extension dispatch 或 API 入口。
 
 ### 9. Native pool 与 OCR cache
@@ -228,8 +254,11 @@ OCR cache key 至少包含 canonical explicit model root、language、engine mod
 任何 EasyCon traineddata，也不要求成功中文 OCR fixture。实际 create/process/reuse/release 门禁使用独立的
 test-only `tessdata_fast` English model：upstream tag `4.1.0`、Apache-2.0、4,113,088 bytes、SHA-256
 `7D4322BD2A7749724879683FC3912CB542F19906C83BCC1A52132556427170B2`。该资产必须带来源/许可证/hash manifest，
-只供 component test，不进入 package default 或关闭 chi_sim O-03。缺模型、bad-image、exception和poison仍是
-必测路径。
+只供 component test，不进入 package default 或关闭 chi_sim O-03。model bytes 和 upstream LICENSE 都不 tracked、
+不打包，也不由 Runtime 下载；tracked manifest 固定两个 HTTPS source URL、size/hash 和 LICENSE 的 11,358 bytes、
+SHA-256 `CFC7749B96F63BD31C3C42B5C471BF756814053E847C10F3EB003417BC523D30`。显式 test provisioning tool 只写 ignored
+`.tools/vision-models`，逐项验 hash 后把路径显式传给 component test；未 provision、hash/license 不匹配或成功
+OCR test 被 skip 都使完整门禁失败。缺模型、bad-image、exception和poison仍是必测路径。
 
 ### 10. 工具链、依赖和许可证
 
@@ -296,7 +325,7 @@ Phase 3 不得：
 - 改变 Phase 1 Runtime/Operation/event/close 语义；确需改变时必须先按 ADR-0007 和 ADR-0006 设计 Gate；
 - 实现 ECS、Automation 跨域运行、正式 C ABI、public header、四语言 binding、package、UI 或网络服务；
 - 把业务状态、retry、deadline、事件或长期线程移入 C++；
-- 复制 EasyCon traineddata、依赖 cwd/PATH 模型、下载模型或把 missing model 伪造成成功；
+- 复制 EasyCon traineddata、依赖 cwd/PATH 模型、让 Runtime/library 下载模型或把 missing model 伪造成成功；
 - 用 fake 代替 actual OpenCV/Tesseract bridge，或用 synthetic capture 宣称硬件通过。
 
 ## 重新打开规则

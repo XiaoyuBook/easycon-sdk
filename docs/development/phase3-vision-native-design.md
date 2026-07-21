@@ -262,8 +262,17 @@ bridge-owned buffer，confidence转换到 `0.0..1.0`。bad image、recognize err
 
 成功OCR component test使用与EasyCon无关的test-only模型：`tesseract-ocr/tessdata_fast` tag `4.1.0` 的
 `eng.traineddata`，Apache-2.0，4,113,088 bytes，SHA-256
-`7D4322BD2A7749724879683FC3912CB542F19906C83BCC1A52132556427170B2`。fixture同时跟踪upstream URL、LICENSE
-hash和model hash；它不进入package/default lookup，也不关闭O-03的chi_sim来源与再分发问题。
+`7D4322BD2A7749724879683FC3912CB542F19906C83BCC1A52132556427170B2`。tracked manifest固定raw tag HTTPS URL；
+upstream LICENSE为11,358 bytes、SHA-256
+`CFC7749B96F63BD31C3C42B5C471BF756814053E847C10F3EB003417BC523D30`。model和LICENSE bytes不tracked、不打包；
+显式test provisioning tool下载到ignored `.tools/vision-models`并在使用前验证URL、size和hash。test harness只从
+`EASYCON_VISION_TEST_TESSDATA`取得目录并作为显式OcrConfig path传入，不形成production env lookup。缺目录、hash
+不符或success test skip都使完整门禁失败。它不关闭O-03的chi_sim来源与再分发问题。
+
+manifest source精确为
+`https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/refs/tags/4.1.0/eng.traineddata` 和
+`https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/refs/tags/4.1.0/LICENSE`；provisioner不接受redirect后
+host离开`raw.githubusercontent.com`，也不接受命令行覆盖URL/hash。
 
 `OcrPool` state：
 
@@ -327,8 +336,9 @@ pub struct Label {
 ```
 
 parser先检查JSON bytes limit和strict UTF-8，再用 `serde_json` typed raw struct。integer从JSON number checked到i64/
-u32，拒绝fraction/negative/out-of-range。字段名按legacy精确大小写；缺字段使用源码default 0，但最终ROI验证会
-拒绝zero size。未知字段记录stable warning diagnostic；duplicate JSON key必须拒绝，不能依赖last-wins。
+u32，拒绝fraction/negative/out-of-range。字段名按legacy精确大小写。缺失 `searchMethod` 使用源码 initializer 的
+`CCoeffNormed` numeric 5；缺失 `ImgBase64` 使用空字符串；缺失 Range/Target 坐标和尺寸使用 0，随后ROI验证拒绝
+zero size。未知字段记录stable warning diagnostic；duplicate JSON key必须拒绝，不能依赖last-wins。
 
 由于serde_json默认不能直接报告duplicate key，使用custom Visitor逐key解析并维护seen set。Base64使用strict
 standard alphabet/padding；decode前用encoded length推导上限。image method load时立即native decode，确保Label
@@ -339,7 +349,7 @@ registry builder输入 `(source_name, bytes)`，先按source_name UTF-8 bytes稳
 diagnostic；任何error则不发布partial registry。duplicate label name对每个冲突source给diagnostic。name normalization
 只做strict UTF-8和非空/NUL/length验证，不做locale case folding。
 
-parser corpus至少包括：BMP、PNG、OCR text、unknown legacy fields、missing/default、unknown method、string enum、
+parser corpus至少包括：BMP、PNG、OCR text、unknown legacy fields、missing/default method 5、unknown method、string enum、
 fraction/negative/overflow ROI、invalid UTF-8、duplicate JSON key、duplicate label name、bad/missing padding Base64、
 decoded limit、embedded/Target dimension mismatch、Target不在Range、frame-out-of-bounds evaluate、`.ILX`
 extension rejection。fuzz seeds来自这些自有文本，不复制 EasyCon fixture。
@@ -349,11 +359,14 @@ extension rejection。fuzz seeds来自这些自有文本，不复制 EasyCon fix
 `LabelEvaluator::evaluate(&Label, Arc<Frame>, ...)`在入口接收一个Frame owner：
 
 - image label：validate frame Range，crop/borrow range，match embedded target，result location转换为frame绝对位置；
-- OCR label：validate frame Target ROI，OCR一次，用rolling two-row算法计算Unicode scalar Levenshtein similarity
-  和confidence product；expected/actual scalar count及checked `n * m` edit-cell count都有独立hard ceiling，
-  超限在分配/循环前失败；
+- OCR label：validate frame Target ROI，OCR一次；只对actual text两端按Rust `char::is_whitespace` trim，expected
+  label text不trim，再用rolling two-row算法计算Unicode scalar Levenshtein distance。双空similarity为1、单空
+  为0，否则为 `1 - distance / max(actual_len, expected_len)`。先分别验证finite并clamp similarity和Tesseract
+  mean confidence到0..1，再相乘并最终clamp；非finite confidence是backend error。返回结果保留bounded raw
+  OCR UTF-8；expected/actual scalar count及checked `n * m` edit-cell count都有独立hard ceiling，超限在分配/
+  循环前失败；
 - result始终带输入 Frame sequence/timestamp，使caller可证明同一帧；
-- score clamp到0..1，只对finite input；OCR output保留bounded UTF-8 text；
+- score clamp到0..1，只对finite input；
 - evaluator不再次访问CaptureSession latest slot。
 
 如果便捷API从CaptureSession evaluate，它先调用snapshot一次，再转给上述函数。测试在evaluate barrier期间发布
@@ -385,9 +398,16 @@ unsupported DShow/MSMF实现必须在open前返回Unsupported；Hardware Unverif
 绕过close证明。interrupt token只持有与VideoCapture handle分离的atomic stop/control；bounded call返回后由
 read worker观察并close。file backend也必须使用可证明的bounded call。
 
-worker close后不在worker thread destroy capture handle。它把唯一已closed handle放入one-shot exit channel，
-然后退出；external owner join成功，释放自己的interrupt token，再destroy handle。其他interrupt clone只持有
-独立control且没有handle pointer，所以其迟到Drop无法访问已destroy handle。
+interrupt token只在CaptureResource内部使用，不向caller/API返回；resource cancellation和startup deadline hook
+各持有受控clone。worker close后不在worker thread destroy capture handle。它把
+`CaptureExit { closed_handle, worker_interrupt }` 放入one-shot channel，然后退出。若send失败，`SendError` payload
+移入shared fallback handoff slot，worker仍不析构handle。
+
+external close join成功后撤销全部 cancellation/deadline hook registration，从exit/fallback收回worker token，并
+调用 `InterruptSet::seal_and_drain`：拒绝新request、等待active request guard归零、证明只剩coordinator token，
+再销毁interrupt control。capture handle只在此后显式destroy；bridge把inout pointer清零并返回per-handle consumed
+ack。global live counter仅用于隔离component test，不作为并发production cleanup判定。late request/drop测试用
+barrier证明seal与callback race，不使用sleep。
 
 backends：
 
@@ -400,31 +420,44 @@ production discovery返回private稳定descriptor候选字段：opaque source id
 
 ## 16. CaptureSession 与 Runtime
 
-`CaptureSession::new(runtime, backend, options)`：
+`CaptureSession::new(runtime, backend, options)`是construction transaction：
 
 1. validate options；创建resource cancellation token；
-2. 构造 `Arc<CaptureInner>`，状态Opening；
-3. `runtime.register_resource`，保存ResourceRegistration；
+2. 构造 `Arc<CaptureResource>`、handoff/coordinator和armed `CaptureConstructionGuard`，状态Opening；
+3. `runtime.register_resource`，并在resource retention cell安装自己的强Arc与ResourceRegistration；
 4. 创建session-owned startup Operation并设置first-frame deadline；deadline hook只锁state、把Opening原子转
    Faulted、请求interrupt并notify，不执行native I/O；
 5. `runtime.spawn_supervised`启动唯一read worker，start gate确保worker handle已保存后才发布session；
 6. worker open、循环bounded read、用Runtime Clock产生timestamp、checked increment sequence并发布latest；
 7. first frame赢得deadline race时状态Streaming并完成startup Operation；deadline/fault赢时worker cleanup后
    完成对应terminal；
-8. close遵守ADR顺序，通过exit channel取回closed handle，join、destroy、核对counts后清latest/registration。
+8. 全部字段安装且worker start barrier通过后commit guard并发布session；close通过exit/fallback取回closed handle，
+   join、drain interrupt、destroy并取得consumed ack后清latest/retention。
 
-`CaptureInner`有 `close_gate`、`admission_gate`、`Mutex<CaptureStateData>`、Condvar、worker start barrier、
-one-shot exit channel、interrupt、registration和resource token。worker不能持有最后一个`Arc<CaptureInner>`；
-它只持有独立shared state/clock/token和backend owner，避免在线程退出时触发self-join。
+guard在任一步失败时先关闭admission/request interrupt；若worker已启动，执行同一exit/join/drain/destroy协议；
+startup Operation以原始construction error进入terminal并完成cleanup；随后unregister并拆除retention。每个注册、
+operation、hook、spawn、start-barrier failpoint都断言Runtime/native counts回到调用前基线。
 
-显式 `CaptureSession::close` 和 `ManagedResource::close` 调用同一幂等确定性 `close_internal`。CaptureInner Drop
-只在admission gate内标记closing、请求resource cancellation/interrupt并notify；不等待、不join、不调用backend
-close、不take registration，也不声称Closed。正式验收始终显式session close后Runtime close。
+public `CaptureSession` 是不实现Clone的外壳；共享caller可自行使用 `Arc<CaptureSession>`。它持有
+`Arc<CaptureResource>`，resource有close/admission gates、state/Condvar、start barrier、exit receiver、fallback
+handoff、interrupt coordinator、retention cell和resource token。worker不持有`Arc<CaptureResource>`；它只持有
+独立shared state/clock/token、exit sender、fallback slot和backend owner，避免在线程退出时触发self-join。
 
-close返回错误分两类：若worker已join、handle已destroy且native counts归零，保存session diagnostic、注销resource，
-显式close返回error但Runtime仍可真实Closed；若join/destroy/count无法确认，保留ResourceRegistration和Stopping/
-fault diagnostic，使现有Runtime registry convergence失败，或由supervised task panic记录CloseFailed。不得把普通
-backend error变成panic。若未来需要更丰富fallible ManagedResource返回，必须先按ADR-0007重开Phase 1。
+Runtime registry只保存Weak。register成功、worker启动前，resource在retention cell安装
+`ResourceRetention { owner: Arc<CaptureResource>, registration: ResourceRegistration }`，形成显式自保持。显式
+`CaptureSession::close` 和 `ManagedResource::close` 调用同一幂等确定性 `close_internal`；只有join、interrupt
+drain和per-handle destroy consumed ack都成立时才显式unregister并take retention。调用栈仍持有external或Runtime
+upgrade得到的Arc，因此不会在自身方法中析构。
+
+`CaptureSession::drop` 只在admission gate内标记closing、请求resource cancellation/interrupt并notify；不等待、
+不join、不调用backend close、不take retention/registration，也不声称Closed。retention使稍后的Runtime close仍能
+upgrade并finalize；未显式调用session或Runtime close时不承诺资源归零。
+
+close返回错误分两类：若backend close报错但worker已join、tokens已drain且handle有destroy consumed ack，保存
+session diagnostic、注销resource并拆除retention；显式close返回error但Runtime仍可真实Closed。若join、handoff、
+token drain或destroy ack无法确认，保留retention/ResourceRegistration和Stopping/fault diagnostic，使现有Runtime
+registry convergence确定失败，或由supervised task panic记录CloseFailed。不得把普通backend error变成panic。
+若未来需要更丰富fallible ManagedResource返回，必须先按ADR-0007重开Phase 1。
 
 snapshot可以有同步internal API和Runtime Operation wrapper。Operation必须是resource token child；wait timeout不
 取消，operation deadline由Runtime取消。snapshot先按state判定，再读取latest，优先级固定为：
@@ -455,14 +488,17 @@ supervisor记录，Runtime close返回CloseFailed。每个可恢复错误只失�
 
 ## 18. 测试资产和差分分类
 
-`spec/fixtures/vision`只放项目自有synthetic资产：
+`spec/fixtures/vision`只放项目自有synthetic资产和外部资产manifest，不放traineddata：
 
 - ASCII PPM/PGM或由明确脚本生成的BMP/PNG，注明generator、license `GPL-3.0-only`和SHA-256；
 - template scene/target和三个mode expected location/raw/score tolerance；
 - XY/Laplacian preprocess expected pixels/hash与match；
 - HSV wrap/non-wrap/empty/no-match/full-match expected count/ratio/bbox；
 - `.IL` corpus和expected diagnostic；
-- OCR missing model config，以及独立Apache-2.0 `tessdata_fast` English test model及其source/license/hash manifest；
+- OCR missing model config，以及独立Apache-2.0 `tessdata_fast` English model的source/license/hash manifest；model和
+  LICENSE bytes只存在于ignored test cache；
+- OCR score synthetic outputs覆盖actual尾随CR/LF、Unicode whitespace、expected不trim、双空、单空、完全匹配、
+  scalar替换、confidence边界和non-finite rejection；
 - capture frame sequence/profile/fault script。
 
 classification：
@@ -508,6 +544,8 @@ component tests直接通过internal header验证：
 native commands固定记录为：
 
 ```powershell
+python tools/provision_vision_test_model.py --manifest spec/fixtures/vision/ocr-model.json --output .tools/vision-models/tessdata_fast-4.1.0
+$env:EASYCON_VISION_TEST_TESSDATA = (Resolve-Path .tools/vision-models/tessdata_fast-4.1.0).Path
 cmake --preset msvc-debug
 cmake --build --preset msvc-debug --parallel
 ctest --preset msvc-debug --no-tests=error
@@ -528,6 +566,10 @@ cmake --preset clang-fuzz
 cmake --build --preset clang-fuzz --target easycon_native_fuzzers --parallel
 ctest --preset clang-fuzz --no-tests=error -L fuzz-seed-replay
 ```
+
+provisioning是显式test setup，不被Runtime或library调用；tool只接受manifest列举的HTTPS URL，使用临时文件、验证
+size/hash后原子rename到ignored output。每个Debug/Release/sanitizer component CTest都包含非skipped
+`ocr-success` label，读取上述环境路径后再次验证manifest，缺失或不匹配直接失败。
 
 `clang-tidy` preset生成 `compile_commands.json`，`easycon_native_clang_tidy` 对全部自有bridge和component test
 translation units运行仓库固定check集并把warning视为error。`msvc-analyze` preset在自有target上固定
@@ -627,7 +669,7 @@ staged diff，只stage Phase 3文件；commit message使用 `英文类型:中文
 7. limits、ROI、stride、Base64、JSON duplicate和UTF-8是否checked；
 8. vcpkg版本/modules/CRT/static策略和许可证是否准确；
 9. synthetic evidence是否被错误外推为hardware/OCR model claim；
-10. Phase 4/5、`.ILX`、traineddata、shared Phase 2B files是否保持排除。
+10. Phase 4/5、`.ILX`、tracked/package traineddata、shared Phase 2B files是否保持排除。
 
 可复现且in-scope finding必须先建立回归再修；只描述未来public ABI、硬件或模型release加固的建议进入backlog，
 不无上限循环。
