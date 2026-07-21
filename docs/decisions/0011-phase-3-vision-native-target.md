@@ -177,16 +177,30 @@ interrupt token 移入 resource-owned fallback handoff slot；worker 线程绝�
 从 channel 或 fallback slot 取回并 destroy。两处都拿不到 owner、token clone 未归还或 destroy 无 consumed ack
 属于 cleanup-unproven，保留 retention/registration 并失败。
 
-construction guard 覆盖 registration、retention、startup Operation、interrupt control、backend owner 和 supervised
-worker handoff。任一步失败都先拒绝 admission/request interrupt；已启动 worker 按同一 join/handoff/destroy 顺序
-回收，startup Operation 进入带原始错误的 terminal 并完成 cleanup，随后 unregister、拆 retention。只有全部字段
-安装且 worker start barrier 通过后才能 commit 并发布 session；每个 failpoint 都验证 Runtime/native counts 回基线。
+worker closure 在 Runtime supervisor 外再设置内层 `catch_unwind`，唯一 handle 始终由外层 `WorkerOwnerGuard`
+持有。run/open/read/publish panic 时，guard 仍在 worker 上执行 noexcept/backend close，把 handle、worker token 和
+panic marker 送到 exit/fallback，disarm 后才 `resume_unwind` 让 supervisor 记录 panic。guard Drop 是最后防线：
+从 poisoned mutex 恢复并把 payload 放入唯一 fallback slot，绝不在 worker 上执行 handle destroy；确定性 failpoint
+覆盖 open 后、read 中、publish 和 close-to-send 间的 panic。
+
+construction guard 覆盖 startup Operation、interrupt control、backend owner、blocked worker、registration、retention
+和 handoff。构造先在 private `Constructing` 状态持有 lifecycle gate，创建 Operation并spawn worker；worker停在
+Run/Abort barrier，不能提前open。`register_resource` 是最后一个可失败步骤和唯一 commit linearization point：成功后
+在仍持 gate 时以不失败的步骤安装 registration/self-retention、把 barrier设为Run并进入Opening；失败则设Abort，
+guard join/handoff/destroy、终结Operation且回滚。并发Runtime close在register前会令register失败；在register成功
+后可upgrade但必须等待同一gate，随后只看到完整Opening或已回滚Aborted，cleanup owner不会重叠。每个构造barrier
+都注入并发Runtime close并验证Runtime/native counts回基线。
 
 backend close 返回错误但 per-handle destroy consumed ack 已确认时，session 保存 diagnostic、返回显式 close
 error 并可注销 resource；Runtime 仍可真实 Closed。若 worker join、内部 token 回收或 handle destroy无法确认，
 retention/registration 必须保留，使现有 Runtime registry convergence 或 supervised task panic 形成 CloseFailed；
 禁止通过 panic 模拟普通错误或忽略失败。若该通道不足，必须先按 ADR-0007 重开 Runtime，不能在 Phase 3 偷改
 callback 签名。
+
+explicit destroy 返回 `Consumed`（pointer已清零，可同时带diagnostic）或
+`Unconsumed { handle, diagnostic }`，Rust 不从status猜ownership。Unconsumed/no-ack时 close 在返回前把仍 armed 的
+唯一 owner 原子放回 resource `unresolved` slot，不允许 stack Drop 重试副作用；retention/registration 保留，后续
+close可显式重试。测试分别注入 destroy-before-consume、consume-with-error 和 protocol no-ack。
 
 synthetic blocking backend 用 barrier/channel 证明 blocked read 可被打断并 join。OpenCV backend 必须实现
 实际 discovery/open/read/interrupt/close，但在具体 capture card/backend/profile 完成物理验证前支持矩阵为空；

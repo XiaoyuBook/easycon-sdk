@@ -403,11 +403,27 @@ interrupt token只在CaptureResource内部使用，不向caller/API返回；reso
 `CaptureExit { closed_handle, worker_interrupt }` 放入one-shot channel，然后退出。若send失败，`SendError` payload
 移入shared fallback handoff slot，worker仍不析构handle。
 
+supervised closure内先构造持有唯一backend/handle/token的 `WorkerOwnerGuard`，再用内层
+`catch_unwind(AssertUnwindSafe(...))` 执行open/read/publish loop。panic后guard仍在当前worker上：它隔离backend close
+panic，执行close并把 `CaptureExit` 连同 `WorkerExitReason::Panicked` handoff，disarm owner后才 `resume_unwind`，使
+Runtime supervisor记录panic。guard Drop覆盖cleanup自身再次panic，从poisoned fallback mutex恢复并移动payload；
+fallback是单worker的唯一empty slot，不分配、不覆盖既有owner。任何worker unwind都不得落到native handle RAII
+Drop。failpoint固定覆盖open后、read中、publish中和close完成/send之前；每条路径external join后仍取得handle。
+
 external close join成功后撤销全部 cancellation/deadline hook registration，从exit/fallback收回worker token，并
 调用 `InterruptSet::seal_and_drain`：拒绝新request、等待active request guard归零、证明只剩coordinator token，
-再销毁interrupt control。capture handle只在此后显式destroy；bridge把inout pointer清零并返回per-handle consumed
-ack。global live counter仅用于隔离component test，不作为并发production cleanup判定。late request/drop测试用
-barrier证明seal与callback race，不使用sleep。
+再销毁interrupt control。capture handle只在此后显式destroy。safe wrapper返回：
+
+```text
+DestroyOutcome::Consumed { diagnostic: Option<NativeError> }
+DestroyOutcome::Unconsumed { handle: CaptureHandle, diagnostic: NativeError }
+```
+
+bridge只以inout pointer是否清零决定consumed，Rust不从status猜ownership。Unconsumed/no-ack时close在返回前把
+armed handle原子移入resource `HandoffState::Unresolved`；close gate保证没有第二cleanup owner，stack上不留会
+再次destroy的wrapper。后续close可显式重试。global live counter仅用于隔离component test，不作为并发production
+cleanup判定。测试注入destroy-before-consume、consume-with-error和OK/error但pointer未清零的no-ack；late
+request/drop测试用barrier证明seal与callback race，不使用sleep。
 
 backends：
 
@@ -422,28 +438,35 @@ production discovery返回private稳定descriptor候选字段：opaque source id
 
 `CaptureSession::new(runtime, backend, options)`是construction transaction：
 
-1. validate options；创建resource cancellation token；
-2. 构造 `Arc<CaptureResource>`、handoff/coordinator和armed `CaptureConstructionGuard`，状态Opening；
-3. `runtime.register_resource`，并在resource retention cell安装自己的强Arc与ResourceRegistration；
-4. 创建session-owned startup Operation并设置first-frame deadline；deadline hook只锁state、把Opening原子转
+1. validate options；构造 `Arc<CaptureResource>`、handoff/coordinator和armed `CaptureConstructionGuard`；
+2. guard取得lifecycle/close gate，内部状态为不可观察的Constructing；创建resource cancellation和interrupt control；
+3. 创建session-owned startup Operation并设置first-frame deadline；deadline hook只锁state、把Opening原子转
    Faulted、请求interrupt并notify，不执行native I/O；
-5. `runtime.spawn_supervised`启动唯一read worker，start gate确保worker handle已保存后才发布session；
-6. worker open、循环bounded read、用Runtime Clock产生timestamp、checked increment sequence并发布latest；
-7. first frame赢得deadline race时状态Streaming并完成startup Operation；deadline/fault赢时worker cleanup后
+4. `runtime.spawn_supervised`启动唯一read worker并先保存SupervisedTask；worker阻塞在明确的Run/Abort start gate，
+   此时不允许open或取得Frame；
+5. 最后调用 `runtime.register_resource`，这是唯一construction commit/admission linearization point；
+6. register成功后仍持lifecycle gate，以不失败的步骤安装ResourceRegistration/self-retention，把state设为Opening、
+   start gate设为Run并disarm guard；随后释放gate并发布session；
+7. worker open、循环bounded read、用Runtime Clock产生timestamp、checked increment sequence并发布latest；
+8. first frame赢得deadline race时状态Streaming并完成startup Operation；deadline/fault赢时worker cleanup后
    完成对应terminal；
-8. 全部字段安装且worker start barrier通过后commit guard并发布session；close通过exit/fallback取回closed handle，
-   join、drain interrupt、destroy并取得consumed ack后清latest/retention。
+9. close通过exit/fallback/unresolved取得handle，join、drain interrupt、destroy并取得consumed ack后清latest/retention。
 
-guard在任一步失败时先关闭admission/request interrupt；若worker已启动，执行同一exit/join/drain/destroy协议；
-startup Operation以原始construction error进入terminal并完成cleanup；随后unregister并拆除retention。每个注册、
-operation、hook、spawn、start-barrier failpoint都断言Runtime/native counts回到调用前基线。
+register失败表示Runtime close/admission rejection赢得线性化：guard仍独占cleanup，把start gate设Abort；worker不open，
+只handoff backend owner并退出；guard join、drain/destroy，startup Operation以原始construction error完成cleanup。
+register成功后不再执行可失败安装；并发Runtime close可从Weak upgrade构造Arc，但其`ManagedResource::close`必须等待
+同一lifecycle gate，随后只会看到完整Opening（并接管cleanup）或Aborted/Closed，绝不与guard同时take receiver、
+worker或retention。Runtime close可在commit后先于constructor return完成，此时成功返回的session允许已是Stopping/
+Closed，线性化顺序仍真实。测试在operation create前后、spawn前后、handle保存、register调用/返回、retention安装
+和Run signal各barrier注入Runtime close；所有分支断言无open-before-register、无双owner且counts回基线。
 
 public `CaptureSession` 是不实现Clone的外壳；共享caller可自行使用 `Arc<CaptureSession>`。它持有
 `Arc<CaptureResource>`，resource有close/admission gates、state/Condvar、start barrier、exit receiver、fallback
-handoff、interrupt coordinator、retention cell和resource token。worker不持有`Arc<CaptureResource>`；它只持有
-独立shared state/clock/token、exit sender、fallback slot和backend owner，避免在线程退出时触发self-join。
+handoff、unresolved owner、interrupt coordinator、retention cell和resource token。worker不持有
+`Arc<CaptureResource>`；它只持有独立shared state/clock/token、exit sender、fallback slot和backend owner，避免在线程
+退出时触发self-join。
 
-Runtime registry只保存Weak。register成功、worker启动前，resource在retention cell安装
+Runtime registry只保存Weak。register成功、worker取得Run signal前，resource在retention cell安装
 `ResourceRetention { owner: Arc<CaptureResource>, registration: ResourceRegistration }`，形成显式自保持。显式
 `CaptureSession::close` 和 `ManagedResource::close` 调用同一幂等确定性 `close_internal`；只有join、interrupt
 drain和per-handle destroy consumed ack都成立时才显式unregister并take retention。调用栈仍持有external或Runtime
@@ -455,7 +478,8 @@ upgrade并finalize；未显式调用session或Runtime close时不承诺资源归
 
 close返回错误分两类：若backend close报错但worker已join、tokens已drain且handle有destroy consumed ack，保存
 session diagnostic、注销resource并拆除retention；显式close返回error但Runtime仍可真实Closed。若join、handoff、
-token drain或destroy ack无法确认，保留retention/ResourceRegistration和Stopping/fault diagnostic，使现有Runtime
+token drain或destroy ack无法确认，把任何Unconsumed handle先放回unresolved slot，再保留retention/
+ResourceRegistration和Stopping/fault diagnostic，使现有Runtime
 registry convergence确定失败，或由supervised task panic记录CloseFailed。不得把普通backend error变成panic。
 若未来需要更丰富fallible ManagedResource返回，必须先按ADR-0007重开Phase 1。
 
@@ -522,11 +546,14 @@ unique IDs和bounds，且不读取EasyCon。
 - operation cancel/deadline使用VirtualClock；
 - native exception test entry；
 - live handle/allocation baselines；
-- panic payload/worker barrier沿用Runtime supervision。
+- worker panic failpoint、owner-guard handoff和supervisor payload；
+- construction Run/Abort gate与每一步Runtime close barrier；
+- destroy consumed/unconsumed/no-ack handoff state。
 
 必须覆盖：open success/failure/cancel/deadline；no first frame；read fault/hot-unplug equivalent；snapshot poll/wait；
 close during blocked read；close racing frame publish；fault racing close；repeated/concurrent close；Frame borrow during latest
-replace；queued/in-flight cancel；OCR poison discard；pool close with waiters；Runtime close registry convergence。
+replace；worker unwind after open/read/publish/close；constructor/Runtime close各线性化顺序；destroy重试；queued/in-flight
+cancel；OCR poison discard；pool close with waiters；Runtime close registry convergence。
 
 ## 20. Native component tests与质量门禁
 
