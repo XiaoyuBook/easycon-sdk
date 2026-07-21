@@ -1,6 +1,10 @@
 #![forbid(unsafe_code)]
 //! Rust-owned Vision types and lifecycle coordination.
 
+mod image;
+
+pub use image::{Frame, Image, ImageError, ImageErrorKind, PixelFormat, Roi, VisionLimits};
+
 pub use easycon_native_sys::NativeError as NativeBridgeError;
 
 /// Counts exposed for internal lifecycle evidence without exposing bridge details.

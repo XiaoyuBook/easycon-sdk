@@ -23,6 +23,8 @@ CMakeLists.txt text eol=lf
 Cargo.lock text eol=lf
 *.yml text eol=lf
 *.yaml text eol=lf
+*.def text eol=lf
+*.hex text eol=lf
 
 *.bin binary
 *.dll binary

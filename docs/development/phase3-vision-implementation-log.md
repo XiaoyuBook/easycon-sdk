@@ -119,3 +119,74 @@ After the final native fixes, the required sequence completed successfully:
 No physical capture device, OCR model, OCR success case, capture profile, or hardware timing claim
 is part of Node A. No traineddata, EasyCon source file, public C ABI symbol, installed header,
 language binding, or package artifact is produced.
+
+## Node B: immutable images, frames, and codec
+
+### Test-first and review evidence
+
+The first Rust image contract and native component tests failed because `Frame`, `Image`, image
+limits, codec ABI entries, and actual OpenCV implementations did not exist. A second regression
+proved that a blanket four-channel preflight incorrectly rejected the exact twelve-byte limit for
+the tracked 24-bit BMP and RGB PNG.
+
+An independent read-only review of the completed diff then reproduced two private-boundary bugs:
+
+- a null error output returned before the four codec result outputs were zeroed;
+- a borrowed image could declare a buffer length above `max_decoded_bytes` while its required
+  layout remained small.
+
+Sentinel and oversized-declared-length component regressions failed five assertions before the
+fix. The codec entries now zero outputs before error-storage validation, and native view validation
+enforces both required layout and declared length ceilings. The same review found that the first
+fixture generator depended on the host zlib compression strategy. It was replaced by a byte-exact
+generator that writes the zlib header, one final stored-DEFLATE block, LEN/NLEN, and Adler-32
+directly. A final directed re-review cleared every finding and found no new reproducible in-scope
+defect.
+
+The completed node provides:
+
+- immutable Rust `Image` and `Frame` values backed by `Arc<[u8]>`, with checked dimensions,
+  pixel count, stride, buffer length, ROI, sequence, and timestamp metadata;
+- BGR8, BGRA8, and Gray8 format conversion, tight native outputs, padded borrowed inputs, and
+  owned crop results;
+- structured BMP and PNG header preflight before OpenCV allocation, followed by actual
+  `imdecode`, `imencode`, `cvtColor`, and ROI clone operations;
+- exact BGR/BGRA/Gray PNG round trips and ROI pixels, opaque alpha insertion, GrayAlpha-to-BGRA
+  normalization, and deterministic rejection of palette, unsupported depth, invalid, truncated,
+  zero-dimension, and oversized inputs;
+- conservative checked PNG output bounds based on zlib `compressBound`, plus bridge allocation
+  release on success, failure, invariant failure, and repeated zero release;
+- five synthetic codec fixtures whose generator, GPL-3.0-only provenance, decoded sizes, hashes,
+  PNG chunk CRCs, and exact file set are enforced by `validate_specs.py`.
+
+### Native gate details
+
+All native configurations were regenerated after the review fixes and deterministic fixture
+changes.
+
+| Gate | Final result |
+| --- | --- |
+| MSVC Debug configure/build and CTest | passed, 1/1 |
+| MSVC Release configure/build and CTest | passed, 1/1 |
+| clang-cl ASan configure/build and CTest | passed, 1/1 |
+| clang-cl UBSan trap configure/build and CTest | passed, 1/1 |
+| clang-tidy build with warnings as errors and CTest | passed, 2/2 including seed replay |
+| MSVC `/analyze /analyze:external- /WX` and CTest | passed, 1/1 |
+| libFuzzer build and `fuzz-seed-replay` CTest | passed, 2/2 |
+
+### Workspace and repository gates
+
+| Command | Final result |
+| --- | --- |
+| `cargo fmt --all --check` | passed |
+| `cargo check --workspace --all-targets` | passed |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | passed |
+| `cargo test --workspace --all-features` | passed, 167 tests |
+| `python tools/run_runtime_models.py` | passed, 6 Loom models |
+| `python tools/validate_specs.py` | passed, including 5 generated Vision codec fixtures |
+| `python tools/check_markdown_links.py` | passed |
+| `python tools/check_repository_guards.py` | passed |
+| `git diff --check` | passed |
+
+Node B makes no capture-device, OCR model, OCR accuracy, hardware profile, or performance claim.
+It adds no traineddata, EasyCon source, public C ABI, installed header, or package artifact.

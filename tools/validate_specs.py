@@ -921,6 +921,24 @@ def validate_conformance():
     return len(tests)
 
 
+def validate_vision_codec_fixtures():
+    generator = ROOT / "tools" / "generate_vision_codec_fixtures.py"
+    completed = subprocess.run(
+        [sys.executable, str(generator), "--check"],
+        cwd=ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    require(
+        completed.returncode == 0,
+        "vision codec fixture validation failed:\n{}".format(
+            completed.stderr.strip() or completed.stdout.strip()
+        ),
+    )
+
+
 def main():
     validate_schemas()
     validate_validator_regressions()
@@ -928,10 +946,13 @@ def main():
     validate_controller_fixture()
     validate_traces()
     validate_latency_result()
+    validate_vision_codec_fixtures()
     test_count = validate_conformance()
     print(
         "validated 5 schemas, 1 behavior spec, 3 controller fixtures, "
-        "9 conformance scenarios, and {} exact Rust tests".format(test_count)
+        "5 vision codec fixtures, 9 conformance scenarios, and {} exact Rust tests".format(
+            test_count
+        )
     )
     return 0
 

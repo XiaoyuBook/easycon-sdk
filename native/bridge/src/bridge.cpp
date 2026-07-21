@@ -36,16 +36,34 @@ easycon_native_status set_error(
     if (message.size() > static_cast<size_t>((std::numeric_limits<uint64_t>::max)())) {
         return status;
     }
-    auto* data = new (std::nothrow) char[message.size()];
+    auto* data = allocate_bytes(message.size());
     if (data == nullptr) {
         return status;
     }
     std::memcpy(data, message.data(), message.size());
-    live_allocations.fetch_add(1, std::memory_order_relaxed);
     out_error->code = status;
-    out_error->data = data;
+    out_error->data = reinterpret_cast<char*>(data);
     out_error->length = static_cast<uint64_t>(message.size());
     return status;
+}
+
+std::byte* allocate_bytes(size_t length) noexcept {
+    if (length == 0) {
+        return nullptr;
+    }
+    auto* data = new (std::nothrow) std::byte[length];
+    if (data != nullptr) {
+        live_allocations.fetch_add(1, std::memory_order_relaxed);
+    }
+    return data;
+}
+
+void release_bytes(void* data) noexcept {
+    if (data == nullptr) {
+        return;
+    }
+    delete[] static_cast<std::byte*>(data);
+    live_allocations.fetch_sub(1, std::memory_order_relaxed);
 }
 
 }  // namespace easycon::native::detail
@@ -56,8 +74,7 @@ extern "C" void EASYCON_NATIVE_CALL easycon_native_error_release(
         return;
     }
     if (error->data != nullptr) {
-        delete[] error->data;
-        live_allocations.fetch_sub(1, std::memory_order_relaxed);
+        easycon::native::detail::release_bytes(error->data);
     }
     *error = {};
 }
@@ -68,8 +85,7 @@ extern "C" void EASYCON_NATIVE_CALL easycon_native_buffer_release(
         return;
     }
     if (buffer->data != nullptr) {
-        delete[] buffer->data;
-        live_allocations.fetch_sub(1, std::memory_order_relaxed);
+        easycon::native::detail::release_bytes(buffer->data);
     }
     *buffer = {};
 }

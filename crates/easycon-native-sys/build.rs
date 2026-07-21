@@ -73,10 +73,22 @@ fn main() {
             .display()
     );
     println!("cargo:rustc-link-lib=static=easycon_native_bridge");
-    println!("cargo:rustc-link-lib=static=opencv_core4");
+    for library in [
+        "opencv_imgcodecs4",
+        "jpeg",
+        "libpng16",
+        "opencv_imgproc4",
+        "opencv_core4",
+        "zs",
+    ] {
+        println!("cargo:rustc-link-lib=static={library}");
+    }
     println!("cargo:rustc-link-lib=dylib=msvcprt");
 
-    for library in ["advapi32", "comctl32", "gdi32", "ole32", "user32"] {
+    for library in [
+        "advapi32", "comctl32", "comdlg32", "gdi32", "ole32", "oleaut32", "shell32", "user32",
+        "uuid", "winspool",
+    ] {
         println!("cargo:rustc-link-lib=dylib={library}");
     }
 
@@ -89,6 +101,7 @@ fn main() {
         "native/bridge/include/internal/easycon_native_bridge.h",
         "native/bridge/src/bridge.cpp",
         "native/bridge/src/bridge_internal.hpp",
+        "native/bridge/src/image_codec.cpp",
     ] {
         println!(
             "cargo:rerun-if-changed={}",

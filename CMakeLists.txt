@@ -20,7 +20,8 @@ if(NOT MSVC)
   message(FATAL_ERROR "Phase 3 native bridge requires the MSVC-compatible ABI")
 endif()
 
-find_package(OpenCV 4.12.0 EXACT CONFIG REQUIRED COMPONENTS core)
+find_package(OpenCV 4.12.0 EXACT CONFIG REQUIRED COMPONENTS core imgcodecs imgproc)
+find_package(ZLIB REQUIRED)
 
 function(easycon_native_find_compiler_runtime output_name runtime_name)
   execute_process(

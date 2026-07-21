@@ -3,6 +3,7 @@
 
 #[allow(unsafe_code)]
 mod call;
+pub mod codec;
 #[allow(unsafe_code)]
 mod ffi;
 
@@ -60,6 +61,27 @@ pub struct NativeError {
 }
 
 impl NativeError {
+    pub(crate) fn invalid_argument(message: impl Into<String>) -> Self {
+        Self {
+            kind: NativeErrorKind::InvalidArgument,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn out_of_range(message: impl Into<String>) -> Self {
+        Self {
+            kind: NativeErrorKind::OutOfRange,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn overflow(message: impl Into<String>) -> Self {
+        Self {
+            kind: NativeErrorKind::Overflow,
+            message: message.into(),
+        }
+    }
+
     fn internal(message: impl Into<String>) -> Self {
         Self {
             kind: NativeErrorKind::Internal,

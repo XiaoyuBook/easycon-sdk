@@ -36,6 +36,10 @@ typedef int32_t easycon_native_status;
 #define EASYCON_NATIVE_STATUS_ALLOCATION_FAILED INT32_C(14)
 #define EASYCON_NATIVE_STATUS_INTERNAL INT32_C(15)
 
+#define EASYCON_NATIVE_PIXEL_FORMAT_BGR8 UINT32_C(1)
+#define EASYCON_NATIVE_PIXEL_FORMAT_BGRA8 UINT32_C(2)
+#define EASYCON_NATIVE_PIXEL_FORMAT_GRAY8 UINT32_C(3)
+
 typedef struct easycon_native_error {
     int32_t code;
     char* data;
@@ -56,6 +60,24 @@ typedef struct easycon_native_image_view {
     uint32_t pixel_format;
 } easycon_native_image_view;
 
+typedef struct easycon_native_image {
+    uint8_t* data;
+    uint64_t length;
+    uint32_t width;
+    uint32_t height;
+    uint64_t stride;
+    uint32_t pixel_format;
+} easycon_native_image;
+
+typedef struct easycon_native_image_limits {
+    uint64_t max_encoded_bytes;
+    uint32_t max_width;
+    uint32_t max_height;
+    uint64_t max_pixels;
+    uint64_t max_decoded_bytes;
+    uint64_t max_stride;
+} easycon_native_image_limits;
+
 typedef struct easycon_native_counts {
     uint64_t live_handles;
     uint64_t live_allocations;
@@ -67,6 +89,35 @@ void EASYCON_NATIVE_CALL easycon_native_error_release(
     easycon_native_error* error) EASYCON_NATIVE_NOEXCEPT;
 void EASYCON_NATIVE_CALL easycon_native_buffer_release(
     easycon_native_buffer* buffer) EASYCON_NATIVE_NOEXCEPT;
+void EASYCON_NATIVE_CALL easycon_native_image_release(
+    easycon_native_image* image) EASYCON_NATIVE_NOEXCEPT;
+
+easycon_native_status EASYCON_NATIVE_CALL easycon_native_image_decode(
+    const uint8_t* encoded,
+    uint64_t encoded_length,
+    const easycon_native_image_limits* limits,
+    easycon_native_image* out_image,
+    easycon_native_error* out_error) EASYCON_NATIVE_NOEXCEPT;
+easycon_native_status EASYCON_NATIVE_CALL easycon_native_image_encode_png(
+    const easycon_native_image_view* image,
+    const easycon_native_image_limits* limits,
+    easycon_native_buffer* out_encoded,
+    easycon_native_error* out_error) EASYCON_NATIVE_NOEXCEPT;
+easycon_native_status EASYCON_NATIVE_CALL easycon_native_image_convert(
+    const easycon_native_image_view* image,
+    uint32_t output_format,
+    const easycon_native_image_limits* limits,
+    easycon_native_image* out_image,
+    easycon_native_error* out_error) EASYCON_NATIVE_NOEXCEPT;
+easycon_native_status EASYCON_NATIVE_CALL easycon_native_image_crop(
+    const easycon_native_image_view* image,
+    uint32_t x,
+    uint32_t y,
+    uint32_t width,
+    uint32_t height,
+    const easycon_native_image_limits* limits,
+    easycon_native_image* out_image,
+    easycon_native_error* out_error) EASYCON_NATIVE_NOEXCEPT;
 
 easycon_native_status EASYCON_NATIVE_CALL easycon_native_debug_counts(
     easycon_native_counts* out_counts,
@@ -106,6 +157,20 @@ static_assert(offsetof(easycon_native_image_view, width) == 16);
 static_assert(offsetof(easycon_native_image_view, height) == 20);
 static_assert(offsetof(easycon_native_image_view, stride) == 24);
 static_assert(offsetof(easycon_native_image_view, pixel_format) == 32);
+static_assert(sizeof(easycon_native_image) == 40);
+static_assert(offsetof(easycon_native_image, data) == 0);
+static_assert(offsetof(easycon_native_image, length) == 8);
+static_assert(offsetof(easycon_native_image, width) == 16);
+static_assert(offsetof(easycon_native_image, height) == 20);
+static_assert(offsetof(easycon_native_image, stride) == 24);
+static_assert(offsetof(easycon_native_image, pixel_format) == 32);
+static_assert(sizeof(easycon_native_image_limits) == 40);
+static_assert(offsetof(easycon_native_image_limits, max_encoded_bytes) == 0);
+static_assert(offsetof(easycon_native_image_limits, max_width) == 8);
+static_assert(offsetof(easycon_native_image_limits, max_height) == 12);
+static_assert(offsetof(easycon_native_image_limits, max_pixels) == 16);
+static_assert(offsetof(easycon_native_image_limits, max_decoded_bytes) == 24);
+static_assert(offsetof(easycon_native_image_limits, max_stride) == 32);
 #endif
 
 #endif

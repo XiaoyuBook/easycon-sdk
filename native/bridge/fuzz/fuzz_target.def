@@ -5,4 +5,9 @@ EXPORTS
     easycon_native_debug_handle_create
     easycon_native_debug_handle_destroy
     easycon_native_error_release
+    easycon_native_image_convert
+    easycon_native_image_crop
+    easycon_native_image_decode
+    easycon_native_image_encode_png
+    easycon_native_image_release
     easycon_native_test_raise

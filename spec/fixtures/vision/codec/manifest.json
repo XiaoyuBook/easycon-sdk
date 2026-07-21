@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "license": "GPL-3.0-only",
+  "generator": "tools/generate_vision_codec_fixtures.py",
+  "provenance": "Synthetic pixels authored for EasyCon SDK Phase 3; PNG uses a deterministic stored-DEFLATE zlib stream and BMP uses uncompressed bottom-up 24-bit rows.",
+  "pixels": {
+    "order": "top-to-bottom BGR8",
+    "description": "red, green, blue, white",
+    "sha256": "3d335acc3b7c9d3edcf42098e24ad875a2c0ba87223c640b1d535be39677009c"
+  },
+  "files": [
+    {
+      "path": "bgr-2x2.bmp.hex",
+      "decoded_bytes": 70,
+      "decoded_sha256": "32595ac4ac54ae42c4f31d77fce001599dc10f5452f7c2de5482f0ed5f0a074d"
+    },
+    {
+      "path": "bgr-2x2.png.hex",
+      "decoded_bytes": 82,
+      "decoded_sha256": "d268586051b64827ed456d804e07a48de48145ac2c7f9b7b5b79c12964551b40"
+    },
+    {
+      "path": "expected-bgr.hex",
+      "decoded_bytes": 12,
+      "decoded_sha256": "3d335acc3b7c9d3edcf42098e24ad875a2c0ba87223c640b1d535be39677009c"
+    },
+    {
+      "path": "gray-alpha-1x1.png.hex",
+      "decoded_bytes": 71,
+      "decoded_sha256": "a2f91ecb37a2a9a471d700d7acf2fd31ff1934817ec085d1b4bec83277dfb68e"
+    },
+    {
+      "path": "palette-1x1.png.hex",
+      "decoded_bytes": 85,
+      "decoded_sha256": "afc53af90286c71237735aa11e31ee1b784a1e5c2eb562d56276600d49e23f30"
+    }
+  ]
+}

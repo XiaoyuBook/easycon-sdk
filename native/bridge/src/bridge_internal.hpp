@@ -3,6 +3,7 @@
 
 #include "internal/easycon_native_bridge.h"
 
+#include <cstddef>
 #include <new>
 #include <string_view>
 #include <utility>
@@ -15,6 +16,9 @@ easycon_native_status set_error(
     easycon_native_error* out_error,
     easycon_native_status status,
     std::string_view message) noexcept;
+
+std::byte* allocate_bytes(size_t length) noexcept;
+void release_bytes(void* data) noexcept;
 
 template <typename Function>
 easycon_native_status guard(easycon_native_error* out_error, Function&& function) noexcept {

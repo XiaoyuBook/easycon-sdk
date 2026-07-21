@@ -3,6 +3,8 @@ use std::ptr::NonNull;
 use crate::ffi;
 use crate::{NativeError, NativeErrorKind, NativeResourceCounts};
 
+pub(super) mod image;
+
 pub(crate) fn counts() -> Result<NativeResourceCounts, NativeError> {
     let mut counts = ffi::Counts::default();
     let mut error = ffi::Error::default();
@@ -35,7 +37,7 @@ pub(crate) fn destroy_debug_handle(handle: NonNull<ffi::DebugHandle>) {
     debug_assert!(raw.is_null(), "debug handle destroy must consume its owner");
 }
 
-fn finish(status: i32, error: ffi::Error) -> Result<(), NativeError> {
+pub(super) fn finish(status: i32, error: ffi::Error) -> Result<(), NativeError> {
     let owned = ErrorOwner { raw: error };
     if status == ffi::STATUS_OK {
         if owned.raw.code != 0 || !owned.raw.data.is_null() || owned.raw.length != 0 {
