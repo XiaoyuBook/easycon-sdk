@@ -4,7 +4,8 @@
 - 日期：2026-07-20
 - 审计基线：`15bd6c762323c34c73956daa2be096442d7724b7`
 - 原始代码基线：`202b2610ffc836f21951e18f69fa98b46d6efc90`
-- 实现状态：未完成；本 ADR 冻结修复目标，不冻结资格实现或完整 Phase 2
+- 实现状态：软件候选已按 [ADR-0011](0011-phase-2b-qualification-software-candidate-freeze.md) 冻结；硬件资格与
+  完整 Phase 2 仍未完成。本 ADR 只冻结修复目标，不冻结硬件结论
 
 ## 背景
 
