@@ -119,6 +119,11 @@ Frame 另含严格递增 sequence 和 Runtime clock 的 monotonic `timestamp_ns`
 decoded bytes、stride、label count、JSON bytes、Base64 bytes、OCR text bytes 和 queued native jobs。所有
 计算使用 checked arithmetic；stride 至少为 row bytes，`stride * height` 不得溢出或超过 buffer。
 
+BMP/PNG decode 必须在 `cv::imdecode` 前结构化读取 header，按允许的 bit depth/color type 计算最坏 decoded
+bytes 并应用 ceiling；decode 后再次复验。PNG encode 在 `cv::imencode` 前按 raw scanline、filter byte、zlib
+`compressBound` 和 chunk overhead 计算保守 output ceiling，返回后再次复验。limit 不能只在 OpenCV 已完成
+潜在大分配之后检查。
+
 ROI 是半开区间 `(x, y, width, height)`，宽高必须非零且完全位于图像内。Phase 3 ROI 产生独立、紧密排列的
 immutable Image，避免跨 ABI 冻结 strided subview lifetime；native 同步调用仍接受显式 stride 的 borrowed
 input。空 ROI 明确失败，不隐式解释为全图。
@@ -129,19 +134,39 @@ input。空 ROI 明确失败，不隐式解释为全图。
 Runtime-supervised read thread 执行 native open 和所有 read。只有首个有效 Frame 发布后才进入 Streaming；
 首帧 deadline 到期、open/read error 或无效帧产生稳定 fault。
 
+首帧 deadline 由 session-owned Runtime Operation 和 Runtime Clock 驱动，不创建 timer thread。deadline hook
+原子把 Opening 转为 Faulted、请求 interrupt 并唤醒 waiter；worker 完成 backend cleanup 后才提交该内部
+operation 终态。VirtualClock 必须能确定性触发此路径。
+
 latest slot 只保存 `Option<Arc<Frame>>`。替换不会修改旧 Frame；snapshot 在同一个锁/condvar 协议中返回当前
 强引用。等待 snapshot 的 caller 可被 resource cancellation、operation deadline、fault 或 close 确定性唤醒，
 不使用随机 sleep。
+
+OpenCV device backend 只在 open/read timeout 参数由选定 backend 明确接纳并能把单次 open/read 限制在冻结
+quantum 内时 admission；否则在 open 前返回 unsupported，不进入支持矩阵。interrupt 只设置独立原子 control
+并唤醒 backend 已证明安全的 wait，不与 `VideoCapture::read` 并发调用 `release`。bounded read 返回后由唯一
+worker 观察 stop。file backend 使用同一有界规则。
 
 close 顺序固定为：
 
 1. 在 admission gate 内进入 Stopping，拒绝新 snapshot/open work并取消 resource token；
 2. 调用 bridge interrupt 或 synthetic backend unblock；
 3. 唤醒首帧/snapshot waiter；
-4. join 唯一 read thread；
-5. read thread 完成 backend close，Rust 再 destroy native handle；
-6. 清空 latest slot，注销 Runtime resource，进入 Closed；
-7. 重复 close 返回同一结果且不重复 native side effect。
+4. read worker 完成 backend close，把唯一 closed handle 通过 one-shot channel 交回 owner 并退出；
+5. join 唯一 read thread；
+6. 释放 session 持有的 interrupt token；其他 token 只引用独立 control、不含 handle pointer；随后 destroy
+   closed native handle；
+7. 清空 latest slot，确认 native handle/allocation counts 回到基线，注销 Runtime resource，进入 Closed；
+8. 重复 close 返回同一结果且不重复 native side effect。
+
+显式 `CaptureSession::close` 和 `ManagedResource::close` 才执行上述确定性协议。Capture 最后 owning Drop 只在
+admission gate 内拒绝新工作、请求 resource cancellation/interrupt 并唤醒 waiter；不等待、不 join、不注销、
+不执行 backend callback，也不声称 Closed。
+
+backend close 返回错误但 handle/counters 已确认归零时，session 保存 diagnostic、返回显式 close error 并可
+注销 resource；Runtime 仍可真实 Closed。若 worker join、handle destroy 或计数归零无法确认，registration
+必须保留，使现有 Runtime registry convergence 或 supervised task panic 形成 CloseFailed；禁止通过 panic
+模拟普通错误或忽略失败。若该通道不足，必须先按 ADR-0007 重开 Runtime，不能在 Phase 3 偷改 callback 签名。
 
 synthetic blocking backend 用 barrier/channel 证明 blocked read 可被打断并 join。OpenCV backend 必须实现
 实际 discovery/open/read/interrupt/close，但在具体 capture card/backend/profile 完成物理验证前支持矩阵为空；
@@ -177,7 +202,8 @@ Label；label name 只来自调用者给出的 source name/文件名。只接受
 
 图像 method 的 `ImgBase64` 必须是有界 Base64，并在 load 时 decode 为 immutable target Image；OCR method
 把该字段解释为 expected UTF-8 text。Range/Target 都是 frame 绝对 ROI。图像 label 在 Range 中搜索 embedded
-target；OCR label 对当前 Frame 的 Target ROI 识别。target/range 超界、target 大于 range、空目标、未知 mode、
+target；OCR label 对当前 Frame 的 Target ROI 识别。Target 必须完全包含于 Range；图像 label 的 embedded
+width/height 必须精确等于 Target width/height。target/range 超界、空目标、未知 mode、
 duplicate name、limit 和 decode error 都产生稳定 diagnostic/error，不打印后跳过。
 
 registry 先按 normalized source path/name 的 UTF-8 byte order稳定排序，再构造；同名是显式 duplicate error，
@@ -193,10 +219,17 @@ Rust native pool 有固定 worker/permit 上限、FIFO ticket admission、有限
 阶段时不执行 native call；执行中无法由第三方库安全中断的调用完成后才提交 Cancelled，不能提前释放借用
 buffer/engine。close 拒绝新 admission、取消 queued job、等待 in-flight job 返回并 join Rust workers。
 
+pool 固定使用 `Runtime::spawn_supervised` 创建 Rust workers；不允许以调用线程同步执行作为另一种实现，也不
+允许 detached `thread::spawn`。OCR cache 的 `creating` 与 `borrowed` 分别计数；engine 在锁外 create 时先
+增加 creating，close 必须等待两者均为零。create 返回后重新检查 close/cancel，必要时立即 destroy 并回滚。
+
 OCR cache key 至少包含 canonical explicit model root、language、engine mode 和 PSM。路径不从 cwd、PATH、
 环境变量或 `EasyCon/` 推导；缺模型返回 `MODEL_NOT_FOUND` 等价错误，不联网下载。O-03 未关闭前不提交
-traineddata，也不要求成功中文 OCR fixture。若使用成功 OCR 资产，必须单独记录来源 URL、版本、许可证和
-SHA-256；否则冻结门槛只要求 missing-model、bad-image、reuse/release、exception 和 poisoned-discard。
+任何 EasyCon traineddata，也不要求成功中文 OCR fixture。实际 create/process/reuse/release 门禁使用独立的
+test-only `tessdata_fast` English model：upstream tag `4.1.0`、Apache-2.0、4,113,088 bytes、SHA-256
+`7D4322BD2A7749724879683FC3912CB542F19906C83BCC1A52132556427170B2`。该资产必须带来源/许可证/hash manifest，
+只供 component test，不进入 package default 或关闭 chi_sim O-03。缺模型、bad-image、exception和poison仍是
+必测路径。
 
 ### 10. 工具链、依赖和许可证
 
@@ -210,8 +243,8 @@ SHA-256；否则冻结门槛只要求 missing-model、bad-image、reuse/release�
 
 自有 C++ target 使用 `/MD`、`/W4 /WX /permissive- /EHsc /Zc:__cplusplus`。第三方 include 标为 system。
 MSVC Debug/Release、clang-cl ASan、clang-cl UBSan、clang-tidy、MSVC `/analyze` 和固定 fuzz seed 都是 native
-门禁。sanitizer 若与某依赖配置不兼容，必须在实现前把精确替代门禁和理由写入本 ADR 的后续 review，
-不能在失败后静默跳过。
+门禁。ASan/UBSan preset 或 runtime 不兼容会阻断冻结；任何替代门禁都必须先修改并独立 review 本 ADR，
+不能在实现后静默跳过或用 counters 冒充 sanitizer coverage。
 
 依赖许可证至少记录 OpenCV Apache-2.0、Tesseract Apache-2.0、Leptonica BSD-style 及实际 transitive
 notices；vcpkg port 中 `license: null` 不能当成已完成审核。SDK 自有代码保持 GPL-3.0-only。

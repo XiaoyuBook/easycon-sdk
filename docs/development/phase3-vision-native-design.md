@@ -61,7 +61,8 @@ tracked inputs：
 - `vcpkg-configuration.json`：builtin registry baseline
   `cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3`；
 - `cmake/triplets/x64-windows-static-md.cmake`：x64、static library、dynamic CRT；
-- `CMakePresets.json`：MSVC Debug/Release、clang-cl ASan/UBSan、analysis/fuzz configure/build/test presets。
+- `CMakePresets.json`：MSVC Debug/Release、clang-cl ASan/UBSan、clang-tidy、MSVC `/analyze` 和 fuzz
+  configure/build/test presets。
 
 binary dirs 使用 `cmake-build-${presetName}`，vcpkg installed tree 位于 binary dir。`VCPKG_ROOT` 只从环境读取。
 本机官方 bootstrap 记录为 vcpkg tool `2026-07-13-bf04c909169fdbb30821c02c6eb01f1cd1295d05`；工具版本
@@ -204,16 +205,22 @@ native view只在同步 call栈中创建；safe wrapper持有 `&Image` 到 call�
 decode流程：
 
 1. Rust拒绝 empty/encoded length limit；
-2. native用 `cv::imdecode(IMREAD_UNCHANGED)`；
-3. 拒绝 empty、depth非 `CV_8U`、channels非 1/3/4、dimension/pixel/byte limit；
-4. clone到连续 owned Mat，复制进 bridge buffer，返回 format/width/height/stride；
-5. Rust再次验证 metadata和 length后接管为 Image。
+2. native先识别BMP/PNG并做header preflight：BMP检查file/DIB header、signed dimensions、planes、bpp和
+   compression；PNG检查signature、首个IHDR length/type、width/height、bit depth和color type；
+3. preflight用checked arithmetic按最多4 channels计算width/height/pixels/decoded bytes，超过ceiling时在
+   OpenCV分配前失败；
+4. native用 `cv::imdecode(IMREAD_UNCHANGED)`；
+5. 拒绝 empty、depth非 `CV_8U`、channels非 1/3/4，并对实际dimension/pixel/byte再次复验；
+6. clone到连续 owned Mat，复制进 bridge buffer，返回 format/width/height/stride；
+7. Rust再次验证 metadata和 length后接管为 Image。
 
 BMP legacy和PNG current都必须有 synthetic fixture。invalid header、truncated BMP/PNG、oversized header、
 decompression limit、unsupported depth/channels和zero dimension都是显式 error。任何情况不返回空成功。
 
-encode只支持 PNG candidate；Rust validation后 native用 `cv::imencode(".png")`。round-trip断言 metadata/pixels；
-有损格式不进入 Phase 3。conversion覆盖 BGR<->BGRA、BGR/BGRA->Gray、Gray->BGR/BGRA，alpha新增时固定255。
+encode只支持 PNG candidate。调用 `cv::imencode(".png")` 前，bridge按 `height * (row_bytes + 1)`、zlib
+`compressBound` 和保守PNG chunk overhead做checked upper-bound；upper-bound超过output ceiling时拒绝。返回后
+再检查实际bytes。round-trip断言 metadata/pixels；有损格式不进入 Phase 3。conversion覆盖 BGR<->BGRA、
+BGR/BGRA->Gray、Gray->BGR/BGRA，alpha新增时固定255。
 
 ## 9. Template 和 edge
 
@@ -248,8 +255,15 @@ normal hue执行一个 `inRange`；wrap执行 `[h_min,179] OR [0,h_max]`。`find
 只用于cache key和path containment；不存在的root/model在create前返回 ModelNotFound。禁止 fallback到cwd。
 
 bridge使用 `tesseract::TessBaseAPI`，create时 `Init(root, language, mode)`，process时从 image view调用
-`SetImage`/`Recognize`/`GetUTF8Text`/`MeanTextConf`，并在每次复用前 `Clear`。UTF-8 text复制到owned buffer，
-confidence转换到 `0.0..1.0`。bad image、recognize error和oversized output显式失败。
+`SetPageSegMode`、`SetImage`、`Recognize`、`GetUTF8Text`、`MeanTextConf`，并在每次复用前 `Clear`。engine mode
+和PSM只接受bridge明确映射的固定值。`GetUTF8Text()` 立即进入 `std::unique_ptr<char[]>` guard；用有界
+`strnlen(max_output_bytes + 1)` 检查NUL和上限，所有success/error/exception路径都 `delete[]`。UTF-8 text复制到
+bridge-owned buffer，confidence转换到 `0.0..1.0`。bad image、recognize error和oversized output显式失败。
+
+成功OCR component test使用与EasyCon无关的test-only模型：`tesseract-ocr/tessdata_fast` tag `4.1.0` 的
+`eng.traineddata`，Apache-2.0，4,113,088 bytes，SHA-256
+`7D4322BD2A7749724879683FC3912CB542F19906C83BCC1A52132556427170B2`。fixture同时跟踪upstream URL、LICENSE
+hash和model hash；它不进入package/default lookup，也不关闭O-03的chi_sim来源与再分发问题。
 
 `OcrPool` state：
 
@@ -257,33 +271,36 @@ confidence转换到 `0.0..1.0`。bad image、recognize error和oversized output�
 open: true/false
 max_engines
 created
+creating
 idle Vec<OcrEngine>
 waiters FIFO ticket queue
 borrowed count
 Condvar changed
 ```
 
-acquire只允许队首在 idle非空或 created<max时推进。cancel hook只notify condvar；wait loop读取 token并移除自己的
-ticket。engine create在锁外完成，但先保留created slot，失败后回滚并notify。lease Drop正常归还；poison flag
-导致destroy并减少created。close标记closed、唤醒所有waiter，等待borrowed归零后destroy idle；重复close幂等。
+acquire只允许队首在 idle非空或 `created + creating < max` 时推进。cancel hook只notify condvar；wait loop读取
+token并移除自己的ticket。engine create在锁外完成，但先增加creating；返回锁内后减少creating并重新检查
+closed/cancelled，若已关闭或取消就立即destroy，否则增加created并发出lease。失败回滚并notify。lease Drop正常
+归还；poison flag导致destroy并减少created。close标记closed、唤醒所有waiter，等待
+`creating == 0 && borrowed == 0` 后destroy idle；重复close幂等。
 
 OCR native exception、unknown exception、engine-invalid status都poison；普通 expected text mismatch不是poison。
 missing model发生在engine create，不占用永久slot。fairness测试使用ticket/barrier，不用wall-clock sleep。
 
 ## 12. Native compute admission
 
-模板、edge、color、codec和OCR共享 `NativePool` 的有界 admission。Phase 3实现固定FIFO permit pool；实际工作
-可由Runtime-supervised worker执行，或在已取得permit的调用线程同步执行，但两种模式必须满足同一契约：
+模板、edge、color、codec和OCR共享 `NativePool` 的有界 admission。Phase 3固定为FIFO job queue和固定数量的
+Runtime-supervised workers，不提供调用线程同步执行的第二种模式：
 
 - total permits和queued waiters有硬上限；
 - ticket顺序稳定；
 - queued cancel不调用native；
 - in-flight cancel保留所有borrowed owner，native返回后提交cancel；
-- close拒绝新ticket、取消queued、等待in-flight归零并join任何worker；
+- close拒绝新ticket、取消queued、等待in-flight归零并join全部worker；
 - panic被Rust boundary捕获，permit guard仍归还，operation失败且其他job继续。
 
-若采用worker queue，worker必须通过 `Runtime::spawn_supervised` 创建，不能用 detached `thread::spawn`。pool本身
-作为ManagedResource登记并在close中unregister。若采用同步permit，capture read thread仍独立受Runtime监管。
+worker只通过 `Runtime::spawn_supervised` 创建，不能用 detached `thread::spawn`。pool本身作为
+ManagedResource登记并在close中unregister。job closure/result slot保留所有Frame/Image/engine owner到worker返回。
 
 ## 13. `.IL` parser 和 Label
 
@@ -315,7 +332,8 @@ u32，拒绝fraction/negative/out-of-range。字段名按legacy精确大小写�
 
 由于serde_json默认不能直接报告duplicate key，使用custom Visitor逐key解析并维护seen set。Base64使用strict
 standard alphabet/padding；decode前用encoded length推导上限。image method load时立即native decode，确保Label
-发布后不会延迟暴露坏target。
+发布后不会延迟暴露坏target。Target ROI必须完全包含于Range ROI；image target decoded width/height必须
+精确等于TargetWidth/TargetHeight。OCR也保留Target containment检查，但只对当前Frame的Target ROI识别。
 
 registry builder输入 `(source_name, bytes)`，先按source_name UTF-8 bytes稳定排序，逐项parse，收集全部有界
 diagnostic；任何error则不发布partial registry。duplicate label name对每个冲突source给diagnostic。name normalization
@@ -323,15 +341,17 @@ diagnostic；任何error则不发布partial registry。duplicate label name对�
 
 parser corpus至少包括：BMP、PNG、OCR text、unknown legacy fields、missing/default、unknown method、string enum、
 fraction/negative/overflow ROI、invalid UTF-8、duplicate JSON key、duplicate label name、bad/missing padding Base64、
-decoded limit、target larger than range、frame-out-of-bounds evaluate、`.ILX` extension rejection。fuzz seeds来自这些
-自有文本，不复制 EasyCon fixture。
+decoded limit、embedded/Target dimension mismatch、Target不在Range、frame-out-of-bounds evaluate、`.ILX`
+extension rejection。fuzz seeds来自这些自有文本，不复制 EasyCon fixture。
 
 ## 14. Label evaluate
 
 `LabelEvaluator::evaluate(&Label, Arc<Frame>, ...)`在入口接收一个Frame owner：
 
 - image label：validate frame Range，crop/borrow range，match embedded target，result location转换为frame绝对位置；
-- OCR label：validate frame Target ROI，OCR一次，计算scalar Levenshtein similarity和confidence product；
+- OCR label：validate frame Target ROI，OCR一次，用rolling two-row算法计算Unicode scalar Levenshtein similarity
+  和confidence product；expected/actual scalar count及checked `n * m` edit-cell count都有独立hard ceiling，
+  超限在分配/循环前失败；
 - result始终带输入 Frame sequence/timestamp，使caller可证明同一帧；
 - score clamp到0..1，只对finite input；OCR output保留bounded UTF-8 text；
 - evaluator不再次访问CaptureSession latest slot。
@@ -359,6 +379,16 @@ trait CaptureInterrupt: Send + Sync {
 实际实现可在构造时先取得interrupt control，read/open/close仍只在read thread。`CaptureRead`是Frame输入或
 deterministic End/Fault；empty native Mat永远不是成功Frame。
 
+OpenCV backend 不通过并发 `VideoCapture::release` 打断read。open request同时传入冻结的open/read timeout
+quantum；只有选定backend明确接受且可读回/探测这两个capability时才允许open，单次call因此有确定上界。
+unsupported DShow/MSMF实现必须在open前返回Unsupported；Hardware Unverified阶段支持矩阵可以为空，但不能
+绕过close证明。interrupt token只持有与VideoCapture handle分离的atomic stop/control；bounded call返回后由
+read worker观察并close。file backend也必须使用可证明的bounded call。
+
+worker close后不在worker thread destroy capture handle。它把唯一已closed handle放入one-shot exit channel，
+然后退出；external owner join成功，释放自己的interrupt token，再destroy handle。其他interrupt clone只持有
+独立control且没有handle pointer，所以其迟到Drop无法访问已destroy handle。
+
 backends：
 
 - `SyntheticCapture` test/support：scripted frames/fault/end，blocking read由barrier/channel控制；
@@ -375,23 +405,37 @@ production discovery返回private稳定descriptor候选字段：opaque source id
 1. validate options；创建resource cancellation token；
 2. 构造 `Arc<CaptureInner>`，状态Opening；
 3. `runtime.register_resource`，保存ResourceRegistration；
-4. `runtime.spawn_supervised`启动唯一read worker，start gate确保worker handle已保存后才发布session；
-5. worker open、循环read、用Runtime Clock产生timestamp、checked increment sequence并发布latest；
-6. first frame发布时状态Streaming并notify；fault时保存immutable VisionError、状态Faulted并notify；
-7. close遵守ADR顺序，join worker后清latest/registration。
+4. 创建session-owned startup Operation并设置first-frame deadline；deadline hook只锁state、把Opening原子转
+   Faulted、请求interrupt并notify，不执行native I/O；
+5. `runtime.spawn_supervised`启动唯一read worker，start gate确保worker handle已保存后才发布session；
+6. worker open、循环bounded read、用Runtime Clock产生timestamp、checked increment sequence并发布latest；
+7. first frame赢得deadline race时状态Streaming并完成startup Operation；deadline/fault赢时worker cleanup后
+   完成对应terminal；
+8. close遵守ADR顺序，通过exit channel取回closed handle，join、destroy、核对counts后清latest/registration。
 
-`CaptureInner`有 `close_gate`、`admission_gate`、`Mutex<CaptureStateData>`、Condvar、worker start barrier、interrupt、
-registration和resource token。ManagedResource::close调用同一幂等 `close_internal`。Drop只作为最后兜底调用同一
-close；正式验收始终显式session close后Runtime close。
+`CaptureInner`有 `close_gate`、`admission_gate`、`Mutex<CaptureStateData>`、Condvar、worker start barrier、
+one-shot exit channel、interrupt、registration和resource token。worker不能持有最后一个`Arc<CaptureInner>`；
+它只持有独立shared state/clock/token和backend owner，避免在线程退出时触发self-join。
+
+显式 `CaptureSession::close` 和 `ManagedResource::close` 调用同一幂等确定性 `close_internal`。CaptureInner Drop
+只在admission gate内标记closing、请求resource cancellation/interrupt并notify；不等待、不join、不调用backend
+close、不take registration，也不声称Closed。正式验收始终显式session close后Runtime close。
+
+close返回错误分两类：若worker已join、handle已destroy且native counts归零，保存session diagnostic、注销resource，
+显式close返回error但Runtime仍可真实Closed；若join/destroy/count无法确认，保留ResourceRegistration和Stopping/
+fault diagnostic，使现有Runtime registry convergence失败，或由supervised task panic记录CloseFailed。不得把普通
+backend error变成panic。若未来需要更丰富fallible ManagedResource返回，必须先按ADR-0007重开Phase 1。
 
 snapshot可以有同步internal API和Runtime Operation wrapper。Operation必须是resource token child；wait timeout不
-取消，operation deadline由Runtime取消。snapshot waiter看到：
+取消，operation deadline由Runtime取消。snapshot先按state判定，再读取latest，优先级固定为：
 
-- latest存在：Succeeded，result在Vision side typed storage中；
+- Streaming且latest存在：Succeeded，result在Vision side typed storage中；
+- Opening：按poll/wait/deadline规则等待首帧；
 - deadline/caller/resource cancel：先退出waiter并释放owner，再Cancelled；
-- Faulted：Failed，保留Vision fault；
+- Faulted：即使latest仍保存旧帧也Failed，保留Vision fault；故障前已经取得的Arc<Frame>继续可读，新snapshot
+  不返回未标记陈旧帧；
 - Stopping/Closed：Failed或ParentClose Cancelled，原因稳定且不伪称NoFrame；
-- poll且无frame：NO_FRAME equivalent，不改变capture state。
+- Opening下poll且无frame：NO_FRAME equivalent，不改变capture state。
 
 Phase 3不修改 `OperationValue` 枚举来塞Frame；内部 `VisionOperation<T>`组合Runtime Operation和typed result slot。
 这避免触碰Phase 1 frozen model。未来Phase 5由easycon-sdk/capi决定public result handle。
@@ -418,7 +462,7 @@ supervisor记录，Runtime close返回CloseFailed。每个可恢复错误只失�
 - XY/Laplacian preprocess expected pixels/hash与match；
 - HSV wrap/non-wrap/empty/no-match/full-match expected count/ratio/bbox；
 - `.IL` corpus和expected diagnostic；
-- OCR missing model config，不含traineddata；
+- OCR missing model config，以及独立Apache-2.0 `tessdata_fast` English test model及其source/license/hash manifest；
 - capture frame sequence/profile/fault script。
 
 classification：
@@ -426,7 +470,7 @@ classification：
 - exact：active `.IL`字段、BMP/PNG、normalized template、XY/Laplacian、OCR default/score formula；
 - corrected：strict errors、stable duplicate diagnostic、limits、immutable frame、explicit model root、resource close；
 - new：HSV ROI statistics、native pool；
-- excluded：`.ILX`、Canny、non-normalized/old pixel、UI、traineddata。
+- excluded：`.ILX`、Canny、non-normalized/old pixel、UI、EasyCon/default package traineddata。
 
 浮点fixture逐项声明tolerance；location/error/order/count必须exact。fixture validation脚本检查license/provenance/hash、
 unique IDs和bounds，且不读取EasyCon。
@@ -476,10 +520,23 @@ ctest --preset clang-asan --no-tests=error
 cmake --preset clang-ubsan
 cmake --build --preset clang-ubsan --parallel
 ctest --preset clang-ubsan --no-tests=error
+cmake --preset clang-tidy
+cmake --build --preset clang-tidy --target easycon_native_clang_tidy --parallel
+cmake --preset msvc-analyze
+cmake --build --preset msvc-analyze --target easycon_native_bridge easycon_native_bridge_tests --parallel
+cmake --preset clang-fuzz
+cmake --build --preset clang-fuzz --target easycon_native_fuzzers --parallel
+ctest --preset clang-fuzz --no-tests=error -L fuzz-seed-replay
 ```
 
-另执行clang-tidy、MSVC `/analyze`和有界fuzz seed replay。Windows ASan不作为leak唯一证据，必须同时核对
-native counters。Debug/Release需要fresh configure，不能复用跨compiler cache。
+`clang-tidy` preset生成 `compile_commands.json`，`easycon_native_clang_tidy` 对全部自有bridge和component test
+translation units运行仓库固定check集并把warning视为error。`msvc-analyze` preset在自有target上固定
+`/analyze /WX`。`clang-fuzz`只构建仓库列举的parser/header fuzz targets；`easycon_native_fuzzers`聚合这些target，
+`fuzz-seed-replay` label逐个重放tracked corpus，并由CTest timeout提供总上界。不得扫描或生成未跟踪corpus。
+
+Windows ASan不作为leak唯一证据，必须同时核对native counters。Debug/Release需要fresh configure，不能复用
+跨compiler cache。`clang-asan` 或 `clang-ubsan` 任一 configure/build/CTest失败、timeout或未执行都阻断Phase 3
+冻结；只有先修改ADR-0011说明精确替代门禁并在新SHA完成独立复审后才能改变该要求。
 
 ## 21. Rust/spec完整门禁
 
