@@ -39,6 +39,8 @@
     单 owner OperatorPort、Ctrl+C cooperative cancellation、逐动作 observation 和终态顺序。
 16. [Phase 2B Amiibo 资格写入安全设计](development/phase2b-amiibo-qualification-safety.md)：
     一次性写入授权、外部 limits 来源、payload hash、chunk write-ahead journal 和 synthetic failpoint 边界。
+17. [Phase 2B telemetry 与资格投影设计](development/phase2b-telemetry-qualification-projection.md)：
+    logical report partial 聚合、native I/O error、checked timing、物理未验证边界和唯一终态三元组。
 
 ## 决策记录
 
