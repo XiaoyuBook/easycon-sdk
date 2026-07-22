@@ -272,14 +272,24 @@ impl Image {
                 "encoded image is empty",
             ));
         }
-        if encoded.len() > limits.max_encoded_bytes() {
+        Self::validate_encoded_size(encoded.len(), limits)?;
+        #[cfg(test)]
+        crate::pool::test_decode_probe::observe_native_decode(encoded);
+        let output = native::decode(encoded, limits.image).map_err(ImageError::from_native)?;
+        Self::from_native(output, limits)
+    }
+
+    pub(crate) fn validate_encoded_size(
+        encoded_bytes: usize,
+        limits: &VisionLimits,
+    ) -> Result<(), ImageError> {
+        if encoded_bytes > limits.max_encoded_bytes() {
             return Err(ImageError::new(
                 ImageErrorKind::OutOfRange,
                 "encoded image exceeds limits",
             ));
         }
-        let output = native::decode(encoded, limits.image).map_err(ImageError::from_native)?;
-        Self::from_native(output, limits)
+        Ok(())
     }
 
     pub(crate) fn encode_png_direct(&self, limits: &VisionLimits) -> Result<Vec<u8>, ImageError> {

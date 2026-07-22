@@ -309,13 +309,19 @@ Runtime-supervised workers，不提供调用线程同步执行的第二种模式
 
 - total permits和queued waiters有硬上限；
 - ticket顺序稳定；
+- admission先在state lock下按cancel、pool lifecycle、queue capacity顺序保留一个FIFO ticket和queue slot，
+  再在锁外构造owned job；后续ticket等待该reservation提交或回滚，不能越过仍在构造的早期ticket；
+- encoded decode在reservation成功后、复制输入和调用OpenCV前执行零复制byte-limit preflight；pre-cancel、closed和
+  full-queue仍优先于encoded limit并且不得产生输入等长owned copy；
 - queued cancel不调用native；
 - in-flight cancel保留所有borrowed owner，native返回后提交cancel；
-- close拒绝新ticket、取消queued、等待in-flight归零并join全部worker；
+- close拒绝新ticket、等待已线性化的reservation提交或回滚、取消queued、等待in-flight归零并join全部worker；
 - panic被Rust boundary捕获，permit guard仍归还，operation失败且其他job继续。
 
 worker只通过 `Runtime::spawn_supervised` 创建，不能用 detached `thread::spawn`。pool本身作为
 ManagedResource登记并在close中unregister。job closure/result slot保留所有Frame/Image/engine owner到worker返回。
+reservation builder不持有state mutex执行native或user call；builder unwind和拒绝路径中的capture都在state mutex
+外析构，reservation Drop只回滚slot并唤醒close/admission waiter。
 
 ## 13. `.IL` parser 和 Label
 

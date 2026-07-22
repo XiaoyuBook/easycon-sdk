@@ -122,7 +122,8 @@ Rust、Cargo、behavior 或 conformance 提交都必须在普通 workspace tests
 - Frame immutable/reference 生命周期；latest slot 并发替换；
 - snapshot 首帧等待、deadline、capture fault；
 - HSV hue wrap、空 ROI、阈值、ratio/count/bounding box；
-- native pool 限流、公平性、取消前后 handle 计数。
+- native pool 限流、公平性、取消前后 handle 计数；oversized、pre-cancelled、closed、full-queue decode在稳定错误
+  返回前不构造输入等长owned copy、不调用native，且reservation的close/panic/可重入Drop路径保持计数收敛。
 
 ### `easycon-sdk`
 

@@ -553,3 +553,37 @@ uses Windows DirectShow and Media Foundation headers and libraries; no non-Windo
 claimed here. It makes no capture-card, stable device identity, backend/profile, resolution, pixel
 format, FPS, close-SLO, packaged OCR model, public C ABI, language binding, ECS, Phase 4, or final
 Phase 3 freeze claim.
+
+## Reopened fix: NativePool decode admission before owned input construction
+
+The independent final review of frozen candidate `76436de98836dc2fff9a43c4560e7dc7f3fea780`
+found that `NativePool::decode` copied the complete encoded slice before cancellation, pool lifecycle,
+queue capacity, and encoded-byte admission. ADR-0013 therefore remains a historical frozen record;
+Phase 3 is reopened until this fix has a new SHA, complete gates, and a fresh independent review.
+
+Four deterministic unit regressions instrument the exact owned-copy builder and native decode
+boundary for unique large inputs. Against the unchanged old ordering, each test first proved the
+stable error, zero native calls, and converged pool/Runtime/native counts, then failed only because
+one equal-length, byte-identical, distinct-storage copy had completed:
+
+- `oversized_decode_rejects_before_input_owned_copy_or_native_call`;
+- `pre_cancelled_decode_rejects_before_input_owned_copy_or_native_call`;
+- `closed_pool_decode_rejects_before_input_owned_copy_or_native_call`;
+- `full_queue_decode_rejects_before_input_owned_copy_or_native_call`.
+
+The fix reserves one FIFO ticket and queue slot under the pool state mutex before owned job
+construction. Later admissions cannot pass the reservation. Encoded size is checked without copying
+after the existing cancellation/lifecycle/capacity priority and before OpenCV. Job allocation and
+capture destruction run outside the state mutex; reservation Drop rolls back capacity during unwind.
+Close changes lifecycle to Closing, waits for an already-linearized reservation to commit or roll
+back, cancels its queued job without running native code, then preserves the existing worker join and
+registry convergence order. Existing Image captures remain `Arc` clones and were not widened into
+this fix.
+
+The four regressions and the complete 16-test `pool::tests` suite are green after the fix, including
+reservation FIFO, cancellation wake, close handoff, builder panic rollback, and reentrant rejected
+capture Drop. The complete `easycon-vision` suite passed 71 tests across pool, image, label, OCR,
+matching/color, capture, and native boundaries. `easycon-native-sys` passed 11 tests plus two
+compile-fail doctests. Fresh Windows MSVC Debug and Release configure/build/CTest each passed 2/2,
+including OCR success. No behavior JSON, conformance fixture, native C++, CMake, vcpkg, public API,
+or ceiling changed; the fix enforces the already-frozen ADR-0012 bounded-admission contract.
