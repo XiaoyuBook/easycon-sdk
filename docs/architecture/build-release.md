@@ -40,7 +40,7 @@
 | --- | --- |
 | Rust | stable toolchain，精确版本在实现开始时写入 `rust-toolchain.toml`；发布分支不跟随 channel 漂移 |
 | C++ | Visual Studio Build Tools 2022 17.10+、MSVC v143、C++20、Windows SDK 10.0.22621+ |
-| Build | CMake 3.28+、Ninja 1.11+、Cargo；统一由 CMake preset/xtask 编排，不维护四套 native build |
+| Build | CMake 3.30+、Ninja 1.11+、Cargo；统一由 CMake preset/xtask 编排，不维护四套 native build |
 | Native deps | manifest-mode vcpkg 或等价可审计 lock，固定 OpenCV 4.x、Tesseract 5.x、Leptonica 及传递依赖 |
 | .NET | .NET 8 SDK 最新 servicing；`dotnet pack` |
 | Python | Python 3.10-3.14 test matrix、build 1.x、twine；wheel repair/inspection 工具 |

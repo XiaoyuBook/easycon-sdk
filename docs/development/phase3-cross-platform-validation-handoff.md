@@ -95,10 +95,11 @@ for preset in linux-x64-debug linux-x64-release linux-x64-asan linux-x64-ubsan; 
 done
 ```
 
-`easycon_native_bridge_components` 必须实际覆盖 codec round-trip/invalid input、template、edge、HSV、prevalidated
-File capture、Linux V4L2 fail-closed admission、exception trampoline、owned handle/buffer/error 和 resource-count
-归零。`easycon_native_ocr_components` 必须同时覆盖 missing-model 和 provisioned English model 成功路径、复用、
-exception 与 release。仅看到 CTest 总数不够；回传日志必须包含两个测试名及成功结果。
+`easycon_native_bridge_components` 必须实际覆盖 codec round-trip/invalid input、template、edge、HSV、native
+path-backed File fail-closed admission、Linux V4L2 fail-closed admission、exception trampoline、owned
+handle/buffer/error 和 resource-count 归零。`easycon_native_ocr_components` 必须同时覆盖 missing-model 和
+provisioned English model 成功路径、复用、exception 与 release。仅看到 CTest 总数不够；回传日志必须包含两个
+测试名及成功结果。Rust-owned prevalidated File 生命周期由下述 Cargo `native_capture_contract` 覆盖。
 
 随后用同一 checkout、vcpkg 和 OCR model 运行 Rust 与仓库门禁：
 
