@@ -170,9 +170,9 @@ python3 tools/provision_vision_test_model.py \
   --manifest spec/fixtures/vision/ocr-model.json \
   --output .tools/vision-models/tessdata_fast-4.1.0
 export EASYCON_VISION_TEST_TESSDATA="$(realpath .tools/vision-models/tessdata_fast-4.1.0)"
-cmake --preset linux-debug
-cmake --build --preset linux-debug --parallel
-ctest --preset linux-debug --no-tests=error
+cmake --preset linux-x64-debug
+cmake --build --preset linux-x64-debug --parallel
+ctest --preset linux-x64-debug --no-tests=error
 cargo fmt --all --check
 cargo check --workspace --all-targets
 cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -183,6 +183,9 @@ python3 tools/check_markdown_links.py
 python3 tools/check_repository_guards.py
 git diff --check
 ```
+
+外部 build root、全部 Linux sanitizer 配置和逐项 evidence 回传格式见
+[Phase 3 Linux/macOS 验证 handoff](phase3-cross-platform-validation-handoff.md)。
 
 native CTest 必须实际覆盖 codec、template、edge、HSV、OCR missing-model 和 provisioned legal English model、
 prevalidated File、exception/ownership/resource count。Linux fixture 结果必须来自 Linux executable，不能复制
