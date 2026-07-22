@@ -305,6 +305,22 @@ cargo run --release -p easycon-test-support --bin controller_latency -- --sample
 环境、六段完整分位数、目标判断和 raw CSV 哈希见
 [Phase 2A latency fixture](../../spec/fixtures/controller/phase2a-latency-result-v1.json)。
 
+### Phase 2B qualification telemetry 软件证据
+
+Phase 2B 的不可发布 hardware CLI 按
+[telemetry 与资格投影设计](../development/phase2b-telemetry-qualification-projection.md) 聚合每个 logical report。
+`write_entered_ns` 固定为第一次 partial transport entry，`transport_accepted_ns` 只在最后一段完整接受后存在；
+failed row、partial count、operation/write sequence、mapped transport error 和 lossy mapping 前的 native serial
+kind/OS code 全部保留。任何 context、prefix 或时间逆序都成为显式 qualification failure，不能以饱和算术隐藏。
+
+sequence 的成功、失败、取消和 cleanup failure 都从同一内存 projection 生成 `sequence-timings.csv`。该 CSV 和
+最终 JSON 的字段、六种合法 execution/qualification/exit 三元组由
+`tests/hardware/fixtures/phase2b-qualification-projection-v1.json` 固定，并由独立 hardware workspace 的 synthetic
+conformance test 读取。fixture 不改变 Phase 2A memory-transport measurement，也不包含物理硬件结论。
+
+OS write acceptance 不是 UART complete frame。UART 值始终标记为 theoretical 且 `measured = false`；没有 analyzer
+或可审计 firmware trace 时，USB HID 和 Switch physical order 明确为 `unverified`。这些软件证据不能关闭 O-04。
+
 ### 矩阵登记
 
 O-01 关闭时建立 `hardware/matrix.yaml`（只记录 SDK 自有测试配置，不记录 EasyCon 源码锁）：
@@ -384,7 +400,7 @@ SLO 在专用、固定电源策略的测试机测量；O-04 依据首轮数据�
 ## 13. 阶段适用门禁
 
 仓库已经包含 Runtime、Controller 和 test support 功能项目，不再处于只验证架构文档的阶段。验证范围
-以根 [AGENTS.md](../../AGENTS.md) 为准：Rust 源码、Cargo、behavior、schema、fixture 或 conformance
+以当前仓库协作规则为准：Rust 源码、Cargo、behavior、schema、fixture 或 conformance
 变更必须执行完整 workspace、Loom 模型、规范、链接、repository guard 和 diff 门禁；当前完整命令清单见
 [Runtime + Controller fake vertical slice](../development/runtime-controller-vertical-slice.md#本地验证)。
 

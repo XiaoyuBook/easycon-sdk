@@ -12,11 +12,18 @@ members = ["file-id-handle"]
 resolver = "3"
 
 [dependencies]
+crossterm = "0.29.0"
+ctrlc = "3.5.0"
+csv = "1.3.1"
 easycon-controller = { path = "../../crates/easycon-controller" }
 easycon-model = { path = "../../crates/easycon-model" }
 easycon-runtime = { path = "../../crates/easycon-runtime" }
 easycon-serial = { path = "../../crates/easycon-serial" }
 serde_json = "1.0"
+sha2 = "0.10.9"
+
+[build-dependencies]
+sha2 = "0.10.9"
 
 [target.'cfg(windows)'.dependencies]
 easycon-hardware-file-id = { path = "file-id-handle" }

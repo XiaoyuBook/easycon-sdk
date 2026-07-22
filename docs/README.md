@@ -31,6 +31,18 @@
     reservation、retained staging、owned auxiliary 和 no-replace publish。
 12. [Phase 2B 设备身份接纳与诊断 readiness 证据设计](development/phase2b-device-admission-readiness.md)：
     expected stable identity、open 前后复核、hotplug 重绑定和 diagnostic prelude 的非 capability 边界。
+13. [Phase 2B 普通命令 runner 所有权与失败证据设计](development/phase2b-command-runner-ownership.md)：
+    非 faults 命令的单 owner、operation 失败收口和动态 partial-cleanup contract。
+14. [Phase 2B durable evidence transaction 设计](development/phase2b-durable-evidence-transaction.md)：
+    build/runtime provenance、append-only journal、manifest、completion marker 和磁盘分类。
+15. [Phase 2B 操作员、取消与观察设计](development/phase2b-operator-cancellation-observation.md)：
+    单 owner OperatorPort、Ctrl+C cooperative cancellation、逐动作 observation 和终态顺序。
+16. [Phase 2B Amiibo 资格写入安全设计](development/phase2b-amiibo-qualification-safety.md)：
+    一次性写入授权、外部 limits 来源、payload hash、chunk write-ahead journal 和 synthetic failpoint 边界。
+17. [Phase 2B telemetry 与资格投影设计](development/phase2b-telemetry-qualification-projection.md)：
+    logical report partial 聚合、native I/O error、checked timing、物理未验证边界和唯一终态三元组。
+18. [Phase 2B checkpoint 软件收口设计](development/phase2b-checkpoint-software-closeout.md)：
+    磁盘 evidence 重验、五类 checkpoint、handoff attestation 边界和 Hardware Unverified transaction。
 
 ## 决策记录
 
@@ -44,6 +56,7 @@
 - [ADR-0008：冻结 Phase 2 Controller/Serial 开发目标](decisions/0008-phase-2-controller-target.md)
 - [ADR-0009：冻结 Phase 2A Controller/Serial Candidate 基线](decisions/0009-phase-2a-freeze.md)
 - [ADR-0010：冻结 Phase 2B 硬件资格工具与证据目标](decisions/0010-phase-2b-qualification-evidence.md)
+- [ADR-0011：冻结 Phase 2B Qualification Software Candidate](decisions/0011-phase-2b-qualification-software-candidate-freeze.md)
 
 ## v1 固定范围
 
@@ -62,10 +75,15 @@ system serial leaf、可注入 byte I/O、CH32 模拟器、Amiibo save/select、
 软件热路径 latency harness 均已实现。详细证据和本地命令见
 [Runtime + Controller Phase 2A Candidate](development/runtime-controller-vertical-slice.md)。
 
-Phase 2B 的首轮交接和资格工具审计已开始，工具修复目标见
-[ADR-0010](decisions/0010-phase-2b-qualification-evidence.md)。当前仍明确标记 `Hardware Unverified`：没有
-冻结任何具体板型/固件、Amiibo 容量、UART/USB/Switch 时序或完整物理中立化能力；O-01、O-02、O-04
-保持开放，完整 Phase 2 未完成，也没有创建完整 Phase 2 冻结 ADR。
+Phase 2B 的资格软件候选已按 [ADR-0011](decisions/0011-phase-2b-qualification-software-candidate-freeze.md) 冻结，
+包括设备身份接纳、持久 evidence transaction、operator/Ctrl+C、Amiibo 写前安全、telemetry 投影和五类 checkpoint。
+复审后的精确实现基线为 `bbebaf458a0f2c0d60f3de6169f0eecfe8ef9fd0`，tree 为
+`020635276554be62d77ef26f8ab9f5bb8237e8ca`；旧候选 `10742b6f28ed17ab429c7e365d520a5f54cff543`
+已被取代。新独立 reviewer 的 13/13 软件门禁通过，根 workspace 157 个测试、hardware workspace 164 个纯软件
+测试通过，且没有新的直接相关、可复现且 in-scope 的 P0/P1/P2。根门禁中的一次 Windows SetupAPI discovery
+只是 ADR-0009 固定的只读 OS conformance，不打开或写入串口，也不构成硬件资格证据。
+当前仍明确标记 `Hardware Unverified`：没有冻结任何具体板型/固件、Amiibo 容量、UART/USB/Switch 时序或完整
+物理中立化能力；O-01、O-02、O-04 保持开放，完整 Phase 2 未完成，也没有创建完整 Phase 2 冻结 ADR。
 
 ## 首发基线
 

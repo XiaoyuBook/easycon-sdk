@@ -4,6 +4,10 @@ use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
 #[cfg(windows)]
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -15,8 +19,20 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
 };
 
+use crate::journal::{
+    EvidenceJournal, JOURNAL_FILE_NAME, JournalEventKind, JournalStart, JournalWriter,
+};
+use crate::provenance::sha256_bytes;
+
 pub(crate) const RESERVATION_FILE_NAME: &str = ".easycon-hardware-run.reservation.json";
 pub(crate) const SEQUENCE_TIMINGS_FILE_NAME: &str = "sequence-timings.csv";
+pub(crate) const MANIFEST_FILE_NAME: &str = "manifest.json";
+pub(crate) const COMPLETION_FILE_NAME: &str = "completion.json";
+
+pub(crate) struct RunStartMetadata {
+    pub(crate) normalized_arguments: Value,
+    pub(crate) provenance: Value,
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum AuxiliaryKind {
@@ -36,6 +52,8 @@ enum OwnedFileRole {
     Reservation,
     Primary,
     Auxiliary(AuxiliaryKind),
+    Manifest,
+    Completion,
 }
 
 trait ArtifactObserver {
@@ -48,6 +66,10 @@ trait ArtifactObserver {
     fn after_auxiliary_published(&self, _kind: AuxiliaryKind, _directory: &Path) {}
 
     fn after_all_published(&self, _directory: &Path) {}
+
+    fn after_manifest_published(&self, _directory: &Path) {}
+
+    fn after_completion_published(&self, _directory: &Path) {}
 }
 
 struct NoopArtifactObserver;
@@ -155,6 +177,10 @@ impl OwnedFile {
     }
 
     fn verify(&mut self) -> Result<(), String> {
+        self.readback().map(|_| ())
+    }
+
+    fn readback(&mut self) -> Result<Vec<u8>, String> {
         self.file
             .seek(SeekFrom::Start(0))
             .map_err(|error| format!("cannot seek {}: {error}", self.path.display()))?;
@@ -171,7 +197,7 @@ impl OwnedFile {
         self.file
             .seek(SeekFrom::End(0))
             .map_err(|error| format!("cannot seek {}: {error}", self.path.display()))?;
-        Ok(())
+        Ok(actual)
     }
 }
 
@@ -182,6 +208,10 @@ struct PublishedFile {
 
 impl PublishedFile {
     fn verify(&mut self, expected: &[u8]) -> Result<(), String> {
+        self.readback(expected).map(|_| ())
+    }
+
+    fn readback(&mut self, expected: &[u8]) -> Result<Vec<u8>, String> {
         self.guard
             .seek(SeekFrom::Start(0))
             .map_err(|error| format!("cannot seek {}: {error}", self.path.display()))?;
@@ -198,7 +228,7 @@ impl PublishedFile {
         self.guard
             .seek(SeekFrom::Start(0))
             .map_err(|error| format!("cannot seek {}: {error}", self.path.display()))?;
-        Ok(())
+        Ok(actual)
     }
 }
 
@@ -207,11 +237,53 @@ struct OwnedAuxiliary {
     staging: OwnedFile,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ManifestMember {
+    role: String,
+    relative_path: String,
+    bytes: u64,
+    sha256: String,
+    same_file_as: Option<String>,
+}
+
+impl ManifestMember {
+    fn new(
+        role: impl Into<String>,
+        relative_path: impl Into<String>,
+        bytes: &[u8],
+        same_file_as: Option<String>,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            role: role.into(),
+            relative_path: relative_path.into(),
+            bytes: u64::try_from(bytes.len())
+                .map_err(|_| "manifest member length does not fit u64".to_owned())?,
+            sha256: sha256_bytes(bytes),
+            same_file_as,
+        })
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "role": self.role,
+            "relative_path": self.relative_path,
+            "bytes": self.bytes,
+            "sha256": self.sha256,
+            "same_file_as": self.same_file_as,
+        })
+    }
+}
+
 pub(crate) struct ArtifactReservation {
     directory: PathBuf,
     command: String,
+    lease_id: String,
+    created_unix_ns: u64,
     tombstone: OwnedFile,
+    journal: Option<EvidenceJournal>,
     primary: ArtifactPlan,
+    manifest: ArtifactPlan,
+    completion: ArtifactPlan,
     planned_auxiliaries: Vec<AuxiliaryPlan>,
     owned_auxiliaries: Vec<OwnedAuxiliary>,
     poisoned: Option<String>,
@@ -229,6 +301,7 @@ impl ArtifactReservation {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn begin(command: &str, directory: &Path) -> Result<Self, String> {
         Self::begin_observed(command, directory, &NOOP_ARTIFACT_OBSERVER)
     }
@@ -253,6 +326,14 @@ impl ArtifactReservation {
         let primary = ArtifactPlan {
             final_name: format!("{command}.json"),
             staging_name: format!(".{command}.{lease_id}.json.staged"),
+        };
+        let manifest = ArtifactPlan {
+            final_name: MANIFEST_FILE_NAME.to_owned(),
+            staging_name: format!(".manifest.{lease_id}.json.staged"),
+        };
+        let completion = ArtifactPlan {
+            final_name: COMPLETION_FILE_NAME.to_owned(),
+            staging_name: format!(".completion.{lease_id}.json.staged"),
         };
         let planned_auxiliaries = if command == "sequence" {
             vec![AuxiliaryPlan {
@@ -287,6 +368,17 @@ impl ArtifactReservation {
                 "staging": primary.staging_name,
             },
             "auxiliary_artifacts": auxiliary_document,
+            "evidence_transaction": {
+                "journal": JOURNAL_FILE_NAME,
+                "manifest": {
+                    "final": manifest.final_name,
+                    "staging": manifest.staging_name,
+                },
+                "completion": {
+                    "final": completion.final_name,
+                    "staging": completion.staging_name,
+                },
+            },
         });
         let reservation_bytes =
             serde_json::to_vec_pretty(&reservation_document).map_err(|error| error.to_string())?;
@@ -305,11 +397,89 @@ impl ArtifactReservation {
         Ok(Self {
             directory: directory.to_path_buf(),
             command: command.to_owned(),
+            lease_id,
+            created_unix_ns,
             tombstone,
+            journal: None,
             primary,
+            manifest,
+            completion,
             planned_auxiliaries,
             owned_auxiliaries: Vec::new(),
             poisoned: None,
+        })
+    }
+
+    pub(crate) fn begin_journaled(
+        command: &str,
+        directory: &Path,
+        metadata: RunStartMetadata,
+    ) -> Result<Self, String> {
+        let mut reservation = Self::begin_observed(command, directory, &NOOP_ARTIFACT_OBSERVER)?;
+        let journal = EvidenceJournal::create(
+            directory.join(JOURNAL_FILE_NAME),
+            JournalStart {
+                lease_id: reservation.lease_id.clone(),
+                command: reservation.command.clone(),
+                process_id: std::process::id(),
+                started_unix_ns: reservation.created_unix_ns,
+                normalized_arguments: metadata.normalized_arguments,
+                provenance: metadata.provenance,
+            },
+        )?;
+        reservation.journal = Some(journal);
+        validate_directory_entries(directory, &reservation.pre_primary_entries())?;
+        reservation.tombstone.verify()?;
+        reservation
+            .journal
+            .as_mut()
+            .expect("journal was installed")
+            .verify()?;
+        Ok(reservation)
+    }
+
+    pub(crate) fn record_event(
+        &mut self,
+        kind: JournalEventKind,
+        payload: Value,
+    ) -> Result<(), String> {
+        self.journal
+            .as_mut()
+            .ok_or_else(|| "artifact reservation has no evidence journal".to_owned())?
+            .append(kind, payload)
+    }
+
+    pub(crate) fn seal_journal(&mut self, payload: Value) -> Result<(), String> {
+        self.journal
+            .as_mut()
+            .ok_or_else(|| "artifact reservation has no evidence journal".to_owned())?
+            .seal(payload)
+    }
+
+    pub(crate) fn journal_projection(&self) -> Result<Value, String> {
+        self.journal
+            .as_ref()
+            .ok_or_else(|| "artifact reservation has no evidence journal".to_owned())
+            .and_then(EvidenceJournal::projection_json)
+    }
+
+    pub(crate) fn journal_writer(&self) -> Result<JournalWriter, String> {
+        self.journal
+            .as_ref()
+            .map(EvidenceJournal::writer)
+            .ok_or_else(|| "artifact reservation has no evidence journal".to_owned())
+    }
+
+    pub(crate) fn lease_id(&self) -> &str {
+        &self.lease_id
+    }
+
+    pub(crate) fn run_identity_json(&self, ended_unix_ns: u64) -> Value {
+        json!({
+            "lease_id": self.lease_id,
+            "started_unix_ns": self.created_unix_ns,
+            "ended_unix_ns": ended_unix_ns,
+            "journal": JOURNAL_FILE_NAME,
         })
     }
 
@@ -402,6 +572,12 @@ impl ArtifactReservation {
         if let Some(error) = &self.poisoned {
             return Err(format!("artifact reservation is poisoned: {error}"));
         }
+        if let Some(journal) = &mut self.journal {
+            if !journal.is_sealed()? {
+                return Err("evidence journal must be sealed before artifact commit".to_owned());
+            }
+            journal.verify()?;
+        }
         self.tombstone.verify()?;
         validate_directory_entries(&self.directory, &self.pre_primary_entries())?;
 
@@ -415,6 +591,9 @@ impl ArtifactReservation {
         )?;
 
         self.tombstone.verify()?;
+        if let Some(journal) = &mut self.journal {
+            journal.verify()?;
+        }
         for auxiliary in &mut self.owned_auxiliaries {
             auxiliary.staging.verify()?;
         }
@@ -451,6 +630,9 @@ impl ArtifactReservation {
 
         validate_directory_entries(&self.directory, &self.published_entries())?;
         self.tombstone.verify()?;
+        if let Some(journal) = &mut self.journal {
+            journal.verify()?;
+        }
         for (auxiliary, published) in self
             .owned_auxiliaries
             .iter_mut()
@@ -461,12 +643,119 @@ impl ArtifactReservation {
         }
         primary.verify()?;
         published_primary.verify(&primary.expected)?;
+        if self.journal.is_none() {
+            return Ok(PathBuf::from(&self.primary.final_name));
+        }
+
+        let members = collect_manifest_members(
+            &mut self.tombstone,
+            self.journal.as_mut().expect("journal presence was checked"),
+            &self.primary,
+            &mut primary,
+            &mut published_primary,
+            &mut self.owned_auxiliaries,
+            &mut published_auxiliaries,
+        )?;
+        let manifest_document = manifest_document(&self.lease_id, &self.command, &members);
+        let manifest_bytes =
+            serde_json::to_vec_pretty(&manifest_document).map_err(|error| error.to_string())?;
+        let mut manifest = OwnedFile::create(
+            self.manifest.staging_path(&self.directory),
+            manifest_bytes,
+            OwnedFileRole::Manifest,
+            observer,
+        )?;
+        validate_directory_entries(&self.directory, &self.manifest_staged_entries())?;
+        let mut published_manifest = publish_owned_artifact(
+            &manifest,
+            &self.manifest.final_path(&self.directory),
+            OwnedFileRole::Manifest,
+            observer,
+            guard_opener,
+            guard_metadata_provider,
+            identity_provider,
+        )?;
+        observer.after_manifest_published(&self.directory);
+        validate_directory_entries(&self.directory, &self.manifest_published_entries())?;
+        let manifest_disk_bytes = published_manifest.readback(&manifest.expected)?;
+        let manifest_disk_document: Value = serde_json::from_slice(&manifest_disk_bytes)
+            .map_err(|error| format!("cannot parse published manifest: {error}"))?;
+        if manifest_disk_document != manifest_document {
+            return Err("published manifest does not match the disk-derived document".to_owned());
+        }
+
+        let completion_document = json!({
+            "schema_version": 1,
+            "kind": "easycon_hardware_evidence_completion",
+            "lease_id": self.lease_id,
+            "manifest": {
+                "relative_path": self.manifest.final_name,
+                "bytes": u64::try_from(manifest_disk_bytes.len())
+                    .map_err(|_| "manifest length does not fit u64".to_owned())?,
+                "sha256": sha256_bytes(&manifest_disk_bytes),
+            },
+        });
+        let completion_bytes =
+            serde_json::to_vec_pretty(&completion_document).map_err(|error| error.to_string())?;
+        let mut completion = OwnedFile::create(
+            self.completion.staging_path(&self.directory),
+            completion_bytes,
+            OwnedFileRole::Completion,
+            observer,
+        )?;
+        validate_directory_entries(&self.directory, &self.completion_staged_entries())?;
+        let mut published_completion = publish_owned_artifact(
+            &completion,
+            &self.completion.final_path(&self.directory),
+            OwnedFileRole::Completion,
+            observer,
+            guard_opener,
+            guard_metadata_provider,
+            identity_provider,
+        )?;
+        observer.after_completion_published(&self.directory);
+        validate_directory_entries(&self.directory, &self.completed_entries())?;
+
+        let final_members = collect_manifest_members(
+            &mut self.tombstone,
+            self.journal.as_mut().expect("journal presence was checked"),
+            &self.primary,
+            &mut primary,
+            &mut published_primary,
+            &mut self.owned_auxiliaries,
+            &mut published_auxiliaries,
+        )?;
+        if final_members != members {
+            return Err("manifest members changed before completion verification".to_owned());
+        }
+        manifest.verify()?;
+        let manifest_final = published_manifest.readback(&manifest.expected)?;
+        if manifest_final != manifest_disk_bytes {
+            return Err("manifest bytes changed before completion verification".to_owned());
+        }
+        completion.verify()?;
+        let completion_final = published_completion.readback(&completion.expected)?;
+        let completion_final_document: Value = serde_json::from_slice(&completion_final)
+            .map_err(|error| format!("cannot parse published completion: {error}"))?;
+        if completion_final_document != completion_document {
+            return Err("published completion does not match its owned document".to_owned());
+        }
+        let inspection = classify_run_directory(&self.directory);
+        if inspection.status != RunDirectoryStatus::Completed {
+            return Err(format!(
+                "completed evidence transaction failed disk classification: {}",
+                inspection.reason
+            ));
+        }
         Ok(PathBuf::from(&self.primary.final_name))
     }
 
     fn pre_primary_entries(&self) -> BTreeSet<OsString> {
         let mut entries = BTreeSet::new();
         entries.insert(OsString::from(RESERVATION_FILE_NAME));
+        if self.journal.is_some() {
+            entries.insert(OsString::from(JOURNAL_FILE_NAME));
+        }
         for auxiliary in &self.owned_auxiliaries {
             entries.insert(OsString::from(&auxiliary.plan.artifact.staging_name));
         }
@@ -487,6 +776,725 @@ impl ArtifactReservation {
         }
         entries
     }
+
+    fn manifest_staged_entries(&self) -> BTreeSet<OsString> {
+        let mut entries = self.published_entries();
+        entries.insert(OsString::from(&self.manifest.staging_name));
+        entries
+    }
+
+    fn manifest_published_entries(&self) -> BTreeSet<OsString> {
+        let mut entries = self.manifest_staged_entries();
+        entries.insert(OsString::from(&self.manifest.final_name));
+        entries
+    }
+
+    fn completion_staged_entries(&self) -> BTreeSet<OsString> {
+        let mut entries = self.manifest_published_entries();
+        entries.insert(OsString::from(&self.completion.staging_name));
+        entries
+    }
+
+    fn completed_entries(&self) -> BTreeSet<OsString> {
+        let mut entries = self.completion_staged_entries();
+        entries.insert(OsString::from(&self.completion.final_name));
+        entries
+    }
+}
+
+fn collect_manifest_members(
+    tombstone: &mut OwnedFile,
+    journal: &mut EvidenceJournal,
+    primary_plan: &ArtifactPlan,
+    primary: &mut OwnedFile,
+    published_primary: &mut PublishedFile,
+    auxiliaries: &mut [OwnedAuxiliary],
+    published_auxiliaries: &mut [PublishedFile],
+) -> Result<Vec<ManifestMember>, String> {
+    if auxiliaries.len() != published_auxiliaries.len() {
+        return Err("published auxiliary count does not match owned auxiliaries".to_owned());
+    }
+    let mut members = vec![
+        ManifestMember::new(
+            "reservation",
+            RESERVATION_FILE_NAME,
+            &tombstone.readback()?,
+            None,
+        )?,
+        ManifestMember::new("journal", JOURNAL_FILE_NAME, &journal.readback()?, None)?,
+        ManifestMember::new(
+            "primary_staging",
+            &primary_plan.staging_name,
+            &primary.readback()?,
+            None,
+        )?,
+        ManifestMember::new(
+            "primary_final",
+            &primary_plan.final_name,
+            &published_primary.readback(&primary.expected)?,
+            Some(primary_plan.staging_name.clone()),
+        )?,
+    ];
+    for (auxiliary, published) in auxiliaries.iter_mut().zip(published_auxiliaries) {
+        let kind = auxiliary.plan.kind.as_str();
+        members.push(ManifestMember::new(
+            format!("{kind}_staging"),
+            &auxiliary.plan.artifact.staging_name,
+            &auxiliary.staging.readback()?,
+            None,
+        )?);
+        members.push(ManifestMember::new(
+            format!("{kind}_final"),
+            &auxiliary.plan.artifact.final_name,
+            &published.readback(&auxiliary.staging.expected)?,
+            Some(auxiliary.plan.artifact.staging_name.clone()),
+        )?);
+    }
+    members.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    Ok(members)
+}
+
+fn manifest_document(lease_id: &str, command: &str, members: &[ManifestMember]) -> Value {
+    json!({
+        "schema_version": 1,
+        "kind": "easycon_hardware_evidence_manifest",
+        "lease_id": lease_id,
+        "command": command,
+        "members": members.iter().map(ManifestMember::to_json).collect::<Vec<_>>(),
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RunDirectoryStatus {
+    Vacant,
+    Incomplete,
+    Polluted,
+    Completed,
+}
+
+impl RunDirectoryStatus {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Vacant => "vacant",
+            Self::Incomplete => "incomplete",
+            Self::Polluted => "polluted",
+            Self::Completed => "completed",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RunDirectoryInspection {
+    pub(crate) status: RunDirectoryStatus,
+    pub(crate) reason: &'static str,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CompletedRunEvidence {
+    pub(crate) lease_id: String,
+    pub(crate) command: String,
+    pub(crate) primary_relative_path: String,
+    pub(crate) document: Value,
+    pub(crate) document_bytes: u64,
+    pub(crate) document_sha256: String,
+    pub(crate) journal_bytes: u64,
+    pub(crate) journal_sha256: String,
+    pub(crate) manifest_bytes: u64,
+    pub(crate) manifest_sha256: String,
+    pub(crate) completion_bytes: u64,
+    pub(crate) completion_sha256: String,
+    pub(crate) manifest_members: Value,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CheckpointRunEvidence {
+    pub(crate) inspection: RunDirectoryInspection,
+    pub(crate) snapshot_sha256: String,
+    pub(crate) snapshot_complete: bool,
+    pub(crate) completed: Option<CompletedRunEvidence>,
+}
+
+#[derive(Clone, Debug)]
+struct DiskTransactionPlan {
+    lease_id: String,
+    command: String,
+    primary: ArtifactPlan,
+    auxiliaries: Vec<AuxiliaryPlan>,
+    manifest: ArtifactPlan,
+    completion: ArtifactPlan,
+}
+
+impl DiskTransactionPlan {
+    fn from_reservation(document: &Value) -> Result<Self, String> {
+        let object = document
+            .as_object()
+            .ok_or_else(|| "reservation is not an object".to_owned())?;
+        let required = [
+            "schema_version",
+            "kind",
+            "lease_id",
+            "command",
+            "process_id",
+            "created_unix_ns",
+            "primary_artifact",
+            "auxiliary_artifacts",
+            "evidence_transaction",
+        ];
+        if object.len() != required.len()
+            || required.iter().any(|field| !object.contains_key(*field))
+        {
+            return Err("reservation schema is not exact".to_owned());
+        }
+        if document["schema_version"].as_u64() != Some(1)
+            || document["kind"] != "run_directory_reservation"
+        {
+            return Err("reservation identity is invalid".to_owned());
+        }
+        let lease_id = nonempty_string(&document["lease_id"], "lease_id")?;
+        let command = nonempty_string(&document["command"], "command")?;
+        ArtifactReservation::validate_command(&command)?;
+        if document["process_id"].as_u64().is_none()
+            || document["created_unix_ns"].as_u64().is_none()
+        {
+            return Err("reservation process/time fields are invalid".to_owned());
+        }
+        let primary = parse_artifact_plan(&document["primary_artifact"])?;
+        let auxiliary_values = document["auxiliary_artifacts"]
+            .as_array()
+            .ok_or_else(|| "reservation auxiliary plan is invalid".to_owned())?;
+        let mut auxiliaries = Vec::with_capacity(auxiliary_values.len());
+        for value in auxiliary_values {
+            let object = value
+                .as_object()
+                .ok_or_else(|| "auxiliary plan is not an object".to_owned())?;
+            if object.len() != 3
+                || !object.contains_key("kind")
+                || !object.contains_key("final")
+                || !object.contains_key("staging")
+            {
+                return Err("auxiliary plan schema is not exact".to_owned());
+            }
+            let kind = match value["kind"].as_str() {
+                Some("sequence_timings_csv") => AuxiliaryKind::SequenceTimingsCsv,
+                _ => return Err("auxiliary plan kind is unknown".to_owned()),
+            };
+            auxiliaries.push(AuxiliaryPlan {
+                kind,
+                artifact: ArtifactPlan {
+                    final_name: safe_relative_name(&value["final"], "auxiliary final")?,
+                    staging_name: safe_relative_name(&value["staging"], "auxiliary staging")?,
+                },
+            });
+        }
+        let transaction = document["evidence_transaction"]
+            .as_object()
+            .ok_or_else(|| "evidence transaction plan is invalid".to_owned())?;
+        if transaction.len() != 3
+            || transaction.get("journal").and_then(Value::as_str) != Some(JOURNAL_FILE_NAME)
+        {
+            return Err("evidence transaction plan schema is invalid".to_owned());
+        }
+        let manifest = parse_artifact_plan(&document["evidence_transaction"]["manifest"])?;
+        let completion = parse_artifact_plan(&document["evidence_transaction"]["completion"])?;
+        if manifest.final_name != MANIFEST_FILE_NAME
+            || completion.final_name != COMPLETION_FILE_NAME
+        {
+            return Err("evidence transaction final names are invalid".to_owned());
+        }
+        let plan = Self {
+            lease_id,
+            command,
+            primary,
+            auxiliaries,
+            manifest,
+            completion,
+        };
+        plan.validate_expected_names()?;
+        plan.completed_entries()?;
+        Ok(plan)
+    }
+
+    fn validate_expected_names(&self) -> Result<(), String> {
+        let mut lease_parts = self.lease_id.split('-');
+        let process = lease_parts.next().unwrap_or_default();
+        let timestamp = lease_parts.next().unwrap_or_default();
+        if lease_parts.next().is_some()
+            || process.len() != 8
+            || timestamp.len() != 32
+            || !process.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || !timestamp.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err("reservation lease_id is invalid".to_owned());
+        }
+        if self.primary.final_name != format!("{}.json", self.command)
+            || self.primary.staging_name
+                != format!(".{}.{}.json.staged", self.command, self.lease_id)
+            || self.manifest.final_name != MANIFEST_FILE_NAME
+            || self.manifest.staging_name != format!(".manifest.{}.json.staged", self.lease_id)
+            || self.completion.final_name != COMPLETION_FILE_NAME
+            || self.completion.staging_name != format!(".completion.{}.json.staged", self.lease_id)
+        {
+            return Err("reservation transaction names do not match lease".to_owned());
+        }
+        match (self.command.as_str(), self.auxiliaries.as_slice()) {
+            ("sequence", [auxiliary])
+                if auxiliary.kind == AuxiliaryKind::SequenceTimingsCsv
+                    && auxiliary.artifact.final_name == SEQUENCE_TIMINGS_FILE_NAME
+                    && auxiliary.artifact.staging_name
+                        == format!(".sequence.{}.sequence-timings.csv.staged", self.lease_id) =>
+            {
+                Ok(())
+            }
+            ("sequence", _) => Err("sequence auxiliary plan is invalid".to_owned()),
+            (_, []) => Ok(()),
+            (_, _) => Err("non-sequence command declared an auxiliary".to_owned()),
+        }
+    }
+
+    fn completed_entries(&self) -> Result<BTreeSet<OsString>, String> {
+        let mut entries = BTreeSet::from([
+            OsString::from(RESERVATION_FILE_NAME),
+            OsString::from(JOURNAL_FILE_NAME),
+            OsString::from(&self.primary.staging_name),
+            OsString::from(&self.primary.final_name),
+            OsString::from(&self.manifest.staging_name),
+            OsString::from(&self.manifest.final_name),
+            OsString::from(&self.completion.staging_name),
+            OsString::from(&self.completion.final_name),
+        ]);
+        let expected = 8 + self.auxiliaries.len() * 2;
+        for auxiliary in &self.auxiliaries {
+            entries.insert(OsString::from(&auxiliary.artifact.staging_name));
+            entries.insert(OsString::from(&auxiliary.artifact.final_name));
+        }
+        if entries.len() != expected {
+            return Err("transaction plan contains duplicate relative names".to_owned());
+        }
+        Ok(entries)
+    }
+
+    fn manifest_specs(&self) -> Vec<(String, String, Option<String>)> {
+        let mut specs = vec![
+            (
+                "reservation".to_owned(),
+                RESERVATION_FILE_NAME.to_owned(),
+                None,
+            ),
+            ("journal".to_owned(), JOURNAL_FILE_NAME.to_owned(), None),
+            (
+                "primary_staging".to_owned(),
+                self.primary.staging_name.clone(),
+                None,
+            ),
+            (
+                "primary_final".to_owned(),
+                self.primary.final_name.clone(),
+                Some(self.primary.staging_name.clone()),
+            ),
+        ];
+        for auxiliary in &self.auxiliaries {
+            let kind = auxiliary.kind.as_str();
+            specs.push((
+                format!("{kind}_staging"),
+                auxiliary.artifact.staging_name.clone(),
+                None,
+            ));
+            specs.push((
+                format!("{kind}_final"),
+                auxiliary.artifact.final_name.clone(),
+                Some(auxiliary.artifact.staging_name.clone()),
+            ));
+        }
+        specs.sort_by(|left, right| left.1.cmp(&right.1));
+        specs
+    }
+}
+
+struct GuardedDiskFile {
+    bytes: Vec<u8>,
+    identity: HighResolutionFileIdentity,
+}
+
+pub(crate) fn classify_run_directory(directory: &Path) -> RunDirectoryInspection {
+    match classify_run_directory_inner(directory) {
+        Ok(status) => status,
+        Err(_) => RunDirectoryInspection {
+            status: RunDirectoryStatus::Polluted,
+            reason: "completed_evidence_invalid",
+        },
+    }
+}
+
+pub(crate) fn checkpoint_run_evidence(directory: &Path) -> CheckpointRunEvidence {
+    let first = classify_run_directory(directory);
+    let (first_snapshot_sha256, first_snapshot_complete) = checkpoint_directory_snapshot(directory);
+    if first.status != RunDirectoryStatus::Completed || !first_snapshot_complete {
+        return CheckpointRunEvidence {
+            inspection: first,
+            snapshot_sha256: first_snapshot_sha256,
+            snapshot_complete: first_snapshot_complete,
+            completed: None,
+        };
+    }
+
+    let completed = completed_run_evidence(directory);
+    let second = classify_run_directory(directory);
+    let (second_snapshot_sha256, second_snapshot_complete) =
+        checkpoint_directory_snapshot(directory);
+    if completed.is_err()
+        || second.status != RunDirectoryStatus::Completed
+        || !second_snapshot_complete
+        || first_snapshot_sha256 != second_snapshot_sha256
+    {
+        return CheckpointRunEvidence {
+            inspection: RunDirectoryInspection {
+                status: RunDirectoryStatus::Polluted,
+                reason: "checkpoint_read_race_or_failure",
+            },
+            snapshot_sha256: second_snapshot_sha256,
+            snapshot_complete: false,
+            completed: None,
+        };
+    }
+
+    CheckpointRunEvidence {
+        inspection: second,
+        snapshot_sha256: second_snapshot_sha256,
+        snapshot_complete: true,
+        completed: completed.ok(),
+    }
+}
+
+pub(crate) fn read_checkpoint_input_file(
+    path: &Path,
+    maximum_bytes: u64,
+) -> Result<Vec<u8>, String> {
+    let first = read_guarded_disk_file_bounded(path, maximum_bytes)?;
+    let second = read_guarded_disk_file_bounded(path, maximum_bytes)?;
+    if first.identity != second.identity || first.bytes != second.bytes {
+        return Err("checkpoint input changed while it was read".to_owned());
+    }
+    Ok(second.bytes)
+}
+
+fn completed_run_evidence(directory: &Path) -> Result<CompletedRunEvidence, String> {
+    let reservation = read_guarded_disk_file(&directory.join(RESERVATION_FILE_NAME))?;
+    let reservation_document: Value = serde_json::from_slice(&reservation.bytes)
+        .map_err(|_| "reservation JSON is invalid".to_owned())?;
+    let plan = DiskTransactionPlan::from_reservation(&reservation_document)?;
+    let primary = read_guarded_disk_file(&directory.join(&plan.primary.final_name))?;
+    let document: Value = serde_json::from_slice(&primary.bytes)
+        .map_err(|_| "primary document JSON is invalid".to_owned())?;
+    let journal = read_guarded_disk_file(&directory.join(JOURNAL_FILE_NAME))?;
+    let manifest = read_guarded_disk_file(&directory.join(&plan.manifest.final_name))?;
+    let manifest_document: Value = serde_json::from_slice(&manifest.bytes)
+        .map_err(|_| "manifest JSON is invalid".to_owned())?;
+    let completion = read_guarded_disk_file(&directory.join(&plan.completion.final_name))?;
+
+    Ok(CompletedRunEvidence {
+        lease_id: plan.lease_id,
+        command: plan.command,
+        primary_relative_path: plan.primary.final_name,
+        document,
+        document_bytes: checked_len(&primary.bytes)?,
+        document_sha256: sha256_bytes(&primary.bytes),
+        journal_bytes: checked_len(&journal.bytes)?,
+        journal_sha256: sha256_bytes(&journal.bytes),
+        manifest_bytes: checked_len(&manifest.bytes)?,
+        manifest_sha256: sha256_bytes(&manifest.bytes),
+        completion_bytes: checked_len(&completion.bytes)?,
+        completion_sha256: sha256_bytes(&completion.bytes),
+        manifest_members: manifest_document["members"].clone(),
+    })
+}
+
+fn checkpoint_directory_snapshot(directory: &Path) -> (String, bool) {
+    let mut digest_input = Vec::new();
+    append_snapshot_field(&mut digest_input, b"easycon-checkpoint-run-snapshot-v1");
+    let Ok(read) = fs::read_dir(directory) else {
+        append_snapshot_field(&mut digest_input, b"directory-unreadable");
+        return (sha256_bytes(&digest_input), false);
+    };
+    let mut names = Vec::new();
+    for entry in read {
+        let Ok(entry) = entry else {
+            append_snapshot_field(&mut digest_input, b"entry-unreadable");
+            return (sha256_bytes(&digest_input), false);
+        };
+        names.push(entry.file_name());
+    }
+    names.sort();
+    let mut complete = true;
+    for name in names {
+        let name_bytes = checkpoint_os_name_bytes(&name);
+        append_snapshot_field(&mut digest_input, &name_bytes);
+        if name.to_str().is_none() {
+            complete = false;
+        }
+        let path = directory.join(&name);
+        match read_guarded_disk_file(&path) {
+            Ok(file) => {
+                append_snapshot_field(&mut digest_input, b"regular-file");
+                append_snapshot_field(
+                    &mut digest_input,
+                    &u64::try_from(file.bytes.len())
+                        .unwrap_or(u64::MAX)
+                        .to_le_bytes(),
+                );
+                append_snapshot_field(&mut digest_input, sha256_bytes(&file.bytes).as_bytes());
+            }
+            Err(_) => {
+                append_snapshot_field(&mut digest_input, b"unreadable-or-nonregular");
+                complete = false;
+            }
+        }
+    }
+    (sha256_bytes(&digest_input), complete)
+}
+
+fn append_snapshot_field(output: &mut Vec<u8>, bytes: &[u8]) {
+    output.extend_from_slice(&u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
+    output.extend_from_slice(bytes);
+}
+
+#[cfg(windows)]
+fn checkpoint_os_name_bytes(name: &OsString) -> Vec<u8> {
+    name.encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>()
+}
+
+#[cfg(unix)]
+fn checkpoint_os_name_bytes(name: &OsString) -> Vec<u8> {
+    name.as_bytes().to_vec()
+}
+
+#[cfg(not(any(windows, unix)))]
+fn checkpoint_os_name_bytes(name: &OsString) -> Vec<u8> {
+    name.to_string_lossy().as_bytes().to_vec()
+}
+
+fn checked_len(bytes: &[u8]) -> Result<u64, String> {
+    u64::try_from(bytes.len()).map_err(|_| "evidence member length does not fit u64".to_owned())
+}
+
+fn classify_run_directory_inner(directory: &Path) -> Result<RunDirectoryInspection, String> {
+    let actual = directory_entries(directory)?;
+    if actual.is_empty() {
+        return Ok(RunDirectoryInspection {
+            status: RunDirectoryStatus::Vacant,
+            reason: "directory_empty",
+        });
+    }
+    if !actual.contains(&OsString::from(RESERVATION_FILE_NAME)) {
+        return Ok(RunDirectoryInspection {
+            status: RunDirectoryStatus::Polluted,
+            reason: "reservation_missing",
+        });
+    }
+    let reservation = read_guarded_disk_file(&directory.join(RESERVATION_FILE_NAME))?;
+    let reservation_document: Value = serde_json::from_slice(&reservation.bytes)
+        .map_err(|_| "reservation JSON is invalid".to_owned())?;
+    let plan = DiskTransactionPlan::from_reservation(&reservation_document)?;
+    let expected = plan.completed_entries()?;
+    if actual.difference(&expected).next().is_some() {
+        return Ok(RunDirectoryInspection {
+            status: RunDirectoryStatus::Polluted,
+            reason: "unexpected_entry",
+        });
+    }
+    for artifact in std::iter::once(&plan.primary)
+        .chain(plan.auxiliaries.iter().map(|plan| &plan.artifact))
+        .chain([&plan.manifest, &plan.completion])
+    {
+        if actual.contains(&OsString::from(&artifact.final_name))
+            && !actual.contains(&OsString::from(&artifact.staging_name))
+        {
+            return Ok(RunDirectoryInspection {
+                status: RunDirectoryStatus::Polluted,
+                reason: "orphan_final_link",
+            });
+        }
+    }
+    if !actual.contains(&OsString::from(&plan.completion.final_name)) {
+        return Ok(RunDirectoryInspection {
+            status: RunDirectoryStatus::Incomplete,
+            reason: "completion_absent",
+        });
+    }
+    if actual != expected {
+        return Ok(RunDirectoryInspection {
+            status: RunDirectoryStatus::Polluted,
+            reason: "completed_entry_missing",
+        });
+    }
+
+    let journal = read_guarded_disk_file(&directory.join(JOURNAL_FILE_NAME))?;
+    let journal_events = crate::journal::parse_journal(&journal.bytes)?;
+    if journal_events
+        .last()
+        .and_then(|event| event["event"].as_str())
+        != Some(JournalEventKind::ArtifactFinalizationStarted.as_str())
+    {
+        return Err("completed journal is not sealed".to_owned());
+    }
+
+    let members = disk_manifest_members(directory, &plan)?;
+    let expected_manifest = manifest_document(&plan.lease_id, &plan.command, &members);
+    let manifest_file = read_guarded_disk_file(&directory.join(&plan.manifest.final_name))?;
+    let manifest_staging = read_guarded_disk_file(&directory.join(&plan.manifest.staging_name))?;
+    if manifest_staging.identity != manifest_file.identity
+        || manifest_staging.bytes != manifest_file.bytes
+    {
+        return Err("manifest staging/final identity does not match".to_owned());
+    }
+    let manifest_document: Value = serde_json::from_slice(&manifest_file.bytes)
+        .map_err(|_| "manifest JSON is invalid".to_owned())?;
+    if manifest_document != expected_manifest {
+        return Err("manifest does not match disk members".to_owned());
+    }
+
+    let completion_file = read_guarded_disk_file(&directory.join(&plan.completion.final_name))?;
+    let completion_staging =
+        read_guarded_disk_file(&directory.join(&plan.completion.staging_name))?;
+    if completion_staging.identity != completion_file.identity
+        || completion_staging.bytes != completion_file.bytes
+    {
+        return Err("completion staging/final identity does not match".to_owned());
+    }
+    let completion: Value = serde_json::from_slice(&completion_file.bytes)
+        .map_err(|_| "completion JSON is invalid".to_owned())?;
+    let expected_completion = json!({
+        "schema_version": 1,
+        "kind": "easycon_hardware_evidence_completion",
+        "lease_id": plan.lease_id,
+        "manifest": {
+            "relative_path": plan.manifest.final_name,
+            "bytes": u64::try_from(manifest_file.bytes.len())
+                .map_err(|_| "manifest length does not fit u64".to_owned())?,
+            "sha256": sha256_bytes(&manifest_file.bytes),
+        },
+    });
+    if completion != expected_completion {
+        return Err("completion does not match the manifest".to_owned());
+    }
+
+    Ok(RunDirectoryInspection {
+        status: RunDirectoryStatus::Completed,
+        reason: "manifest_verified",
+    })
+}
+
+fn disk_manifest_members(
+    directory: &Path,
+    plan: &DiskTransactionPlan,
+) -> Result<Vec<ManifestMember>, String> {
+    let mut files = std::collections::BTreeMap::new();
+    let mut members = Vec::new();
+    for (role, relative_path, same_file_as) in plan.manifest_specs() {
+        let file = read_guarded_disk_file(&directory.join(&relative_path))?;
+        if let Some(source) = &same_file_as {
+            let source_file = if let Some(source_file) = files.get(source) {
+                source_file
+            } else {
+                let source_file = read_guarded_disk_file(&directory.join(source))?;
+                files.insert(source.clone(), source_file);
+                files.get(source).expect("source was inserted")
+            };
+            if source_file.identity != file.identity {
+                return Err("manifest same_file_as identity does not match".to_owned());
+            }
+        }
+        members.push(ManifestMember::new(
+            role,
+            relative_path.clone(),
+            &file.bytes,
+            same_file_as,
+        )?);
+        files.insert(relative_path, file);
+    }
+    members.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    Ok(members)
+}
+
+fn read_guarded_disk_file(path: &Path) -> Result<GuardedDiskFile, String> {
+    read_guarded_disk_file_inner(path, None)
+}
+
+fn read_guarded_disk_file_bounded(
+    path: &Path,
+    maximum_bytes: u64,
+) -> Result<GuardedDiskFile, String> {
+    read_guarded_disk_file_inner(path, Some(maximum_bytes))
+}
+
+fn read_guarded_disk_file_inner(
+    path: &Path,
+    maximum_bytes: Option<u64>,
+) -> Result<GuardedDiskFile, String> {
+    let mut file = SYSTEM_FINAL_GUARD_OPENER.open(path, final_guard_open_spec())?;
+    let metadata = SYSTEM_FINAL_GUARD_METADATA_PROVIDER.metadata(&file, path)?;
+    validate_final_guard_metadata(metadata, path)?;
+    let identity = SYSTEM_FILE_IDENTITY_PROVIDER.high_resolution_identity(&file, path)?;
+    let mut bytes = Vec::new();
+    match maximum_bytes {
+        Some(maximum_bytes) => {
+            Read::by_ref(&mut file)
+                .take(maximum_bytes.saturating_add(1))
+                .read_to_end(&mut bytes)
+                .map_err(|error| format!("cannot read guarded evidence file: {error}"))?;
+            if u64::try_from(bytes.len()).map_or(true, |length| length > maximum_bytes) {
+                return Err("checkpoint input exceeds its byte limit".to_owned());
+            }
+        }
+        None => {
+            file.read_to_end(&mut bytes)
+                .map_err(|error| format!("cannot read guarded evidence file: {error}"))?;
+        }
+    }
+    Ok(GuardedDiskFile { bytes, identity })
+}
+
+fn directory_entries(directory: &Path) -> Result<BTreeSet<OsString>, String> {
+    fs::read_dir(directory)
+        .map_err(|error| format!("cannot inspect run directory: {error}"))?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.file_name())
+                .map_err(|error| format!("cannot inspect run directory entry: {error}"))
+        })
+        .collect()
+}
+
+fn parse_artifact_plan(value: &Value) -> Result<ArtifactPlan, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "artifact plan is not an object".to_owned())?;
+    if object.len() != 2 || !object.contains_key("final") || !object.contains_key("staging") {
+        return Err("artifact plan schema is not exact".to_owned());
+    }
+    Ok(ArtifactPlan {
+        final_name: safe_relative_name(&value["final"], "artifact final")?,
+        staging_name: safe_relative_name(&value["staging"], "artifact staging")?,
+    })
+}
+
+fn safe_relative_name(value: &Value, field: &str) -> Result<String, String> {
+    let value = nonempty_string(value, field)?;
+    let path = Path::new(&value);
+    if path.components().count() != 1 || path.file_name().is_none() || value == "." || value == ".."
+    {
+        return Err(format!("{field} is not a single relative name"));
+    }
+    Ok(value)
+}
+
+fn nonempty_string(value: &Value, field: &str) -> Result<String, String> {
+    value
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| format!("{field} is empty or invalid"))
 }
 
 #[cfg(windows)]
@@ -724,6 +1732,319 @@ mod tests {
         }
     }
 
+    #[test]
+    fn checkpoint_snapshot_hashes_name_kind_length_and_content_digest() {
+        let directory = TestDirectory::new("checkpoint-snapshot");
+        let name = OsString::from("evidence.bin");
+        let payload = b"stable snapshot payload";
+        fs::write(directory.0.join(&name), payload).expect("snapshot member");
+
+        let (actual, complete) = checkpoint_directory_snapshot(&directory.0);
+        let mut expected_input = Vec::new();
+        append_snapshot_field(&mut expected_input, b"easycon-checkpoint-run-snapshot-v1");
+        append_snapshot_field(&mut expected_input, &checkpoint_os_name_bytes(&name));
+        append_snapshot_field(&mut expected_input, b"regular-file");
+        append_snapshot_field(
+            &mut expected_input,
+            &u64::try_from(payload.len())
+                .expect("payload length")
+                .to_le_bytes(),
+        );
+        append_snapshot_field(&mut expected_input, sha256_bytes(payload).as_bytes());
+
+        assert!(complete);
+        assert_eq!(actual, sha256_bytes(&expected_input));
+    }
+
+    fn journal_metadata() -> RunStartMetadata {
+        RunStartMetadata {
+            normalized_arguments: json!(["handshake", "--port", "COM8"]),
+            provenance: json!({"trusted": true}),
+        }
+    }
+
+    #[test]
+    fn journaled_reservation_requires_a_sealed_durable_prefix() {
+        let incomplete_directory = TestDirectory::new("journal-unsealed");
+        let reservation = ArtifactReservation::begin_journaled(
+            "handshake",
+            &incomplete_directory.0,
+            journal_metadata(),
+        )
+        .expect("journaled reservation");
+        assert!(reservation.commit(&json!({"status": "failed"})).is_err());
+        assert!(incomplete_directory.0.join(JOURNAL_FILE_NAME).is_file());
+        assert!(!incomplete_directory.0.join("handshake.json").exists());
+        assert_eq!(
+            classify_run_directory(&incomplete_directory.0),
+            RunDirectoryInspection {
+                status: RunDirectoryStatus::Incomplete,
+                reason: "completion_absent",
+            }
+        );
+
+        let directory = TestDirectory::new("journal-sealed");
+        let mut reservation =
+            ArtifactReservation::begin_journaled("handshake", &directory.0, journal_metadata())
+                .expect("journaled reservation");
+        reservation
+            .record_event(
+                JournalEventKind::CommandDispatchStarted,
+                json!({"command": "handshake"}),
+            )
+            .expect("dispatch event");
+        reservation
+            .record_event(
+                JournalEventKind::RunProjectionFinalized,
+                json!({"status": "failed"}),
+            )
+            .expect("projection event");
+        reservation
+            .seal_journal(json!({"primary_artifact": "handshake.json"}))
+            .expect("seal journal");
+        let projection = reservation.journal_projection().expect("projection");
+
+        reservation
+            .commit(&json!({"status": "failed", "journal_projection": projection}))
+            .expect("publish journaled result");
+
+        let journal = fs::read(directory.0.join(JOURNAL_FILE_NAME)).expect("journal bytes");
+        let events = crate::journal::parse_journal(&journal).expect("durable journal");
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0]["event"], "run_started");
+        assert_eq!(events[3]["event"], "artifact_finalization_started");
+        assert_eq!(
+            classify_run_directory(&directory.0),
+            RunDirectoryInspection {
+                status: RunDirectoryStatus::Completed,
+                reason: "manifest_verified",
+            }
+        );
+
+        let manifest_bytes = fs::read(directory.0.join(MANIFEST_FILE_NAME)).expect("manifest");
+        let manifest: Value = serde_json::from_slice(&manifest_bytes).expect("manifest JSON");
+        let members = manifest["members"].as_array().expect("manifest members");
+        assert!(members.iter().all(|member| {
+            !matches!(
+                member["relative_path"].as_str(),
+                Some(MANIFEST_FILE_NAME | COMPLETION_FILE_NAME)
+            )
+        }));
+        for member in members {
+            let relative = member["relative_path"].as_str().expect("relative path");
+            let bytes = fs::read(directory.0.join(relative)).expect("manifest member");
+            assert_eq!(member["bytes"].as_u64(), Some(bytes.len() as u64));
+            assert_eq!(member["sha256"], sha256_bytes(&bytes));
+        }
+        let completion: Value = serde_json::from_slice(
+            &fs::read(directory.0.join(COMPLETION_FILE_NAME)).expect("completion"),
+        )
+        .expect("completion JSON");
+        assert_eq!(
+            completion["manifest"]["sha256"],
+            sha256_bytes(&manifest_bytes)
+        );
+
+        fs::write(
+            directory.0.join("handshake.json"),
+            b"mutated after completion",
+        )
+        .expect("post-owner mutation");
+        assert_eq!(
+            classify_run_directory(&directory.0).status,
+            RunDirectoryStatus::Polluted
+        );
+    }
+
+    #[test]
+    fn classifier_distinguishes_vacant_and_polluted_incomplete_directories() {
+        let vacant = TestDirectory::new("classification-vacant");
+        assert_eq!(
+            classify_run_directory(&vacant.0).status,
+            RunDirectoryStatus::Vacant
+        );
+
+        let polluted = TestDirectory::new("classification-polluted");
+        let _reservation =
+            ArtifactReservation::begin_journaled("handshake", &polluted.0, journal_metadata())
+                .expect("journaled reservation");
+        fs::write(polluted.0.join("intruder.bin"), b"not owned").expect("pollution");
+        assert_eq!(
+            classify_run_directory(&polluted.0),
+            RunDirectoryInspection {
+                status: RunDirectoryStatus::Polluted,
+                reason: "unexpected_entry",
+            }
+        );
+    }
+
+    #[test]
+    fn sequence_manifest_hashes_both_csv_links_from_disk() {
+        let directory = TestDirectory::new("manifest-sequence");
+        let csv = b"sequence,dispatch_ns\n1,10\n".to_vec();
+        let mut reservation =
+            ArtifactReservation::begin_journaled("sequence", &directory.0, journal_metadata())
+                .expect("journaled sequence");
+        reservation
+            .stage_auxiliary(AuxiliaryKind::SequenceTimingsCsv, csv.clone())
+            .expect("stage CSV");
+        reservation
+            .record_event(
+                JournalEventKind::RunProjectionFinalized,
+                json!({"status": "unverified"}),
+            )
+            .expect("projection");
+        reservation
+            .seal_journal(json!({"primary_artifact": "sequence.json"}))
+            .expect("seal");
+        reservation
+            .commit(&json!({
+                "status": "unverified",
+                "auxiliary_artifacts": [{
+                    "kind": "sequence_timings_csv",
+                    "relative_path": SEQUENCE_TIMINGS_FILE_NAME,
+                    "bytes": csv.len(),
+                    "sha256": sha256_bytes(&csv),
+                }],
+            }))
+            .expect("commit sequence transaction");
+
+        let manifest: Value = serde_json::from_slice(
+            &fs::read(directory.0.join(MANIFEST_FILE_NAME)).expect("manifest"),
+        )
+        .expect("manifest JSON");
+        let csv_members = manifest["members"]
+            .as_array()
+            .expect("members")
+            .iter()
+            .filter(|member| {
+                member["role"] == "sequence_timings_csv_staging"
+                    || member["role"] == "sequence_timings_csv_final"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(csv_members.len(), 2);
+        assert!(
+            csv_members
+                .iter()
+                .all(|member| member["sha256"] == sha256_bytes(&csv))
+        );
+        assert_eq!(
+            classify_run_directory(&directory.0).status,
+            RunDirectoryStatus::Completed
+        );
+    }
+
+    #[derive(Clone, Copy)]
+    enum TransactionCollision {
+        Manifest,
+        Completion,
+    }
+
+    struct TransactionCollisionObserver {
+        point: TransactionCollision,
+        bytes: Vec<u8>,
+    }
+
+    impl ArtifactObserver for TransactionCollisionObserver {
+        fn after_all_published(&self, directory: &Path) {
+            if matches!(self.point, TransactionCollision::Manifest) {
+                fs::write(directory.join(MANIFEST_FILE_NAME), &self.bytes)
+                    .expect("inject manifest collision");
+            }
+        }
+
+        fn after_manifest_published(&self, directory: &Path) {
+            if matches!(self.point, TransactionCollision::Completion) {
+                fs::write(directory.join(COMPLETION_FILE_NAME), &self.bytes)
+                    .expect("inject completion collision");
+            }
+        }
+    }
+
+    #[test]
+    fn manifest_and_completion_collisions_preserve_injected_bytes() {
+        for point in [
+            TransactionCollision::Manifest,
+            TransactionCollision::Completion,
+        ] {
+            let label = match point {
+                TransactionCollision::Manifest => "manifest-collision",
+                TransactionCollision::Completion => "completion-collision",
+            };
+            let final_name = match point {
+                TransactionCollision::Manifest => MANIFEST_FILE_NAME,
+                TransactionCollision::Completion => COMPLETION_FILE_NAME,
+            };
+            let directory = TestDirectory::new(label);
+            let sentinel = format!("injected {label}").into_bytes();
+            let observer = TransactionCollisionObserver {
+                point,
+                bytes: sentinel.clone(),
+            };
+            let mut reservation =
+                ArtifactReservation::begin_journaled("handshake", &directory.0, journal_metadata())
+                    .expect("journaled reservation");
+            reservation
+                .seal_journal(json!({"primary_artifact": "handshake.json"}))
+                .expect("seal journal");
+
+            assert!(
+                reservation
+                    .commit_observed(&json!({"status": "failed"}), &observer)
+                    .is_err()
+            );
+            assert_eq!(
+                fs::read(directory.0.join(final_name)).expect("preserved collision"),
+                sentinel
+            );
+            assert!(
+                !directory.0.join(COMPLETION_FILE_NAME).is_file()
+                    || matches!(point, TransactionCollision::Completion)
+            );
+            assert_eq!(
+                classify_run_directory(&directory.0).status,
+                match point {
+                    TransactionCollision::Manifest => RunDirectoryStatus::Polluted,
+                    TransactionCollision::Completion => RunDirectoryStatus::Polluted,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn classifier_rejects_same_bytes_with_a_different_final_file_identity() {
+        let directory = TestDirectory::new("classifier-file-identity");
+        let mut reservation =
+            ArtifactReservation::begin_journaled("handshake", &directory.0, journal_metadata())
+                .expect("journaled reservation");
+        reservation
+            .seal_journal(json!({"primary_artifact": "handshake.json"}))
+            .expect("seal journal");
+        reservation
+            .commit(&json!({"status": "failed"}))
+            .expect("completed transaction");
+        let reservation: Value = serde_json::from_slice(
+            &fs::read(directory.0.join(RESERVATION_FILE_NAME)).expect("reservation"),
+        )
+        .expect("reservation JSON");
+        let staging = reservation["primary_artifact"]["staging"]
+            .as_str()
+            .expect("staging");
+        let staging_bytes = fs::read(directory.0.join(staging)).expect("staging bytes");
+
+        fs::remove_file(directory.0.join("handshake.json")).expect("remove final link");
+        fs::write(directory.0.join("handshake.json"), &staging_bytes)
+            .expect("replace with equal bytes");
+        assert_eq!(
+            fs::read(directory.0.join("handshake.json")).expect("replacement"),
+            staging_bytes
+        );
+        assert_eq!(
+            classify_run_directory(&directory.0).status,
+            RunDirectoryStatus::Polluted
+        );
+    }
+
     #[derive(Default)]
     struct MutationObserver {
         attempts: RefCell<Vec<(OwnedFileRole, bool, bool)>>,
@@ -737,6 +2058,41 @@ mod tests {
                 .borrow_mut()
                 .push((role, delete_blocked, write_blocked));
         }
+    }
+
+    #[test]
+    fn manifest_and_completion_staging_remain_retained_through_verification() {
+        let directory = TestDirectory::new("retained-transaction-files");
+        let observer = MutationObserver::default();
+        let mut reservation =
+            ArtifactReservation::begin_journaled("handshake", &directory.0, journal_metadata())
+                .expect("journaled reservation");
+        reservation
+            .seal_journal(json!({"primary_artifact": "handshake.json"}))
+            .expect("seal journal");
+
+        reservation
+            .commit_observed(&json!({"status": "failed"}), &observer)
+            .expect("transaction");
+
+        let attempts = observer.attempts.borrow();
+        assert_eq!(attempts.len(), 3);
+        assert!(attempts.iter().all(|(_, delete, write)| *delete && *write));
+        assert!(
+            attempts
+                .iter()
+                .any(|(role, _, _)| *role == OwnedFileRole::Primary)
+        );
+        assert!(
+            attempts
+                .iter()
+                .any(|(role, _, _)| *role == OwnedFileRole::Manifest)
+        );
+        assert!(
+            attempts
+                .iter()
+                .any(|(role, _, _)| *role == OwnedFileRole::Completion)
+        );
     }
 
     #[test]
@@ -1039,6 +2395,21 @@ mod tests {
             document["auxiliary_artifacts"][0]["staging"]
                 .as_str()
                 .expect("auxiliary staging"),
+            document["evidence_transaction"]["journal"]
+                .as_str()
+                .expect("journal"),
+            document["evidence_transaction"]["manifest"]["final"]
+                .as_str()
+                .expect("manifest final"),
+            document["evidence_transaction"]["manifest"]["staging"]
+                .as_str()
+                .expect("manifest staging"),
+            document["evidence_transaction"]["completion"]["final"]
+                .as_str()
+                .expect("completion final"),
+            document["evidence_transaction"]["completion"]["staging"]
+                .as_str()
+                .expect("completion staging"),
         ];
         for name in names {
             let path = Path::new(name);
