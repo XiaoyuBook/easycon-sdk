@@ -8,8 +8,8 @@
 | 项目 | 固定值 |
 | --- | --- |
 | integration base | `main@41c5f0c2b19165769d4aa8e4512ad46280a1415b` |
-| implementation commit | `b1b3aee5f4a734e1df632c40b52edf8d70fe0d0c` |
-| implementation tree | `5feab09398bfe38e9586ff7424ab01f1b4a72997` |
+| implementation commit | `27444f16d0625a7ab7e4e1543736c7c3c225ce8a` |
+| implementation tree | `334a3fb21bf4d6ca55e0bcbe3e2daa6e675b3194` |
 | vcpkg tool commit | `bf04c909169fdbb30821c02c6eb01f1cd1295d05` |
 | vcpkg registry baseline | `cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3` |
 | OpenCV | `4.12.0#5` |
@@ -21,8 +21,8 @@
 验证方必须从精确 commit 或协调方提供的 Git bundle 建立干净 checkout，并先执行：
 
 ```bash
-test "$(git rev-parse HEAD)" = "b1b3aee5f4a734e1df632c40b52edf8d70fe0d0c"
-test "$(git rev-parse 'HEAD^{tree}')" = "5feab09398bfe38e9586ff7424ab01f1b4a72997"
+test "$(git rev-parse HEAD)" = "27444f16d0625a7ab7e4e1543736c7c3c225ce8a"
+test "$(git rev-parse 'HEAD^{tree}')" = "334a3fb21bf4d6ca55e0bcbe3e2daa6e675b3194"
 test -z "$(git status --porcelain=v1)"
 git fsck --strict
 ```
@@ -32,7 +32,8 @@ build cache 和设备日志不得进入 bundle。所有 build、Cargo target、v
 checkout 之外的本次验证独占目录；下列命令用 `EASYCON_BUILD_ROOT` 表示该目录。唯一例外是 provisioner 强制写入
 ignored `.tools/vision-models` 的合法 OCR 测试模型；它不能成为 bundle 或 package 输入。
 
-截至 2026-07-22，Windows x64 软件/native 门禁已在上述实现提交通过，capture hardware 仍为
+截至 2026-07-22，Windows x64 软件/native 门禁已由全新只读 reviewer 在上述修复 implementation 上通过，
+包括 Rust/Loom、MSVC Debug/Release、ASan、UBSan、MSVC analyze、clang-tidy 和 libFuzzer；capture hardware 仍为
 `Hardware Unverified`。当前 Windows 主机没有可用 WSL、Docker 或 Podman，且未获授权使用远程 Linux 主机，所以
 Linux 证据保持 `Candidate / Build Unverified`。没有 Xcode/Apple SDK 证据，macOS 保持 Apple Silicon arm64
 `Experimental Source Candidate / Build Unverified / Hardware Unverified / Not Shipped`。

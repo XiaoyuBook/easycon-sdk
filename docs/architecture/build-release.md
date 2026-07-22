@@ -21,12 +21,13 @@
 
 | 平台 | 方向 | 当前允许的最高状态 | 发布边界 |
 | --- | --- | --- | --- |
-| Windows 10/11 x64 | v1 Tier 1 | Vision `Hardware Unverified` | 完整 Phase 3、硬件、ABI、四语言与 package 门禁前不发布 |
+| Windows 10/11 x64 | v1 Tier 1 | Vision software/native `Passed` | `Hardware Unverified`；完整 Phase 3、ABI、四语言与 package 门禁前不发布 |
 | Linux x64 | v1 正式目标方向 | Vision Build Candidate；按实际 build 标记 Passed/Build Unverified | serial、硬件、四语言与 package 未完成，不是完整 Linux SDK |
 | macOS Apple Silicon arm64 | experimental source | Build/Hardware Unverified、Not Shipped | 无 binary/package；不承诺 Intel 或 universal |
 
-该表的目标由 [ADR-0012](../decisions/0012-phase-3-vision-native-target.md) 管理，当前证据状态由
-[ADR-0013](../decisions/0013-phase-3-vision-cross-platform-source-candidate-freeze.md) 冻结，不改变 v1.0 只有
+该表的目标由 [ADR-0012](../decisions/0012-phase-3-vision-native-target.md) 管理，第一次冻结历史见
+[ADR-0013](../decisions/0013-phase-3-vision-cross-platform-source-candidate-freeze.md)，当前证据状态由 NativePool admission
+修复后的 [ADR-0014](../decisions/0014-phase-3-native-pool-admission-refreeze.md) 重新冻结，不改变 v1.0 只有
 Windows Tier 1 的发布承诺。macOS 至少一次真实 arm64 compile/software gate 通过前，不实现完整 AVFoundation
 backend 或合并大段平台专属生产代码。
 

@@ -11,15 +11,16 @@ latency harness。
 
 [Phase 2 Controller/Serial 开发目标](docs/decisions/0008-phase-2-controller-target.md) 已冻结；Phase 2A 仍为
 `Hardware Unverified`：没有验证任何具体控制板、固件、VID/PID、Amiibo 容量或 UART/USB/Switch 时序，
-O-01、O-02、O-04 保持开放。当前也未发布稳定公共 API/ABI；Phase 3 只冻结私有 Vision 跨平台源码候选，
+O-01、O-02、O-04 保持开放。当前也未发布稳定公共 API/ABI；Phase 3 只重新冻结私有 Vision 跨平台源码候选，
 不包含 ECS、语言绑定、固件或 UI；
 完整 Phase 2 必须在 CH32 可用后通过 Phase 2B 硬件资格验证。
 
 [Phase 2B Qualification Software Candidate](docs/decisions/0011-phase-2b-qualification-software-candidate-freeze.md)
 已冻结并通过 fake/synthetic 门禁，但尚未在目标设备上执行资格命令，也没有创建支持矩阵或关闭任何硬件开放项。
 
-Phase 3 私有 Vision 跨平台源码候选已按
-[ADR-0013](docs/decisions/0013-phase-3-vision-cross-platform-source-candidate-freeze.md) 冻结：Windows x64
+Phase 3 私有 Vision 跨平台源码候选在旧候选因 NativePool admission P2 被重开后，已按
+[ADR-0014](docs/decisions/0014-phase-3-native-pool-admission-refreeze.md) 以 implementation `27444f16` 重新冻结；
+[ADR-0013](docs/decisions/0013-phase-3-vision-cross-platform-source-candidate-freeze.md) 仅保留第一次冻结的历史记录。Windows x64
 软件/native 门禁通过但 capture hardware 未验证；Linux x64 是 v1 正式目标方向的 `Candidate / Build Unverified`；
 macOS 只形成 Apple Silicon arm64 `Experimental Source Candidate / Build Unverified / Hardware Unverified /
 Not Shipped`。三者均不等于完整 SDK 发布，且未冻结 public C ABI、Phase 4、四语言或 package。

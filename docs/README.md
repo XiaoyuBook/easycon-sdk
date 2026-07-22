@@ -63,6 +63,7 @@
 - [ADR-0011：冻结 Phase 2B Qualification Software Candidate](decisions/0011-phase-2b-qualification-software-candidate-freeze.md)
 - [ADR-0012：冻结 Phase 3 Vision 与跨平台私有 native bridge 开发目标](decisions/0012-phase-3-vision-native-target.md)
 - [ADR-0013：冻结 Phase 3 Vision 跨平台源码候选](decisions/0013-phase-3-vision-cross-platform-source-candidate-freeze.md)
+- [ADR-0014：Phase 3 NativePool admission 修复后重新冻结](decisions/0014-phase-3-native-pool-admission-refreeze.md)
 
 ## v1 固定范围
 
@@ -91,9 +92,11 @@ Phase 2B 的资格软件候选已按 [ADR-0011](decisions/0011-phase-2b-qualific
 当前仍明确标记 `Hardware Unverified`：没有冻结任何具体板型/固件、Amiibo 容量、UART/USB/Switch 时序或完整
 物理中立化能力；O-01、O-02、O-04 保持开放，完整 Phase 2 未完成，也没有创建完整 Phase 2 冻结 ADR。
 
-Phase 3 私有 Vision 跨平台源码候选已按
-[ADR-0013](decisions/0013-phase-3-vision-cross-platform-source-candidate-freeze.md) 冻结；实现 checkpoint 为
-`b1b3aee5f4a734e1df632c40b52edf8d70fe0d0c`。Windows software/native gates 已通过，capture hardware 保持
+Phase 3 私有 Vision 跨平台源码候选在旧候选 `76436de` 因 NativePool admission P2 被重开后，已按
+[ADR-0014](decisions/0014-phase-3-native-pool-admission-refreeze.md) 以 implementation
+`27444f16d0625a7ab7e4e1543736c7c3c225ce8a`、tree `334a3fb21bf4d6ca55e0bcbe3e2daa6e675b3194`
+重新冻结；[ADR-0013](decisions/0013-phase-3-vision-cross-platform-source-candidate-freeze.md) 保留历史原文。
+Windows software/native gates 已通过，capture hardware 保持
 `Hardware Unverified`；Linux x64 保持 `Candidate / Build Unverified`；macOS Apple Silicon arm64 保持
 `Experimental Source Candidate / Build Unverified / Hardware Unverified / Not Shipped`。该冻结不包含 public
 C ABI、Phase 4、Controller serial、四语言、package 或完整跨平台 SDK 支持。

@@ -157,9 +157,12 @@ Phase 2A 和 Phase 2B 软件候选完成都不等于完整 Phase 2 完成。
 ### Phase 3：Vision 与私有 bridge
 
 目标由 [ADR-0012](../decisions/0012-phase-3-vision-native-target.md) 和
-[跨平台边界设计](../development/phase3-cross-platform-design.md) 冻结。私有 Vision 跨平台源码候选已按
-[ADR-0013](../decisions/0013-phase-3-vision-cross-platform-source-candidate-freeze.md) 冻结在实现
-`b1b3aee5f4a734e1df632c40b52edf8d70fe0d0c`；这不是 public C ABI、完整 SDK 或发布冻结。
+[跨平台边界设计](../development/phase3-cross-platform-design.md) 冻结。第一次冻结候选 `76436de` 因 NativePool
+admission P2 被重开后，私有 Vision 跨平台源码候选已按
+[ADR-0014](../decisions/0014-phase-3-native-pool-admission-refreeze.md) 重新冻结在 implementation
+`27444f16d0625a7ab7e4e1543736c7c3c225ce8a`；
+[ADR-0013](../decisions/0013-phase-3-vision-cross-platform-source-candidate-freeze.md) 保留历史记录。这不是 public C ABI、
+完整 SDK 或发布冻结。
 
 交付：
 

@@ -173,7 +173,7 @@ BackendUnavailable，不能以空 discovery/profile/frame success 通过测试�
 平台结果的完整门槛和 macOS 两阶段 handoff 见
 [Phase 3 跨平台边界设计](../development/phase3-cross-platform-design.md) 与
 [Linux/macOS 验证 handoff](../development/phase3-cross-platform-validation-handoff.md)；当前证据状态由
-[ADR-0013](../decisions/0013-phase-3-vision-cross-platform-source-candidate-freeze.md) 冻结。
+[ADR-0014](../decisions/0014-phase-3-native-pool-admission-refreeze.md) 重新冻结；ADR-0013 仅保留旧候选的历史冻结记录。
 
 ## 6. C ABI 测试
 

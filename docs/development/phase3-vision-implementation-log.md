@@ -587,3 +587,18 @@ matching/color, capture, and native boundaries. `easycon-native-sys` passed 11 t
 compile-fail doctests. Fresh Windows MSVC Debug and Release configure/build/CTest each passed 2/2,
 including OCR success. No behavior JSON, conformance fixture, native C++, CMake, vcpkg, public API,
 or ceiling changed; the fix enforces the already-frozen ADR-0012 bounded-admission contract.
+
+### Independent rereview and refreeze qualification
+
+A fresh read-only reviewer fixed the candidate at `27444f16d0625a7ab7e4e1543736c7c3c225ce8a`,
+tree `334a3fb21bf4d6ca55e0bcbe3e2daa6e675b3194`, and independently reproduced the old-to-new copy
+transition with an external allocator harness: the pre-cancelled public decode call observed one
+input-sized allocation on `76436de` and zero on `27444f16`, with the same stable error and converged
+pool counts. The reviewer then reran the four regressions, the 16-test pool suite, 71 Vision tests,
+11 native-sys tests, two compile-fail doctests, and six Loom models.
+
+Fresh Windows MSVC Debug/Release, clang-cl ASan/UBSan, MSVC analyze, clang-tidy, and libFuzzer 128-run
+gates all passed on the repaired implementation. The reviewer found no unresolved, reproducible,
+actionable in-scope finding and concluded that the implementation qualified for refreeze. ADR-0014
+records that refreeze without rewriting the historical ADR-0013. Linux and macOS builds and all
+capture hardware remain unverified.
