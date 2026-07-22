@@ -3,9 +3,10 @@
 ## 1. 目的和状态
 
 本文把 [ADR-0012](../decisions/0012-phase-3-vision-native-target.md) 的冻结目标细化为可逐节点实现、验证和
-审查的内部设计。起点固定为 `9944dba50adc34484b65206e07ea0a444103f656`。完成状态只能是
-`Hardware Unverified Vision Candidate`，不等于公共 C ABI、binding、发布包、capture hardware 或 OCR model
-release candidate。
+审查的内部设计。起点固定为 `9944dba50adc34484b65206e07ea0a444103f656`。最终状态必须逐平台记录为 Windows
+`Hardware Unverified`、Linux Candidate 的实际 Passed/Build Unverified 等级，以及 macOS Apple Silicon arm64
+`Experimental Source Candidate / Build Unverified / Hardware Unverified / Not Shipped`。这些状态都不等于公共
+C ABI、binding、发布包、capture hardware 或 OCR model release candidate。
 
 本文中的类型和函数名是 Phase 3 Rust/private bridge 内部契约，可在 Phase 3 review 中调整；它们不是
 `easycon_v1_*` 公共 ABI 承诺。
@@ -686,7 +687,7 @@ staged diff，只stage Phase 3文件；commit message使用 `英文类型:中文
 - Runtime resource/task/operation不变语义接入；
 - all component/Rust/fixture/fault gates；
 - fixed SHA independent review和必要修复复审；
-- freeze ADR记录精确SHA、依赖、命令结果、O-03/capture hardware边界和reopen rule。
+- freeze ADR记录精确SHA、依赖、命令结果、三平台独立证据等级、O-03/capture hardware边界和reopen rule。
 
 ## 23. Review checklist
 

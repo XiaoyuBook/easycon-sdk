@@ -338,7 +338,9 @@ notices；vcpkg port 中 `license: null` 不能当成已完成审核。SDK 自�
 
 ## Phase 3 退出门槛
 
-只有以下条件全部满足，才能另建 ADR 冻结 `Hardware Unverified Vision Candidate`：
+只有以下条件全部满足，才能另建 ADR 冻结分平台 Phase 3 状态：Windows `Hardware Unverified`、Linux
+Candidate 并按实际证据标记 Passed/Build Unverified、macOS Apple Silicon arm64
+`Experimental Source Candidate / Build Unverified / Hardware Unverified / Not Shipped`：
 
 1. A-F 生产实现、fixture 和测试完整，不存在空壳、假的 native result 或测试专用 release 分支。
 2. Runtime close 后 Vision resource、operation、task、native handle 和 bridge allocation 计数全部归零；
@@ -351,6 +353,8 @@ notices；vcpkg port 中 `license: null` 不能当成已完成审核。SDK 自�
 7. 没有公共 `easycon_v1_*`、public C header、语言 binding、package、ECS、`.ILX`、traineddata、硬件支持行、
    开发机绝对路径、缓存或设备日志。
 8. worktree/index 干净，`EasyCon/` 仍 ignored、tracked count 为零且未被修改。
+9. 最终 ADR 不得把任一平台的 software/synthetic/file 证据外推为 capture hardware、Controller serial、
+   四语言 package、完整 SDK 或 shipped 支持。
 
 ## Hardware Unverified 边界
 

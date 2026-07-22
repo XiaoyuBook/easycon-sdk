@@ -50,7 +50,8 @@ v1 正式目标方向的 Vision candidate，macOS 只形成 Apple Silicon arm64 
 - `EasyCon/` 是本地携带的第三方源码目录，由外层 `.gitignore` 完整忽略。
 - 外层仓库不记录 EasyCon 的远程地址、分支、提交锁或下载脚本。
 - 未经明确安排，不直接修改 `EasyCon/` 中的源码。
-- 跨电脑开发时可以打包完整目录，以同时携带外层 SDK 仓库和本地 EasyCon 源码。
+- 跨电脑开发只传输 Git tracked archive/bundle 与单独列明的可审计依赖；ignored `EasyCon/`、`.tools/`、
+  build cache 和设备日志不得进入 SDK handoff bundle。
 
 详细边界见 [源码边界决策](docs/decisions/0001-source-boundary.md)。
 

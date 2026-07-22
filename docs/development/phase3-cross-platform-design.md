@@ -35,9 +35,13 @@ macOS；synthetic/file 结果不能替代摄像头、USB/CH32 或 hot-plug 证�
 
 ## 3. Rust 扩展边界
 
-`CaptureBackendKind`、native `CaptureBackend`、Capture error kind 使用 `#[non_exhaustive]` 或等价可扩展机制。
-现有值保持 `Synthetic`、预验证 `File`、`DirectShow`、`MediaFoundation`；Linux 可以增加 `V4l2`。本轮不增加
-`AvFoundation` 值，因为没有实现或编译证据。调用方遇到未来值不得以穷举业务分支崩溃。
+公开 `CaptureBackendKind` 和 Capture error kind 使用 `#[non_exhaustive]` 或等价可扩展机制。公开 backend 只表达
+平台中立的 `Synthetic`、预验证 `File` 与 `SystemDevice`；不得出现 `DirectShow`、`MediaFoundation`、`V4l2` 或
+`AvFoundation`。调用方遇到未来平台中立能力值不得以穷举业务分支崩溃。
+
+DirectShow、Media Foundation 和 V4L2 只存在于 `easycon-native-sys` 私有 platform detail。公开 descriptor 内部
+持有不可解释的 adapter token，必要时只暴露 bounded UTF-8 diagnostic 字符串；device open 消费同一 descriptor/
+token，不让调用方按平台 enum 重建业务分支。本轮没有 AVFoundation token 或值。
 
 `CaptureSourceDescriptor` 的 `source_id` 是平台提供的 opaque strict UTF-8 值：
 
@@ -162,6 +166,10 @@ Synthetic backend 是平台中立状态机的正式可复现测试输入，继�
 Linux 环境存在时至少执行：
 
 ```bash
+python3 tools/provision_vision_test_model.py \
+  --manifest spec/fixtures/vision/ocr-model.json \
+  --output .tools/vision-models/tessdata_fast-4.1.0
+export EASYCON_VISION_TEST_TESSDATA="$(realpath .tools/vision-models/tessdata_fast-4.1.0)"
 cmake --preset linux-debug
 cmake --build --preset linux-debug --parallel
 ctest --preset linux-debug --no-tests=error
