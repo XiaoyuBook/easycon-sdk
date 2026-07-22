@@ -1,17 +1,41 @@
 set(EASYCON_NATIVE_BRIDGE_SOURCES
-  src/bridge.cpp
-  src/capture.cpp
-  src/image_codec.cpp
-  src/ocr.cpp
-  src/vision_ops.cpp
+  src/common/bridge.cpp
+  src/common/capture_common.cpp
+  src/common/image_codec.cpp
+  src/common/ocr.cpp
+  src/common/vision_ops.cpp
 )
 
-add_library(easycon_native_bridge STATIC ${EASYCON_NATIVE_BRIDGE_SOURCES})
+if(WIN32)
+  set(EASYCON_NATIVE_CAPTURE_PLATFORM_SOURCE src/platform/windows/capture.cpp)
+  set(EASYCON_NATIVE_PLATFORM_LIBRARIES mf mfplat mfuuid ole32 oleaut32 strmiids)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  set(EASYCON_NATIVE_CAPTURE_PLATFORM_SOURCE src/platform/linux/capture.cpp)
+  set(EASYCON_NATIVE_PLATFORM_LIBRARIES)
+elseif(APPLE)
+  set(EASYCON_NATIVE_CAPTURE_PLATFORM_SOURCE src/platform/macos/capture_unavailable.cpp)
+  set(EASYCON_NATIVE_PLATFORM_LIBRARIES)
+else()
+  message(FATAL_ERROR "No native capture platform source selected")
+endif()
+
+list(APPEND EASYCON_NATIVE_BRIDGE_SOURCES ${EASYCON_NATIVE_CAPTURE_PLATFORM_SOURCE})
+
+set(EASYCON_NATIVE_BRIDGE_LIBRARY_TYPE STATIC)
+if(EASYCON_NATIVE_RUST_BUILD AND NOT WIN32)
+  set(EASYCON_NATIVE_BRIDGE_LIBRARY_TYPE SHARED)
+endif()
+
+add_library(
+  easycon_native_bridge
+  ${EASYCON_NATIVE_BRIDGE_LIBRARY_TYPE}
+  ${EASYCON_NATIVE_BRIDGE_SOURCES}
+)
 target_include_directories(
   easycon_native_bridge
   PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/common
 )
 target_include_directories(easycon_native_bridge SYSTEM PRIVATE ${OpenCV_INCLUDE_DIRS})
 target_link_libraries(
@@ -20,26 +44,31 @@ target_link_libraries(
     ${OpenCV_LIBS}
     Tesseract::libtesseract
     ZLIB::ZLIB
-    mf
-    mfplat
-    mfuuid
-    ole32
-    oleaut32
-    strmiids
+    ${EASYCON_NATIVE_PLATFORM_LIBRARIES}
 )
 set_target_properties(
   easycon_native_bridge
   PROPERTIES
     ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
 )
+if(NOT WIN32 AND DEFINED VCPKG_TARGET_TRIPLET)
+  set_target_properties(
+    easycon_native_bridge
+    PROPERTIES
+      BUILD_RPATH "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/lib"
+  )
+endif()
 easycon_native_configure_owned_target(easycon_native_bridge)
 
 set(EASYCON_NATIVE_ANALYSIS_SOURCES
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/bridge.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/capture.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/image_codec.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/ocr.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/vision_ops.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/common/bridge.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/common/capture_common.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/common/image_codec.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/common/ocr.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/common/vision_ops.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/${EASYCON_NATIVE_CAPTURE_PLATFORM_SOURCE}
 )
 
 if(EASYCON_BUILD_COMPONENT_TESTS OR EASYCON_BUILD_FUZZERS)
@@ -50,7 +79,7 @@ if(EASYCON_BUILD_COMPONENT_TESTS OR EASYCON_BUILD_FUZZERS)
     easycon_native_bridge_test_support
     PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/include
-      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${CMAKE_CURRENT_SOURCE_DIR}/src/common
   )
   target_include_directories(easycon_native_bridge_test_support SYSTEM PRIVATE ${OpenCV_INCLUDE_DIRS})
   target_link_libraries(easycon_native_bridge_test_support PRIVATE easycon_native_bridge ${OpenCV_LIBS})
@@ -155,17 +184,16 @@ endif()
 
 if(EASYCON_BUILD_FUZZERS)
   if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-    message(FATAL_ERROR "EASYCON_BUILD_FUZZERS requires clang-cl")
+    message(FATAL_ERROR "EASYCON_BUILD_FUZZERS requires Clang")
+  endif()
+  if(NOT WIN32)
+    message(FATAL_ERROR "Phase 3 fuzz packaging is currently a Windows-only gate")
   endif()
 
   add_library(
     easycon_native_bridge_fuzz_target
     SHARED
-      src/bridge.cpp
-      src/capture.cpp
-      src/image_codec.cpp
-      src/ocr.cpp
-      src/vision_ops.cpp
+      ${EASYCON_NATIVE_BRIDGE_SOURCES}
       src/test_support.cpp
       fuzz/fuzz_target.def
   )
@@ -178,7 +206,7 @@ if(EASYCON_BUILD_FUZZERS)
     easycon_native_bridge_fuzz_target
     PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/include
-      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${CMAKE_CURRENT_SOURCE_DIR}/src/common
   )
   target_include_directories(
     easycon_native_bridge_fuzz_target
@@ -191,6 +219,7 @@ if(EASYCON_BUILD_FUZZERS)
       ${OpenCV_LIBS}
       Tesseract::libtesseract
       ZLIB::ZLIB
+      ${EASYCON_NATIVE_PLATFORM_LIBRARIES}
   )
   easycon_native_configure_owned_target(easycon_native_bridge_fuzz_target)
   easycon_native_enable_asan(easycon_native_bridge_fuzz_target)

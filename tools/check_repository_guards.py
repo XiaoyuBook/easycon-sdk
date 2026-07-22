@@ -35,6 +35,28 @@ FORBIDDEN_RUNTIME_PATTERNS = {
     "service process": re.compile(r"service[_ -]?process", re.IGNORECASE),
     "WebSocket": re.compile(r"\bwebsocket\b", re.IGNORECASE),
 }
+NATIVE_COMMON_SOURCES = {
+    "native/bridge/src/common/bridge.cpp",
+    "native/bridge/src/common/bridge_internal.hpp",
+    "native/bridge/src/common/capture_common.cpp",
+    "native/bridge/src/common/capture_platform.hpp",
+    "native/bridge/src/common/image_codec.cpp",
+    "native/bridge/src/common/ocr.cpp",
+    "native/bridge/src/common/vision_ops.cpp",
+}
+NATIVE_PLATFORM_SOURCES = {
+    "native/bridge/src/platform/windows/capture.cpp",
+    "native/bridge/src/platform/linux/capture.cpp",
+    "native/bridge/src/platform/macos/capture_unavailable.cpp",
+}
+PLATFORM_NATIVE_PATTERNS = (
+    re.compile(
+        r"(?:<Windows\.h>|<dshow\.h>|<mfapi\.h>|<mfidl\.h>|"
+        r"<linux/videodev2\.h>|AVFoundation|Objective-C)",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\b(?:HRESULT|HANDLE)\b"),
+)
 
 
 def git_files():
@@ -149,6 +171,24 @@ def main():
                 failures.append("legacy {} architecture keyword in {}".format(label, relative))
         if "easycon_v1_" in text:
             failures.append("public C ABI symbol leaked into Phase 3 source: {}".format(relative))
+
+    if not NATIVE_COMMON_SOURCES.issubset(tracked_set):
+        failures.append("native common source layout is incomplete")
+    if not NATIVE_PLATFORM_SOURCES.issubset(tracked_set):
+        failures.append("native platform source layout is incomplete")
+    for relative in sorted(NATIVE_COMMON_SOURCES & tracked_set):
+        text = (ROOT / relative).read_text(encoding="utf-8")
+        if any(pattern.search(text) for pattern in PLATFORM_NATIVE_PATTERNS):
+            failures.append("platform type or header leaked into native common source: {}".format(relative))
+
+    vision_capture = (ROOT / "crates/easycon-vision/src/capture.rs").read_text(encoding="utf-8")
+    for platform_backend in ("DirectShow", "MediaFoundation", "V4l2", "AvFoundation"):
+        if platform_backend in vision_capture:
+            failures.append(
+                "platform backend leaked into public Vision capture module: {}".format(
+                    platform_backend
+                )
+            )
 
     cmake_paths = ["CMakeLists.txt", "native/bridge/CMakeLists.txt"]
     for relative in cmake_paths:

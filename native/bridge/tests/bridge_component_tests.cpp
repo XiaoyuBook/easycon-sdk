@@ -943,6 +943,7 @@ void test_capture_hardware_admission_and_destroy_outcomes() {
 
 void test_capture_discovery_is_bounded_and_owned() {
     const auto baseline = counts();
+#if defined(_WIN32)
     for (const auto backend : {
              EASYCON_NATIVE_CAPTURE_BACKEND_DIRECTSHOW,
              EASYCON_NATIVE_CAPTURE_BACKEND_MEDIA_FOUNDATION,
@@ -980,6 +981,21 @@ void test_capture_discovery_is_bounded_and_owned() {
             "capture discovery destroy succeeds");
         expect(discovery == nullptr, "capture discovery destroy consumes its owner");
     }
+#else
+    easycon_native_capture_discovery* discovery = nullptr;
+    easycon_native_error error{};
+#if defined(__linux__)
+    constexpr uint32_t backend = EASYCON_NATIVE_CAPTURE_BACKEND_V4L2;
+#else
+    constexpr uint32_t backend = EASYCON_NATIVE_CAPTURE_BACKEND_DIRECTSHOW;
+#endif
+    expect(
+        easycon_native_capture_discovery_create(backend, &discovery, &error) ==
+            EASYCON_NATIVE_STATUS_UNSUPPORTED,
+        "unqualified platform discovery fails closed");
+    expect(discovery == nullptr, "unsupported discovery leaves no owner");
+    easycon_native_error_release(&error);
+#endif
     expect(counts().live_handles == baseline.live_handles, "discovery handles return to baseline");
     expect(counts().live_allocations == baseline.live_allocations,
            "discovery buffers return to baseline");
@@ -1066,7 +1082,7 @@ void test_capture_exception_isolation_and_retry() {
 }  // namespace
 
 int main() {
-    static_assert(sizeof(void*) == 8, "Phase 3 native bridge is x64-only");
+    static_assert(sizeof(void*) == 8, "Phase 3 native bridge is 64-bit-only");
 
     test_handle_lifecycle();
     test_status_error_and_zero_buffer();

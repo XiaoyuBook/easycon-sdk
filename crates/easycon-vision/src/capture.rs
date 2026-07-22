@@ -1,6 +1,5 @@
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -22,11 +21,11 @@ const MAX_CAPTURE_NAME_BYTES: usize = 1024;
 const MAX_FIRST_FRAME_TIMEOUT_NS: u64 = 300_000_000_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum CaptureBackendKind {
     Synthetic,
     File,
-    DirectShow,
-    MediaFoundation,
+    SystemDevice,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -241,50 +240,52 @@ impl NativeCaptureOptions {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct CaptureSourceDescriptor {
-    source_id: Arc<str>,
-    display_name: Arc<str>,
-    backend: CaptureBackendKind,
+    token: native::CaptureDescriptor,
 }
 
 impl CaptureSourceDescriptor {
     #[must_use]
     pub fn source_id(&self) -> &str {
-        &self.source_id
+        self.token.source_id()
     }
 
     #[must_use]
     pub fn display_name(&self) -> &str {
-        &self.display_name
+        self.token.display_name()
     }
 
     #[must_use]
     pub const fn backend(&self) -> CaptureBackendKind {
-        self.backend
+        CaptureBackendKind::SystemDevice
+    }
+
+    #[must_use]
+    pub const fn adapter_diagnostic(&self) -> &'static str {
+        self.token.adapter_diagnostic()
     }
 }
 
-pub fn discover_capture_sources(
-    backend: CaptureBackendKind,
-) -> Result<Vec<CaptureSourceDescriptor>, VisionError> {
-    let native_backend = native_backend(backend)?;
-    if native_backend == native::CaptureBackend::File {
-        return Err(VisionError::validation(
-            "file capture does not support device discovery",
-        ));
+impl std::fmt::Debug for CaptureSourceDescriptor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CaptureSourceDescriptor")
+            .field("source_id", &self.source_id())
+            .field("display_name", &self.display_name())
+            .field("backend", &CaptureBackendKind::SystemDevice)
+            .field("adapter_diagnostic", &self.adapter_diagnostic())
+            .finish()
     }
-    native::discover(native_backend)
+}
+
+pub fn discover_capture_sources() -> Result<Vec<CaptureSourceDescriptor>, VisionError> {
+    native::discover_system_devices()
         .map_err(VisionError::from_native)?
         .into_iter()
-        .map(|descriptor| {
-            let backend = vision_backend(descriptor.backend());
-            validate_capture_identity(descriptor.source_id(), descriptor.display_name())?;
-            Ok(CaptureSourceDescriptor {
-                source_id: Arc::from(descriptor.source_id()),
-                display_name: Arc::from(descriptor.display_name()),
-                backend,
-            })
+        .map(|token| {
+            validate_capture_identity(token.source_id(), token.display_name())?;
+            Ok(CaptureSourceDescriptor { token })
         })
         .collect()
 }
@@ -316,6 +317,10 @@ pub struct SyntheticCaptureCounts {
 pub struct SyntheticCapture {
     shared: Arc<SyntheticShared>,
     profile: CaptureProfile,
+}
+
+pub struct FileCapture {
+    inner: SyntheticCapture,
 }
 
 #[derive(Clone)]
@@ -356,7 +361,6 @@ struct NativeCaptureBackend {
     interrupt: Option<Arc<NativeCaptureInterrupt>>,
     source_id: Arc<str>,
     display_name: Arc<str>,
-    backend: CaptureBackendKind,
     limits: VisionLimits,
 }
 
@@ -365,26 +369,23 @@ struct NativeCaptureInterrupt {
 }
 
 impl NativeCaptureBackend {
-    fn create(
-        backend: CaptureBackendKind,
-        source_id: Arc<str>,
-        display_name: Arc<str>,
+    fn create_device(
+        descriptor: CaptureSourceDescriptor,
         session_options: CaptureOptions,
         native_options: NativeCaptureOptions,
     ) -> Result<Self, VisionError> {
+        let source_id = Arc::from(descriptor.source_id());
+        let display_name = Arc::from(descriptor.display_name());
         validate_capture_identity(&source_id, &display_name)?;
-        let (handle, interrupt) = native::CaptureHandle::create(
-            native_backend(backend)?,
-            &source_id,
-            native_options.into_native(session_options.limits())?,
-        )
-        .map_err(VisionError::from_native)?;
+        let (handle, interrupt) = descriptor
+            .token
+            .into_capture(native_options.into_native(session_options.limits())?)
+            .map_err(VisionError::from_native)?;
         Ok(Self {
             handle: Some(handle),
             interrupt: Some(Arc::new(NativeCaptureInterrupt { inner: interrupt })),
             source_id,
             display_name,
-            backend,
             limits: session_options.limits(),
         })
     }
@@ -424,6 +425,28 @@ impl SyntheticCapture {
             },
             SyntheticCaptureControl { shared },
         )
+    }
+}
+
+impl FileCapture {
+    pub fn new(
+        source_id: impl Into<Arc<str>>,
+        display_name: impl Into<Arc<str>>,
+        image: Image,
+    ) -> Result<Self, VisionError> {
+        let profile = CaptureProfile::new_with_stride(
+            source_id,
+            display_name,
+            CaptureBackendKind::File,
+            image.width(),
+            image.height(),
+            image.stride(),
+            image.format(),
+            None,
+        )?;
+        let (inner, control) = SyntheticCapture::controlled(profile, false);
+        control.push_frame(image)?;
+        Ok(Self { inner })
     }
 }
 
@@ -596,15 +619,10 @@ impl CaptureBackend for NativeCaptureBackend {
             .handle_mut()?
             .open()
             .map_err(VisionError::from_native)?;
-        if vision_backend(profile.backend()) != self.backend {
-            return Err(VisionError::internal(
-                "native capture opened a different backend than requested",
-            ));
-        }
         CaptureProfile::new_with_stride(
             Arc::clone(&self.source_id),
             Arc::clone(&self.display_name),
-            self.backend,
+            CaptureBackendKind::SystemDevice,
             profile.width(),
             profile.height(),
             profile.stride(),
@@ -759,6 +777,28 @@ impl CaptureBackend for SyntheticCapture {
         state.counts.finalize_calls += 1;
         drop(state);
         BackendFinalize::Consumed { diagnostic: None }
+    }
+}
+
+impl CaptureBackend for FileCapture {
+    fn open(&mut self, cancellation: &CancellationToken) -> Result<CaptureProfile, VisionError> {
+        self.inner.open(cancellation)
+    }
+
+    fn read(&mut self, cancellation: &CancellationToken) -> Result<CaptureRead, VisionError> {
+        self.inner.read(cancellation)
+    }
+
+    fn close(&mut self) -> Result<(), VisionError> {
+        self.inner.close()
+    }
+
+    fn interrupt(&self) -> Arc<dyn CaptureInterrupt> {
+        self.inner.interrupt()
+    }
+
+    fn finalize(self: Box<Self>) -> BackendFinalize {
+        Box::new(self.inner).finalize()
     }
 }
 
@@ -947,59 +987,21 @@ impl CaptureSession {
         Self::open_backend(runtime, Box::new(backend), options)
     }
 
-    pub fn open_file(
+    pub fn open_prevalidated_file(
         runtime: &Runtime,
-        source: &Path,
+        file: FileCapture,
         options: CaptureOptions,
-        native_options: NativeCaptureOptions,
     ) -> Result<Self, VisionError> {
-        if !source.is_absolute() {
-            return Err(VisionError::validation(
-                "file capture source must be absolute",
-            ));
-        }
-        let source_id = source
-            .to_str()
-            .ok_or_else(|| VisionError::validation("file capture source is not UTF-8"))?;
-        let display_name = source
-            .file_name()
-            .and_then(|name| name.to_str())
-            .filter(|name| !name.is_empty())
-            .unwrap_or("File capture sequence");
-        let backend = NativeCaptureBackend::create(
-            CaptureBackendKind::File,
-            Arc::from(source_id),
-            Arc::from(display_name),
-            options,
-            native_options,
-        )?;
-        Self::open_backend(runtime, Box::new(backend), options)
+        Self::open_backend(runtime, Box::new(file), options)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn open_device(
         runtime: &Runtime,
-        backend: CaptureBackendKind,
-        source_id: impl Into<Arc<str>>,
-        display_name: impl Into<Arc<str>>,
+        descriptor: CaptureSourceDescriptor,
         options: CaptureOptions,
         native_options: NativeCaptureOptions,
     ) -> Result<Self, VisionError> {
-        if !matches!(
-            backend,
-            CaptureBackendKind::DirectShow | CaptureBackendKind::MediaFoundation
-        ) {
-            return Err(VisionError::validation(
-                "device capture requires DirectShow or Media Foundation",
-            ));
-        }
-        let backend = NativeCaptureBackend::create(
-            backend,
-            source_id.into(),
-            display_name.into(),
-            options,
-            native_options,
-        )?;
+        let backend = NativeCaptureBackend::create_device(descriptor, options, native_options)?;
         Self::open_backend(runtime, Box::new(backend), options)
     }
 
@@ -1789,25 +1791,6 @@ fn normalize_capture_fault(error: VisionError) -> VisionError {
     }
 }
 
-fn native_backend(backend: CaptureBackendKind) -> Result<native::CaptureBackend, VisionError> {
-    match backend {
-        CaptureBackendKind::File => Ok(native::CaptureBackend::File),
-        CaptureBackendKind::DirectShow => Ok(native::CaptureBackend::DirectShow),
-        CaptureBackendKind::MediaFoundation => Ok(native::CaptureBackend::MediaFoundation),
-        CaptureBackendKind::Synthetic => Err(VisionError::validation(
-            "synthetic capture has no native backend",
-        )),
-    }
-}
-
-const fn vision_backend(backend: native::CaptureBackend) -> CaptureBackendKind {
-    match backend {
-        native::CaptureBackend::File => CaptureBackendKind::File,
-        native::CaptureBackend::DirectShow => CaptureBackendKind::DirectShow,
-        native::CaptureBackend::MediaFoundation => CaptureBackendKind::MediaFoundation,
-    }
-}
-
 const fn vision_pixel_format(format: easycon_native_sys::codec::PixelFormat) -> PixelFormat {
     match format {
         easycon_native_sys::codec::PixelFormat::Bgr8 => PixelFormat::Bgr8,
@@ -1899,9 +1882,10 @@ fn vision_to_runtime_error(error: &VisionError) -> EasyConError {
         VisionErrorKind::Cancelled | VisionErrorKind::Closed => {
             (ErrorDomain::Runtime, ErrorCode::Cancelled)
         }
-        VisionErrorKind::Faulted | VisionErrorKind::NoFrame | VisionErrorKind::Native => {
-            (ErrorDomain::Io, ErrorCode::Transport)
-        }
+        VisionErrorKind::Faulted
+        | VisionErrorKind::NoFrame
+        | VisionErrorKind::BackendUnavailable
+        | VisionErrorKind::Native => (ErrorDomain::Io, ErrorCode::Transport),
         VisionErrorKind::InvalidImage
         | VisionErrorKind::ModelNotFound
         | VisionErrorKind::PoolClosed

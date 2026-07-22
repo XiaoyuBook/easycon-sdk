@@ -1231,6 +1231,7 @@ fn decode_diagnostic_code(kind: VisionErrorKind) -> Option<LabelDiagnosticCode> 
         | VisionErrorKind::Cancelled
         | VisionErrorKind::Deadline
         | VisionErrorKind::ModelNotFound
+        | VisionErrorKind::BackendUnavailable
         | VisionErrorKind::Native
         | VisionErrorKind::PoolClosed
         | VisionErrorKind::Internal => None,

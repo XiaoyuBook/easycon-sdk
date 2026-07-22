@@ -19,6 +19,7 @@ pub enum CaptureBackend {
     File,
     DirectShow,
     MediaFoundation,
+    V4l2,
 }
 
 impl CaptureBackend {
@@ -27,6 +28,7 @@ impl CaptureBackend {
             Self::File => ffi::CAPTURE_BACKEND_FILE,
             Self::DirectShow => ffi::CAPTURE_BACKEND_DIRECTSHOW,
             Self::MediaFoundation => ffi::CAPTURE_BACKEND_MEDIA_FOUNDATION,
+            Self::V4l2 => ffi::CAPTURE_BACKEND_V4L2,
         }
     }
 
@@ -35,7 +37,17 @@ impl CaptureBackend {
             ffi::CAPTURE_BACKEND_FILE => Some(Self::File),
             ffi::CAPTURE_BACKEND_DIRECTSHOW => Some(Self::DirectShow),
             ffi::CAPTURE_BACKEND_MEDIA_FOUNDATION => Some(Self::MediaFoundation),
+            ffi::CAPTURE_BACKEND_V4L2 => Some(Self::V4l2),
             _ => None,
+        }
+    }
+
+    const fn diagnostic(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::DirectShow => "directshow",
+            Self::MediaFoundation => "media-foundation",
+            Self::V4l2 => "v4l2",
         }
     }
 }
@@ -61,6 +73,37 @@ impl CaptureDescriptor {
     #[must_use]
     pub fn display_name(&self) -> &str {
         &self.display_name
+    }
+
+    #[must_use]
+    pub const fn adapter_diagnostic(&self) -> &'static str {
+        self.backend.diagnostic()
+    }
+
+    pub fn into_capture(
+        self,
+        options: CaptureOptions,
+    ) -> Result<(CaptureHandle, CaptureInterrupt), NativeError> {
+        CaptureHandle::create(self.backend, &self.source_id, options)
+    }
+}
+
+pub fn discover_system_devices() -> Result<Vec<CaptureDescriptor>, NativeError> {
+    #[cfg(target_os = "windows")]
+    {
+        let mut descriptors = discover(CaptureBackend::DirectShow)?;
+        descriptors.extend(discover(CaptureBackend::MediaFoundation)?);
+        Ok(descriptors)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        discover(CaptureBackend::V4l2)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Err(NativeError::unsupported(
+            "macOS capture has no implemented adapter",
+        ))
     }
 }
 
@@ -231,6 +274,7 @@ pub enum CaptureRead {
 /// ```
 pub struct CaptureHandle {
     raw: Option<NonNull<ffi::Capture>>,
+    expected_backend: CaptureBackend,
     not_sync: PhantomData<Cell<()>>,
 }
 
@@ -267,6 +311,7 @@ impl CaptureHandle {
         Ok((
             Self {
                 raw: Some(capture),
+                expected_backend: backend,
                 not_sync: PhantomData,
             },
             CaptureInterrupt {
@@ -276,7 +321,13 @@ impl CaptureHandle {
     }
 
     pub fn open(&mut self) -> Result<CaptureProfile, NativeError> {
-        call::capture::open(self.armed()?)
+        let profile = call::capture::open(self.armed()?)?;
+        if profile.backend() != self.expected_backend {
+            return Err(NativeError::internal(
+                "native capture opened a different adapter than requested",
+            ));
+        }
+        Ok(profile)
     }
 
     pub fn read(&mut self) -> Result<CaptureRead, NativeError> {
@@ -298,6 +349,7 @@ impl CaptureHandle {
                 CaptureDestroyOutcome::Unconsumed {
                     handle: Self {
                         raw: Some(raw),
+                        expected_backend: self.expected_backend,
                         not_sync: PhantomData,
                     },
                     diagnostic,

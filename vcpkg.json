@@ -8,10 +8,16 @@
       "name": "opencv4",
       "default-features": false,
       "features": [
-        "dshow",
+        {
+          "name": "dshow",
+          "platform": "windows"
+        },
         "intrinsics",
         "jpeg",
-        "msmf",
+        {
+          "name": "msmf",
+          "platform": "windows"
+        },
         "png",
         "thread"
       ]

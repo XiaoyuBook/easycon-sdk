@@ -63,12 +63,9 @@ fn explicit_model_processes_twice_and_releases_the_engine() {
 #[test]
 fn missing_model_has_a_stable_error_and_no_handle() {
     let baseline = easycon_native_sys::debug::counts().expect("baseline counts");
-    let error = OcrEngine::create(
-        Path::new("Z:/easycon-sdk-missing-tessdata"),
-        "eng",
-        EngineMode::Default,
-    )
-    .expect_err("missing OCR model");
+    let missing = std::env::temp_dir().join("easycon-sdk-missing-tessdata");
+    let error =
+        OcrEngine::create(&missing, "eng", EngineMode::Default).expect_err("missing OCR model");
     assert_eq!(error.kind(), NativeErrorKind::ModelNotFound);
     assert_eq!(
         easycon_native_sys::debug::counts().expect("final counts"),

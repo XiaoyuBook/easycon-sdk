@@ -12,7 +12,7 @@ mod pool;
 
 pub use capture::{
     CaptureBackendKind, CaptureOptions, CaptureProfile, CaptureSession, CaptureSnapshotWait,
-    CaptureSourceDescriptor, CaptureState, NativeCaptureOptions, SyntheticCapture,
+    CaptureSourceDescriptor, CaptureState, FileCapture, NativeCaptureOptions, SyntheticCapture,
     SyntheticCaptureControl, SyntheticCaptureCounts, discover_capture_sources,
 };
 pub use color::{ColorStatistics, HsvRange};

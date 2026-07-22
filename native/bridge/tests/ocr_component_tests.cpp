@@ -110,7 +110,7 @@ easycon_native_ocr_engine* create_engine(std::string_view model_root) {
 }
 
 void test_missing_model_is_explicit() {
-    constexpr std::string_view missing = "Z:/easycon-sdk-missing-tessdata";
+    constexpr std::string_view missing = "fixtures/ocr/missing-tessdata";
     constexpr std::string_view language = "eng";
     easycon_native_ocr_engine* engine = reinterpret_cast<easycon_native_ocr_engine*>(UINTPTR_MAX);
     easycon_native_error error{};
@@ -357,19 +357,29 @@ void test_model_check_exception_is_isolated(std::string_view model_root) {
 }  // namespace
 
 int main() {
-    static_assert(sizeof(void*) == 8, "Phase 3 native bridge is x64-only");
-    char* model_root = nullptr;
+    static_assert(sizeof(void*) == 8, "Phase 3 native bridge is 64-bit-only");
+#if defined(_WIN32)
+    char* model_root_owner = nullptr;
     size_t model_root_length = 0;
     const auto environment_status =
-        _dupenv_s(&model_root, &model_root_length, "EASYCON_VISION_TEST_TESSDATA");
+        _dupenv_s(&model_root_owner, &model_root_length, "EASYCON_VISION_TEST_TESSDATA");
+    const auto* model_root = model_root_owner;
+#else
+    const auto* model_root = std::getenv("EASYCON_VISION_TEST_TESSDATA");
+#endif
     expect(
-        environment_status == 0 && model_root != nullptr && model_root_length > 1,
+#if defined(_WIN32)
+        environment_status == 0 && model_root_length > 1 &&
+#endif
+        model_root != nullptr && model_root[0] != '\0',
         "OCR test model path is required");
     test_missing_model_is_explicit();
-    if (environment_status == 0 && model_root != nullptr && model_root_length > 1) {
+    if (model_root != nullptr && model_root[0] != '\0') {
         test_process_reuse_exception_and_release(model_root);
         test_model_check_exception_is_isolated(model_root);
     }
-    std::free(model_root);
+#if defined(_WIN32)
+    std::free(model_root_owner);
+#endif
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

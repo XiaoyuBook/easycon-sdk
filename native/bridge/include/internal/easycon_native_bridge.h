@@ -59,6 +59,7 @@ typedef int32_t easycon_native_status;
 #define EASYCON_NATIVE_CAPTURE_BACKEND_FILE UINT32_C(1)
 #define EASYCON_NATIVE_CAPTURE_BACKEND_DIRECTSHOW UINT32_C(2)
 #define EASYCON_NATIVE_CAPTURE_BACKEND_MEDIA_FOUNDATION UINT32_C(3)
+#define EASYCON_NATIVE_CAPTURE_BACKEND_V4L2 UINT32_C(4)
 
 typedef struct easycon_native_error {
     int32_t code;
@@ -333,7 +334,7 @@ easycon_native_status EASYCON_NATIVE_CALL easycon_native_test_capture_fail_next(
 #if defined(__cplusplus)
 }
 
-static_assert(sizeof(void*) == 8, "Phase 3 native bridge is x64-only");
+static_assert(sizeof(void*) == 8, "Phase 3 native bridge is 64-bit-only");
 static_assert(sizeof(easycon_native_error) == 24);
 static_assert(alignof(easycon_native_error) == 8);
 static_assert(offsetof(easycon_native_error, code) == 0);

@@ -73,19 +73,64 @@ fn hardware_open_is_unsupported_before_device_access() {
 }
 
 #[test]
-fn windows_discovery_returns_only_bounded_owned_descriptors() {
+fn v4l2_open_is_unsupported_without_hardware_qualification() {
     let _gate = CAPTURE_TEST_GATE.lock().expect("capture test gate");
     let baseline = counts().expect("baseline counts");
-    for backend in [CaptureBackend::DirectShow, CaptureBackend::MediaFoundation] {
-        let descriptors = discover(backend).expect("Windows capture discovery");
-        assert!(descriptors.len() <= 64);
-        for descriptor in descriptors {
-            assert_eq!(descriptor.backend(), backend);
-            assert!(!descriptor.source_id().is_empty());
-            assert!(descriptor.source_id().len() <= 4096);
-            assert!(!descriptor.display_name().is_empty());
-            assert!(descriptor.display_name().len() <= 1024);
+    let (mut capture, interrupt) =
+        CaptureHandle::create(CaptureBackend::V4l2, "v4l2:/dev/video0", options())
+            .expect("V4L2 capture request create");
+    assert_eq!(
+        capture
+            .open()
+            .expect_err("V4L2 hardware support is not qualified")
+            .kind(),
+        NativeErrorKind::Unsupported
+    );
+    capture.close().expect("close unopened V4L2 capture");
+    assert!(matches!(
+        capture.destroy(),
+        CaptureDestroyOutcome::Consumed { diagnostic: None }
+    ));
+    drop(interrupt);
+    assert_eq!(counts().expect("final counts"), baseline);
+}
+
+#[test]
+fn platform_discovery_is_bounded_or_explicitly_unavailable() {
+    let _gate = CAPTURE_TEST_GATE.lock().expect("capture test gate");
+    let baseline = counts().expect("baseline counts");
+    #[cfg(target_os = "windows")]
+    {
+        for backend in [CaptureBackend::DirectShow, CaptureBackend::MediaFoundation] {
+            let descriptors = discover(backend).expect("Windows device discovery");
+            assert!(descriptors.len() <= 64);
+            for descriptor in descriptors {
+                assert_eq!(descriptor.backend(), backend);
+                assert!(!descriptor.source_id().is_empty());
+                assert!(descriptor.source_id().len() <= 4096);
+                assert!(!descriptor.display_name().is_empty());
+                assert!(descriptor.display_name().len() <= 1024);
+            }
         }
+        assert_eq!(
+            discover(CaptureBackend::V4l2)
+                .expect_err("V4L2 is not a Windows adapter")
+                .kind(),
+            NativeErrorKind::Unsupported
+        );
+    }
+    #[cfg(not(target_os = "windows"))]
+    for backend in [
+        CaptureBackend::DirectShow,
+        CaptureBackend::MediaFoundation,
+        CaptureBackend::V4l2,
+    ] {
+        assert_eq!(
+            discover(backend)
+                .expect_err("unqualified adapter discovery must fail closed")
+                .kind(),
+            NativeErrorKind::Unsupported
+        );
     }
     assert_eq!(counts().expect("final counts"), baseline);
 }

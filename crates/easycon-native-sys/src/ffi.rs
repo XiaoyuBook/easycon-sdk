@@ -40,6 +40,7 @@ pub(crate) const OCR_PSM_SINGLE_WORD: u32 = 4;
 pub(crate) const CAPTURE_BACKEND_FILE: u32 = 1;
 pub(crate) const CAPTURE_BACKEND_DIRECTSHOW: u32 = 2;
 pub(crate) const CAPTURE_BACKEND_MEDIA_FOUNDATION: u32 = 3;
+pub(crate) const CAPTURE_BACKEND_V4L2: u32 = 4;
 
 #[repr(C)]
 #[derive(Default)]
@@ -316,7 +317,7 @@ mod tests {
     };
 
     #[test]
-    fn private_image_layout_matches_the_x64_header() {
+    fn private_image_layout_matches_the_64_bit_header() {
         assert_eq!(size_of::<Error>(), 24);
         assert_eq!(align_of::<Error>(), 8);
         assert_eq!(offset_of!(Error, code), 0);

@@ -17,6 +17,7 @@ pub enum VisionErrorKind {
     Deadline,
     InvalidImage,
     ModelNotFound,
+    BackendUnavailable,
     Native,
     PoolClosed,
     Internal,
@@ -83,6 +84,7 @@ impl VisionError {
             NativeErrorKind::InvalidImage => VisionErrorKind::InvalidImage,
             NativeErrorKind::NoFrame => VisionErrorKind::NoFrame,
             NativeErrorKind::Cancelled => VisionErrorKind::Cancelled,
+            NativeErrorKind::Unsupported => VisionErrorKind::BackendUnavailable,
             NativeErrorKind::Internal => VisionErrorKind::Internal,
             _ => VisionErrorKind::Native,
         };

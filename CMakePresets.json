@@ -14,8 +14,6 @@
       "cacheVariables": {
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
         "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
-        "VCPKG_OVERLAY_TRIPLETS": "${sourceDir}/cmake/triplets",
-        "VCPKG_TARGET_TRIPLET": "x64-windows-static-md",
         "EASYCON_BUILD_COMPONENT_TESTS": "ON"
       },
       "environment": {
@@ -23,8 +21,17 @@
       }
     },
     {
-      "name": "msvc-debug",
+      "name": "windows-base",
+      "hidden": true,
       "inherits": "base",
+      "cacheVariables": {
+        "VCPKG_OVERLAY_TRIPLETS": "${sourceDir}/cmake/triplets",
+        "VCPKG_TARGET_TRIPLET": "x64-windows-static-md"
+      }
+    },
+    {
+      "name": "msvc-debug",
+      "inherits": "windows-base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
         "CMAKE_CXX_COMPILER": "cl.exe"
@@ -32,7 +39,7 @@
     },
     {
       "name": "msvc-release",
-      "inherits": "base",
+      "inherits": "windows-base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_CXX_COMPILER": "cl.exe"
@@ -40,7 +47,7 @@
     },
     {
       "name": "clang-asan",
-      "inherits": "base",
+      "inherits": "windows-base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
         "CMAKE_CXX_COMPILER": "clang-cl.exe",
@@ -49,7 +56,7 @@
     },
     {
       "name": "clang-ubsan",
-      "inherits": "base",
+      "inherits": "windows-base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
         "CMAKE_CXX_COMPILER": "clang-cl.exe",
@@ -58,7 +65,7 @@
     },
     {
       "name": "clang-tidy",
-      "inherits": "base",
+      "inherits": "windows-base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
         "CMAKE_CXX_COMPILER": "clang-cl.exe",
@@ -68,7 +75,7 @@
     },
     {
       "name": "msvc-analyze",
-      "inherits": "base",
+      "inherits": "windows-base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
         "CMAKE_CXX_COMPILER": "cl.exe",
@@ -77,11 +84,53 @@
     },
     {
       "name": "clang-fuzz",
-      "inherits": "base",
+      "inherits": "windows-base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
         "CMAKE_CXX_COMPILER": "clang-cl.exe",
         "EASYCON_BUILD_FUZZERS": "ON"
+      }
+    },
+    {
+      "name": "linux-base",
+      "hidden": true,
+      "inherits": "base",
+      "cacheVariables": {
+        "VCPKG_TARGET_TRIPLET": "x64-linux"
+      }
+    },
+    {
+      "name": "linux-x64-debug",
+      "inherits": "linux-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_CXX_COMPILER": "g++"
+      }
+    },
+    {
+      "name": "linux-x64-release",
+      "inherits": "linux-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CXX_COMPILER": "g++"
+      }
+    },
+    {
+      "name": "linux-x64-asan",
+      "inherits": "linux-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "EASYCON_ENABLE_ASAN": "ON"
+      }
+    },
+    {
+      "name": "linux-x64-ubsan",
+      "inherits": "linux-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "EASYCON_ENABLE_UBSAN": "ON"
       }
     }
   ],
@@ -92,7 +141,11 @@
     { "name": "clang-ubsan", "configurePreset": "clang-ubsan" },
     { "name": "clang-tidy", "configurePreset": "clang-tidy" },
     { "name": "msvc-analyze", "configurePreset": "msvc-analyze" },
-    { "name": "clang-fuzz", "configurePreset": "clang-fuzz" }
+    { "name": "clang-fuzz", "configurePreset": "clang-fuzz" },
+    { "name": "linux-x64-debug", "configurePreset": "linux-x64-debug" },
+    { "name": "linux-x64-release", "configurePreset": "linux-x64-release" },
+    { "name": "linux-x64-asan", "configurePreset": "linux-x64-asan" },
+    { "name": "linux-x64-ubsan", "configurePreset": "linux-x64-ubsan" }
   ],
   "testPresets": [
     {
@@ -118,6 +171,26 @@
     {
       "name": "clang-fuzz",
       "configurePreset": "clang-fuzz",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "linux-x64-debug",
+      "configurePreset": "linux-x64-debug",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "linux-x64-release",
+      "configurePreset": "linux-x64-release",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "linux-x64-asan",
+      "configurePreset": "linux-x64-asan",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "linux-x64-ubsan",
+      "configurePreset": "linux-x64-ubsan",
       "output": { "outputOnFailure": true }
     }
   ]

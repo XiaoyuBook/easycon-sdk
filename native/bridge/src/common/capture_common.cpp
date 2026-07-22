@@ -1,20 +1,8 @@
-#include "bridge_internal.hpp"
-
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <Windows.h>
-#include <dshow.h>
-#include <mfapi.h>
-#include <mfidl.h>
-#include <oleauto.h>
-#include <wrl/client.h>
+#include "capture_platform.hpp"
 
 #include <atomic>
-#include <climits>
 #include <cstdint>
 #include <cstring>
-#include <cwchar>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -22,8 +10,6 @@
 #include <string_view>
 #include <utility>
 #include <vector>
-
-#include <opencv2/videoio/registry.hpp>
 
 namespace {
 
@@ -34,85 +20,15 @@ constexpr uint64_t max_source_bytes = UINT64_C(32768);
 constexpr uint64_t max_timeout_ns = UINT64_C(60000000000);
 constexpr uint32_t max_capture_frames = UINT32_C(4096);
 constexpr size_t max_discovered_sources = 64;
-constexpr size_t max_discovery_source_bytes = 4096;
-constexpr size_t max_discovery_name_bytes = 1024;
 
 struct CaptureControl {
     std::atomic<bool> stop_requested{false};
-};
-
-struct CaptureDescriptor {
-    std::string source_id;
-    std::string display_name;
 };
 
 easycon_native_status fail(
     easycon_native_error* error,
     easycon_native_status status,
     std::string_view message) noexcept;
-
-class ComApartment {
-public:
-    ComApartment() noexcept : result_(CoInitializeEx(nullptr, COINIT_MULTITHREADED)) {}
-
-    ~ComApartment() {
-        if (SUCCEEDED(result_)) {
-            CoUninitialize();
-        }
-    }
-
-    ComApartment(const ComApartment&) = delete;
-    ComApartment& operator=(const ComApartment&) = delete;
-
-    [[nodiscard]] bool available() const noexcept {
-        return SUCCEEDED(result_) || result_ == RPC_E_CHANGED_MODE;
-    }
-
-private:
-    HRESULT result_;
-};
-
-class MediaFoundationLifetime {
-public:
-    MediaFoundationLifetime() noexcept : result_(MFStartup(MF_VERSION, MFSTARTUP_LITE)) {}
-
-    ~MediaFoundationLifetime() {
-        if (SUCCEEDED(result_)) {
-            static_cast<void>(MFShutdown());
-        }
-    }
-
-    MediaFoundationLifetime(const MediaFoundationLifetime&) = delete;
-    MediaFoundationLifetime& operator=(const MediaFoundationLifetime&) = delete;
-
-    [[nodiscard]] bool available() const noexcept { return SUCCEEDED(result_); }
-
-private:
-    HRESULT result_;
-};
-
-struct MediaFoundationDevices {
-    IMFActivate** data{};
-    UINT32 count{};
-
-    ~MediaFoundationDevices() {
-        if (data == nullptr) {
-            return;
-        }
-        for (UINT32 index = 0; index < count; ++index) {
-            if (data[index] != nullptr) {
-                data[index]->Release();
-            }
-        }
-        CoTaskMemFree(static_cast<void*>(data));
-    }
-};
-
-struct CoTaskMemString {
-    wchar_t* data{};
-
-    ~CoTaskMemString() { CoTaskMemFree(data); }
-};
 
 bool valid_utf8(std::string_view text) noexcept {
     size_t index = 0;
@@ -159,196 +75,6 @@ bool valid_utf8(std::string_view text) noexcept {
     return true;
 }
 
-constexpr bool is_path_separator(char value) noexcept {
-    return value == '\\' || value == '/';
-}
-
-bool is_absolute_windows_path(std::string_view path) noexcept {
-    const bool drive_path =
-        path.size() >= 3 &&
-        ((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) &&
-        path[1] == ':' && is_path_separator(path[2]);
-    const bool unc_path =
-        path.size() >= 2 && is_path_separator(path[0]) && is_path_separator(path[1]);
-    return drive_path || unc_path;
-}
-
-bool wide_to_utf8(
-    const wchar_t* text,
-    size_t length,
-    size_t maximum,
-    std::string& output) {
-    if (text == nullptr || length == 0 || length > static_cast<size_t>(INT_MAX)) {
-        return false;
-    }
-    const auto input_length = static_cast<int>(length);
-    const auto required = WideCharToMultiByte(
-        CP_UTF8,
-        WC_ERR_INVALID_CHARS,
-        text,
-        input_length,
-        nullptr,
-        0,
-        nullptr,
-        nullptr);
-    if (required <= 0 || static_cast<size_t>(required) > maximum) {
-        return false;
-    }
-    output.resize(static_cast<size_t>(required));
-    const auto written = WideCharToMultiByte(
-        CP_UTF8,
-        WC_ERR_INVALID_CHARS,
-        text,
-        input_length,
-        output.data(),
-        required,
-        nullptr,
-        nullptr);
-    return written == required && valid_utf8(output);
-}
-
-easycon_native_status discover_directshow(
-    std::vector<CaptureDescriptor>& output,
-    easycon_native_error* error) {
-    ComApartment apartment;
-    if (!apartment.available()) {
-        return fail(error, EASYCON_NATIVE_STATUS_BACKEND_ERROR, "DirectShow COM initialization failed");
-    }
-    Microsoft::WRL::ComPtr<ICreateDevEnum> device_enumerator;
-    auto result = CoCreateInstance(
-        CLSID_SystemDeviceEnum,
-        nullptr,
-        CLSCTX_INPROC_SERVER,
-        IID_PPV_ARGS(device_enumerator.GetAddressOf()));
-    if (FAILED(result)) {
-        return fail(error, EASYCON_NATIVE_STATUS_BACKEND_ERROR, "DirectShow enumerator creation failed");
-    }
-    Microsoft::WRL::ComPtr<IEnumMoniker> monikers;
-    result = device_enumerator->CreateClassEnumerator(
-        CLSID_VideoInputDeviceCategory, monikers.GetAddressOf(), 0);
-    if (result == S_FALSE) {
-        return EASYCON_NATIVE_STATUS_OK;
-    }
-    if (FAILED(result)) {
-        return fail(error, EASYCON_NATIVE_STATUS_BACKEND_ERROR, "DirectShow enumeration failed");
-    }
-    Microsoft::WRL::ComPtr<IBindCtx> bind_context;
-    if (FAILED(CreateBindCtx(0, bind_context.GetAddressOf()))) {
-        return fail(error, EASYCON_NATIVE_STATUS_BACKEND_ERROR, "DirectShow bind context failed");
-    }
-
-    Microsoft::WRL::ComPtr<IMoniker> moniker;
-    ULONG fetched = 0;
-    while (output.size() < max_discovered_sources &&
-           monikers->Next(1, moniker.ReleaseAndGetAddressOf(), &fetched) == S_OK) {
-        Microsoft::WRL::ComPtr<IPropertyBag> properties;
-        if (FAILED(moniker->BindToStorage(
-                bind_context.Get(), nullptr, IID_PPV_ARGS(properties.GetAddressOf())))) {
-            continue;
-        }
-        VARIANT friendly{};
-        VariantInit(&friendly);
-        const auto friendly_result = properties->Read(L"FriendlyName", &friendly, nullptr);
-        std::string display_name;
-        const bool valid_name = SUCCEEDED(friendly_result) && friendly.vt == VT_BSTR &&
-                                wide_to_utf8(
-                                    friendly.bstrVal,
-                                    SysStringLen(friendly.bstrVal),
-                                    max_discovery_name_bytes,
-                                    display_name);
-        VariantClear(&friendly);
-        if (!valid_name) {
-            continue;
-        }
-
-        LPOLESTR display = nullptr;
-        if (FAILED(moniker->GetDisplayName(bind_context.Get(), nullptr, &display)) ||
-            display == nullptr) {
-            continue;
-        }
-        const auto display_length = wcsnlen_s(display, max_discovery_source_bytes + 1);
-        std::string source_id;
-        const bool valid_source = display_length <= max_discovery_source_bytes &&
-                                  wide_to_utf8(
-                                      display,
-                                      display_length,
-                                      max_discovery_source_bytes - 6,
-                                      source_id);
-        CoTaskMemFree(display);
-        if (!valid_source) {
-            continue;
-        }
-        source_id.insert(0, "dshow:");
-        output.push_back(CaptureDescriptor{std::move(source_id), std::move(display_name)});
-    }
-    return EASYCON_NATIVE_STATUS_OK;
-}
-
-easycon_native_status discover_media_foundation(
-    std::vector<CaptureDescriptor>& output,
-    easycon_native_error* error) {
-    ComApartment apartment;
-    MediaFoundationLifetime media_foundation;
-    if (!apartment.available() || !media_foundation.available()) {
-        return fail(
-            error,
-            EASYCON_NATIVE_STATUS_BACKEND_ERROR,
-            "Media Foundation initialization failed");
-    }
-    Microsoft::WRL::ComPtr<IMFAttributes> attributes;
-    if (FAILED(MFCreateAttributes(attributes.GetAddressOf(), 1)) ||
-        FAILED(attributes->SetGUID(
-            MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
-            MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID))) {
-        return fail(
-            error,
-            EASYCON_NATIVE_STATUS_BACKEND_ERROR,
-            "Media Foundation attributes failed");
-    }
-    MediaFoundationDevices devices;
-    if (FAILED(MFEnumDeviceSources(attributes.Get(), &devices.data, &devices.count))) {
-        return fail(
-            error,
-            EASYCON_NATIVE_STATUS_BACKEND_ERROR,
-            "Media Foundation enumeration failed");
-    }
-    for (UINT32 index = 0;
-         index < devices.count && output.size() < max_discovered_sources;
-         ++index) {
-        CoTaskMemString friendly;
-        CoTaskMemString symbolic;
-        UINT32 friendly_length = 0;
-        UINT32 symbolic_length = 0;
-        if (FAILED(devices.data[index]->GetAllocatedString(
-                MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME,
-                &friendly.data,
-                &friendly_length)) ||
-            FAILED(devices.data[index]->GetAllocatedString(
-                MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK,
-                &symbolic.data,
-                &symbolic_length))) {
-            continue;
-        }
-        std::string display_name;
-        std::string source_id;
-        if (!wide_to_utf8(
-                friendly.data,
-                friendly_length,
-                max_discovery_name_bytes,
-                display_name) ||
-            !wide_to_utf8(
-                symbolic.data,
-                symbolic_length,
-                max_discovery_source_bytes - 5,
-                source_id)) {
-            continue;
-        }
-        source_id.insert(0, "msmf:");
-        output.push_back(CaptureDescriptor{std::move(source_id), std::move(display_name)});
-    }
-    return EASYCON_NATIVE_STATUS_OK;
-}
-
 easycon_native_status copy_discovery_string(
     std::string_view value,
     easycon_native_buffer* output,
@@ -376,7 +102,8 @@ easycon_native_status fail(
 bool valid_backend(uint32_t backend) noexcept {
     return backend == EASYCON_NATIVE_CAPTURE_BACKEND_FILE ||
            backend == EASYCON_NATIVE_CAPTURE_BACKEND_DIRECTSHOW ||
-           backend == EASYCON_NATIVE_CAPTURE_BACKEND_MEDIA_FOUNDATION;
+           backend == EASYCON_NATIVE_CAPTURE_BACKEND_MEDIA_FOUNDATION ||
+           backend == EASYCON_NATIVE_CAPTURE_BACKEND_V4L2;
 }
 
 #if defined(EASYCON_NATIVE_TESTING)
@@ -423,7 +150,7 @@ struct easycon_native_capture_interrupt {
 struct easycon_native_capture_discovery {
     uint64_t marker;
     uint32_t backend;
-    std::vector<CaptureDescriptor> descriptors;
+    std::vector<easycon::native::capture::Descriptor> descriptors;
 };
 
 struct easycon_native_capture {
@@ -502,21 +229,6 @@ extern "C" easycon_native_status EASYCON_NATIVE_CALL easycon_native_capture_crea
                     EASYCON_NATIVE_STATUS_OUT_OF_RANGE,
                     "capture options exceed fixed bounds");
             }
-            if (backend == EASYCON_NATIVE_CAPTURE_BACKEND_FILE) {
-                constexpr std::string_view placeholder = "%02d";
-                const auto placeholder_offset = source_view.find(placeholder);
-                if (!is_absolute_windows_path(source_view) ||
-                    placeholder_offset == std::string_view::npos ||
-                    source_view.find('%') != placeholder_offset ||
-                    source_view.find('%', placeholder_offset + placeholder.size()) !=
-                        std::string_view::npos) {
-                    return fail(
-                        out_error,
-                        EASYCON_NATIVE_STATUS_INVALID_ARGUMENT,
-                        "file capture requires an absolute image-sequence pattern");
-                }
-            }
-
             std::string source(source_view);
             auto control = std::make_shared<CaptureControl>();
             auto capture = std::make_unique<easycon_native_capture>(easycon_native_capture{
@@ -571,16 +283,18 @@ extern "C" easycon_native_status EASYCON_NATIVE_CALL easycon_native_capture_open
             return fail(
                 out_error,
                 EASYCON_NATIVE_STATUS_UNSUPPORTED,
-                "file capture is disabled until bounded cancellable path access is verified");
+                "path-backed native file capture is unavailable; use prevalidated Rust-owned images");
         }
-        const auto api = capture->backend == EASYCON_NATIVE_CAPTURE_BACKEND_DIRECTSHOW
-                             ? cv::CAP_DSHOW
-                             : cv::CAP_MSMF;
-        static_cast<void>(cv::videoio_registry::hasBackend(api));
-        return fail(
-            out_error,
-            EASYCON_NATIVE_STATUS_UNSUPPORTED,
-            "DShow/MSMF capture is disabled until bounded timeout capability is verified");
+        const auto status = easycon::native::capture::platform_open(
+            capture->backend,
+            capture->source,
+            capture->options,
+            out_profile,
+            out_error);
+        if (status == EASYCON_NATIVE_STATUS_OK) {
+            capture->opened = true;
+        }
+        return status;
     });
 }
 
@@ -740,18 +454,16 @@ extern "C" easycon_native_status EASYCON_NATIVE_CALL easycon_native_capture_disc
                 EASYCON_NATIVE_STATUS_INVALID_ARGUMENT,
                 "capture discovery output is null");
         }
-        if (backend != EASYCON_NATIVE_CAPTURE_BACKEND_DIRECTSHOW &&
-            backend != EASYCON_NATIVE_CAPTURE_BACKEND_MEDIA_FOUNDATION) {
+        if (backend == EASYCON_NATIVE_CAPTURE_BACKEND_FILE || !valid_backend(backend)) {
             return fail(
                 out_error,
                 EASYCON_NATIVE_STATUS_INVALID_ARGUMENT,
-                "capture discovery requires a Windows device backend");
+                "capture discovery requires a device adapter");
         }
-        std::vector<CaptureDescriptor> descriptors;
+        std::vector<easycon::native::capture::Descriptor> descriptors;
         descriptors.reserve(max_discovered_sources);
-        const auto status = backend == EASYCON_NATIVE_CAPTURE_BACKEND_DIRECTSHOW
-                                ? discover_directshow(descriptors, out_error)
-                                : discover_media_foundation(descriptors, out_error);
+        const auto status =
+            easycon::native::capture::platform_discover(backend, descriptors, out_error);
         if (status != EASYCON_NATIVE_STATUS_OK) {
             return status;
         }

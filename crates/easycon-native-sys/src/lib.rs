@@ -87,6 +87,14 @@ impl NativeError {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) fn unsupported(message: impl Into<String>) -> Self {
+        Self {
+            kind: NativeErrorKind::Unsupported,
+            message: message.into(),
+        }
+    }
+
     fn internal(message: impl Into<String>) -> Self {
         Self {
             kind: NativeErrorKind::Internal,

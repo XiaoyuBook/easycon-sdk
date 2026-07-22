@@ -153,6 +153,8 @@ def load_manifest(path):
 
 def provision(manifest, output):
     cache_root = CACHE_ROOT.resolve()
+    if not output.is_absolute():
+        output = ROOT / output
     resolved_output = output.resolve()
     try:
         resolved_output.relative_to(cache_root)
