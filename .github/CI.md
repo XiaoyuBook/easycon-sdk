@@ -1,0 +1,35 @@
+# GitHub CI 运维边界
+
+本目录只建立可审计、可逐步启用的工程门禁，不改变 Phase 3 的冻结结论、平台支持状态或发布范围。
+
+## Workflow 分层
+
+| Workflow | 触发 | 稳定 check 名 | Ruleset 边界 |
+| --- | --- | --- | --- |
+| `Required CI` | pull request、merge queue、`main` push | `Required / Policy`、`Required / Windows Workspace` | 两项都在 GitHub-hosted runner 首次实际通过后，才可作为 `main` required checks |
+| `Native Quality (Non-Required)` | 每周 schedule、手动 dispatch | `Windows Native / <preset>`、`Linux Phase 3 Candidate (Non-Required)` | 重型证据任务，不设为 required |
+
+`Required / Policy` 校验规范、Markdown 链接、repository guards、变更行和 clean tree。`Required / Windows Workspace` 在 MSVC x64
+环境中执行冻结 Rust workspace、Loom runtime models、规范、链接、repository guards 和 diff 全门禁。
+
+重型 Windows native matrix 与 Phase 3 文档保持一致：MSVC Debug/Release、clang-cl ASan、clang-cl UBSan trap、
+MSVC analyze、clang-tidy warnings-as-errors 和 libFuzzer tracked corpus。它们只能由 schedule 或手动触发，普通
+PR 上的 workspace 结果不能替代这些 native-quality 证据。
+
+Linux job 是 non-required Vision build candidate。只有四个 Linux native 配置、完整 Cargo/Loom/fixture/repository
+门禁在真实 GitHub Linux executable 上通过并保留 Actions 日志后，才产生该次 software evidence；workflow 文件本身
+不把 Linux 标记为 Passed，也不代表 serial、硬件、四语言、package 或完整 Linux SDK 支持。
+
+## 固定输入与输出
+
+- Rust 固定为 `rust-toolchain.toml` 的 `1.97.1`，job 同时核对实际 `rustc`。
+- vcpkg tool 固定并核对 commit `bf04c909169fdbb30821c02c6eb01f1cd1295d05`；registry baseline 固定并核对
+  `cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3`。
+- OCR 只调用仓库 provisioner；manifest、来源、大小、SHA-256 和许可证在每次运行中重新核验。
+- Workflow 权限只有 `contents: read`，checkout 不持久化凭据，不读取本地第三方源码目录，也不使用 repository secret。
+- Cargo target、CMake build、vcpkg install/binary cache 和测试模型仅位于 runner temp 或 ignored `.tools/`；cache hit
+  只缩短依赖准备时间，后续实际 gate 仍必须执行并成功。
+
+首次启用 Ruleset 时，应从成功的 `Required CI` 运行中选择精确 check 名 `Required / Policy` 与
+`Required / Windows Workspace`。
+不要选择 native matrix 或 Linux candidate；本仓库不由 workflow 自动创建或修改 Ruleset。
