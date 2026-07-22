@@ -157,8 +157,9 @@ Phase 2A 和 Phase 2B 软件候选完成都不等于完整 Phase 2 完成。
 ### Phase 3：Vision 与私有 bridge
 
 目标由 [ADR-0012](../decisions/0012-phase-3-vision-native-target.md) 和
-[跨平台边界设计](../development/phase3-cross-platform-design.md) 冻结。Node F Windows checkpoint 为
-`9a1f6a57cf5b17c606b3c594b24cf25331aad302`；它不是最终 Phase 3 freeze。
+[跨平台边界设计](../development/phase3-cross-platform-design.md) 冻结。私有 Vision 跨平台源码候选已按
+[ADR-0013](../decisions/0013-phase-3-vision-cross-platform-source-candidate-freeze.md) 冻结在实现
+`b1b3aee5f4a734e1df632c40b52edf8d70fe0d0c`；这不是 public C ABI、完整 SDK 或发布冻结。
 
 交付：
 

@@ -62,6 +62,7 @@
 - [ADR-0010：冻结 Phase 2B 硬件资格工具与证据目标](decisions/0010-phase-2b-qualification-evidence.md)
 - [ADR-0011：冻结 Phase 2B Qualification Software Candidate](decisions/0011-phase-2b-qualification-software-candidate-freeze.md)
 - [ADR-0012：冻结 Phase 3 Vision 与跨平台私有 native bridge 开发目标](decisions/0012-phase-3-vision-native-target.md)
+- [ADR-0013：冻结 Phase 3 Vision 跨平台源码候选](decisions/0013-phase-3-vision-cross-platform-source-candidate-freeze.md)
 
 ## v1 固定范围
 
@@ -90,11 +91,12 @@ Phase 2B 的资格软件候选已按 [ADR-0011](decisions/0011-phase-2b-qualific
 当前仍明确标记 `Hardware Unverified`：没有冻结任何具体板型/固件、Amiibo 容量、UART/USB/Switch 时序或完整
 物理中立化能力；O-01、O-02、O-04 保持开放，完整 Phase 2 未完成，也没有创建完整 Phase 2 冻结 ADR。
 
-Phase 3 Node F 已在 `9a1f6a57cf5b17c606b3c594b24cf25331aad302` 完成 Windows private bridge、
-Frame/Image/Label/OCR/pool 与 synthetic Capture 状态机 checkpoint。该 checkpoint 只资格化 synthetic input；
-DirectShow、Media Foundation 和 native path-backed File open 都在访问设备/文件前返回 Unsupported。跨平台收口
-由 [ADR-0012](decisions/0012-phase-3-vision-native-target.md) 和
-[跨平台边界设计](development/phase3-cross-platform-design.md) 管理，不把 Node F 写成最终 Phase 3 冻结。
+Phase 3 私有 Vision 跨平台源码候选已按
+[ADR-0013](decisions/0013-phase-3-vision-cross-platform-source-candidate-freeze.md) 冻结；实现 checkpoint 为
+`b1b3aee5f4a734e1df632c40b52edf8d70fe0d0c`。Windows software/native gates 已通过，capture hardware 保持
+`Hardware Unverified`；Linux x64 保持 `Candidate / Build Unverified`；macOS Apple Silicon arm64 保持
+`Experimental Source Candidate / Build Unverified / Hardware Unverified / Not Shipped`。该冻结不包含 public
+C ABI、Phase 4、Controller serial、四语言、package 或完整跨平台 SDK 支持。
 
 ## 首发基线
 

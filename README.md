@@ -11,20 +11,21 @@ latency harness。
 
 [Phase 2 Controller/Serial 开发目标](docs/decisions/0008-phase-2-controller-target.md) 已冻结；Phase 2A 仍为
 `Hardware Unverified`：没有验证任何具体控制板、固件、VID/PID、Amiibo 容量或 UART/USB/Switch 时序，
-O-01、O-02、O-04 保持开放。当前也未发布稳定公共 API/ABI，Phase 3 Vision 尚未冻结，且不包含 ECS、
-语言绑定、固件或 UI；
+O-01、O-02、O-04 保持开放。当前也未发布稳定公共 API/ABI；Phase 3 只冻结私有 Vision 跨平台源码候选，
+不包含 ECS、语言绑定、固件或 UI；
 完整 Phase 2 必须在 CH32 可用后通过 Phase 2B 硬件资格验证。
 
 [Phase 2B Qualification Software Candidate](docs/decisions/0011-phase-2b-qualification-software-candidate-freeze.md)
 已冻结并通过 fake/synthetic 门禁，但尚未在目标设备上执行资格命令，也没有创建支持矩阵或关闭任何硬件开放项。
 
-Phase 3 已完成 Windows private Vision Node F checkpoint `9a1f6a57`，包含 Frame/Image/Label/OCR/pool 与
-synthetic Capture 状态机，但 native device/file open 尚未资格化，也没有硬件支持行。当前跨平台收口由
-[ADR-0012](docs/decisions/0012-phase-3-vision-native-target.md) 管理：Windows x64 是 v1 Tier 1，Linux x64 是
-v1 正式目标方向的 Vision candidate，macOS 只形成 Apple Silicon arm64 experimental source candidate；三者均
-不等于完整 SDK 发布。
+Phase 3 私有 Vision 跨平台源码候选已按
+[ADR-0013](docs/decisions/0013-phase-3-vision-cross-platform-source-candidate-freeze.md) 冻结：Windows x64
+软件/native 门禁通过但 capture hardware 未验证；Linux x64 是 v1 正式目标方向的 `Candidate / Build Unverified`；
+macOS 只形成 Apple Silicon arm64 `Experimental Source Candidate / Build Unverified / Hardware Unverified /
+Not Shipped`。三者均不等于完整 SDK 发布，且未冻结 public C ABI、Phase 4、四语言或 package。
 
-此前的实验性共享运行基线已经移除，不再作为本项目的产品架构或兼容性约束。共享核心、C ABI 和各语言绑定将在架构与行为规范固定后重新实现。
+此前的实验性共享运行基线已经移除，不再作为本项目的产品架构或兼容性约束。后续 public C ABI 和各语言绑定
+将在当前 Rust 共享核心之上按 Phase 5/6 的独立门禁实现。
 
 完整架构固定在 [docs/README.md](docs/README.md)，包括源码能力映射、Rust/C++/C ABI
 边界、生命周期与并发、四语言绑定、构建发布、测试和实施路线。首个里程碑的实现范围、
