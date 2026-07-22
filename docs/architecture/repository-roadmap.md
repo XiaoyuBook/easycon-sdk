@@ -156,13 +156,21 @@ Phase 2A 和 Phase 2B 软件候选完成都不等于完整 Phase 2 完成。
 
 ### Phase 3：Vision 与私有 bridge
 
+目标由 [ADR-0012](../decisions/0012-phase-3-vision-native-target.md) 和
+[跨平台边界设计](../development/phase3-cross-platform-design.md) 冻结。Node F Windows checkpoint 为
+`9a1f6a57cf5b17c606b3c594b24cf25331aad302`；它不是最终 Phase 3 freeze。
+
 交付：
 
 - C++ capture/image/template/OCR/color 窄桥接。
 - Frame/Image/Label、latest slot、`.IL`、native pool 和 synthetic capture。
 - native exception isolation 和 sanitizer harness。
+- `common`、`platform/windows`、`platform/linux` 与 fail-closed `platform/macos` 构建边界。
+- Windows Tier 1 零回归、Linux x64 Vision build candidate、macOS Apple Silicon arm64 experimental source handoff。
 
-退出门槛：Vision fixture、资源计数、可中断 capture close、missing model/invalid image/fault tests 通过；`.ILX` 不进入 API。
+退出门槛：Vision fixture、资源计数、可中断 capture close、missing model/invalid image/fault tests 通过；`.ILX`
+不进入 API。各平台必须单独记录 Passed/Build Unverified/Hardware Unverified；Linux Vision candidate 不代表
+serial/四语言/package 支持，macOS 保持 Build/Hardware Unverified、Not Shipped。
 
 ### Phase 4：ECS 与跨域 Automation
 

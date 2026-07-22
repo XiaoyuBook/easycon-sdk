@@ -17,9 +17,22 @@
 
 **[已决定]** ARM64、x86、Linux 和 macOS 不属于 v1.0 支持面。代码必须保留 target module 和 native bridge 边界，但不得在没有硬件、打包、ABI 和四语言一致性测试时发布对应 binary。
 
+### Phase 3 平台候选
+
+| 平台 | 方向 | 当前允许的最高状态 | 发布边界 |
+| --- | --- | --- | --- |
+| Windows 10/11 x64 | v1 Tier 1 | Vision `Hardware Unverified` | 完整 Phase 3、硬件、ABI、四语言与 package 门禁前不发布 |
+| Linux x64 | v1 正式目标方向 | Vision Build Candidate；按实际 build 标记 Passed/Build Unverified | serial、硬件、四语言与 package 未完成，不是完整 Linux SDK |
+| macOS Apple Silicon arm64 | experimental source | Build/Hardware Unverified、Not Shipped | 无 binary/package；不承诺 Intel 或 universal |
+
+该表由 [ADR-0012](../decisions/0012-phase-3-vision-native-target.md) 管理，不改变 v1.0 只有 Windows Tier 1
+的发布承诺。macOS 至少一次真实 arm64 compile/software gate 通过前，不实现完整 AVFoundation backend 或合并
+大段平台专属生产代码。
+
 ### 平台扩展条件
 
-新增 target 必须同时具备：serial/capture backend、OpenCV/Tesseract 依赖构建、四语言包（适用时）、硬件矩阵、关闭可中断性和 conformance。只“能够编译”不等于受支持。
+新增 target 必须同时具备：serial/capture backend、OpenCV/Tesseract 依赖构建、四语言包（适用时）、硬件矩阵、关闭可中断性和 conformance。只“能够编译”不等于受支持。Vision source/build candidate 只能证明该域的
+对应门禁，不能越级形成 SDK 支持行。
 
 ## 2. 工具链基线
 

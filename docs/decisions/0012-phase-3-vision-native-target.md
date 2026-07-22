@@ -1,8 +1,10 @@
-# 0011：冻结 Phase 3 Vision 与私有 native bridge 开发目标
+# 0012：冻结 Phase 3 Vision 与跨平台私有 native bridge 开发目标
 
 - 状态：Frozen Target (`Hardware Unverified`)
 - 日期：2026-07-21
 - 开发起点：`9944dba50adc34484b65206e07ea0a444103f656`
+- 跨平台接管起点：`9a1f6a57cf5b17c606b3c594b24cf25331aad302`
+- 集成基线：`main@41c5f0c2b19165769d4aa8e4512ad46280a1415b`
 - 实现状态：未完成；本 ADR 冻结目标，不冻结实现、公共 C ABI 或发布包
 
 ## 背景
@@ -13,7 +15,31 @@ Phase 1 Runtime 已按 [ADR-0007](0007-phase-1-freeze.md) 冻结，Phase 2A Cont
 
 本目标以只读 EasyCon 源码事实为兼容依据，但 `EasyCon/` 仍受
 [ADR-0001](0001-source-boundary.md) 约束，不成为构建、测试、fixture、submodule 或下载输入。完整实现设计见
-[Phase 3 Vision 与私有 native bridge 设计](../development/phase3-vision-native-design.md)。
+[Phase 3 Vision 与私有 native bridge 设计](../development/phase3-vision-native-design.md) 与
+[Phase 3 跨平台边界设计](../development/phase3-cross-platform-design.md)。本 ADR 的编号由 Phase 3 原先的
+`0011` 调整为 `0012`，因为 `main` 的 `0011` 已冻结 Phase 2B Qualification Software Candidate；本决定不覆盖、
+替换或重写 Phase 2B ADR。
+
+## 跨平台目标增补
+
+Phase 3 在 Node F checkpoint 后增加跨平台收口，但不扩大到公共 C ABI、语言 binding、完整 SDK 发布或 Phase 4。
+平台状态固定如下：
+
+| 平台 | Phase 3 目标状态 | 允许声明 | 明确禁止 |
+| --- | --- | --- | --- |
+| Windows 10/11 x64 | v1 Tier 1 正式目标，Vision `Hardware Unverified` | 已执行的 MSVC/native/synthetic/file fixture 软件证据 | 未测试 capture card、profile、FPS、close SLO 或完整 SDK GA |
+| Linux x64 | v1 正式目标方向，Vision Build Candidate；按实际证据标记 Passed 或 Build Unverified，硬件始终单列 | 实际 Linux build/native fixture/synthetic 与预验证 file capture 的结果 | 用 Windows 结果替代 Linux、把 Vision 候选写成 serial/四语言/package 已支持 |
+| macOS Apple Silicon arm64 | `Experimental Source Candidate / Build Unverified / Hardware Unverified / Not Shipped` | fail-closed 架构选择点、最小 unavailable adapter、未来验证 handoff | AVFoundation 空成功、未编译的大段平台代码、binary/package、Intel 或 universal 支持声明 |
+
+Windows 仍是 v1.0 GA 的唯一 Tier 1 发布目标。Linux 是 v1 正式目标方向，但必须在 Vision build 之外继续完成
+Controller serial、硬件矩阵、四语言包和发布工程才可晋级完整 SDK 支持。macOS 只形成 Apple Silicon arm64
+实验源码候选；至少一次真实 macOS 编译通过是实现完整 AVFoundation backend 或合并较大 macOS 专属生产代码的
+前置条件，云端 Mac 软件门禁不能替代实体摄像头与 USB/CH32 资格。
+
+跨平台收口不得改变以下平台中立语义：Frame/Image/Label、Capture 五态、operation、latest slot、pool、取消、
+deadline、fault、close、唯一 worker handoff/join 和资源所有权。Windows 类型、HRESULT、HANDLE、COM、DirectShow、
+Media Foundation 与平台库只能出现在 `platform/windows` 实现或私有 detail；Rust 公共语义和未来公共 C ABI 不得
+依赖它们。
 
 ### 已核对的源码事实
 
@@ -76,7 +102,8 @@ C++ 只实现：
 
 - OpenCV image decode/encode/format conversion/ROI、template/edge、HSV mask/statistics；
 - Tesseract engine create/process/release；
-- Windows/OpenCV capture discovery/open/read/interrupt/close 和实际 profile 查询；
+- platform-selected OpenCV capture adapter；Windows 只在 `platform/windows` 提供 DirectShow/Media
+  Foundation，Linux 只预留 V4L2 admission 边界，macOS 本轮只提供显式 unavailable；
 - bridge-owned buffer/error/opaque handle 的创建与释放。
 
 C++ 禁止实现 operation、event、deadline、retry、label parser、score policy、业务状态机、长期线程、
@@ -84,8 +111,10 @@ C++ 禁止实现 operation、event、deadline、retry、label parser、score pol
 
 ### 3. 私有 C-compatible 边界
 
-bridge 只暴露内部前缀 `easycon_native_*`，使用 Windows x64 `cdecl`、固定宽度标量、显式长度 UTF-8、
+bridge 只暴露内部前缀 `easycon_native_*`，使用调用约定宏、固定宽度标量、显式长度 UTF-8、
 opaque handle、status、owned error 和 owned buffer。不得出现 public `easycon_v1_*` symbol 或安装 header。
+Windows x64 宏展开为 `__cdecl`；Linux/macOS 使用平台 C ABI。边界禁止 C++ STL、C enum layout、OpenCV enum、
+`long`、`wchar_t`、HRESULT、HANDLE 或其他平台指针布局。
 
 每个 entry point 必须 `noexcept`，并按顺序捕获 `cv::Exception`、`std::exception` 和未知异常。所有 out
 parameter 在进入工作前清零；参数、length、stride、乘法、offset 和 output size 在 native 调用前校验。
@@ -276,7 +305,9 @@ OCR test 被 skip 都使完整门禁失败。缺模型、bad-image、exception�
 
 ### 10. 工具链、依赖和许可证
 
-首发目标是 Windows 10/11 x64、MSVC v143、C++20、CMake/Ninja。vcpkg registry 锁固定为官方 release
+Windows Tier 1 目标是 Windows 10/11 x64、MSVC v143、C++20、CMake/Ninja。Linux x64 candidate 使用同一
+C++20、OpenCV/Tesseract/Leptonica 版本和 registry baseline；macOS arm64 只保留 experimental source 选择点，
+没有 Xcode/Apple SDK 证据时不得产生通过状态或 binary。vcpkg registry 锁固定为官方 release
 `2026.06.24` 的 commit `cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3`，`x64-windows-static-md`，并解析：
 
 - OpenCV `4.12.0#5`，关闭 default features，只启用 core/imgproc/imgcodecs/videoio 所需的
@@ -284,7 +315,8 @@ OCR test 被 skip 都使完整门禁失败。缺模型、bad-image、exception�
 - Tesseract `5.5.2`；
 - Leptonica `1.87.0`（Tesseract transitively required）。
 
-自有 C++ target 使用 `/MD`、`/W4 /WX /permissive- /EHsc /Zc:__cplusplus`。第三方 include 标为 system。
+Windows 自有 C++ target 使用 `/MD`、`/W4 /WX /permissive- /EHsc /Zc:__cplusplus`；Linux owned target 使用
+Clang/GCC 的 `-Wall -Wextra -Wpedantic -Werror`，两者均将第三方 include 标为 system。
 MSVC Debug/Release、clang-cl ASan、clang-cl UBSan、clang-tidy、MSVC `/analyze` 和固定 fuzz seed 都是 native
 门禁。ASan/UBSan preset 或 runtime 不兼容会阻断冻结；任何替代门禁都必须先修改并独立 review 本 ADR，
 不能在实现后静默跳过或用 counters 冒充 sanitizer coverage。
@@ -340,7 +372,8 @@ Phase 3 不得：
 - 实现 ECS、Automation 跨域运行、正式 C ABI、public header、四语言 binding、package、UI 或网络服务；
 - 把业务状态、retry、deadline、事件或长期线程移入 C++；
 - 复制 EasyCon traineddata、依赖 cwd/PATH 模型、让 Runtime/library 下载模型或把 missing model 伪造成成功；
-- 用 fake 代替 actual OpenCV/Tesseract bridge，或用 synthetic capture 宣称硬件通过。
+- 用 fake 代替 actual OpenCV/Tesseract bridge，或用 synthetic capture 宣称硬件通过；
+- 用返回成功的空 native stub 冒充 Linux/macOS backend，或在没有真实 build/package/hardware 证据时作平台支持声明。
 
 ## 重新打开规则
 
@@ -348,7 +381,8 @@ Phase 3 不得：
 
 - 改变依赖方向、Rust/C++ ownership、private bridge ABI ownership 或 Send/Sync 证明；
 - 改变 Frame metadata、score、`.IL` active method/ROI、capture state/close order、pool fairness 或 O-03 边界；
-- 增加 `.ILX`、Canny、non-normalized template、公共 C ABI、ECS、语言 binding 或支持平台；
+- 增加 `.ILX`、Canny、non-normalized template、公共 C ABI、ECS、语言 binding，或把任何 Candidate/Experimental
+  平台晋级为 shipped/supported；
 - 更换 vcpkg baseline、OpenCV/Tesseract/Leptonica major/minor 或 sanitizer 门禁。
 
 保持本目标的局部实现选择和 bug fix 不重新打开目标，但行为变化必须同步 fixture、测试和设计说明。实现冻结
@@ -366,3 +400,4 @@ Phase 3 不得：
 - [测试策略](../architecture/testing-strategy.md)
 - [构建、发布与合规](../architecture/build-release.md)
 - [实施路线](../architecture/repository-roadmap.md)
+- [Phase 3 跨平台边界设计](../development/phase3-cross-platform-design.md)

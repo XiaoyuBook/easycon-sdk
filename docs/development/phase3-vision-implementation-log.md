@@ -1,6 +1,6 @@
 # Phase 3 Vision implementation log
 
-This log records implementation evidence against ADR-0011. It is not a public ABI, release, or
+This log records implementation evidence against ADR-0012. It is not a public ABI, release, or
 hardware qualification record.
 
 ## Baseline and architecture gate
@@ -422,7 +422,7 @@ so a Windows checkout cannot rewrite corpus bytes. No EasyCon file or model byte
 
 ### Independent review
 
-The latest Node E working tree received an independent read-only review against ADR-0011, the Phase
+The latest Node E working tree received an independent read-only review against ADR-0012, the Phase
 3 design, and the EasyCon `ImgLabel`, `Search`, and `MatchFacts` facts. Reproducible findings were
 first fixed by regressions:
 

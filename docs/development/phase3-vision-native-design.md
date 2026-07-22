@@ -2,13 +2,18 @@
 
 ## 1. 目的和状态
 
-本文把 [ADR-0011](../decisions/0011-phase-3-vision-native-target.md) 的冻结目标细化为可逐节点实现、验证和
+本文把 [ADR-0012](../decisions/0012-phase-3-vision-native-target.md) 的冻结目标细化为可逐节点实现、验证和
 审查的内部设计。起点固定为 `9944dba50adc34484b65206e07ea0a444103f656`。完成状态只能是
 `Hardware Unverified Vision Candidate`，不等于公共 C ABI、binding、发布包、capture hardware 或 OCR model
 release candidate。
 
 本文中的类型和函数名是 Phase 3 Rust/private bridge 内部契约，可在 Phase 3 review 中调整；它们不是
 `easycon_v1_*` 公共 ABI 承诺。
+
+Node F checkpoint `9a1f6a57cf5b17c606b3c594b24cf25331aad302` 后的平台与构建增补由
+[Phase 3 跨平台边界设计](phase3-cross-platform-design.md) 负责。该增补取代本文中“Windows-only target”、单一
+triplet、flat native source 和 Windows capture adapter 的构建限制，但不改变本文的 Rust 状态机、所有权、
+Frame/Image/Label、private C 数据模型、pool、取消、deadline 或 close 契约。
 
 ## 2. 证据到实现的映射
 
@@ -605,7 +610,7 @@ translation units运行仓库固定check集并把warning视为error。`msvc-anal
 
 Windows ASan不作为leak唯一证据，必须同时核对native counters。Debug/Release需要fresh configure，不能复用
 跨compiler cache。`clang-asan` 或 `clang-ubsan` 任一 configure/build/CTest失败、timeout或未执行都阻断Phase 3
-冻结；只有先修改ADR-0011说明精确替代门禁并在新SHA完成独立复审后才能改变该要求。
+冻结；只有先修改ADR-0012说明精确替代门禁并在新SHA完成独立复审后才能改变该要求。
 
 ## 21. Rust/spec完整门禁
 

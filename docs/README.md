@@ -43,6 +43,8 @@
     logical report partial 聚合、native I/O error、checked timing、物理未验证边界和唯一终态三元组。
 18. [Phase 2B checkpoint 软件收口设计](development/phase2b-checkpoint-software-closeout.md)：
     磁盘 evidence 重验、五类 checkpoint、handoff attestation 边界和 Hardware Unverified transaction。
+19. [Phase 3 Vision 跨平台边界设计](development/phase3-cross-platform-design.md)：Windows Tier 1、Linux
+    candidate、macOS arm64 experimental source 的 ownership、构建、证据和晋级边界。
 
 ## 决策记录
 
@@ -57,6 +59,7 @@
 - [ADR-0009：冻结 Phase 2A Controller/Serial Candidate 基线](decisions/0009-phase-2a-freeze.md)
 - [ADR-0010：冻结 Phase 2B 硬件资格工具与证据目标](decisions/0010-phase-2b-qualification-evidence.md)
 - [ADR-0011：冻结 Phase 2B Qualification Software Candidate](decisions/0011-phase-2b-qualification-software-candidate-freeze.md)
+- [ADR-0012：冻结 Phase 3 Vision 与跨平台私有 native bridge 开发目标](decisions/0012-phase-3-vision-native-target.md)
 
 ## v1 固定范围
 
@@ -85,10 +88,19 @@ Phase 2B 的资格软件候选已按 [ADR-0011](decisions/0011-phase-2b-qualific
 当前仍明确标记 `Hardware Unverified`：没有冻结任何具体板型/固件、Amiibo 容量、UART/USB/Switch 时序或完整
 物理中立化能力；O-01、O-02、O-04 保持开放，完整 Phase 2 未完成，也没有创建完整 Phase 2 冻结 ADR。
 
+Phase 3 Node F 已在 `9a1f6a57cf5b17c606b3c594b24cf25331aad302` 完成 Windows private bridge、
+Frame/Image/Label/OCR/pool 与 synthetic Capture 状态机 checkpoint。该 checkpoint 只资格化 synthetic input；
+DirectShow、Media Foundation 和 native path-backed File open 都在访问设备/文件前返回 Unsupported。跨平台收口
+由 [ADR-0012](decisions/0012-phase-3-vision-native-target.md) 和
+[跨平台边界设计](development/phase3-cross-platform-design.md) 管理，不把 Node F 写成最终 Phase 3 冻结。
+
 ## 首发基线
 
-- **[已决定]** v1.0 GA 只承诺 Windows 10/11 x64，目标三元组为 `x86_64-pc-windows-msvc`。
-- **[已决定]** Linux x64 与 macOS arm64 只要求代码边界可移植；在各自硬件、打包和一致性门槛通过前不得出现在支持矩阵中。
+- **[已决定]** Windows 10/11 x64 是 v1 Tier 1，v1.0 GA 目标三元组为 `x86_64-pc-windows-msvc`。
+- **[已决定]** Linux x64 是 v1 正式目标方向；Phase 3 只形成 Vision build candidate，serial、硬件、四语言包
+  和发布门禁完成前保持 Candidate/Unverified。
+- **[已决定]** macOS 只形成 Apple Silicon arm64 `Experimental Source Candidate / Build Unverified /
+  Hardware Unverified / Not Shipped`；不承诺 Intel 或 universal binary。
 - **[已决定]** 四种 SDK 必须装载同一份原生核心构建，不允许复制业务实现或形成语言特有语义。
 - **[已决定]** 所有发布物统一采用 `GPL-3.0-only`，不存在专有链接例外。
 
@@ -102,4 +114,5 @@ Phase 2B 的资格软件候选已按 [ADR-0011](decisions/0011-phase-2b-qualific
 | O-02 | Amiibo 槽位数量与允许的数据长度 | Controller 默认没有该 capability；只有调用方显式提供 Hardware Unverified limit 后才接纳 save/select | C ABI 冻结前 |
 | O-03 | 官方包内置的 OCR 语言数据 | 默认接口语言为 `chi_sim`，模型只有在来源和许可证核验后才随包发布 | 首个发布候选版前 |
 | O-04 | 物理硬件动作时序 SLO | 采用 ADR-0008 的分段暂定目标，以逻辑分析仪、firmware trace 和 Switch 可观察结果校准 | Controller 硬件 Beta 前 |
-| O-05 | v1.1 是否增加 Linux x64 或 macOS arm64 | 不承诺 | v1.0 发布后规划 |
+| O-05 | Linux x64 完整 SDK 晋级 | Vision build candidate；serial、硬件、四语言和 package 未完成 | Linux 支持声明前 |
+| O-06 | macOS Apple Silicon arm64 晋级 | Experimental Source Candidate；build/hardware unverified，not shipped | 首次真实 build 后重开 |

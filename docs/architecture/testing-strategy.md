@@ -156,6 +156,22 @@ Rust、Cargo、behavior 或 conformance 提交都必须在普通 workspace tests
 
 浮点结果比较由每个 fixture 声明容差；位置、错误和 event order 不使用模糊比较。
 
+### Phase 3 平台证据分级
+
+- Windows 10/11 x64 是 Tier 1：MSVC Debug/Release、clang-cl ASan/UBSan、clang-tidy、MSVC analyze、fuzz、
+  Rust/spec 全门禁必须在最终源码执行。
+- Linux x64 是 Vision build candidate：只有真实 Linux configure/build/CTest、Cargo 和 fixture log 可以标记
+  software Passed；没有可用环境时保持 Build Unverified，并交付 exact bundle/dependencies/commands/SHA-256。
+- macOS Apple Silicon arm64 是 Experimental Source Candidate：本轮只验证 fail-closed 结构和平台无关契约；
+  没有 Xcode/Apple SDK log 时 build/hardware 均 Unverified，且 Not Shipped。云端 Mac 不能替代摄像头/USB 硬件。
+
+common fixture 至少覆盖 codec、template、edge、HSV、OCR missing-model/合法独立资产、prevalidated finite File、
+synthetic Capture、exception/ownership/resource count。平台 native adapter 未资格化时必须返回 Unsupported/
+BackendUnavailable，不能以空 discovery/profile/frame success 通过测试。
+
+平台结果的完整门槛和 macOS 两阶段 handoff 见
+[Phase 3 跨平台边界设计](../development/phase3-cross-platform-design.md)。
+
 ## 6. C ABI 测试
 
 ### 编译与布局

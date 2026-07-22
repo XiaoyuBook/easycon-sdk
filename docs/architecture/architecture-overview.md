@@ -152,6 +152,20 @@ flowchart TB
 
 内部桥接函数必须是 C-compatible、`noexcept`，捕获所有 C++ 异常并返回 native status + owned error。OpenCV/Tesseract 对象只能通过私有不透明 handle 存活；Rust RAII wrapper 是其唯一上层 owner。
 
+### 平台 adapter 分层
+
+**[已决定]** Vision 的 Rust 状态机和 native common 算法平台中立。native source 分为 `common`、
+`platform/windows`、`platform/linux` 和 fail-closed `platform/macos`：
+
+- `common` 拥有 fixed-width private C 数据模型、exception/ownership、codec/template/OCR/color、预验证 File glue；
+- Windows adapter 独占 COM、DirectShow、Media Foundation、HRESULT/HANDLE 与对应系统库；
+- Linux adapter 只建立 V4L2 admission 边界，未经过真实设备矩阵前不声明 discovery/profile/FPS；
+- macOS 只形成 Apple Silicon arm64 experimental unavailable adapter，不实现或伪造 AVFoundation。
+
+新增平台不得修改 Frame/Image/Label、Capture 五态、operation、latest slot、pool、cancel/deadline 或
+interrupt/handoff/join/handle-release 语义。完整约束见
+[Phase 3 跨平台边界设计](../development/phase3-cross-platform-design.md)。
+
 ## 5. 公共 C ABI 与语言层
 
 公共 native 层只安装：
@@ -244,7 +258,8 @@ sequenceDiagram
 
 ## 9. 推导与待确认
 
-**[推导]** Windows 首发并不允许在 Rust 核心中散布 Win32 类型。串口与采集都是 trait/bridge 实现，因此后续平台增加的是叶子模块和包，不是新的核心。
+**[推导]** Windows Tier 1 并不允许在 Rust 核心中散布 Win32 类型。串口与采集都是 trait/bridge 实现，
+因此 Linux x64 candidate 和 macOS arm64 experimental source 增加的是叶子 adapter，不是新的核心。
 
 **[推导]** 只发布一个公共 native binary，能消除 Rust/C++ 双 ABI、跨 CRT 释放和四语言装载不同核心的风险。
 
