@@ -103,6 +103,51 @@ void exercise_ocr_validation(const uint8_t* data, size_t size, easycon_native_er
     release_error(error);
 }
 
+void exercise_capture_validation(const uint8_t* data, size_t size, easycon_native_error& error) {
+    if (size == 0) {
+        return;
+    }
+    const easycon_native_capture_options options{
+        {64, 64, 64, 4096, 4096, 64},
+        UINT64_C(1000000),
+        UINT64_C(1000000),
+        UINT32_C(4),
+        0,
+    };
+    easycon_native_capture* capture = nullptr;
+    easycon_native_capture_interrupt* interrupt = nullptr;
+    const auto backend = UINT32_C(1) + (data[0] % UINT8_C(4));
+    const auto source_length = static_cast<uint64_t>((std::min)(size, size_t{64}));
+    (void)easycon_native_capture_create(
+        backend,
+        data,
+        source_length,
+        &options,
+        &capture,
+        &interrupt,
+        &error);
+    release_error(error);
+    if (capture != nullptr) {
+        easycon_native_capture_profile profile{};
+        (void)easycon_native_capture_open(capture, &profile, &error);
+        release_error(error);
+        easycon_native_image image{};
+        (void)easycon_native_capture_read(capture, &image, &error);
+        easycon_native_image_release(&image);
+        release_error(error);
+        (void)easycon_native_capture_close(capture, &error);
+        release_error(error);
+        (void)easycon_native_capture_destroy(&capture, &error);
+        release_error(error);
+    }
+    if (interrupt != nullptr) {
+        (void)easycon_native_capture_interrupt_request(interrupt, &error);
+        release_error(error);
+        (void)easycon_native_capture_interrupt_destroy(&interrupt, &error);
+        release_error(error);
+    }
+}
+
 }  // namespace
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
@@ -127,6 +172,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         easycon_native_error_release(&error);
         exercise_vision(data, size, error);
         exercise_ocr_validation(data, size, error);
+        exercise_capture_validation(data, size, error);
     }
 
     easycon_native_counts final_counts{};

@@ -50,6 +50,12 @@ easycon_native_status copy_image_mat(
     const easycon_native_image_limits& limits,
     easycon_native_image* output,
     easycon_native_error* error) noexcept;
+easycon_native_status decode_image_mat(
+    const uint8_t* encoded,
+    uint64_t encoded_length,
+    const easycon_native_image_limits& limits,
+    cv::Mat& output,
+    easycon_native_error* error);
 
 template <typename Function>
 easycon_native_status guard(easycon_native_error* out_error, Function&& function) noexcept {

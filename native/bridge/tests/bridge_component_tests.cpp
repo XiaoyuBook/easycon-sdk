@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -110,6 +111,11 @@ bool is_zero(const easycon_native_match_extrema& result) {
 bool is_zero(const easycon_native_color_result& result) {
     return result.count == 0 && result.bbox_x == 0 && result.bbox_y == 0 &&
            result.bbox_width == 0 && result.bbox_height == 0 && result.has_bbox == 0;
+}
+
+easycon_native_capture_options capture_options() {
+    return easycon_native_capture_options{
+        image_limits(), UINT64_C(1000000000), UINT64_C(100000000), UINT32_C(8), 0};
 }
 
 void expect_pixels(
@@ -800,6 +806,263 @@ void test_vision_ops_formats_validation_and_output_zeroing() {
     expect(is_zero(color), "HSV count zeroes output before error storage validation");
 }
 
+void test_capture_file_admission_interrupt_and_ownership() {
+    const auto baseline = counts();
+    const auto source =
+        std::filesystem::absolute("fixtures/no-file-access/frame-%02d.bmp").u8string();
+    const auto options = capture_options();
+    easycon_native_capture* capture = nullptr;
+    easycon_native_capture_interrupt* interrupt = nullptr;
+    easycon_native_error error{};
+
+    expect(
+        easycon_native_capture_create(
+            EASYCON_NATIVE_CAPTURE_BACKEND_FILE,
+            reinterpret_cast<const uint8_t*>(source.data()),
+            source.size(),
+            &options,
+            &capture,
+            &interrupt,
+            &error) == EASYCON_NATIVE_STATUS_OK,
+        "file capture owner and interrupt are created");
+    expect(capture != nullptr && interrupt != nullptr, "capture create returns both owners");
+    expect(counts().live_handles == baseline.live_handles + 2, "capture owners are counted");
+
+    easycon_native_capture_profile profile{1, 1, 1, 1, 1, 1};
+    expect(
+        easycon_native_capture_open(capture, &profile, &error) ==
+            EASYCON_NATIVE_STATUS_UNSUPPORTED,
+        "file capture is rejected before unbounded path access");
+    expect(
+        profile.backend == 0 && profile.width == 0 && profile.height == 0 && profile.stride == 0 &&
+            profile.pixel_format == 0 && profile.frame_interval_ns == 0,
+        "unsupported file capture leaves the profile empty");
+    easycon_native_error_release(&error);
+
+    expect(
+        easycon_native_capture_interrupt_request(interrupt, &error) == EASYCON_NATIVE_STATUS_OK,
+        "capture interrupt is lock-free from the reader owner");
+    expect(
+        easycon_native_capture_close(capture, &error) == EASYCON_NATIVE_STATUS_OK,
+        "capture closes on its owner thread");
+    expect(
+        easycon_native_capture_destroy(&capture, &error) == EASYCON_NATIVE_STATUS_OK,
+        "capture destroy consumes the owner");
+    expect(capture == nullptr, "capture destroy acknowledges consumption");
+    expect(
+        easycon_native_capture_interrupt_destroy(&interrupt, &error) == EASYCON_NATIVE_STATUS_OK,
+        "interrupt destroy consumes the token");
+    expect(interrupt == nullptr, "interrupt destroy acknowledges consumption");
+    expect(counts().live_handles == baseline.live_handles, "capture handles return to baseline");
+    expect(counts().live_allocations == baseline.live_allocations, "capture allocations return to baseline");
+}
+
+void test_capture_hardware_admission_and_destroy_outcomes() {
+    const auto baseline = counts();
+    const std::string source = "dshow:0";
+    const auto options = capture_options();
+    easycon_native_capture* capture = nullptr;
+    easycon_native_capture_interrupt* interrupt = nullptr;
+    easycon_native_capture_profile profile{};
+    easycon_native_error error{};
+
+    expect(
+        easycon_native_capture_create(
+            EASYCON_NATIVE_CAPTURE_BACKEND_DIRECTSHOW,
+            reinterpret_cast<const uint8_t*>(source.data()),
+            source.size(),
+            &options,
+            &capture,
+            &interrupt,
+            &error) == EASYCON_NATIVE_STATUS_OK,
+        "DShow capture request is represented without opening hardware");
+    expect(
+        easycon_native_capture_open(capture, &profile, &error) ==
+            EASYCON_NATIVE_STATUS_UNSUPPORTED,
+        "DShow is rejected before OpenCV open without bounded timeout capability");
+    expect(profile.width == 0 && profile.height == 0, "unsupported open leaves profile zero");
+    easycon_native_error_release(&error);
+
+    expect(
+        easycon_native_test_capture_fail_next(
+            EASYCON_NATIVE_TEST_CAPTURE_DESTROY_BEFORE_CONSUME, &error) ==
+            EASYCON_NATIVE_STATUS_OK,
+        "destroy-before-consume failpoint arms");
+    expect(
+        easycon_native_capture_destroy(&capture, &error) ==
+            EASYCON_NATIVE_STATUS_BACKEND_ERROR,
+        "destroy-before-consume returns a diagnostic");
+    expect(capture != nullptr, "destroy-before-consume preserves the owner");
+    easycon_native_error_release(&error);
+
+    expect(
+        easycon_native_test_capture_fail_next(
+            EASYCON_NATIVE_TEST_CAPTURE_CONSUME_WITH_ERROR, &error) ==
+            EASYCON_NATIVE_STATUS_OK,
+        "consume-with-error failpoint arms");
+    expect(
+        easycon_native_capture_destroy(&capture, &error) ==
+            EASYCON_NATIVE_STATUS_BACKEND_ERROR,
+        "consume-with-error returns its diagnostic");
+    expect(capture == nullptr, "consume-with-error still acknowledges ownership consumption");
+    easycon_native_error_release(&error);
+    expect(
+        easycon_native_capture_interrupt_destroy(&interrupt, &error) == EASYCON_NATIVE_STATUS_OK,
+        "hardware interrupt owner is released");
+
+    const std::string mf_source = "msmf:0";
+    expect(
+        easycon_native_capture_create(
+            EASYCON_NATIVE_CAPTURE_BACKEND_MEDIA_FOUNDATION,
+            reinterpret_cast<const uint8_t*>(mf_source.data()),
+            mf_source.size(),
+            &options,
+            &capture,
+            &interrupt,
+            &error) == EASYCON_NATIVE_STATUS_OK,
+        "MSMF capture request is represented without opening hardware");
+    expect(
+        easycon_native_test_capture_fail_next(
+            EASYCON_NATIVE_TEST_CAPTURE_DESTROY_OK_NO_ACK, &error) ==
+            EASYCON_NATIVE_STATUS_OK,
+        "OK-without-ack failpoint arms");
+    expect(
+        easycon_native_capture_destroy(&capture, &error) == EASYCON_NATIVE_STATUS_OK,
+        "protocol no-ack can accompany OK status");
+    expect(capture != nullptr, "OK without pointer clear preserves the only owner");
+    expect(
+        easycon_native_capture_destroy(&capture, &error) == EASYCON_NATIVE_STATUS_OK,
+        "retry consumes a no-ack owner");
+    expect(capture == nullptr, "retry acknowledges capture consumption");
+    expect(
+        easycon_native_capture_interrupt_destroy(&interrupt, &error) == EASYCON_NATIVE_STATUS_OK,
+        "MSMF interrupt owner is released");
+    expect(counts().live_handles == baseline.live_handles, "capture failpoints preserve handle symmetry");
+    expect(counts().live_allocations == baseline.live_allocations, "capture diagnostics are released");
+}
+
+void test_capture_discovery_is_bounded_and_owned() {
+    const auto baseline = counts();
+    for (const auto backend : {
+             EASYCON_NATIVE_CAPTURE_BACKEND_DIRECTSHOW,
+             EASYCON_NATIVE_CAPTURE_BACKEND_MEDIA_FOUNDATION,
+         }) {
+        easycon_native_capture_discovery* discovery = nullptr;
+        easycon_native_error error{};
+        expect(
+            easycon_native_capture_discovery_create(backend, &discovery, &error) ==
+                EASYCON_NATIVE_STATUS_OK,
+            "Windows capture discovery succeeds even when no device is present");
+        expect(discovery != nullptr, "capture discovery returns an owner");
+        uint32_t length = 0;
+        expect(
+            easycon_native_capture_discovery_count(discovery, &length, &error) ==
+                EASYCON_NATIVE_STATUS_OK,
+            "capture discovery count succeeds");
+        expect(length <= 64, "capture discovery is bounded");
+        for (uint32_t index = 0; index < length; ++index) {
+            easycon_native_buffer source{};
+            easycon_native_buffer name{};
+            expect(
+                easycon_native_capture_discovery_get(
+                    discovery, index, &source, &name, &error) == EASYCON_NATIVE_STATUS_OK,
+                "capture descriptor copies through bridge-owned buffers");
+            expect(source.data != nullptr && source.length > 0 && source.length <= 4096,
+                   "capture source ID is bounded UTF-8");
+            expect(name.data != nullptr && name.length > 0 && name.length <= 1024,
+                   "capture display name is bounded UTF-8");
+            easycon_native_buffer_release(&source);
+            easycon_native_buffer_release(&name);
+        }
+        expect(
+            easycon_native_capture_discovery_destroy(&discovery, &error) ==
+                EASYCON_NATIVE_STATUS_OK,
+            "capture discovery destroy succeeds");
+        expect(discovery == nullptr, "capture discovery destroy consumes its owner");
+    }
+    expect(counts().live_handles == baseline.live_handles, "discovery handles return to baseline");
+    expect(counts().live_allocations == baseline.live_allocations,
+           "discovery buffers return to baseline");
+}
+
+void test_capture_exception_isolation_and_retry() {
+    const auto baseline = counts();
+    const auto source =
+        std::filesystem::absolute("fixtures/no-file-access/frame-%02d.bmp").u8string();
+    const auto options = capture_options();
+    easycon_native_capture* capture = nullptr;
+    easycon_native_capture_interrupt* interrupt = nullptr;
+    easycon_native_capture_profile profile{1, 1, 1, 1, 1, 1};
+    easycon_native_error error{};
+    expect(
+        easycon_native_capture_create(
+            EASYCON_NATIVE_CAPTURE_BACKEND_FILE,
+            reinterpret_cast<const uint8_t*>(source.data()),
+            source.size(),
+            &options,
+            &capture,
+            &interrupt,
+            &error) == EASYCON_NATIVE_STATUS_OK,
+        "capture exception test owners are created");
+
+    expect(
+        easycon_native_test_capture_fail_next(EASYCON_NATIVE_TEST_CAPTURE_OPEN_CV, &error) ==
+            EASYCON_NATIVE_STATUS_OK,
+        "capture open cv failpoint arms");
+    expect(
+        easycon_native_capture_open(capture, &profile, &error) ==
+            EASYCON_NATIVE_STATUS_CV_EXCEPTION,
+        "capture open isolates cv::Exception");
+    expect(profile.width == 0 && profile.height == 0, "open exception zeroes profile");
+    easycon_native_error_release(&error);
+    expect(
+        easycon_native_capture_open(capture, &profile, &error) ==
+            EASYCON_NATIVE_STATUS_UNSUPPORTED,
+        "capture open returns the stable unqualified result after isolated exception");
+    easycon_native_error_release(&error);
+
+    expect(
+        easycon_native_test_capture_fail_next(EASYCON_NATIVE_TEST_CAPTURE_READ_STD, &error) ==
+            EASYCON_NATIVE_STATUS_OK,
+        "capture read std failpoint arms");
+    easycon_native_image frame{reinterpret_cast<uint8_t*>(UINTPTR_MAX), 1, 1, 1, 1, 1};
+    expect(
+        easycon_native_capture_read(capture, &frame, &error) ==
+            EASYCON_NATIVE_STATUS_STD_EXCEPTION,
+        "capture read isolates std::exception");
+    expect(is_zero(frame), "read exception zeroes image output");
+    easycon_native_error_release(&error);
+    expect(
+        easycon_native_capture_read(capture, &frame, &error) ==
+            EASYCON_NATIVE_STATUS_INVALID_ARGUMENT,
+        "capture read remains invalid after unsupported open");
+    expect(is_zero(frame), "invalid capture read leaves image empty");
+    easycon_native_error_release(&error);
+
+    expect(
+        easycon_native_test_capture_fail_next(EASYCON_NATIVE_TEST_CAPTURE_CLOSE_UNKNOWN, &error) ==
+            EASYCON_NATIVE_STATUS_OK,
+        "capture close unknown failpoint arms");
+    expect(
+        easycon_native_capture_close(capture, &error) ==
+            EASYCON_NATIVE_STATUS_UNKNOWN_EXCEPTION,
+        "capture close isolates unknown exception");
+    easycon_native_error_release(&error);
+    expect(
+        easycon_native_capture_close(capture, &error) == EASYCON_NATIVE_STATUS_OK,
+        "capture close retries after isolated exception");
+    expect(
+        easycon_native_capture_destroy(&capture, &error) == EASYCON_NATIVE_STATUS_OK,
+        "capture exception owner is destroyed");
+    expect(
+        easycon_native_capture_interrupt_destroy(&interrupt, &error) == EASYCON_NATIVE_STATUS_OK,
+        "capture exception interrupt is destroyed");
+    expect(counts().live_handles == baseline.live_handles,
+           "capture exception handles return to baseline");
+    expect(counts().live_allocations == baseline.live_allocations,
+           "capture exception diagnostics return to baseline");
+}
+
 }  // namespace
 
 int main() {
@@ -826,6 +1089,10 @@ int main() {
     test_edge_preprocess_and_match_fixtures();
     test_hsv_count_wrap_and_bbox();
     test_vision_ops_formats_validation_and_output_zeroing();
+    test_capture_file_admission_interrupt_and_ownership();
+    test_capture_hardware_admission_and_destroy_outcomes();
+    test_capture_discovery_is_bounded_and_owned();
+    test_capture_exception_isolation_and_retry();
 
     const auto final_counts = counts();
     expect(final_counts.live_handles == 0, "all native handles are released");

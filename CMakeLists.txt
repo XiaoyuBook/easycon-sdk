@@ -20,7 +20,7 @@ if(NOT MSVC)
   message(FATAL_ERROR "Phase 3 native bridge requires the MSVC-compatible ABI")
 endif()
 
-find_package(OpenCV 4.12.0 EXACT CONFIG REQUIRED COMPONENTS core imgcodecs imgproc)
+find_package(OpenCV 4.12.0 EXACT CONFIG REQUIRED COMPONENTS core imgcodecs imgproc videoio)
 find_package(Tesseract CONFIG REQUIRED)
 find_package(ZLIB REQUIRED)
 

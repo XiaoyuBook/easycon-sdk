@@ -3,6 +3,7 @@
 
 #[allow(unsafe_code)]
 mod call;
+pub mod capture;
 pub mod codec;
 #[allow(unsafe_code)]
 mod ffi;
@@ -30,6 +31,7 @@ pub enum NativeErrorKind {
     UnknownException,
     AllocationFailed,
     Internal,
+    Unsupported,
 }
 
 impl NativeErrorKind {
@@ -50,6 +52,7 @@ impl NativeErrorKind {
             ffi::STATUS_UNKNOWN_EXCEPTION => Self::UnknownException,
             ffi::STATUS_ALLOCATION_FAILED => Self::AllocationFailed,
             ffi::STATUS_INTERNAL => Self::Internal,
+            ffi::STATUS_UNSUPPORTED => Self::Unsupported,
             _ => Self::Internal,
         }
     }

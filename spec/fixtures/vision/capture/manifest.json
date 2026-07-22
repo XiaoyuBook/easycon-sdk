@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "license": "GPL-3.0-only",
+  "generator": "tools/generate_vision_capture_fixtures.py",
+  "provenance": "Repository-owned deterministic codec BMP reserved for a future bounded file-capture qualification; current native capture admission performs no path access and no physical capture device is represented.",
+  "native_admission": {
+    "file": "unsupported-before-path-access",
+    "directshow": "unsupported-before-device-access",
+    "media_foundation": "unsupported-before-device-access"
+  },
+  "sequence": {
+    "pattern": "frame-%02d.bmp",
+    "frame_count": 2,
+    "source_fixture": "../codec/bgr-2x2.bmp.hex",
+    "encoded_bytes_per_frame": 70,
+    "encoded_sha256": "32595ac4ac54ae42c4f31d77fce001599dc10f5452f7c2de5482f0ed5f0a074d",
+    "width": 2,
+    "height": 2,
+    "stride": 6,
+    "pixel_format": "BGR8",
+    "decoded_sha256": "3d335acc3b7c9d3edcf42098e24ad875a2c0ba87223c640b1d535be39677009c"
+  },
+  "hardware_support": []
+}

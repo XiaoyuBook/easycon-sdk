@@ -3,6 +3,7 @@ use std::ptr::NonNull;
 use crate::ffi;
 use crate::{NativeError, NativeErrorKind, NativeResourceCounts};
 
+pub(super) mod capture;
 pub(super) mod image;
 pub(super) mod ocr;
 pub(super) mod vision;

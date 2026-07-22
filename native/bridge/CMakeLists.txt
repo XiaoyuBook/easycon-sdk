@@ -1,5 +1,6 @@
 set(EASYCON_NATIVE_BRIDGE_SOURCES
   src/bridge.cpp
+  src/capture.cpp
   src/image_codec.cpp
   src/ocr.cpp
   src/vision_ops.cpp
@@ -19,6 +20,12 @@ target_link_libraries(
     ${OpenCV_LIBS}
     Tesseract::libtesseract
     ZLIB::ZLIB
+    mf
+    mfplat
+    mfuuid
+    ole32
+    oleaut32
+    strmiids
 )
 set_target_properties(
   easycon_native_bridge
@@ -29,6 +36,7 @@ easycon_native_configure_owned_target(easycon_native_bridge)
 
 set(EASYCON_NATIVE_ANALYSIS_SOURCES
   ${CMAKE_CURRENT_SOURCE_DIR}/src/bridge.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/capture.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/image_codec.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/ocr.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/vision_ops.cpp
@@ -154,6 +162,7 @@ if(EASYCON_BUILD_FUZZERS)
     easycon_native_bridge_fuzz_target
     SHARED
       src/bridge.cpp
+      src/capture.cpp
       src/image_codec.cpp
       src/ocr.cpp
       src/vision_ops.cpp
@@ -217,7 +226,7 @@ if(EASYCON_BUILD_FUZZERS)
       easycon_native_abi_fuzzer
       easycon_native_bridge_fuzz_target
   )
-  foreach(seed IN ITEMS cv.txt std.txt unknown.txt)
+  foreach(seed IN ITEMS capture.txt cv.txt std.txt unknown.txt)
     configure_file(
       ${CMAKE_CURRENT_SOURCE_DIR}/fuzz/seeds/abi/${seed}
       ${CMAKE_BINARY_DIR}/fuzz-corpus/abi/${seed}

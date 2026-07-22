@@ -462,3 +462,94 @@ ran the provisioned independent English OCR success asset without skipping.
 Node E makes no capture-device, hardware profile/FPS, packaged OCR model, Chinese OCR accuracy, ECS
 integer-rounding, or Phase 4 claim. It adds no traineddata, EasyCon source, public C ABI, installed
 header, language binding, or package artifact.
+
+## Node F: Capture state machine and latest Frame slot
+
+### Test-first and implementation evidence
+
+The first capture contract builds failed because no private capture ABI, safe native owner,
+`CaptureSession`, synthetic backend, state machine, or fixture manifest existed. Directed red tests
+then fixed opening/streaming/fault/stop/closed transitions, one-reader ownership, immutable latest
+Frame replacement, first-frame deadlines, cancellation, panic handoff, repeated close, destroy
+acknowledgement, and Runtime registry convergence before the corresponding production paths were
+accepted.
+
+The completed node provides:
+
+- a Rust-owned `CaptureSession` with one Runtime-supervised worker, an `Option<Arc<Frame>>` latest
+  slot, checked sequence/timestamp/profile validation, and stable Opening, Streaming, Faulted,
+  Stopping, and Closed states;
+- Runtime Operation arbitration for first-frame deadlines, a `VirtualClock`-driven wait path, caller
+  cancellation, fault-over-stale-frame behavior, and Streaming/latest priority over a caller token
+  cancelled after the Frame became available;
+- a deterministic synthetic backend with explicit open/read barriers, scripted frame/fault/end and
+  panic paths, interrupt observation, finalize ownership failpoints, and no random sleeps;
+- `easycon-native-sys::capture::CaptureHandle` as the unique `Send` and non-`Sync` owner, plus a
+  cloneable `Send + Sync` atomic interrupt token; native destroy ownership is decided only from the
+  inout pointer acknowledgement and preserves an Unconsumed owner for explicit retry or deliberate
+  Runtime `CloseFailed` quarantine;
+- a private Windows C++ bridge for bounded descriptor discovery, lexical absolute file-pattern
+  validation, interrupt/close/destroy, three exception classes, output zeroing, allocation/handle
+  counters, and consumed/unconsumed/no-ack destroy failpoints;
+- a generated capture manifest and ABI fuzz seed that preserve a two-frame deterministic BMP corpus
+  for future qualification while fixing the current support matrix to no native open backend.
+
+DirectShow and Media Foundation discovery execute their real Windows enumeration APIs, but their
+open paths remain Unsupported before device access. Path-backed File open likewise returns
+Unsupported before filesystem or OpenCV decode access: synchronous path/decode calls cannot prove
+the frozen timeout and interruptible-join contract. Only the Rust synthetic backend is qualified as
+a reproducible capture input in this checkpoint.
+
+### Independent review
+
+The independent Node F review reproduced and closed two final implementation findings:
+
+- synchronous File metadata/read/decode performed only a post-call elapsed check, so slow storage
+  could exceed the requested quantum and make Runtime close block in join; three red tests first
+  proved the old NoFrame/success behavior, then File admission was moved before all path access and
+  fixed to Unsupported;
+- a register-failure Abort worker could settle the startup Operation before the constructor
+  committed the original Runtime admission error; a private red regression now proves Aborted
+  leaves terminal ownership with the construction failure path.
+
+The review also drove regressions for deadline-overflow backend finalization, output cleanup after a
+native read error, unique `%02d` file-pattern validation, profile/stride limits, combined cleanup
+diagnostics, interrupt-drain diagnostics, startup test synchronization, snapshot priority, and the
+saved `CloseFailed` Unconsumed quarantine. The final directed re-review reported zero open finding
+and confirmed that no public `easycon_v1_*` symbol, hardware profile/FPS claim, or support entry was
+introduced.
+
+### Native gate details
+
+The ignored English OCR model and license were revalidated from the frozen manifest before every
+component matrix that exercises OCR success. The final native source passed:
+
+| Gate | Final result |
+| --- | --- |
+| MSVC Debug fresh configure/build and CTest | passed, 2/2 |
+| MSVC Release fresh configure/build and CTest | passed, 2/2 |
+| clang-cl ASan fresh configure/build and CTest | passed, 2/2 |
+| clang-cl UBSan trap fresh configure/build and CTest | passed, 2/2 |
+| clang-tidy warnings-as-errors | passed for all 9 bridge, support, component, and fuzz translation units |
+| MSVC `/analyze /analyze:external- /WX` | passed for the bridge and component executable |
+| clang-cl libFuzzer seed replay | passed, 1/1 CTest and 128 runs over the tracked ABI corpus |
+
+### Workspace and repository gates
+
+| Command | Final result |
+| --- | --- |
+| `cargo fmt --all --check` | passed |
+| `cargo check --workspace --all-targets` | passed |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | passed |
+| `cargo test --workspace --all-features` | passed, 229 tests plus 2 compile-fail doctests |
+| `python tools/run_runtime_models.py` | passed, 6 Loom models |
+| `python tools/validate_specs.py` | passed, including 15 Vision binary fixtures, 1 capture manifest, and 24 label corpus entries |
+| `python tools/check_markdown_links.py` | passed, 123 references across 31 files |
+| `python tools/check_repository_guards.py` | passed |
+| `git diff --check` | passed |
+
+Node F remains a Windows 10/11 x64, MSVC/CMake private-native checkpoint. The capture bridge directly
+uses Windows DirectShow and Media Foundation headers and libraries; no non-Windows build contract is
+claimed here. It makes no capture-card, stable device identity, backend/profile, resolution, pixel
+format, FPS, close-SLO, packaged OCR model, public C ABI, language binding, ECS, Phase 4, or final
+Phase 3 freeze claim.

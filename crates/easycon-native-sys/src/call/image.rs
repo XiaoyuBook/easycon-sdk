@@ -118,6 +118,14 @@ struct ImageOwner {
     raw: ffi::Image,
 }
 
+pub(crate) fn copy_owned(raw: ffi::Image) -> Result<OwnedImage, NativeError> {
+    ImageOwner { raw }.copy_tight()
+}
+
+pub(crate) fn release_owned(raw: ffi::Image) {
+    drop(ImageOwner { raw });
+}
+
 impl ImageOwner {
     fn copy_tight(&self) -> Result<OwnedImage, NativeError> {
         let format = PixelFormat::from_raw(self.raw.pixel_format)

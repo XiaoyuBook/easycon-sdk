@@ -2,6 +2,7 @@
 """Validate the milestone JSON schemas and fixtures without third-party packages."""
 
 import copy
+import hashlib
 import json
 import os
 import re
@@ -964,6 +965,54 @@ def validate_vision_label_fixtures(runner=subprocess.run):
     )
 
 
+def validate_vision_capture_fixtures(runner=subprocess.run):
+    validate_generated_vision_fixtures(
+        "generate_vision_capture_fixtures.py", "vision capture", runner
+    )
+    manifest = load_json("fixtures/vision/capture/manifest.json")
+    require(manifest.get("version") == 1, "capture fixture version changed")
+    require(manifest.get("license") == "GPL-3.0-only", "capture fixture license changed")
+    require(manifest.get("hardware_support") == [], "capture hardware support must remain empty")
+    require(
+        manifest.get("native_admission")
+        == {
+            "file": "unsupported-before-path-access",
+            "directshow": "unsupported-before-device-access",
+            "media_foundation": "unsupported-before-device-access",
+        },
+        "unqualified native capture admission changed",
+    )
+    sequence = manifest.get("sequence")
+    require(
+        sequence
+        == {
+            "pattern": "frame-%02d.bmp",
+            "frame_count": 2,
+            "source_fixture": "../codec/bgr-2x2.bmp.hex",
+            "encoded_bytes_per_frame": 70,
+            "encoded_sha256": (
+                "32595ac4ac54ae42c4f31d77fce001599dc10f5452f7c2de5482f0ed5f0a074d"
+            ),
+            "width": 2,
+            "height": 2,
+            "stride": 6,
+            "pixel_format": "BGR8",
+            "decoded_sha256": (
+                "3d335acc3b7c9d3edcf42098e24ad875a2c0ba87223c640b1d535be39677009c"
+            ),
+        },
+        "capture sequence contract changed",
+    )
+    encoded = bytes.fromhex(
+        (SPEC / "fixtures/vision/codec/bgr-2x2.bmp.hex").read_text(encoding="ascii")
+    )
+    require(len(encoded) == sequence["encoded_bytes_per_frame"], "capture BMP size changed")
+    require(
+        hashlib.sha256(encoded).hexdigest() == sequence["encoded_sha256"],
+        "capture BMP hash changed",
+    )
+
+
 def validate_vision_model_provisioner_regressions():
     import provision_vision_test_model as model
 
@@ -1055,6 +1104,7 @@ def validate_vision_fixture_validator_regressions():
         (validate_vision_operation_fixtures, "operation"),
         (validate_vision_ocr_fixtures, "OCR"),
         (validate_vision_label_fixtures, "label"),
+        (validate_vision_capture_fixtures, "capture"),
     ):
         try:
             validator(runner=failing_runner)
@@ -1078,11 +1128,13 @@ def main():
     validate_vision_operation_fixtures()
     validate_vision_ocr_fixtures()
     validate_vision_label_fixtures()
+    validate_vision_capture_fixtures()
     validate_vision_model_provisioner_regressions()
     test_count = validate_conformance()
     print(
         "validated 5 schemas, 1 behavior spec, 3 controller fixtures, "
-        "15 vision binary fixtures, 24 label corpus entries, 9 conformance scenarios, "
+        "15 vision binary fixtures, 1 capture manifest, 24 label corpus entries, "
+        "9 conformance scenarios, "
         "and {} exact Rust tests".format(
             test_count
         )

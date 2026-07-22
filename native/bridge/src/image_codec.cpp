@@ -387,6 +387,28 @@ easycon_native_status copy_image_mat(
     return copy_mat(mat, limits, output, error);
 }
 
+easycon_native_status decode_image_mat(
+    const uint8_t* encoded,
+    uint64_t encoded_length,
+    const easycon_native_image_limits& limits,
+    cv::Mat& output,
+    easycon_native_error* error) {
+    const auto preflight_status = preflight_encoded(encoded, encoded_length, limits, error);
+    if (preflight_status != EASYCON_NATIVE_STATUS_OK) {
+        return preflight_status;
+    }
+    cv::Mat encoded_view(
+        1,
+        static_cast<int>(encoded_length),
+        CV_8UC1,
+        const_cast<uint8_t*>(encoded));
+    output = cv::imdecode(encoded_view, cv::IMREAD_UNCHANGED);
+    if (output.empty()) {
+        return fail(error, EASYCON_NATIVE_STATUS_INVALID_IMAGE, "OpenCV image decode failed");
+    }
+    return EASYCON_NATIVE_STATUS_OK;
+}
+
 }  // namespace easycon::native::detail
 
 extern "C" void EASYCON_NATIVE_CALL easycon_native_image_release(
@@ -415,16 +437,12 @@ extern "C" easycon_native_status EASYCON_NATIVE_CALL easycon_native_image_decode
         if (limit_status != EASYCON_NATIVE_STATUS_OK) {
             return limit_status;
         }
-        const auto preflight_status = preflight_encoded(encoded, encoded_length, *limits, out_error);
-        if (preflight_status != EASYCON_NATIVE_STATUS_OK) {
-            return preflight_status;
+        cv::Mat decoded;
+        const auto decode_status = easycon::native::detail::decode_image_mat(
+            encoded, encoded_length, *limits, decoded, out_error);
+        if (decode_status != EASYCON_NATIVE_STATUS_OK) {
+            return decode_status;
         }
-        cv::Mat encoded_view(
-            1,
-            static_cast<int>(encoded_length),
-            CV_8UC1,
-            const_cast<uint8_t*>(encoded));
-        const auto decoded = cv::imdecode(encoded_view, cv::IMREAD_UNCHANGED);
         return copy_mat(decoded, *limits, out_image, out_error);
     });
 }

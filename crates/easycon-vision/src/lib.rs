@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 //! Rust-owned Vision types and lifecycle coordination.
 
+mod capture;
 mod color;
 mod error;
 mod image;
@@ -9,6 +10,11 @@ mod matching;
 mod ocr;
 mod pool;
 
+pub use capture::{
+    CaptureBackendKind, CaptureOptions, CaptureProfile, CaptureSession, CaptureSnapshotWait,
+    CaptureSourceDescriptor, CaptureState, NativeCaptureOptions, SyntheticCapture,
+    SyntheticCaptureControl, SyntheticCaptureCounts, discover_capture_sources,
+};
 pub use color::{ColorStatistics, HsvRange};
 pub use error::{VisionError, VisionErrorKind};
 pub use image::{Frame, Image, ImageError, ImageErrorKind, PixelFormat, Roi, VisionLimits};

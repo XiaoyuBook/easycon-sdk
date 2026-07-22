@@ -180,6 +180,11 @@ impl OwnedImage {
         self.format
     }
 
+    #[must_use]
+    pub fn into_pixels(self) -> Vec<u8> {
+        self.pixels
+    }
+
     pub(crate) fn from_parts(
         pixels: Vec<u8>,
         width: u32,

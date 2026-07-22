@@ -58,6 +58,20 @@ impl VisionError {
         Self::new(VisionErrorKind::Internal, message)
     }
 
+    pub(crate) fn reclassify(mut self, kind: VisionErrorKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    pub(crate) fn append_diagnostic(mut self, diagnostic: Self) -> Self {
+        self.message.push_str("; ");
+        self.message.push_str(&diagnostic.to_string());
+        if self.native.is_none() {
+            self.native = diagnostic.native;
+        }
+        self
+    }
+
     pub(crate) fn from_native(error: NativeError) -> Self {
         let kind = match error.kind() {
             NativeErrorKind::InvalidArgument => VisionErrorKind::Validation,

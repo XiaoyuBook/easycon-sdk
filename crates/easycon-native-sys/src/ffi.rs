@@ -16,6 +16,7 @@ pub(crate) const STATUS_STD_EXCEPTION: i32 = 12;
 pub(crate) const STATUS_UNKNOWN_EXCEPTION: i32 = 13;
 pub(crate) const STATUS_ALLOCATION_FAILED: i32 = 14;
 pub(crate) const STATUS_INTERNAL: i32 = 15;
+pub(crate) const STATUS_UNSUPPORTED: i32 = 16;
 
 pub(crate) const PIXEL_FORMAT_BGR8: u32 = 1;
 pub(crate) const PIXEL_FORMAT_BGRA8: u32 = 2;
@@ -35,6 +36,10 @@ pub(crate) const OCR_PSM_AUTO: u32 = 1;
 pub(crate) const OCR_PSM_SINGLE_BLOCK: u32 = 2;
 pub(crate) const OCR_PSM_SINGLE_LINE: u32 = 3;
 pub(crate) const OCR_PSM_SINGLE_WORD: u32 = 4;
+
+pub(crate) const CAPTURE_BACKEND_FILE: u32 = 1;
+pub(crate) const CAPTURE_BACKEND_DIRECTSHOW: u32 = 2;
+pub(crate) const CAPTURE_BACKEND_MEDIA_FOUNDATION: u32 = 3;
 
 #[repr(C)]
 #[derive(Default)]
@@ -124,8 +129,32 @@ pub(crate) struct ColorResult {
     pub(crate) has_bbox: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct CaptureOptions {
+    pub(crate) image_limits: ImageLimits,
+    pub(crate) open_timeout_ns: u64,
+    pub(crate) read_timeout_ns: u64,
+    pub(crate) max_frames: u32,
+    pub(crate) reserved: u32,
+}
+
+#[repr(C)]
+#[derive(Default)]
+pub(crate) struct CaptureProfile {
+    pub(crate) backend: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) pixel_format: u32,
+    pub(crate) stride: u64,
+    pub(crate) frame_interval_ns: u64,
+}
+
 pub(crate) type DebugHandle = c_void;
 pub(crate) type OcrEngine = c_void;
+pub(crate) type Capture = c_void;
+pub(crate) type CaptureInterrupt = c_void;
+pub(crate) type CaptureDiscovery = c_void;
 
 unsafe extern "C" {
     pub(crate) fn easycon_native_error_release(error: *mut Error);
@@ -209,6 +238,60 @@ unsafe extern "C" {
         inout_engine: *mut *mut OcrEngine,
         out_error: *mut Error,
     ) -> i32;
+    pub(crate) fn easycon_native_capture_create(
+        backend: u32,
+        source_utf8: *const u8,
+        source_length: u64,
+        options: *const CaptureOptions,
+        out_capture: *mut *mut Capture,
+        out_interrupt: *mut *mut CaptureInterrupt,
+        out_error: *mut Error,
+    ) -> i32;
+    pub(crate) fn easycon_native_capture_open(
+        capture: *mut Capture,
+        out_profile: *mut CaptureProfile,
+        out_error: *mut Error,
+    ) -> i32;
+    pub(crate) fn easycon_native_capture_read(
+        capture: *mut Capture,
+        out_image: *mut Image,
+        out_error: *mut Error,
+    ) -> i32;
+    pub(crate) fn easycon_native_capture_close(capture: *mut Capture, out_error: *mut Error)
+    -> i32;
+    pub(crate) fn easycon_native_capture_destroy(
+        inout_capture: *mut *mut Capture,
+        out_error: *mut Error,
+    ) -> i32;
+    pub(crate) fn easycon_native_capture_interrupt_request(
+        interrupt: *mut CaptureInterrupt,
+        out_error: *mut Error,
+    ) -> i32;
+    pub(crate) fn easycon_native_capture_interrupt_destroy(
+        inout_interrupt: *mut *mut CaptureInterrupt,
+        out_error: *mut Error,
+    ) -> i32;
+    pub(crate) fn easycon_native_capture_discovery_create(
+        backend: u32,
+        out_discovery: *mut *mut CaptureDiscovery,
+        out_error: *mut Error,
+    ) -> i32;
+    pub(crate) fn easycon_native_capture_discovery_count(
+        discovery: *mut CaptureDiscovery,
+        out_count: *mut u32,
+        out_error: *mut Error,
+    ) -> i32;
+    pub(crate) fn easycon_native_capture_discovery_get(
+        discovery: *mut CaptureDiscovery,
+        index: u32,
+        out_source_id: *mut Buffer,
+        out_display_name: *mut Buffer,
+        out_error: *mut Error,
+    ) -> i32;
+    pub(crate) fn easycon_native_capture_discovery_destroy(
+        inout_discovery: *mut *mut CaptureDiscovery,
+        out_error: *mut Error,
+    ) -> i32;
     pub(crate) fn easycon_native_debug_counts(
         out_counts: *mut Counts,
         out_error: *mut Error,
@@ -228,7 +311,8 @@ mod tests {
     use std::mem::{align_of, offset_of, size_of};
 
     use super::{
-        Buffer, ColorResult, Counts, Error, HsvRange, Image, ImageLimits, ImageView, MatchExtrema,
+        Buffer, CaptureOptions, CaptureProfile, ColorResult, Counts, Error, HsvRange, Image,
+        ImageLimits, ImageView, MatchExtrema,
     };
 
     #[test]
@@ -294,5 +378,20 @@ mod tests {
         assert_eq!(align_of::<Counts>(), 8);
         assert_eq!(offset_of!(Counts, live_handles), 0);
         assert_eq!(offset_of!(Counts, live_allocations), 8);
+        assert_eq!(size_of::<CaptureOptions>(), 64);
+        assert_eq!(align_of::<CaptureOptions>(), 8);
+        assert_eq!(offset_of!(CaptureOptions, image_limits), 0);
+        assert_eq!(offset_of!(CaptureOptions, open_timeout_ns), 40);
+        assert_eq!(offset_of!(CaptureOptions, read_timeout_ns), 48);
+        assert_eq!(offset_of!(CaptureOptions, max_frames), 56);
+        assert_eq!(offset_of!(CaptureOptions, reserved), 60);
+        assert_eq!(size_of::<CaptureProfile>(), 32);
+        assert_eq!(align_of::<CaptureProfile>(), 8);
+        assert_eq!(offset_of!(CaptureProfile, backend), 0);
+        assert_eq!(offset_of!(CaptureProfile, width), 4);
+        assert_eq!(offset_of!(CaptureProfile, height), 8);
+        assert_eq!(offset_of!(CaptureProfile, pixel_format), 12);
+        assert_eq!(offset_of!(CaptureProfile, stride), 16);
+        assert_eq!(offset_of!(CaptureProfile, frame_interval_ns), 24);
     }
 }
