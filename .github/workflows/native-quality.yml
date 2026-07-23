@@ -1,0 +1,444 @@
+name: Native Quality (Non-Required)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 3 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-quality-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  EASYCON_RUST_VERSION: "1.97.1"
+  EASYCON_VCPKG_SCRIPTS_COMMIT: cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3
+  EASYCON_VCPKG_TOOL_RELEASE: "2026-07-13"
+  EASYCON_VCPKG_TOOL_COMMIT: bf04c909169fdbb30821c02c6eb01f1cd1295d05
+  EASYCON_VCPKG_WINDOWS_ASSET_BYTES: "6749536"
+  EASYCON_VCPKG_WINDOWS_ASSET_SHA256: 67958c6a13a35130ff8035bef33097ffe3376a6708577a826cfa41fa592db611
+  EASYCON_VCPKG_LINUX_ASSET_BYTES: "8553216"
+  EASYCON_VCPKG_LINUX_ASSET_SHA256: 9f68d6f2158c8a1ae4800260fad2972a21a48f2d43c02d40e79049650b5260c9
+  EASYCON_VCPKG_REGISTRY_BASELINE: cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3
+  VCPKG_DISABLE_METRICS: "1"
+  VCPKG_FEATURE_FLAGS: manifests,registries,versions
+
+jobs:
+  windows-native:
+    name: Windows Native / ${{ matrix.label }}
+    runs-on: windows-2022
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - label: MSVC Debug
+            preset: msvc-debug
+          - label: MSVC Release
+            preset: msvc-release
+          - label: clang-cl ASan
+            preset: clang-asan
+          - label: clang-cl UBSan Trap
+            preset: clang-ubsan
+          - label: MSVC Analyze
+            preset: msvc-analyze
+          - label: clang-tidy
+            preset: clang-tidy
+          - label: libFuzzer Corpus
+            preset: clang-fuzz
+    env:
+      EASYCON_NATIVE_PRESET: ${{ matrix.preset }}
+      EASYCON_VISION_TEST_TESSDATA: ${{ github.workspace }}/.tools/vision-models/tessdata_fast-4.1.0
+    steps:
+      - name: Check out the scheduled candidate
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Isolate generated outputs
+        shell: pwsh
+        run: |
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "EASYCON_VCPKG_BINARY_CACHE=$env:RUNNER_TEMP\easycon-vcpkg-binary-cache" -Encoding utf8
+
+      - name: Load the MSVC x64 developer environment
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path -LiteralPath $vswhere)) {
+            throw "vswhere.exe was not found"
+          }
+          $installationPath = (@(& $vswhere -latest -products "*" -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath))[0]
+          if ([string]::IsNullOrWhiteSpace($installationPath)) {
+            throw "Visual Studio with the x64 C++ toolchain was not found"
+          }
+          $installationPath = $installationPath.Trim()
+          $devShell = Join-Path $installationPath "Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
+          Import-Module $devShell
+          Enter-VsDevShell -VsInstallPath $installationPath -SkipAutomaticLocation -DevCmdArguments "-arch=x64 -host_arch=x64"
+          if ($env:VSCMD_ARG_TGT_ARCH -cne "x64") {
+            throw "MSVC target architecture is not x64"
+          }
+          $variables = @(
+            "INCLUDE",
+            "LIB",
+            "LIBPATH",
+            "VCINSTALLDIR",
+            "VCToolsInstallDir",
+            "VSINSTALLDIR",
+            "WindowsSdkDir",
+            "WindowsSDKVersion",
+            "UniversalCRTSdkDir",
+            "UCRTVersion",
+            "VSCMD_ARG_HOST_ARCH",
+            "VSCMD_ARG_TGT_ARCH"
+          )
+          foreach ($name in $variables) {
+            $value = [Environment]::GetEnvironmentVariable($name)
+            if ([string]::IsNullOrWhiteSpace($value)) {
+              throw "MSVC environment variable $name is empty"
+            }
+            Add-Content -LiteralPath $env:GITHUB_ENV -Value "$name=$value" -Encoding utf8
+          }
+          $toolDirectories = @("cl.exe", "link.exe", "lib.exe", "rc.exe", "mt.exe") |
+            ForEach-Object { Split-Path -Parent (Get-Command $_ -ErrorAction Stop).Source } |
+            Select-Object -Unique
+          foreach ($directory in $toolDirectories) {
+            Add-Content -LiteralPath $env:GITHUB_PATH -Value $directory -Encoding utf8
+          }
+
+      - name: Verify native tool availability
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
+            throw "cl.exe is not available after loading the MSVC environment"
+          }
+          if (-not (Get-Command clang-cl.exe -ErrorAction SilentlyContinue)) {
+            throw "clang-cl.exe is not available on the Windows runner"
+          }
+          if (-not (Get-Command clang-tidy.exe -ErrorAction SilentlyContinue)) {
+            throw "clang-tidy.exe is not available on the Windows runner"
+          }
+          cmake --version
+          ninja --version
+          $cl = Get-Command cl.exe
+          Get-Item -LiteralPath $cl.Source | Select-Object -ExpandProperty VersionInfo | Format-List FileVersion,ProductVersion
+          clang-cl.exe --version
+          clang-tidy.exe --version
+          python --version
+
+      - name: Restore vcpkg binary cache
+        id: vcpkg_cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/easycon-vcpkg-binary-cache
+          key: windows-native-${{ matrix.preset }}-vcpkg-v2-scripts-cd61e1e2-tool-bf04c909-registry-cd61e1e2-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'cmake/triplets/**', 'CMakePresets.json', '.github/workflows/required-ci.yml', '.github/workflows/native-quality.yml') }}
+
+      - name: Restore the verified OCR test model
+        id: ocr_cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ github.workspace }}/.tools/vision-models/tessdata_fast-4.1.0
+          key: ocr-model-v2-${{ hashFiles('spec/fixtures/vision/ocr-model.json', 'tools/provision_vision_test_model.py', '.github/workflows/required-ci.yml', '.github/workflows/native-quality.yml') }}
+
+      - name: Install and verify pinned vcpkg scripts and tool
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          $configuration = Get-Content -Raw -LiteralPath vcpkg-configuration.json | ConvertFrom-Json
+          $baseline = $configuration.'default-registry'.baseline
+          if ($baseline -cne $env:EASYCON_VCPKG_REGISTRY_BASELINE) {
+            throw "vcpkg registry baseline $baseline is not frozen"
+          }
+          $vcpkgRoot = Join-Path $env:RUNNER_TEMP "easycon-vcpkg"
+          git init $vcpkgRoot
+          git -C $vcpkgRoot remote add origin https://github.com/microsoft/vcpkg.git
+          git -C $vcpkgRoot fetch --depth 1 origin $env:EASYCON_VCPKG_SCRIPTS_COMMIT
+          git -C $vcpkgRoot checkout --detach FETCH_HEAD
+          $actualScriptsCommit = (git -C $vcpkgRoot rev-parse HEAD).Trim()
+          if ($actualScriptsCommit -cne $env:EASYCON_VCPKG_SCRIPTS_COMMIT) {
+            throw "vcpkg scripts commit $actualScriptsCommit is not frozen"
+          }
+          foreach ($relative in @(".vcpkg-root", "bootstrap-vcpkg.bat", "bootstrap-vcpkg.sh", "scripts/buildsystems/vcpkg.cmake")) {
+            if (-not (Test-Path -LiteralPath (Join-Path $vcpkgRoot $relative) -PathType Leaf)) {
+              throw "vcpkg scripts checkout is missing $relative"
+            }
+          }
+          $downloadPath = Join-Path $env:RUNNER_TEMP "vcpkg-$env:EASYCON_VCPKG_TOOL_RELEASE.exe.download"
+          $downloadUrl = "https://github.com/microsoft/vcpkg-tool/releases/download/$env:EASYCON_VCPKG_TOOL_RELEASE/vcpkg.exe"
+          curl.exe --fail --location --silent --show-error --retry 5 --retry-all-errors `
+            --proto "=https" --proto-redir "=https" --output $downloadPath $downloadUrl
+          $asset = Get-Item -LiteralPath $downloadPath
+          if ($asset.Length -ne [int64]$env:EASYCON_VCPKG_WINDOWS_ASSET_BYTES) {
+            throw "vcpkg.exe has $($asset.Length) bytes; expected $env:EASYCON_VCPKG_WINDOWS_ASSET_BYTES"
+          }
+          $assetHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $downloadPath).Hash.ToLowerInvariant()
+          if ($assetHash -cne $env:EASYCON_VCPKG_WINDOWS_ASSET_SHA256) {
+            throw "vcpkg.exe SHA-256 $assetHash is not frozen"
+          }
+          $vcpkg = Join-Path $vcpkgRoot "vcpkg.exe"
+          Move-Item -LiteralPath $downloadPath -Destination $vcpkg
+          $version = @(& $vcpkg version)
+          $expectedVersion = "vcpkg package management program version $env:EASYCON_VCPKG_TOOL_RELEASE-$env:EASYCON_VCPKG_TOOL_COMMIT"
+          if ($version[0].Trim() -cne $expectedVersion) {
+            throw "unexpected vcpkg version: $($version[0])"
+          }
+          $version | Out-Host
+          $trackedStatus = @(git -C $vcpkgRoot status --porcelain=v1 --untracked-files=no)
+          if ($trackedStatus.Count -ne 0) {
+            $trackedStatus | Out-Host
+            throw "vcpkg scripts checkout was modified"
+          }
+          New-Item -ItemType Directory -Force -Path $env:EASYCON_VCPKG_BINARY_CACHE | Out-Null
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "VCPKG_ROOT=$vcpkgRoot" -Encoding utf8
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "VCPKG_BINARY_SOURCES=clear;files,$env:EASYCON_VCPKG_BINARY_CACHE,readwrite" -Encoding utf8
+
+      - name: Provision and verify the frozen OCR test model
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          python tools/provision_vision_test_model.py `
+            --manifest spec/fixtures/vision/ocr-model.json `
+            --output $env:EASYCON_VISION_TEST_TESSDATA
+
+      - name: Configure, build, and test the native quality preset
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          $buildDirectory = Join-Path $env:RUNNER_TEMP "easycon-cmake-$env:EASYCON_NATIVE_PRESET"
+          cmake --preset $env:EASYCON_NATIVE_PRESET -B $buildDirectory
+          cmake --build $buildDirectory --parallel
+          if ($env:EASYCON_NATIVE_PRESET -ceq "clang-tidy") {
+            cmake --build $buildDirectory --target easycon_native_clang_tidy
+          }
+          ctest --test-dir $buildDirectory --output-on-failure --no-tests=error
+          $status = @(git status --porcelain=v1 --untracked-files=all)
+          if ($status.Count -ne 0) {
+            $status | Out-Host
+            throw "native quality gates left tracked or unignored output"
+          }
+
+      - name: Save vcpkg binaries from trusted main
+        if: github.ref == 'refs/heads/main' && steps.vcpkg_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/easycon-vcpkg-binary-cache
+          key: ${{ steps.vcpkg_cache.outputs.cache-primary-key }}
+
+      - name: Save the verified OCR model from trusted main
+        if: github.ref == 'refs/heads/main' && steps.ocr_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ github.workspace }}/.tools/vision-models/tessdata_fast-4.1.0
+          key: ${{ steps.ocr_cache.outputs.cache-primary-key }}
+
+  linux-phase3-candidate:
+    name: Linux Phase 3 Candidate (Non-Required)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      CARGO_INCREMENTAL: "0"
+      EASYCON_VISION_TEST_TESSDATA: ${{ github.workspace }}/.tools/vision-models/tessdata_fast-4.1.0
+    steps:
+      - name: Check out the scheduled candidate
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Isolate generated outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'CARGO_TARGET_DIR=%s\n' "$RUNNER_TEMP/easycon-cargo-target" >> "$GITHUB_ENV"
+          printf 'EASYCON_VCPKG_BINARY_CACHE=%s\n' \
+            "$RUNNER_TEMP/easycon-vcpkg-binary-cache" >> "$GITHUB_ENV"
+
+      - name: Install Linux build prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install --yes \
+            autoconf \
+            autoconf-archive \
+            automake \
+            bison \
+            build-essential \
+            curl \
+            flex \
+            libtool \
+            linux-libc-dev \
+            ninja-build \
+            pkg-config \
+            tar \
+            unzip \
+            zip
+
+      - name: Install and verify the frozen Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Fx 'channel = "1.97.1"' rust-toolchain.toml
+          rustup toolchain install "$EASYCON_RUST_VERSION" \
+            --profile minimal \
+            --component clippy \
+            --component rustfmt \
+            --target x86_64-pc-windows-msvc
+          actual_version="$(rustc --version | awk '{print $2}')"
+          test "$actual_version" = "$EASYCON_RUST_VERSION"
+
+      - name: Record the Linux software environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          uname -a
+          getconf GNU_LIBC_VERSION
+          gcc --version
+          g++ --version
+          clang++ --version
+          cmake --version
+          ninja --version
+          python3 --version
+          rustc --version --verbose
+          cargo --version --verbose
+          git --version
+
+      - name: Restore Cargo downloads
+        id: cargo_cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: linux-phase3-cargo-v2-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.github/workflows/native-quality.yml') }}
+
+      - name: Restore vcpkg binary cache
+        id: vcpkg_cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/easycon-vcpkg-binary-cache
+          key: linux-phase3-vcpkg-v2-scripts-cd61e1e2-tool-bf04c909-registry-cd61e1e2-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'CMakePresets.json', '.github/workflows/required-ci.yml', '.github/workflows/native-quality.yml') }}
+
+      - name: Restore the verified OCR test model
+        id: ocr_cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ github.workspace }}/.tools/vision-models/tessdata_fast-4.1.0
+          key: ocr-model-v2-${{ hashFiles('spec/fixtures/vision/ocr-model.json', 'tools/provision_vision_test_model.py', '.github/workflows/required-ci.yml', '.github/workflows/native-quality.yml') }}
+
+      - name: Install and verify pinned vcpkg scripts and tool
+        shell: bash
+        run: |
+          set -euo pipefail
+          baseline="$(python3 -c 'import json; print(json.load(open("vcpkg-configuration.json", encoding="utf-8"))["default-registry"]["baseline"])')"
+          test "$baseline" = "$EASYCON_VCPKG_REGISTRY_BASELINE"
+          vcpkg_root="$RUNNER_TEMP/easycon-vcpkg"
+          git init "$vcpkg_root"
+          git -C "$vcpkg_root" remote add origin https://github.com/microsoft/vcpkg.git
+          git -C "$vcpkg_root" fetch --depth 1 origin "$EASYCON_VCPKG_SCRIPTS_COMMIT"
+          git -C "$vcpkg_root" checkout --detach FETCH_HEAD
+          test "$(git -C "$vcpkg_root" rev-parse HEAD)" = "$EASYCON_VCPKG_SCRIPTS_COMMIT"
+          for relative in \
+            .vcpkg-root \
+            bootstrap-vcpkg.bat \
+            bootstrap-vcpkg.sh \
+            scripts/buildsystems/vcpkg.cmake
+          do
+            test -f "$vcpkg_root/$relative"
+          done
+          download_path="$RUNNER_TEMP/vcpkg-$EASYCON_VCPKG_TOOL_RELEASE-glibc.download"
+          download_url="https://github.com/microsoft/vcpkg-tool/releases/download/$EASYCON_VCPKG_TOOL_RELEASE/vcpkg-glibc"
+          curl --fail --location --silent --show-error --retry 5 --retry-all-errors \
+            --proto '=https' --proto-redir '=https' --output "$download_path" "$download_url"
+          asset_bytes="$(wc -c < "$download_path" | tr -d '[:space:]')"
+          test "$asset_bytes" = "$EASYCON_VCPKG_LINUX_ASSET_BYTES"
+          printf '%s  %s\n' "$EASYCON_VCPKG_LINUX_ASSET_SHA256" "$download_path" | sha256sum --check -
+          install -m 0755 "$download_path" "$vcpkg_root/vcpkg"
+          version="$("$vcpkg_root/vcpkg" version | sed -n '1p')"
+          expected_version="vcpkg package management program version $EASYCON_VCPKG_TOOL_RELEASE-$EASYCON_VCPKG_TOOL_COMMIT"
+          test "$version" = "$expected_version"
+          printf '%s\n' "$version"
+          test -z "$(git -C "$vcpkg_root" status --porcelain=v1 --untracked-files=no)"
+          mkdir -p "$EASYCON_VCPKG_BINARY_CACHE"
+          printf 'VCPKG_ROOT=%s\n' "$vcpkg_root" >> "$GITHUB_ENV"
+          printf 'VCPKG_BINARY_SOURCES=clear;files,%s,readwrite\n' \
+            "$EASYCON_VCPKG_BINARY_CACHE" >> "$GITHUB_ENV"
+
+      - name: Provision and verify the frozen OCR test model
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/provision_vision_test_model.py \
+            --manifest spec/fixtures/vision/ocr-model.json \
+            --output "$EASYCON_VISION_TEST_TESSDATA"
+          sha256sum \
+            "$EASYCON_VISION_TEST_TESSDATA/eng.traineddata" \
+            "$EASYCON_VISION_TEST_TESSDATA/LICENSE"
+
+      - name: Run all Linux Phase 3 native candidate configurations
+        shell: bash
+        run: |
+          set -euo pipefail
+          for preset in \
+            linux-x64-debug \
+            linux-x64-release \
+            linux-x64-asan \
+            linux-x64-ubsan
+          do
+            binary="$RUNNER_TEMP/easycon-cmake-$preset"
+            cmake --preset "$preset" -B "$binary"
+            cmake --build "$binary" --parallel
+            ctest --test-dir "$binary" --output-on-failure --no-tests=error
+          done
+
+      - name: Run Linux workspace and repository gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all --check
+          cargo check --workspace --all-targets
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
+          cargo test --workspace --all-features
+          python3 tools/run_runtime_models.py
+          python3 tools/validate_specs.py
+          python3 tools/check_markdown_links.py
+          python3 tools/check_repository_guards.py
+          git diff --check
+          status="$(git status --porcelain=v1 --untracked-files=all)"
+          if [[ -n "$status" ]]; then
+            printf '%s\n' "$status"
+            exit 1
+          fi
+
+      - name: Save Cargo downloads from trusted main
+        if: github.ref == 'refs/heads/main' && steps.cargo_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ steps.cargo_cache.outputs.cache-primary-key }}
+
+      - name: Save vcpkg binaries from trusted main
+        if: github.ref == 'refs/heads/main' && steps.vcpkg_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/easycon-vcpkg-binary-cache
+          key: ${{ steps.vcpkg_cache.outputs.cache-primary-key }}
+
+      - name: Save the verified OCR model from trusted main
+        if: github.ref == 'refs/heads/main' && steps.ocr_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ github.workspace }}/.tools/vision-models/tessdata_fast-4.1.0
+          key: ${{ steps.ocr_cache.outputs.cache-primary-key }}

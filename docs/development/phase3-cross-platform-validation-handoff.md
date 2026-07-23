@@ -10,13 +10,22 @@
 | integration base | `main@41c5f0c2b19165769d4aa8e4512ad46280a1415b` |
 | implementation commit | `27444f16d0625a7ab7e4e1543736c7c3c225ce8a` |
 | implementation tree | `334a3fb21bf4d6ca55e0bcbe3e2daa6e675b3194` |
-| vcpkg tool commit | `bf04c909169fdbb30821c02c6eb01f1cd1295d05` |
+| vcpkg scripts source | `microsoft/vcpkg` release `2026.06.24`，commit `cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3` |
+| vcpkg tool release | `microsoft/vcpkg-tool` release `2026-07-13`，commit `bf04c909169fdbb30821c02c6eb01f1cd1295d05` |
+| Windows x64 tool asset | `vcpkg.exe`，6,749,536 bytes，SHA-256 `67958c6a13a35130ff8035bef33097ffe3376a6708577a826cfa41fa592db611` |
+| Linux x64 glibc tool asset | `vcpkg-glibc`，8,553,216 bytes，SHA-256 `9f68d6f2158c8a1ae4800260fad2972a21a48f2d43c02d40e79049650b5260c9` |
+| macOS tool asset | `vcpkg-macos`，12,666,208 bytes，SHA-256 `e41ff27a982e8dff1e058f8a69565ba8d64557011e8d50f3267fb4077aaaec45` |
 | vcpkg registry baseline | `cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3` |
 | OpenCV | `4.12.0#5` |
 | Tesseract | `5.5.2` |
 | Leptonica | `1.87.0` |
 | Rust | `1.97.1` |
 | CMake / Ninja | `4.3.3` / `1.13.2` |
+
+这里显式拆分三个角色：`microsoft/vcpkg` commit 提供 bootstrap/CMake scripts，`microsoft/vcpkg-tool` release
+提供平台 executable，registry baseline 决定 port versions。scripts source 与 registry 恰好复用同一已冻结 release
+commit，但必须分别核验；不得把 `vcpkg-tool` commit 当成 `microsoft/vcpkg` commit fetch。该修正只纠正获取来源，
+没有改变冻结 tool/version、registry、依赖解析或任何平台状态，也不形成新的 build/hardware 证据。
 
 验证方必须从精确 commit 或协调方提供的 Git bundle 建立干净 checkout，并先执行：
 
@@ -59,21 +68,43 @@ cargo --version --verbose
 git --version
 ```
 
-在 checkout 之外取得并固定 vcpkg tool：
+在 checkout 之外分别取得固定 scripts 与 Linux tool asset。release asset 即使由本地 cache 提供，也必须重新执行
+大小、SHA-256 和 version 核验：
 
 ```bash
-git clone https://github.com/microsoft/vcpkg.git "$HOME/.cache/easycon-vcpkg"
-git -C "$HOME/.cache/easycon-vcpkg" checkout --detach bf04c909169fdbb30821c02c6eb01f1cd1295d05
-"$HOME/.cache/easycon-vcpkg/bootstrap-vcpkg.sh" -disableMetrics
-export VCPKG_ROOT="$HOME/.cache/easycon-vcpkg"
-test "$(git -C "$VCPKG_ROOT" rev-parse HEAD)" = "bf04c909169fdbb30821c02c6eb01f1cd1295d05"
+export EASYCON_VCPKG_SCRIPTS_COMMIT=cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3
+export EASYCON_VCPKG_TOOL_RELEASE=2026-07-13
+export EASYCON_VCPKG_TOOL_COMMIT=bf04c909169fdbb30821c02c6eb01f1cd1295d05
+export EASYCON_VCPKG_REGISTRY_BASELINE=cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3
+export EASYCON_BUILD_ROOT="${TMPDIR:-/tmp}/easycon-phase3-$USER-$(date +%Y%m%d%H%M%S)"
+export VCPKG_ROOT="$EASYCON_BUILD_ROOT/vcpkg"
+mkdir -p "$VCPKG_ROOT"
+git init "$VCPKG_ROOT"
+git -C "$VCPKG_ROOT" remote add origin https://github.com/microsoft/vcpkg.git
+git -C "$VCPKG_ROOT" fetch --depth 1 origin "$EASYCON_VCPKG_SCRIPTS_COMMIT"
+git -C "$VCPKG_ROOT" checkout --detach FETCH_HEAD
+test "$(git -C "$VCPKG_ROOT" rev-parse HEAD)" = "$EASYCON_VCPKG_SCRIPTS_COMMIT"
+test -f "$VCPKG_ROOT/bootstrap-vcpkg.sh"
+test -f "$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
+vcpkg_download="$EASYCON_BUILD_ROOT/vcpkg-glibc.download"
+curl --fail --location --proto '=https' --proto-redir '=https' \
+  --output "$vcpkg_download" \
+  "https://github.com/microsoft/vcpkg-tool/releases/download/$EASYCON_VCPKG_TOOL_RELEASE/vcpkg-glibc"
+test "$(wc -c < "$vcpkg_download" | tr -d '[:space:]')" = "8553216"
+printf '%s  %s\n' \
+  '9f68d6f2158c8a1ae4800260fad2972a21a48f2d43c02d40e79049650b5260c9' \
+  "$vcpkg_download" | sha256sum --check -
+install -m 0755 "$vcpkg_download" "$VCPKG_ROOT/vcpkg"
+test "$("$VCPKG_ROOT/vcpkg" version | sed -n '1p')" = \
+  "vcpkg package management program version $EASYCON_VCPKG_TOOL_RELEASE-$EASYCON_VCPKG_TOOL_COMMIT"
+test "$(python3 -c 'import json; print(json.load(open("vcpkg-configuration.json", encoding="utf-8"))["default-registry"]["baseline"])')" = \
+  "$EASYCON_VCPKG_REGISTRY_BASELINE"
 ```
 
 准备独占输出和合法 OCR 测试模型。模型只用于测试，不进入源码、bundle 或 package：
 
 ```bash
 export EASYCON_SOURCE="$PWD"
-export EASYCON_BUILD_ROOT="${TMPDIR:-/tmp}/easycon-phase3-$USER-$(date +%Y%m%d%H%M%S)"
 export CARGO_TARGET_DIR="$EASYCON_BUILD_ROOT/cargo-target"
 export EASYCON_VISION_TEST_TESSDATA="$EASYCON_SOURCE/.tools/vision-models/tessdata_fast-4.1.0"
 mkdir -p "$CARGO_TARGET_DIR"
@@ -140,7 +171,27 @@ export EASYCON_EXPERIMENTAL_MACOS=1
 export EASYCON_BUILD_ROOT="${TMPDIR:-/tmp}/easycon-phase3-$USER-$(date +%Y%m%d%H%M%S)"
 export CARGO_TARGET_DIR="$EASYCON_BUILD_ROOT/cargo-target"
 export EASYCON_VISION_TEST_TESSDATA="$PWD/.tools/vision-models/tessdata_fast-4.1.0"
+export EASYCON_VCPKG_SCRIPTS_COMMIT=cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3
+export EASYCON_VCPKG_TOOL_RELEASE=2026-07-13
+export EASYCON_VCPKG_TOOL_COMMIT=bf04c909169fdbb30821c02c6eb01f1cd1295d05
+export VCPKG_ROOT="$EASYCON_BUILD_ROOT/vcpkg"
 mkdir -p "$CARGO_TARGET_DIR"
+git init "$VCPKG_ROOT"
+git -C "$VCPKG_ROOT" remote add origin https://github.com/microsoft/vcpkg.git
+git -C "$VCPKG_ROOT" fetch --depth 1 origin "$EASYCON_VCPKG_SCRIPTS_COMMIT"
+git -C "$VCPKG_ROOT" checkout --detach FETCH_HEAD
+test "$(git -C "$VCPKG_ROOT" rev-parse HEAD)" = "$EASYCON_VCPKG_SCRIPTS_COMMIT"
+vcpkg_download="$EASYCON_BUILD_ROOT/vcpkg-macos.download"
+curl --fail --location --proto '=https' --proto-redir '=https' \
+  --output "$vcpkg_download" \
+  "https://github.com/microsoft/vcpkg-tool/releases/download/$EASYCON_VCPKG_TOOL_RELEASE/vcpkg-macos"
+test "$(wc -c < "$vcpkg_download" | tr -d '[:space:]')" = "12666208"
+printf '%s  %s\n' \
+  'e41ff27a982e8dff1e058f8a69565ba8d64557011e8d50f3267fb4077aaaec45' \
+  "$vcpkg_download" | shasum -a 256 --check -
+install -m 0755 "$vcpkg_download" "$VCPKG_ROOT/vcpkg"
+test "$("$VCPKG_ROOT/vcpkg" version | sed -n '1p')" = \
+  "vcpkg package management program version $EASYCON_VCPKG_TOOL_RELEASE-$EASYCON_VCPKG_TOOL_COMMIT"
 python3 tools/provision_vision_test_model.py \
   --manifest spec/fixtures/vision/ocr-model.json \
   --output "$EASYCON_VISION_TEST_TESSDATA"
