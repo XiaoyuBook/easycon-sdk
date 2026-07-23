@@ -47,6 +47,8 @@
     candidate、macOS arm64 experimental source 的 ownership、构建、证据和晋级边界。
 20. [Phase 3 Linux/macOS 验证 handoff](development/phase3-cross-platform-validation-handoff.md)：固定实现
     SHA、依赖版本、外部 build root、Linux 软件门禁与 macOS arm64 分阶段资格矩阵。
+21. [Phase 2B faults 协议证据修订设计](development/phase2b-fault-protocol-evidence-remediation.md)：每个 faults
+    role 的 baud/handshake ledger、qualification-only reply byte correlation、legacy 分类与 candidate refreeze 门槛。
 
 ## 决策记录
 
