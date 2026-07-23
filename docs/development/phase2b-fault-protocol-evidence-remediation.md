@@ -7,7 +7,8 @@
 - 上位契约：[ADR-0010](../decisions/0010-phase-2b-qualification-evidence.md)
 - candidate 边界：[ADR-0011](../decisions/0011-phase-2b-qualification-software-candidate-freeze.md)
 - 相邻设计：[faults runner 所有权](phase2b-fault-runner.md)、
-  [telemetry 与资格投影](phase2b-telemetry-qualification-projection.md)
+  [telemetry 与资格投影](phase2b-telemetry-qualification-projection.md)、
+  [checkpoint 软件收口](phase2b-checkpoint-software-closeout.md)
 
 ## 范围、非目标与冻结边界
 
@@ -123,6 +124,53 @@ outcome 映射固定为：
 expected 不同；timeout/cancel/disconnect/I/O/普通 protocol failure 没有成功 reply read 时 observed 必须为
 `null`。任何 byte 都只按无符号十进制 JSON number 保存；不得生成十六进制字符串、字符解释或固件含义推断。
 
+### Command-level 全出口 result 构造
+
+九字段不能只由 `FaultRun::new` 初始化，因为 device admission、interrupt handler、command dispatch 和通用 `Err`
+都可能在创建 `FaultRun` 前退出。未来实现必须在识别到 `faults` 命令、进入 admission 或 `FaultRun` 前创建唯一的
+command-level `faults_result_base`。base 至少包含：
+
+- `command = "faults"`；
+- `faults_protocol_evidence_schema_version = 1`；
+- 四个 `<role>_actual_baud = null` 和四个 `<role>_handshake_attempts = []`；
+- `scenarios.port_occupied/cancel/deadline.status = "not_run"`；
+- `resources.occupier/occupied_probe/cancel/deadline.created = false`。
+
+admission evidence、`FaultRun` 和 cleanup 只能取得并单调填充同一 base，不能另建 result、删除字段、把
+`created = true` 重置为 false，或清空已经开始的 attempt。`FaultRun` 应改为接收该 base 的 owner，而不是成为
+九字段的唯一构造点。
+
+faults dispatch 得到任何 `Ok`/`Err` 后，必须先经过 command-specific
+`normalize_faults_execution(base, execution)`，再生成 operation/cleanup journal payload 并调用 `finalize_result`。
+normalizer 的职责是：
+
+1. 对 `Ok(result)` 合并 admission/FaultRun evidence，并 exact validate base、resources/scenarios 和协议子合同；
+   只可为确认未创建的 role 保留空值，不能用默认空数组修补已创建 role 的缺失或矛盾 evidence。
+2. 对通用 `Err(message)` 从原 base 生成结构化 faults result，保存原 message，并写入非空稳定
+   `execution_error.stage`；随后仍以 `Ok(structured_result)` 进入通用 finalizer。因此 faults final document 的
+   `result` 永远存在，不再出现 `result = None`。
+3. 已有首个 execution error 不得被 protocol normalization 或 cleanup error 覆盖；后者追加为独立诊断。base/validator
+   也不得把 execution/qualification/exit triplet 从原路径语义改成另一种结果。
+
+全出口映射固定如下：
+
+| 出口 | 稳定 stage / 终态 |
+| --- | --- |
+| `device_target_request` 参数失败 | `device_target_request`；`failed/failed/1`，保留原参数诊断，不伪装 `not_run`。 |
+| admission `Rejected` | 无 execution error；保持 `completed/not_run/2` 和原 admission reason。 |
+| admission `Ambiguous` | `identity_admission`；`failed/failed/1`。 |
+| discovery error | `identity_admission_discovery`；`failed/failed/1`，保留 structured serial error。 |
+| interrupt handler install failure | `interrupt_handler_install`；`failed/failed/1`。 |
+| dispatch/admission/runner precheck interrupt | 保留 `command_dispatch_interrupt`、`identity_admission_interrupt` 或 `runner_interrupt`；`cancelled/unverified/130`。 |
+| faults precheck interrupt | 保留 `faults_interrupt`；`cancelled/unverified/130`。 |
+| admitted runner `Err` | `admitted_runner_failure`；`failed/failed/1`，保留 runner message。 |
+| 其他 faults 通用 `Err` | fallback stage `faults_command_error`；`failed/failed/1`，不得产生 `result = None`。 |
+
+以上所有 pre-Harness 出口都保持四个 role 未创建、actual baud 为 `null`、attempts 为空；这表示未开始，不是伪造
+cleanup 或 handshake evidence。cleanup/qualification validator 必须把上表枚举的零 role 出口识别为精确的
+no-resource layout：不要求伪 cleanup，也不能把 Rejected 或 interrupt 改成 execution failure；没有匹配 admission、
+interrupt 或 execution-error 语义的未知零 role `Ok` 仍须 fail closed，不能因此通过 faults qualification。
+
 ### Role 与 fallback 规则
 
 1. `resources.<role>.created = false` 时，该 role 必须是 `actual_baud = null` 和空 attempts；不得伪造 attempt。
@@ -137,11 +185,12 @@ expected 不同；timeout/cancel/disconnect/I/O/普通 protocol failure 没有�
 6. `FaultCloseEvidence` 是 close 后的权威 role snapshot；partial-failure capture 必须先保留已取得的 attempt，随后
    recovery/close 只能完成同一 attempt 或追加合法 fallback，不能重排、覆盖或跨 role 合并。
 
-`FaultRun::new` 必须在任何 role create 前初始化全部九个字段。同一 typed recorder 是既有 append-only journal
-transition 与 final result projection 的唯一来源：attempt start/finalization 作为结构化 transition 保存，final JSON
-不得从 diagnostic message 或 raw log 重建。已终结 attempt 必须在进入 fallback、下一 role 或 cleanup 前进入既有
-action-group durability boundary；不新增单独 raw protocol artifact。进程在 finalization 前异常终止时保留
-in-progress journal，由 checkpoint 标为 incomplete，不能合成 v1 completed evidence。
+command-level base、`FaultRun` 和每个 Harness 内的 typed recorder 共同构成同一 run-owned projection；不得在
+`FaultRun` 内重新初始化协议字段。同一 recorder 是既有 append-only journal transition 与 final result projection
+的唯一来源：attempt start/finalization 作为结构化 transition 保存，final JSON 不得从 diagnostic message 或 raw
+log 重建。已终结 attempt 必须在进入 fallback、下一 role 或 cleanup 前进入既有 action-group durability boundary；
+不新增单独 raw protocol artifact。进程在 finalization 前异常终止时保留 in-progress journal，由 checkpoint 标为
+incomplete，不能合成 v1 completed evidence。
 
 ## Run-local reply correlation
 
@@ -157,15 +206,28 @@ recorder。实现应在 qualification workspace 内增加单调递增、run-loca
 4. outer handshake 返回后，`ObservedTransport` 以同一 ID 和 typed `TransportErrorKind` finalization；不得解析
    diagnostic message 来判断 mismatch、取消或 native cause。
 
+上述时序保持现有可实现边界：`ObservedTransport::handshake` 先创建 attempt，随后 inner
+`SerialControllerTransport::handshake` 才执行 factory open。因此 open failure 也属于已经开始且必须保留的 attempt，
+不能因没有返回 `ObservedByteIo` 而退化为空数组。
+
 mutex 只保护 attempt 状态转换；任何 open/read/close 或 inner transport 调用期间都不得持锁。Controller 的单写者
 lane 保证一个 Harness 正常情况下只有一个 handshake in flight；recorder 仍必须 fail closed 检出无 active attempt、
 baud/ID 不匹配、重复 reply、跨 attempt reply、重复 finalization、成功却缺少匹配 byte、或 mismatch 却没有不同
 byte。上述情况输出 `contradiction`，不能修改 inner 返回值来“修正”生产行为。
 
-取消、deadline 与 close 的 finalization 顺序固定为：先让 active operation 经现有 recovery/取消路径取得唯一终态，
-再显式 close Controller/Runtime，最后从 `FaultCloseEvidence` 固定 role protocol fields。immediate deadline 若在 outer
-handshake 前被 Controller 接受为终态，则 attempts 为空；in-flight deadline/cancel 必须 finalization 已开始的
-attempt，observed 在没有成功 read 时为 `null`。cleanup failure 不覆盖已终结的 protocol evidence。
+取消、deadline 与 close 使用两阶段 recovery，而不是要求 operation 必须在 close 前先终态：
+
+1. 若 active operation 尚未终态，先 request cancel 并 bounded settle；若已终态，再按正常路径 consuming close。
+2. 若 bounded settle 失败或 operation 仍非终态，owner 必须继续执行 consuming Controller close 作为最后 recovery。
+   resource cancellation 应唤醒被 handshake read/open 阻塞的 lane，close join worker；不得因 operation 未终态跳过 close。
+3. worker 中的 inner handshake 返回后，`ObservedTransport` 必须把同一 attempt 恰好 finalization 一次。close 返回后再
+   固定 post-close operation snapshot、protocol evidence、Controller/Runtime cleanup 和 registry counts。
+4. 若 close 或 worker 无法确认收敛，结果 fail closed，并保留首个 execution error、settle error、已知 attempt 和
+   cleanup diagnostic；不得无限等待、丢 evidence、伪造 operation 终态或重复 finalization。
+
+immediate deadline 若在 outer handshake 前被 Controller 接受为终态，则 attempts 为空；in-flight deadline/cancel
+必须 finalization 已开始的 attempt，observed 在没有成功 read 时为 `null`。cleanup failure 不覆盖已终结的 protocol
+evidence。
 
 所有竞态测试使用 scripted fake、barrier/channel、可控 cancellation 和 VirtualClock/脚本时钟；不得用随机 sleep
 制造 read、cancel、deadline 或 close 顺序。
@@ -185,15 +247,35 @@ attempt 顺序、成功后无追加、outcome/error/byte 组合和 partial-failu
 passed、failed、cancelled、unverified 或 not-run，都必须携带可验证的 v1 子合同；合同缺失或 contradiction 不能通过
 资格判据。
 
-旧 artifact 保持 immutable：
+### Checkpoint faults-only proposed supersession
 
-- 旧 `passed` faults evidence 因缺少 mandatory v1 子合同，在新 checkpoint 下只能是 `Unverified`，稳定原因为
-  legacy protocol evidence missing；不得继续作为新 faults gate 的 `Observed` pass。
-- 旧 `failed` faults evidence 仍为 `Failed` 历史事实，但不能因缺少新字段被重写、补齐或重新解释为根因证据。
-- 旧 `unverified`/`cancelled`/`not_run` 保持原有较弱分类；任何分类都不改变原 final、manifest、completion 或 hash。
+当前 [checkpoint 软件收口设计](phase2b-checkpoint-software-closeout.md) 和现有 binary 仍把 trusted
+`completed/passed/0` 映射为 `Observed`。本文状态是 `Proposed / Not Implemented`；在新 faults v1 software
+candidate 完成实现、独立 review 和 refreeze 前，该既有映射仍然有效，本文不声称旧 passed faults 已经降级。
 
-checkpoint 只消费原有 immutable bytes并记录 legacy classification；不得从聊天、本地 raw artifact 或后来的硬件
-观察回填旧 run。
+新 faults v1 合同随新 candidate/refreeze 生效时，本文对 checkpoint 设计提出一项仅限 `command = "faults"` 的
+supersession：
+
+- 由 refreeze provenance fence 明确认定为 pre-v1 的旧 trusted passed faults，缺少 v1 子合同时投影到
+  `Unverified`，并保存稳定机器 token `legacy_protocol_evidence_missing`；未知或 v1 生效后的 provenance 缺失/畸形
+  子合同必须是 `Failed`，不能借 legacy 分支降级逃逸。
+- 旧 failed faults 继续投影为 `Failed`；缺少新字段不能改写其失败事实或升级分类。
+- 其他非 faults 的 trusted passed run 完全不受影响，继续按 checkpoint 设计投影为 `Observed`。
+- new v1 faults passed 只有在子合同 exact valid、provenance trusted、磁盘/manifest/snapshot 和其余既有条件全部通过时，
+  才能投影为 `Observed`。
+
+新 checkpoint record 必须保留旧 artifact 的原始 `document_outcome` 三元组、hash 和完整 provenance；只改变新
+checkpoint binary 生成的 `evidence_class`，并以 `validation_reason = "legacy_protocol_evidence_missing"` 解释该
+faults-only projection。不得改写原 final、journal、manifest、completion、provenance 或 hash，也不得从聊天、本地
+raw artifact 或后来的硬件观察回填旧 run。
+
+checkpoint exact projection validator 与 integration regression 必须共同覆盖：旧 trusted passed faults 的
+`Unverified` + token、旧 failed faults 的 `Failed`、非 faults passed 的不变映射，以及 new v1 passed 在其余条件
+满足后的 `Observed`；token 出现在其他 command、未知/new provenance 或已有 v1 合同上都必须 fail closed。
+
+该 proposed supersession 是 ADR-0010 既有 faults evidence 完整性要求内的 bugfix，不要求修改 ADR-0010 或根
+behavior/schema/conformance；但 executable、artifact/checkpoint projection 和 telemetry 会变化，因此 ADR-0011
+software candidate 仍必须重开、独立 review 并 refreeze。
 
 ## 预计实现清单
 
@@ -201,11 +283,12 @@ checkpoint 只消费原有 immutable bytes并记录 legacy classification；不�
 
 | 文件/类型 | 预计变更 |
 | --- | --- |
-| `tests/hardware/src/main.rs` | 扩展内部 `HandshakeAttempt`/`Telemetry`；为 `ObservedTransport`、`ObservedByteIoFactory`、`ObservedByteIo` 增加 attempt correlation；新增 faults serializer 与 exact validator，同时保留非 faults 既有 projection。 |
-| `tests/hardware/src/faults.rs` | 让 `FaultHarness` 提供 protocol snapshot；扩展 `FaultCloseEvidence`、`FaultRun::capture_partial_harness_evidence`、`close_role` 和 role 字段 helper；增加 deterministic regression-first tests。 |
+| `tests/hardware/src/main.rs` | 在 admission 前建立 faults command-level base，对全部 Ok/Err 出口做 monotonic normalizer；扩展内部 `HandshakeAttempt`/`Telemetry` 和两层 observer correlation；新增 faults serializer 与 exact validator，同时保留非 faults projection。 |
+| `tests/hardware/src/faults.rs` | 让 `FaultRun` 接收 command base、`FaultHarness` 提供 protocol snapshot；扩展 `FaultCloseEvidence`、partial capture、`close_role`，并实现 bounded settle 后可由 consuming close 驱动的 recovery 与确定性测试。 |
 | `tests/hardware/fixtures/phase2b-fault-protocol-evidence-v1.json` | 新增独立 v1 synthetic fixture。 |
-| `tests/hardware/src/checkpoint.rs`、`tests/hardware/tests/checkpoint.rs` | 在不改写输入 artifact 的前提下执行 faults v1/legacy 分类，并覆盖旧 passed/failed checkpoint。 |
+| `tests/hardware/src/checkpoint.rs`、`tests/hardware/tests/checkpoint.rs` | 实现 refreeze provenance fence 与 faults-only supersession；保留原 outcome/hash/provenance，覆盖旧/new faults 和非 faults checkpoint。 |
 | `tests/hardware/tests/qualification_status.rs` | 固定缺失/矛盾 faults 子合同不能得到 `passed/0`。 |
+| `docs/development/phase2b-checkpoint-software-closeout.md` | 实现/refreeze 时同步 faults-only supersession、稳定 token 和生效边界；本次文档返工不修改该文件。 |
 | `docs/architecture/testing-strategy.md` | 实现时补充新 fixture、exact validator 和物理未验证边界；不得改 milestone 状态。 |
 
 不应修改 `crates/easycon-serial/src/transport.rs`、`crates/easycon-serial/src/io.rs`、
@@ -227,9 +310,25 @@ conformance、现有 qualification projection v1 fixture、Cargo/Cargo.lock、wo
 | open failure | open 返回 PortBusy/AccessDenied/Disconnected synthetic error；保留 started attempt、typed outcome 和 diagnostic，observed 为 `null`。 |
 | partial-failure | 在各 role create/admit/wait/action failpoint 失败；已创建 role 保留当时 attempts，未创建 role 固定 `null`/空数组，首错不被覆盖。 |
 | cleanup failure | Controller/Runtime close failpoint 后仍保留 close 前已终结 attempts 与 actual baud，最终状态保持 fail closed。 |
+| close 驱动 recovery | handshake read 由 barrier 阻塞，operation cancel 后 bounded settle 失败，只有 resource-close cancellation 才通过 channel 释放；零 `sleep`，断言 close 解锁并 join、attempt 只 finalization 一次、counts/owner 收敛、无泄漏，首错与 cleanup error 均保留。 |
 | 跨 role 隔离 | 四个 Harness 使用不同 scripted reply；attempt ID 从各自 run-local recorder 绑定，任何 role 都不能看到其他 role 的 byte/baud。 |
 | reply correlation contradiction | 注入无 active read、错误 attempt ID/baud、重复 reply/finalization、success-without-byte 与 mismatch-with-equal-byte；均为 `contradiction` 且不能 `passed/0`。 |
-| legacy checkpoint | immutable 旧 passed faults -> `Unverified`，旧 failed -> `Failed`；输入 bytes/hash 不变，新 v1 passed 才可按其他 checkpoint 条件进入 `Observed`。 |
+| legacy checkpoint | provenance-fenced 旧 trusted passed faults -> `Unverified` + `legacy_protocol_evidence_missing`；旧 failed -> `Failed`；非 faults passed 不变；new v1 passed 仅在其余条件通过时为 `Observed`，输入 outcome/hash/provenance 不变。 |
+
+command-level 全出口另以表驱动 fake 固定：
+
+| Case | 必须断言 |
+| --- | --- |
+| device target request failure | final `result` 存在，stage 为 `device_target_request`，九字段与初始 resources/scenarios 存在，`failed/failed/1`。 |
+| admission Rejected | final `result` 存在且 `completed/not_run/2`；四 role 未创建、无 attempt，原 rejection reason 保留。 |
+| admission Ambiguous / discovery error | 分别保留 `identity_admission` / `identity_admission_discovery` 与原 structured diagnostic；均为 `failed/failed/1`。 |
+| handler install / command dispatch interrupt | handler failure 为 `interrupt_handler_install` 和 `failed/failed/1`；dispatch interrupt 保留 `command_dispatch_interrupt` 和 `cancelled/unverified/130`。 |
+| admission/runner/faults precheck interrupt | 分别保留 `identity_admission_interrupt`、`runner_interrupt`、`faults_interrupt`；均有 result、零 attempt 和 `cancelled/unverified/130`。 |
+| admitted runner failure | 保留 `admitted_runner_failure` 与原 runner message；result 存在且 `failed/failed/1`。 |
+| generic faults Err | 生成 stage `faults_command_error` 的结构化 result，不再是 `result = None`，保持 `failed/failed/1`。 |
+
+每一行都必须使用 deterministic fake，不调用真实 discovery/I/O，并断言九字段存在、没有伪造 attempt、resources/
+scenarios 与实际创建前缀一致、原始 execution/qualification/exit triplet 不被 normalizer 改写。
 
 ## Candidate 重开、验证与 refreeze
 
@@ -284,6 +383,7 @@ qualification 门槛；不能由本次 diagnostic result 或实现细节默认�
 - 当前 mismatch 没有 observed byte，根因仍未知；本设计只提高下一次授权复测的证据分辨率。
 - qualification 两层 observer 的 correlation 若实现错误会制造伪 reply 归属，因此 contradiction 必须 fail closed，
   且跨 role/取消/deadline 回归是 candidate 阻断项。
-- legacy passed faults 的降级会改变新 checkpoint 的聚合结果，但不会也不得改变旧 artifact；该变化需要独立审查。
+- faults-only legacy supersession 只在新 candidate/refreeze 后生效；当前 checkpoint 映射不变。未来实现必须可靠区分
+  provenance-fenced legacy 与新/未知 artifact，否则可能错误降级无效 pass。
 - 在新实现、完整门禁、独立 review、refreeze 和受控硬件 next gate 完成前，Phase 2B、设备支持、固件身份和根因均
   保持未完成或未确定。
