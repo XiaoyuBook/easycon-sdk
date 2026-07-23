@@ -17,7 +17,11 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   EASYCON_RUST_VERSION: "1.97.1"
+  EASYCON_VCPKG_SCRIPTS_COMMIT: cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3
+  EASYCON_VCPKG_TOOL_RELEASE: "2026-07-13"
   EASYCON_VCPKG_TOOL_COMMIT: bf04c909169fdbb30821c02c6eb01f1cd1295d05
+  EASYCON_VCPKG_WINDOWS_ASSET_BYTES: "6749536"
+  EASYCON_VCPKG_WINDOWS_ASSET_SHA256: 67958c6a13a35130ff8035bef33097ffe3376a6708577a826cfa41fa592db611
   EASYCON_VCPKG_REGISTRY_BASELINE: cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3
   VCPKG_DISABLE_METRICS: "1"
   VCPKG_FEATURE_FLAGS: manifests,registries,versions
@@ -176,7 +180,30 @@ jobs:
           ninja --version
           python --version
 
-      - name: Bootstrap and verify pinned vcpkg
+      - name: Restore Cargo downloads
+        id: cargo_cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: windows-workspace-cargo-v2-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.github/workflows/required-ci.yml') }}
+
+      - name: Restore vcpkg binary cache
+        id: vcpkg_cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/easycon-vcpkg-binary-cache
+          key: windows-workspace-vcpkg-v2-scripts-cd61e1e2-tool-bf04c909-registry-cd61e1e2-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'cmake/triplets/**', 'CMakePresets.json', '.github/workflows/required-ci.yml', '.github/workflows/native-quality.yml') }}
+
+      - name: Restore the verified OCR test model
+        id: ocr_cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ github.workspace }}/.tools/vision-models/tessdata_fast-4.1.0
+          key: ocr-model-v2-${{ hashFiles('spec/fixtures/vision/ocr-model.json', 'tools/provision_vision_test_model.py', '.github/workflows/required-ci.yml', '.github/workflows/native-quality.yml') }}
+
+      - name: Install and verify pinned vcpkg scripts and tool
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -189,40 +216,45 @@ jobs:
           $vcpkgRoot = Join-Path $env:RUNNER_TEMP "easycon-vcpkg"
           git init $vcpkgRoot
           git -C $vcpkgRoot remote add origin https://github.com/microsoft/vcpkg.git
-          git -C $vcpkgRoot fetch --depth 1 origin $env:EASYCON_VCPKG_TOOL_COMMIT
+          git -C $vcpkgRoot fetch --depth 1 origin $env:EASYCON_VCPKG_SCRIPTS_COMMIT
           git -C $vcpkgRoot checkout --detach FETCH_HEAD
-          $actualCommit = (git -C $vcpkgRoot rev-parse HEAD).Trim()
-          if ($actualCommit -cne $env:EASYCON_VCPKG_TOOL_COMMIT) {
-            throw "vcpkg tool commit $actualCommit is not frozen"
+          $actualScriptsCommit = (git -C $vcpkgRoot rev-parse HEAD).Trim()
+          if ($actualScriptsCommit -cne $env:EASYCON_VCPKG_SCRIPTS_COMMIT) {
+            throw "vcpkg scripts commit $actualScriptsCommit is not frozen"
           }
-          & (Join-Path $vcpkgRoot "bootstrap-vcpkg.bat") -disableMetrics
+          foreach ($relative in @(".vcpkg-root", "bootstrap-vcpkg.bat", "bootstrap-vcpkg.sh", "scripts/buildsystems/vcpkg.cmake")) {
+            if (-not (Test-Path -LiteralPath (Join-Path $vcpkgRoot $relative) -PathType Leaf)) {
+              throw "vcpkg scripts checkout is missing $relative"
+            }
+          }
+          $downloadPath = Join-Path $env:RUNNER_TEMP "vcpkg-$env:EASYCON_VCPKG_TOOL_RELEASE.exe.download"
+          $downloadUrl = "https://github.com/microsoft/vcpkg-tool/releases/download/$env:EASYCON_VCPKG_TOOL_RELEASE/vcpkg.exe"
+          curl.exe --fail --location --silent --show-error --retry 5 --retry-all-errors `
+            --proto "=https" --proto-redir "=https" --output $downloadPath $downloadUrl
+          $asset = Get-Item -LiteralPath $downloadPath
+          if ($asset.Length -ne [int64]$env:EASYCON_VCPKG_WINDOWS_ASSET_BYTES) {
+            throw "vcpkg.exe has $($asset.Length) bytes; expected $env:EASYCON_VCPKG_WINDOWS_ASSET_BYTES"
+          }
+          $assetHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $downloadPath).Hash.ToLowerInvariant()
+          if ($assetHash -cne $env:EASYCON_VCPKG_WINDOWS_ASSET_SHA256) {
+            throw "vcpkg.exe SHA-256 $assetHash is not frozen"
+          }
+          $vcpkg = Join-Path $vcpkgRoot "vcpkg.exe"
+          Move-Item -LiteralPath $downloadPath -Destination $vcpkg
+          $version = @(& $vcpkg version)
+          $expectedVersion = "vcpkg package management program version $env:EASYCON_VCPKG_TOOL_RELEASE-$env:EASYCON_VCPKG_TOOL_COMMIT"
+          if ($version[0].Trim() -cne $expectedVersion) {
+            throw "unexpected vcpkg version: $($version[0])"
+          }
+          $version | Out-Host
+          $trackedStatus = @(git -C $vcpkgRoot status --porcelain=v1 --untracked-files=no)
+          if ($trackedStatus.Count -ne 0) {
+            $trackedStatus | Out-Host
+            throw "vcpkg scripts checkout was modified"
+          }
           New-Item -ItemType Directory -Force -Path $env:EASYCON_VCPKG_BINARY_CACHE | Out-Null
           Add-Content -LiteralPath $env:GITHUB_ENV -Value "VCPKG_ROOT=$vcpkgRoot" -Encoding utf8
           Add-Content -LiteralPath $env:GITHUB_ENV -Value "VCPKG_BINARY_SOURCES=clear;files,$env:EASYCON_VCPKG_BINARY_CACHE,readwrite" -Encoding utf8
-
-      - name: Restore Cargo downloads
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: windows-workspace-cargo-v1-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
-          restore-keys: |
-            windows-workspace-cargo-v1-
-
-      - name: Restore vcpkg binary cache
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: ${{ runner.temp }}/easycon-vcpkg-binary-cache
-          key: windows-vcpkg-binary-v1-bf04c909169fdbb30821c02c6eb01f1cd1295d05-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'cmake/triplets/**') }}
-          restore-keys: |
-            windows-vcpkg-binary-v1-bf04c909169fdbb30821c02c6eb01f1cd1295d05-
-
-      - name: Restore the verified OCR test model
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: ${{ github.workspace }}/.tools/vision-models/tessdata_fast-4.1.0
-          key: ocr-model-v1-${{ hashFiles('spec/fixtures/vision/ocr-model.json', 'tools/provision_vision_test_model.py') }}
 
       - name: Provision and verify the frozen OCR test model
         shell: pwsh
@@ -261,3 +293,26 @@ jobs:
             $status | Out-Host
             throw "workspace gates left tracked or unignored output"
           }
+
+      - name: Save Cargo downloads from trusted main
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.cargo_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ steps.cargo_cache.outputs.cache-primary-key }}
+
+      - name: Save vcpkg binaries from trusted main
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.vcpkg_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/easycon-vcpkg-binary-cache
+          key: ${{ steps.vcpkg_cache.outputs.cache-primary-key }}
+
+      - name: Save the verified OCR model from trusted main
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.ocr_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ github.workspace }}/.tools/vision-models/tessdata_fast-4.1.0
+          key: ${{ steps.ocr_cache.outputs.cache-primary-key }}
