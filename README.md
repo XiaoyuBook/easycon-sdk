@@ -25,6 +25,10 @@ Phase 3 私有 Vision 跨平台源码候选在旧候选因 NativePool admission 
 macOS 只形成 Apple Silicon arm64 `Experimental Source Candidate / Build Unverified / Hardware Unverified /
 Not Shipped`。三者均不等于完整 SDK 发布，且未冻结 public C ABI、Phase 4、四语言或 package。
 
+[ADR-0016](docs/decisions/0016-phase-3-downstream-reopen-boundary.md) 以 `Proposed Refreeze` 状态承认：准备增加
+Phase 4 按 ADR-0014 的现行字面规则确实触发治理 reopen。Phase 3 implementation、public-neutral contract 和
+平台/支持状态均未改变；独立审查与后续 refreeze 提交完成前，该提议不生效，也不授权 Phase 4 target 或实现。
+
 此前的实验性共享运行基线已经移除，不再作为本项目的产品架构或兼容性约束。后续 public C ABI 和各语言绑定
 将在当前 Rust 共享核心之上按 Phase 5/6 的独立门禁实现。
 
