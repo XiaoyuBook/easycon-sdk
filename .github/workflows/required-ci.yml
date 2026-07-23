@@ -29,8 +29,11 @@ env:
 jobs:
   policy:
     name: Required / Policy
-    runs-on: ubuntu-24.04
+    runs-on: windows-2022
     timeout-minutes: 20
+    env:
+      CARGO_BUILD_TARGET: x86_64-pc-windows-msvc
+      CARGO_INCREMENTAL: "0"
     steps:
       - name: Check out the candidate
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -38,45 +41,123 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Install and verify the frozen Rust toolchain
-        shell: bash
+      - name: Isolate generated outputs
+        shell: pwsh
         run: |
-          set -euo pipefail
-          grep -Fx 'channel = "1.97.1"' rust-toolchain.toml
-          rustup toolchain install "$EASYCON_RUST_VERSION" \
-            --profile minimal \
-            --component clippy \
-            --component rustfmt \
-            --target x86_64-pc-windows-msvc
-          actual_version="$(rustc --version | awk '{print $2}')"
-          test "$actual_version" = "$EASYCON_RUST_VERSION"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "CARGO_TARGET_DIR=$env:RUNNER_TEMP\easycon-policy-cargo-target" -Encoding utf8
+
+      - name: Load the MSVC x64 developer environment
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path -LiteralPath $vswhere)) {
+            throw "vswhere.exe was not found"
+          }
+          $installationPath = (@(& $vswhere -latest -products "*" -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath))[0]
+          if ([string]::IsNullOrWhiteSpace($installationPath)) {
+            throw "Visual Studio with the x64 C++ toolchain was not found"
+          }
+          $installationPath = $installationPath.Trim()
+          $devShell = Join-Path $installationPath "Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
+          Import-Module $devShell
+          Enter-VsDevShell -VsInstallPath $installationPath -SkipAutomaticLocation -DevCmdArguments "-arch=x64 -host_arch=x64"
+          if ($env:VSCMD_ARG_TGT_ARCH -cne "x64") {
+            throw "MSVC target architecture is not x64"
+          }
+          $variables = @(
+            "INCLUDE",
+            "LIB",
+            "LIBPATH",
+            "VCINSTALLDIR",
+            "VCToolsInstallDir",
+            "VSINSTALLDIR",
+            "WindowsSdkDir",
+            "WindowsSDKVersion",
+            "UniversalCRTSdkDir",
+            "UCRTVersion",
+            "VSCMD_ARG_HOST_ARCH",
+            "VSCMD_ARG_TGT_ARCH"
+          )
+          foreach ($name in $variables) {
+            $value = [Environment]::GetEnvironmentVariable($name)
+            if ([string]::IsNullOrWhiteSpace($value)) {
+              throw "MSVC environment variable $name is empty"
+            }
+            Add-Content -LiteralPath $env:GITHUB_ENV -Value "$name=$value" -Encoding utf8
+          }
+          $toolDirectories = @("cl.exe", "link.exe", "lib.exe", "rc.exe", "mt.exe") |
+            ForEach-Object { Split-Path -Parent (Get-Command $_ -ErrorAction Stop).Source } |
+            Select-Object -Unique
+          foreach ($directory in $toolDirectories) {
+            Add-Content -LiteralPath $env:GITHUB_PATH -Value $directory -Encoding utf8
+          }
+
+      - name: Install and verify the frozen Rust toolchain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          $toolchain = Get-Content -Raw -LiteralPath rust-toolchain.toml
+          if ($toolchain -notmatch '(?m)^channel = "1\.97\.1"\r?$') {
+            throw "rust-toolchain.toml does not pin Rust 1.97.1"
+          }
+          rustup toolchain install $env:EASYCON_RUST_VERSION `
+            --profile minimal `
+            --component clippy `
+            --component rustfmt `
+            --target $env:CARGO_BUILD_TARGET
+          $actualVersion = ((rustc --version) -split '\s+')[1]
+          if ($actualVersion -cne $env:EASYCON_RUST_VERSION) {
+            throw "rustc $actualVersion does not match $env:EASYCON_RUST_VERSION"
+          }
+          $actualHost = ((rustc --version --verbose | Select-String '^host: ').Line -split '\s+')[1]
+          if ($actualHost -cne $env:CARGO_BUILD_TARGET) {
+            throw "Rust host $actualHost does not match $env:CARGO_BUILD_TARGET"
+          }
+          $installedTargets = @(rustup target list --toolchain $env:EASYCON_RUST_VERSION --installed)
+          if ($installedTargets -notcontains $env:CARGO_BUILD_TARGET) {
+            throw "the frozen Windows Rust target is not installed"
+          }
+          if ($env:VSCMD_ARG_HOST_ARCH -cne "x64" -or $env:VSCMD_ARG_TGT_ARCH -cne "x64") {
+            throw "the persisted MSVC developer environment is not x64-hosted x64"
+          }
+          if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
+            throw "cl.exe is not available after loading the MSVC environment"
+          }
+          if (-not (Get-Command link.exe -ErrorAction SilentlyContinue)) {
+            throw "link.exe is not available after loading the MSVC environment"
+          }
           rustc --version --verbose
           cargo --version --verbose
+          python --version
 
       - name: Run repository policy gates
-        shell: bash
+        shell: pwsh
         run: |
-          set -euo pipefail
-          python3 tools/validate_specs.py
-          python3 tools/check_markdown_links.py
-          python3 tools/check_repository_guards.py
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          python tools/check_repository_guards.py
+          python tools/check_markdown_links.py
+          python tools/validate_specs.py
 
       - name: Check changed lines and repository cleanliness
-        shell: bash
+        shell: pwsh
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
         run: |
-          set -euo pipefail
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
           git diff --check
-          if [[ -n "$BASE_SHA" && ! "$BASE_SHA" =~ ^0+$ ]]; then
-            git cat-file -e "$BASE_SHA^{commit}"
-            git diff --check "$BASE_SHA...HEAD"
-          fi
-          status="$(git status --porcelain=v1 --untracked-files=all)"
-          if [[ -n "$status" ]]; then
-            printf '%s\n' "$status"
-            exit 1
-          fi
+          if (-not [string]::IsNullOrWhiteSpace($env:BASE_SHA) -and $env:BASE_SHA -notmatch '^0+$') {
+            git cat-file -e "${env:BASE_SHA}^{commit}"
+            git diff --check "${env:BASE_SHA}...HEAD"
+          }
+          $status = @(git status --porcelain=v1 --untracked-files=all)
+          if ($status.Count -ne 0) {
+            $status | Out-Host
+            throw "policy gates left tracked or unignored output"
+          }
 
   windows-workspace:
     name: Required / Windows Workspace

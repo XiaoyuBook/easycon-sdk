@@ -57,6 +57,13 @@ PLATFORM_NATIVE_PATTERNS = (
     ),
     re.compile(r"\b(?:HRESULT|HANDLE)\b"),
 )
+CONFORMANCE_MARKER = re.compile(
+    r"^[ \t]*// conformance: [a-z0-9][a-z0-9.-]*[ \t]*$", re.MULTILINE
+)
+WORKFLOW_JOB = re.compile(
+    r"^  (?P<name>[a-z0-9-]+):\r?\n(?P<body>.*?)(?=^  [a-z0-9-]+:\r?\n|\Z)",
+    re.MULTILINE | re.DOTALL,
+)
 
 
 def git_files():
@@ -99,6 +106,80 @@ def workspace_dependencies(metadata, path):
         for dependency in package["dependencies"]
         if dependency["kind"] != "build" and dependency["name"].startswith("easycon-")
     }
+
+
+def required_ci_failures(workflow):
+    failures = []
+    jobs = {
+        match.group("name"): match.group("body")
+        for match in WORKFLOW_JOB.finditer(workflow)
+    }
+    policy = jobs.get("policy", "")
+    windows_workspace = jobs.get("windows-workspace", "")
+    if "name: Required / Policy" not in policy:
+        failures.append("Required / Policy check name changed or its job is missing")
+    if "name: Required / Windows Workspace" not in windows_workspace:
+        failures.append("Required / Windows Workspace check name changed or its job is missing")
+
+    runner = re.search(r"(?m)^    runs-on: ([^\r\n]+)", policy)
+    runner = runner.group(1).strip() if runner else ""
+    explicit_target = re.search(
+        r"(?m)^      CARGO_BUILD_TARGET: ([^\r\n]+)", policy
+    )
+    default_target = re.search(
+        r'(?m)^target = "([^"\r\n]+)"',
+        (ROOT / ".cargo/config.toml").read_text(encoding="utf-8"),
+    )
+    target = (
+        explicit_target.group(1).strip()
+        if explicit_target
+        else default_target.group(1) if default_target else ""
+    )
+    windows_marker_count = sum(
+        len(CONFORMANCE_MARKER.findall(path.read_text(encoding="utf-8")))
+        for path in (ROOT / "crates/easycon-serial/src/windows").rglob("*.rs")
+    )
+
+    if runner.startswith("ubuntu") and target == "x86_64-pc-windows-msvc":
+        failures.append(
+            "Required / Policy pairs an Ubuntu runner with the MSVC Cargo target; "
+            "exact Rust tests cannot link without link.exe"
+        )
+    if runner.startswith("ubuntu") and target == "x86_64-unknown-linux-gnu" and windows_marker_count:
+        failures.append(
+            "Required / Policy selects a Linux target that excludes {} Windows-only exact "
+            "conformance tests".format(windows_marker_count)
+        )
+    if runner != "windows-2022":
+        failures.append("Required / Policy must run on windows-2022")
+    if target != "x86_64-pc-windows-msvc":
+        failures.append("Required / Policy must execute the x86_64-pc-windows-msvc target")
+
+    required_policy_fragments = [
+        "Import-Module $devShell",
+        "Enter-VsDevShell -VsInstallPath $installationPath -SkipAutomaticLocation "
+        '-DevCmdArguments "-arch=x64 -host_arch=x64"',
+        "Add-Content -LiteralPath $env:GITHUB_ENV",
+        "Add-Content -LiteralPath $env:GITHUB_PATH",
+        "Get-Command link.exe",
+        "BASE_SHA: ${{ github.event.pull_request.base.sha || "
+        "github.event.merge_group.base_sha || github.event.before }}",
+        "git diff --check",
+        "git status --porcelain=v1 --untracked-files=all",
+    ]
+    python = "python" if runner == "windows-2022" else "python3"
+    required_policy_fragments.extend(
+        "{} tools/{}.py".format(python, tool)
+        for tool in (
+            "validate_specs",
+            "check_markdown_links",
+            "check_repository_guards",
+        )
+    )
+    for fragment in required_policy_fragments:
+        if fragment not in policy:
+            failures.append("Required / Policy is missing {!r}".format(fragment))
+    return failures
 
 
 def main():
@@ -200,6 +281,9 @@ def main():
     if "cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3" not in vcpkg_configuration:
         failures.append("Phase 3 vcpkg registry baseline changed")
 
+    required_ci = (ROOT / ".github/workflows/required-ci.yml").read_text(encoding="utf-8")
+    failures.extend(required_ci_failures(required_ci))
+
     runtime_source = (ROOT / "crates/easycon-runtime/src/runtime.rs").read_text(
         encoding="utf-8"
     )
@@ -214,10 +298,23 @@ def main():
         return 1
     print(
         "repository guards passed: frozen workspace, Phase 3 dependency direction, GPL license, "
-        "private native boundary, source boundary, Drop finalizer ban, and legacy process scan"
+        "private native boundary, source boundary, Drop finalizer ban, legacy process scan, and "
+        "Required CI execution ownership"
     )
     return 0
 
 
 if __name__ == "__main__":
+    if sys.argv[1:] == ["--required-ci-stdin"]:
+        workflow_failures = required_ci_failures(sys.stdin.read())
+        if workflow_failures:
+            print("Required CI guard check failed:", file=sys.stderr)
+            for failure in sorted(set(workflow_failures)):
+                print("  " + failure, file=sys.stderr)
+            sys.exit(1)
+        print("Required CI guard passed")
+        sys.exit(0)
+    if sys.argv[1:]:
+        print("usage: check_repository_guards.py [--required-ci-stdin]", file=sys.stderr)
+        sys.exit(2)
     sys.exit(main())

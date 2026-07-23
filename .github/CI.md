@@ -9,8 +9,15 @@
 | `Required CI` | pull request、merge queue、`main` push | `Required / Policy`、`Required / Windows Workspace` | 两项都在 GitHub-hosted runner 首次实际通过后，才可作为 `main` required checks |
 | `Native Quality (Non-Required)` | 每周 schedule、手动 dispatch | `Windows Native / <preset>`、`Linux Phase 3 Candidate (Non-Required)` | 重型证据任务，不设为 required |
 
-`Required / Policy` 校验规范、Markdown 链接、repository guards、变更行和 clean tree。`Required / Windows Workspace` 在 MSVC x64
-环境中执行冻结 Rust workspace、Loom runtime models、规范、链接、repository guards 和 diff 全门禁。
+`Required / Policy` 在 Windows Server 2022 的 MSVC x64 developer environment 中校验规范、65 个 exact Rust
+conformance tests、Markdown 链接、repository guards、变更行和 clean tree。选择 Windows runner 是为了让
+`easycon-serial` 中 6 个 `#[cfg(windows)]` exact tests 与其余测试在同一 Policy job 中真实编译并各执行一次；
+Ubuntu runner 既不能链接仓库默认的 MSVC target，改用 Linux target 又会排除这 6 个测试。
+
+`Required / Windows Workspace` 仍在独立的 MSVC x64 job 中执行冻结 Rust workspace、Loom runtime models、规范、
+链接、repository guards 和 diff 全门禁，并保留完整 vcpkg、OCR、cache 与权限边界。Policy 使用 Windows runner
+只证明该次 repository policy 与 exact conformance gate；它不产生新的 Windows 平台、serial 硬件、Phase 3 native
+或发布支持结论，也不能替代 Windows Workspace 或 non-required native-quality 证据。
 
 重型 Windows native matrix 与 Phase 3 文档保持一致：MSVC Debug/Release、clang-cl ASan、clang-cl UBSan trap、
 MSVC analyze、clang-tidy warnings-as-errors 和 libFuzzer tracked corpus。它们只能由 schedule 或手动触发，普通
