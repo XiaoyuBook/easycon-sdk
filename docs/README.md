@@ -67,6 +67,7 @@
 - [ADR-0013：冻结 Phase 3 Vision 跨平台源码候选](decisions/0013-phase-3-vision-cross-platform-source-candidate-freeze.md)
 - [ADR-0014：Phase 3 NativePool admission 修复后重新冻结](decisions/0014-phase-3-native-pool-admission-refreeze.md)
 - [ADR-0016：重新冻结 Phase 3 候选的下游阶段重新打开边界](decisions/0016-phase-3-downstream-reopen-boundary.md)
+- [ADR-0017：提议冻结 Phase 4 ECS 与 Automation 目标（Proposed / Not Effective）](decisions/0017-phase-4-ecs-automation-target.md)
 
 ## v1 固定范围
 
@@ -108,6 +109,11 @@ C ABI、Phase 4、Controller serial、四语言、package 或完整跨平台 SDK
 准备增加 Phase 4 按 ADR-0014 的现行字面规则确实重新打开该候选，本次 refreeze 已闭合该治理 reopen。从本次
 refreeze 之后，纯下游阶段增加本身不再自动重开 Phase 3，只有实际改变其冻结面时才重开。Phase 3 的同一
 implementation/tree 与平台状态保持不变；该治理决定本身不授权 Phase 4 target 或实现。
+
+[ADR-0017](decisions/0017-phase-4-ecs-automation-target.md) 现为 `Proposed / Not Effective`。它提议冻结 Phase 4
+ECS/Automation 的 ownership、产品语义、ProgramHash/PCG golden、`EcsLimitsV1`、抽象 ports、Runtime 窄重开和
+安全实施 DAG；在固定 proposal SHA 的独立 design review 清零、且后续单独 acceptance/freeze commit 完成前，
+不授权 R0/W0/S0/D0 或实现。
 
 ## 首发基线
 

@@ -30,6 +30,11 @@ Not Shipped`。三者均不等于完整 SDK 发布，且未冻结 public C ABI�
 refreeze 之后，纯下游 Phase 4/5/6 增加本身不再自动重开 Phase 3，只有实际改变其冻结面时才重开。Phase 3
 implementation、public-neutral contract 和平台/支持状态均未改变；该治理决定本身不授权 Phase 4 target 或实现。
 
+[ADR-0017](docs/decisions/0017-phase-4-ecs-automation-target.md) 现为 `Proposed / Not Effective`，提议冻结
+Phase 4 `easycon-ecs` 的 compiler、不可变 Program、Automation Run、抽象 ports、确定性语义、limits、Runtime
+窄重开边界与安全实施 DAG。它必须先在固定 proposal SHA 上完成独立 design review、清零 finding，并由后续单独
+acceptance/freeze commit 接受；此前不授权 R0/W0/S0/D0 或任何实现。
+
 此前的实验性共享运行基线已经移除，不再作为本项目的产品架构或兼容性约束。后续 public C ABI 和各语言绑定
 将在当前 Rust 共享核心之上按 Phase 5/6 的独立门禁实现。
 
