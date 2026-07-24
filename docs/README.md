@@ -113,8 +113,9 @@ implementation/tree 与平台状态保持不变；该治理决定本身不授权
 [ADR-0017](decisions/0017-phase-4-ecs-automation-target.md) 现为 `Proposed / Not Effective`。它提议冻结 Phase 4
 ECS/Automation 的 ownership、产品语义、ProgramHash/PCG golden、`EcsLimitsV1`、抽象 ports、Runtime 窄重开和
 安全实施 DAG。初始 fixed proposal `6468da5` 的独立 design review 结论为 `REWORK`（P0=0、P1=3、P2=2）；
-当前 docs-only 修订只关闭该轮 finding，仍为未生效 proposal。在修订后的新 fixed SHA 完成独立 full re-review、
-清零 finding，且后续单独 acceptance/freeze commit 完成前，不授权 R0/W0/S0/D0 或实现。
+第一轮 fixed 修订 `9983d42` 的独立 full re-review 仍为 `REWORK`（P0=0、P1=1、P2=1）。当前第二轮 docs-only
+修订只关闭后一轮 finding，仍为未生效 proposal。在修订后的新 fixed SHA 完成独立 full re-review、清零 finding，
+且后续单独 acceptance/freeze commit 完成前，不授权 R0/W0/S0/D0 或实现。
 
 ## 首发基线
 

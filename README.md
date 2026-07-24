@@ -33,8 +33,9 @@ implementation、public-neutral contract 和平台/支持状态均未改变；�
 [ADR-0017](docs/decisions/0017-phase-4-ecs-automation-target.md) 现为 `Proposed / Not Effective`，提议冻结
 Phase 4 `easycon-ecs` 的 compiler、不可变 Program、Automation Run、抽象 ports、确定性语义、limits、Runtime
 窄重开边界与安全实施 DAG。初始 fixed proposal `6468da5` 的独立 design review 结论为 `REWORK`
-（P0=0、P1=3、P2=2）；当前 docs-only 修订只关闭该轮 finding，仍不是 acceptance/freeze。它必须以新的 fixed SHA
-完成一次独立 full re-review、清零 finding，并由后续单独 acceptance/freeze commit 接受；此前不授权
+（P0=0、P1=3、P2=2）；第一轮 fixed 修订 `9983d42` 的独立 full re-review 仍为 `REWORK`
+（P0=0、P1=1、P2=1）。当前第二轮 docs-only 修订只关闭后一轮 finding，仍不是 acceptance/freeze。它必须以新的
+fixed SHA 完成一次独立 full re-review、清零 finding，并由后续单独 acceptance/freeze commit 接受；此前不授权
 R0/W0/S0/D0 或任何实现。
 
 此前的实验性共享运行基线已经移除，不再作为本项目的产品架构或兼容性约束。后续 public C ABI 和各语言绑定

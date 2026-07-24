@@ -26,9 +26,14 @@ Git 对象、固定 ref 与外部结构化 `TASK_REPORT` 记录；未来 accepta
 自身 SHA/tree。任一步发生语义修订，都必须固定新的 proposal SHA 并重新接受完整独立审查。
 
 初始 proposal `6468da5` 的独立 design review 任务 `019f922d-192f-7e70-b32a-6b76eeb3ee8b` 结论为
-`REWORK`（P0=0、P1=3、P2=2）。本次 docs-only 修订只关闭该轮五项 finding，不是 acceptance/freeze，状态仍为
-`Proposed / Not Effective`。修订提交必须作为新的 fixed-SHA proposal 接受一次完整独立 re-review；不得把对
-`6468da5` 的审查结论沿用为对修订后对象的批准。
+`REWORK`（P0=0、P1=3、P2=2）。第一轮 docs-only 修订只关闭该轮五项 finding，不是 acceptance/freeze，固定为
+`9983d42c4ecba0080e8fcdacab93fd5b73dc9b50`，tree `a753b2fe42bd895e84221ffa4e80a873140dfc78`，parent
+`6468da576471975a05458767f14a55a31926e169`。独立 full re-review 任务
+`019f9324-c32f-7af3-8928-a003ff7f051d` 对该 fixed SHA 的结论仍为 `REWORK`（P0=0、P1=1、P2=1）。
+
+本次第二轮 docs-only 修订只关闭该轮一项 P1 与一项 P2，不是 acceptance/freeze，状态仍为
+`Proposed / Not Effective`。它必须作为新的 fixed-SHA proposal 接受一次完整独立 re-review；不得把对
+`6468da5` 或 `9983d42` 的审查结论沿用为对修订后对象的批准。
 
 本提议吸收了 architecture input 任务 `019f8e7d-67ee-7920-9e0c-c05b803c7415`、独立 `REWORK` review
 任务 `019f8e9a-6c58-71e0-8f2b-8a45c36c1526` 的 `0 P0 / 7 P1 / 3 P2` 修订，以及 product decision
@@ -361,6 +366,37 @@ logical array allocation 精确 charge checked `N * 8` bytes；cell 引用的 ne
 计费。不同实现即使采用不同增长策略或结构共享，同一 ProgramHash/profile 也必须在相同 semantic checkpoint 得到
 相同 `live_logical_heap_bytes` 与终态。
 
+v1 同时把所有表达式 child 的求值次序冻结为严格 source-order、left-to-right。这是参考 legacy
+`src/EasyCon.Script/Evaluator.cs` 的递归次序后选择的 v1 产品语义，不是未验证的兼容性声明：
+
+- 对所有语义上需要求值的 children，unary/conversion/parenthesized expression 求其唯一 operand；binary expression
+  先 left、后 right；builtin 与 user function call 如有 receiver 则先 receiver，再按源码从左到右求 arguments；array
+  literal elements 按源码从左到右；index 先 base/receiver、后 index；slice 先 base/receiver、再 lower、最后 upper；
+  `FOR` 仍按 lower、upper 各一次的既有合同执行。任何其他 multi-child expression 也按其 child 在源码中的出现顺序；
+- `and/or` 保持既有 short-circuit：先求 left；left 已决定结果时 right 不求值，否则才求 right。lowerer、optimizer、
+  constant folding、inlining 或其他 rewrite 可以改变表示，但不得重排、重复或省略语义上应求值的 child，也不得改变
+  heap success/failure、first error 或 observable effect 的次序；
+- RAND state advance、TIME observation、WAIT/cancel/deadline checkpoint，以及 Controller/Vision/OutputPort effect 都服从
+  同一 source-order。第一个 child failure 立即成为权威 failure，后续 children 不求值；已经在线性化的 effect 不回滚，
+  更晚的 cancel/deadline 或 failure 不覆盖它，既有 side-effect/first-error/cancel/deadline priority 不变。
+
+每个 parent expression 在求第一个 child 前建立 reservation-journal checkpoint。一个 child 成功后，其返回的 charged
+value、通过该 value 仍可达的 logical allocation/reservation，以及该结果形成的 temporary alias 都必须保持 live；在
+后续 siblings 求值和 parent 的全部 checked length、reserve-before-copy、allocation/copy 完成前，不得提前 release。
+parent 的成功 commit checkpoint 精确定义为：全部 children 已成功，parent 的全部 reservation、allocation/copy 已完成，
+且 committed result 已形成，但尚未把该 result 返回给 enclosing expression。此时先把 committed result 仍引用的
+allocation/reservation 转移给 result，再按 source evaluation 的逆序 discard 已消费且未被 result 接管的 child
+temporaries；每项只在最后一个 logical alias 消失时释放一次。完成此 checkpoint 后，parent result 才成为其 parent 的
+held child；因此实现不得先释放 operand 再为 result reserve 来压低 canonical peak。
+
+任一 child 以 failure/cancel/deadline 终止时不再求后续 child；任一 parent reserve/allocation/copy 失败时不发布 partial
+result。failure/cancel/deadline unwind 先让当前 child 按同一规则清理自身未提交 journal，再按取得顺序的逆序 rollback
+parent 尚未提交的 reservations，最后按 source evaluation 的逆序 discard 已产生但未消费的 child temporaries。alias
+transfer 只 drop temporary alias，只有最后一个 alias 才减 ledger；未取得的 reservation 不得虚构 release，已
+rollback 的 reservation 不得重复 release。
+该 parent journal 在 unwind 后精确回到其 entry checkpoint；先前已经提交到 binding 或外部 port 的 effect 及其独立
+ownership 不属于该 journal，不被回滚。这些路径不得 retry、换序或用 later reason 覆盖 source-order 的 first reason。
+
 array reservation ownership 固定如下：
 
 - array literal 创建一个长度等于元素数的新 logical allocation；assignment、parameter binding、argument passing 和
@@ -378,9 +414,21 @@ array reservation ownership 固定如下：
 
 所有 literal、slice、concat、`APPEND` 和 string copy 都先 checked 计算 result length、`array_cells`/`string_bytes`、
 `delta` 及 `live + delta`，在任何 allocation/copy 前原子 reserve。reservation 失败时不 allocation、不复制、不改 binding；
-reservation 后的 allocation/copy/fault failure 必须撤销该 expression 新取得的全部 reservations，并保持原数组、binding、
-temporaries 和 ledger 可观察状态不变。concat/`APPEND` 的 result 计算和 replacement 因此会在提交前同时计入仍 live 的
+reservation 后的 allocation/copy/fault failure 必须撤销该 expression 新取得的全部 reservations；在 failure
+linearization point 保持原数组、binding、enclosing parent 已持有的 temporaries 与 entry ledger 不变，再按上述 failure
+unwind 逐层释放未提交 temporary。concat/`APPEND` 的 result 计算和 replacement 因此会在提交前同时计入仍 live 的
 source 与新 result，这是规范峰值，不允许先释放 source 来规避上限。
+
+S0 必须固定一个 `v1-native` order-sensitive heap-limit fixture family：132 个 distinct 251,000-byte strings 加 132 个
+direct cells 形成 baseline `33,133,056`；`LEFT()` 先产生 251,000 bytes 再返回 1-byte slice，`MEDIUM()` 返回
+200,000 bytes。
+exact source/hash/profile 的 `LEFT() + MEDIUM()` 只有一个合法结果：严格 left-first，canonical peak
+`33,533,058 < 33,554,432`，成功；同一 source 的 counterfactual right-first trace 会尝试
+`33,584,056 > 33,554,432`，只能作为禁止实现的 negative oracle，不能被列为另一个允许结果。配对 assertion 只交换
+两个 operand 的源码位置，`MEDIUM() + LEFT()` 必须在对应 reserve-before-copy checkpoint 以稳定 heap-limit failure
+失败。S0 保存两份 exact input/hash/profile、ledger trace 与单一 expected outcome；E1 加入 executable conformance
+assertion，Q0/Q1 在 limits/full gates 中重跑。C1-C3 只验证各自 stage-relevant 的 exact source/hash 与 child-order
+mapping，不得提前声称 evaluator outcome 已通过。任何“success 或 limit failure 都可接受”的 assertion 都不合格。
 
 `array_cells` 的 N/N+1 证据按单个结果的 direct cell length 计；`live_logical_heap_bytes` 的 N/N+1 证据按上述 canonical
 ledger 在同一 semantic checkpoint 计。恰好 `limit` 可在其他条件满足时成功，`limit + 1` 必须在 allocation/copy 前以
@@ -415,6 +463,7 @@ v1 executable assertion。这里仅冻结未来 fixture 合同，不在 G0b prop
 | --- | --- | --- | --- |
 | `corrected.print.cli` | Production CLI | `src/EasyCon.Script/Binding/BuiltinCallable.cs::ImplPrint`；`src/EasyCon2.CLI/ConsoleOutAdapter.cs::Print` | legacy 把 bool 当作写入前换行并加入 timestamp/ANSI；保留其 token trace，v1 为下述四个 `PrintFragment` |
 | `corrected.print.winforms` | Production WinForms | `src/EasyCon.Script/Binding/BuiltinCallable.cs::ImplPrint`；`src/EasyCon2/App/EasyConForm.cs::Print`；`src/EasyCon2/Controls/RichLogBox.cs::Print` | legacy 把 bool 当作写入前 `Environment.NewLine` 并加入 timestamp；保留 UI queue token trace，v1 为同一四个 fragments |
+| `corrected.print.winforms-lite` | Production WinForms-lite | `src/EasyCon.Script/Binding/BuiltinCallable.cs::BuiltinCallable.ImplPrint`；`src/EasyCon2/Program.cs::Program.Main`；`src/EasyCon2/App/MainForm.cs::MainForm.runStopBtn_Click`、`MainForm.Print`；`src/EasyCon2/Controls/RichLogBox.cs::RichLogBox.Print` | `Program.Main` 对 `*lite` 启动 `App.MainForm`，runner 把 `this` 作为 output adapter，`MainForm.Print` 委托 shared `RichLogBox`；使用同一 canonical PRINT probe 与 typed-token schema，但必须保留独立 SDK-local manifest record、observed artifact/bytes/hash，即使结果与另一 WinForms path 相同 |
 | `corrected.print.avalonia` | Production Avalonia | `src/EasyCon.Script/Binding/BuiltinCallable.cs::ImplPrint`；`src/EasyCon2.Avalonia/Services/LogService.cs::Print`；`src/EasyCon2.Avalonia.Core/Services/LogService.cs::Print` | legacy 把 bool 当作 payload 后 LF 并在 true 分支加入 timestamp；两个 production implementation 都须保留，v1 为同一四个 fragments |
 | `corrected.print.test-mock` | Test oracle，非 production | `test/EasyCon.Tests/EvaluatorTests.cs::MockOutputAdapter.Print` | 单独记录 legacy mock 的 trailing-LF list；不得用它替代或证明任一 production row，v1 expected 仍是同一 fragments |
 | `corrected.label.cli` | Production CLI | `src/EasyCon.Capture/ImgLabel.cs::Search`；`src/EasyCon2.CLI/Program.cs` external getter | legacy `md *= 100` 后 `(int)md` truncation；canonical normalized score `0.4225` observed 42，v1 `floor(clamp(score,0,1)*100)` 为 42 |
@@ -422,7 +471,7 @@ v1 executable assertion。这里仅冻结未来 fixture 合同，不在 G0b prop
 | `corrected.label.winforms` | Production WinForms | `src/EasyCon.Capture/ImgLabel.cs::Search`；`src/EasyCon2/Services/CaptureService.cs::BuildExternalGetters` | legacy `md *= 100` 后 `Math.Ceiling(md)` observed 43；同一 canonical input 的 v1 expected 为 42 |
 
 PRINT canonical probe 是 UTF-8、无 BOM、LF 分隔且末尾有 LF 的以下 exact source；legacy capture 必须保留四次 adapter
-调用及 frontend rendering token，不得通过删除 timestamp/newline 差异把三个 production oracle 归一成同一 observed：
+调用及 frontend rendering token，不得通过删除 timestamp/newline 差异把四个 production oracle 归一成同一 observed：
 
 ```ecs
 PRINT "A\"
@@ -444,6 +493,11 @@ lowercase SHA-256、SDK-local v1 expected path + lowercase SHA-256、capture/nor
 record 的 observed hash 必须覆盖 ordered typed tokens。S0 的 static validator 验证 schema、路径、hash、obligation 完整性、
 duplicate/unknown-field/tamper fail-closed；Q0 只从 SDK-local artifacts 建立 executable assertions。两者都不得读取、构建或
 运行 ignored `EasyCon/`，legacy commit/path 只是不可变 provenance metadata。
+
+`corrected.print.winforms-lite` 不得与 `corrected.print.winforms` 共用 legacy observed artifact：即使 ordered bytes 与
+lowercase SHA-256 恰好相同，两行也必须各自拥有 SDK-local observed path、实际 bytes、hash field 与可追溯 manifest
+record；Program/MainForm/RichLogBox 的上述 commit/path/symbol 必须全部出现在 lite record。CI 仍只验证 SDK-local
+trace、manifest 与 hash，不读取或运行 `EasyCon/`。
 
 Exact fixture 同时保存 legacy observed 与 v1 expected；Corrected fixture 同时保存旧观察、v1 expected 和修订理由；
 v1-native 只验证本 ADR 合同，不伪称 differential legacy evidence。Python/Lua/FFI、bytecode/firmware、selective
@@ -509,7 +563,7 @@ freeze 混成一个提交。
 | Incremental mapping | C1-C3/E1/E2 每节点 exactly-one passing assertion、zero ignored；Q0 完整双向覆盖 |
 | Canonical golden/replay | ProgramHash 与 PCG hex vectors、source permutation、same Program/seed/fake-clock trace replay |
 | Deterministic fuzz | pinned parser/evaluator seed corpus、固定资源/时间上界、never panic；失败 seed 可直接 replay |
-| Limits/runner evidence | 所有 N/N+1、charge-before-copy/allocation、rollback、diagnostic saturation、dense peak memory/time |
+| Limits/runner evidence | 所有 N/N+1、fixed source-order heap-limit pair、charge-before-copy/allocation、rollback、diagnostic saturation、dense peak memory/time |
 | Coverage | pinned coverage tool/version/exclusion，业务 crate line `>=85%`、branch `>=80%`；关键 terminal/limit state 语义分支全覆盖 |
 
 以下是建议的模型/性质测试，不得在其 executable harness 落盘前称为已有 gate：terminal permit 与 cancel/deadline/close
@@ -524,11 +578,12 @@ ADR 的完整门禁并接受新的独立 review；纯 Phase 4 docs/code 不把 h
 ## Proposal chain 的验证边界
 
 初始 proposal `6468da5` 只新增本 ADR 并更新两处索引；其提交前实测结果为 Markdown links Passed（239
-references / 44 files）、repository guards Passed、working/new-file diff checks Passed。本次 REWORK 仍只允许修改本
-ADR 与同两处索引，用于关闭固定 review 的五项 finding；不修改 code、Cargo、workflow、Ruleset、fixture、support
-matrix 或 architecture/source map，不运行 hardware/COM，也不执行 R0/W0/S0/D0。
+references / 44 files）、repository guards Passed、working/new-file diff checks Passed。第一轮 REWORK 只修改本 ADR
+与同两处索引，关闭初始 review 的五项 finding；第二轮仍限于同三份文档，只关闭对 `9983d42` 的一项 P1 与一项 P2。
+两轮都不修改 code、Cargo、workflow、Ruleset、fixture、support matrix 或 architecture/source map，不运行
+hardware/COM，也不执行 R0/W0/S0/D0。
 
-REWORK 修订只运行 AGENTS.md 要求的 docs-only links、repository guards 与 diff checks，精确结果由修订后的 Git
+REWORK 修订只运行 AGENTS.md 要求的 docs-only links、repository guards 与 diff checks，精确结果由各轮修订后的 Git
 对象和外部结构化 `TASK_REPORT` 固定。proposal chain 没有运行 Rust、Loom、spec、native、coverage 或 fuzz，不能把
 未来 gate 描述成当前已通过，也不能把 docs-only 通过描述为 design acceptance。
 
