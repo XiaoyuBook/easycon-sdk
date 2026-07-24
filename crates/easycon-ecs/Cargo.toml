@@ -1,0 +1,11 @@
+[package]
+name = "easycon-ecs"
+description = "Internal ECS and Automation boundary for EasyCon SDK"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true

@@ -13,6 +13,7 @@ EXPECTED_MEMBERS = {
     "crates/easycon-model",
     "crates/easycon-runtime",
     "crates/easycon-controller",
+    "crates/easycon-ecs",
     "crates/easycon-serial",
     "crates/easycon-native-sys",
     "crates/easycon-vision",
@@ -25,7 +26,6 @@ FORBIDDEN_PREFIXES = (
     "services/",
     "ui/",
     "crates/easycon-capi/",
-    "crates/easycon-ecs/",
     "crates/easycon-sdk/",
 )
 FORBIDDEN_RUNTIME_PATTERNS = {
@@ -200,7 +200,7 @@ def main():
 
     metadata = cargo_metadata()
     if workspace_members(metadata) != EXPECTED_MEMBERS:
-        failures.append("workspace members differ from frozen Phase 2A plus Phase 3 packages")
+        failures.append("workspace members differ from frozen workspace packages")
     for package in metadata["packages"]:
         if package["id"] in metadata["workspace_members"] and package["license"] != "GPL-3.0-only":
             failures.append("{} is not GPL-3.0-only".format(package["name"]))
@@ -209,6 +209,7 @@ def main():
         "crates/easycon-model/Cargo.toml": set(),
         "crates/easycon-runtime/Cargo.toml": {"easycon-model"},
         "crates/easycon-controller/Cargo.toml": {"easycon-model", "easycon-runtime"},
+        "crates/easycon-ecs/Cargo.toml": set(),
         "crates/easycon-serial/Cargo.toml": {
             "easycon-controller",
             "easycon-model",
@@ -297,7 +298,7 @@ def main():
             print("  " + failure, file=sys.stderr)
         return 1
     print(
-        "repository guards passed: frozen workspace, Phase 3 dependency direction, GPL license, "
+        "repository guards passed: frozen workspace and dependency direction, GPL license, "
         "private native boundary, source boundary, Drop finalizer ban, legacy process scan, and "
         "Required CI execution ownership"
     )
