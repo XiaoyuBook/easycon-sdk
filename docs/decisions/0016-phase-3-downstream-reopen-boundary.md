@@ -1,35 +1,37 @@
 # 0016：澄清 Phase 3 候选的下游阶段重新打开边界
 
-- 状态：Proposed Refreeze（待独立治理审查）
-- 日期：2026-07-23
+- 状态：Refrozen Governance Boundary
+- 提议日期：2026-07-23
+- 重新冻结日期：2026-07-24
 - 治理基线：`origin/main@bc24f0bfe65a34ba54ffacad62dd41905c77f952`
 - Phase 3 implementation：`27444f16d0625a7ab7e4e1543736c7c3c225ce8a`
 - implementation tree：`334a3fb21bf4d6ca55e0bcbe3e2daa6e675b3194`
 - implementation parent：`76436de98836dc2fff9a43c4560e7dc7f3fea780`
+- 固定 proposal：`e3f0df9865119877b95732d2a6100ef15ed7ab9b`
+- 独立治理复审：任务 `019f91fe-0f5a-7d71-a216-46312ecf721e`，结论 `APPROVE`，P0/P1/P2 均为空
 - 被澄清记录：[ADR-0014](0014-phase-3-native-pool-admission-refreeze.md)
 - 编号说明：ADR-0015 已保留给 Phase 2B refreeze；本提议落盘前已扫描全部本地 refs 与 worktrees，后续可用编号为 0016
 
 ## 状态与生效条件
 
-本 ADR 是语义完整的 successor/refreeze **提议**，不是已经完成的重新冻结。ADR-0014 的现行“重新打开规则”
-明确把“增加 public ABI、Phase 4/5/6、binding、package、support row 或发布声明”列为任一即触发的条件；该文本
-没有纯下游消费豁免。因此，准备增加 Phase 4 target 按现行字面规则确实重新打开 Phase 3 候选，不能追溯声称
-ADR-0014 原本允许该例外。
+ADR-0014 的现行“重新打开规则”明确把“增加 public ABI、Phase 4/5/6、binding、package、support row 或发布声明”
+列为任一即触发的条件；该文本没有纯下游消费豁免。因此，准备增加 Phase 4 target 按现行字面规则确实重新打开
+Phase 3 候选，不能追溯声称 ADR-0014 原本允许该例外。
 
-在固定本提议提交完成独立治理审查、清零可复现且 in-scope 的 finding，并由后续提交记录 refreeze 证据之前：
+固定 proposal 已完成独立治理复审并清零可复现且 in-scope 的 P0/P1/P2。本次 tracked refreeze 提交闭合上述
+Phase 3 governance reopen；从该提交之后，本 ADR 的 successor 重新打开规则生效：
 
 - ADR-0014 的原文和历史重新冻结证据保持权威且不被改写；
-- Phase 3 implementation 继续固定为 `27444f16`，但本次治理 reopen 尚未闭合；
-- 本提议不授权 Phase 4 target、workspace scaffold、Runtime 或 Controller 实现；
-- 后续提交不得把本文件的 `Proposed Refreeze` 状态描述为最终 freeze/refreeze。
+- Phase 3 implementation 继续固定为 `27444f16`，本次只重新冻结治理边界；
+- 本 ADR 不授权 Phase 4 target、workspace scaffold、Runtime 或 Controller 实现；
+- 后续工作仍须以实际 diff 和合同审查证明“纯下游”，不能仅凭阶段名称获得豁免。
 
-独立审查通过后的后续 tracked 提交才可把本 ADR 更新为最终 refreeze 状态；该 tracked 提交只在本 ADR 中记录
-固定的 proposal SHA、review task、精确门禁结果、最终状态与索引推进。该 refreeze commit/tree 只能在提交后由
-Git 对象和外部结构化 `TASK_REPORT`/handoff 固定，不写回任何 tracked ADR。
+本次 tracked 提交只在本 ADR 中记录固定 proposal SHA、review task、精确门禁结果、最终状态与索引推进。该
+refreeze commit/tree 只能在提交后由 Git 对象和外部结构化 `TASK_REPORT`/handoff 固定，不写回任何 tracked ADR。
 
 ## 已核验且不变的 Phase 3 基线
 
-本提议不产生新的 Phase 3 implementation。Git 对象核验确认：
+本次 refreeze 不产生新的 Phase 3 implementation。Git 对象核验确认：
 
 | 固定项 | `27444f16` | `bc24f0b` | 结论 |
 | --- | --- | --- | --- |
@@ -56,13 +58,13 @@ package 或 release API。
 | Linux x64 | Vision `Candidate / Build Unverified` | `Hardware Unverified` | 不发布；不是完整 Linux SDK |
 | macOS Apple Silicon arm64 | `Experimental Source Candidate / Build Unverified` | `Hardware Unverified` | `Not Shipped`；无 Intel/universal 声明 |
 
-本提议不新增或晋级 backend、hardware、public ABI、binding、package、support row 或发布声明，也不关闭 O-03。
+本次 refreeze 不新增或晋级 backend、hardware、public ABI、binding、package、support row 或发布声明，也不关闭 O-03。
 `EasyCon/` 继续只读、ignored，不是 tracked source、fixture、build、bundle 或发布输入。
 
-## 提议决定
+## 重新冻结决定
 
-独立审查和最终 refreeze 完成后，仅取代 ADR-0014 重新打开规则中把“增加 Phase 4/5/6”本身视为无条件触发的
-部分。ADR-0014 的 implementation、历史 finding、门禁证据、平台分级和其余 reopen 条件全部保留。
+从本次 tracked refreeze 提交之后，本 ADR 仅取代 ADR-0014 重新打开规则中把“增加 Phase 4/5/6”本身视为
+无条件触发的部分。ADR-0014 的 implementation、历史 finding、门禁证据、平台分级和其余 reopen 条件全部保留。
 
 未来 Phase 4/5/6 的纯下游增加，只有实际改变以下任一 Phase 3 冻结面时才重新打开 Phase 3：
 
@@ -96,32 +98,46 @@ Phase 3 冻结面，就必须先按本 ADR 与 ADR-0012/0014 重新打开、运�
 
 这些事项分别属于后续 G0b、R0、D0 或实现节点，不能混入本次 Phase 3 治理 successor。
 
-## 本提议的验证与最终 refreeze gate
+## Proposal、独立复审与本次 refreeze 证据
 
-本地 proposal 提交前必须在包含本文件及索引差异的工作树上通过 ADR-0012/0014 要求的完整软件门禁：
+固定 proposal 的证据链在 proposal 阶段实际运行了 ADR-0012/0014 要求的完整软件矩阵，最终结果为：
 
-```powershell
-cargo fmt --all --check
-cargo check --workspace --all-targets
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
-python tools/run_runtime_models.py
-python tools/validate_specs.py
-python tools/check_markdown_links.py
-python tools/check_repository_guards.py
-git diff --check
-```
+| Proposal gate | 实际结果 |
+| --- | --- |
+| `cargo fmt --all --check` | Passed |
+| `cargo check --workspace --all-targets` | Passed，59.28 秒 |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | 修正环境后的离线重跑 Passed，37.2 秒 |
+| `cargo test --workspace --all-features` | Passed，51.6 秒；全部测试及 2 个 compile-fail doctest 通过 |
+| `python tools/run_runtime_models.py` | Passed，6/6 Loom models |
+| `python tools/validate_specs.py` | Passed：5 schemas、1 behavior spec、3 controller fixtures、15 Vision binary fixtures、1 capture manifest、24 label corpus entries、9 scenarios、65 exact Rust tests |
+| OCR provisioner/hash | Passed：`eng.traineddata` SHA-256 `7d4322bd2a7749724879683fc3912cb542f19906c83bcc1a52132556427170b2`；`LICENSE` SHA-256 `cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30` |
+| MSVC Debug / Release configure、build、CTest | Passed，各 2/2 |
+| clang-cl ASan / UBSan trap configure、build、CTest | Passed，各 2/2，无 sanitizer violation |
+| MSVC `/analyze /analyze:external- /WX` build、CTest | Passed，2/2 |
+| clang-tidy warnings-as-errors | Passed，10 个 owned translation units 无 finding；CTest 3/3 |
+| clang-cl libFuzzer tracked-corpus replay | Passed，CTest 3/3，包含 128-run replay |
+| Markdown links / repository guards / diff checks | Passed，links 221 references / 43 files；guards、worktree/cached/post-commit diff checks 均通过 |
 
-同时必须执行 provisioned OCR model、MSVC Debug/Release、clang-cl ASan/UBSan trap、MSVC analyze、clang-tidy
-warnings-as-errors 和 clang-cl libFuzzer tracked-corpus replay。全部命令只验证 software/native 与 synthetic/fixture
-路径，不运行串口命令、物理硬件或资格 CLI。
+Proposal 阶段首次 strict clippy 的 fresh native configure 因共享 registry 元数据损坏且网络不可达而失败；该次失败
+没有被计为 Passed。随后使用同一固定 vcpkg checkout 的 ports 和只读 binary cache 恢复相同依赖版本/ABI，离线重跑
+通过。OCR 首次因输出路径不符合 ignored cache 边界被拒绝，随后下载超时；从已核验冻结副本填充合法 ignored cache
+后，provisioner 按 manifest 重新验 hash 并通过。上述软件、native 与 synthetic/fixture 证据没有运行硬件、串口或
+qualification CLI。
 
-提交后仍有以下独立 gate，当前线程不得代替或启动：
+固定 proposal `e3f0df9865119877b95732d2a6100ef15ed7ab9b` 是移除 tracked refreeze SHA 自指的 docs-only 修订；该修订
+实际运行并通过 links 221/43、repository guards、提交前 diff check，以及 parent/range 提交后 diff checks。它没有
+重跑 Rust、Loom、spec、OCR 或 native 矩阵，也不把前述 proposal 矩阵描述为该三行修订刚刚执行。
 
-1. reviewer 固定本 proposal commit SHA/tree/parent 并审查完整 `bc24f0b..proposal` docs diff；
-2. reviewer 核验本节门禁证据、Phase 3 owned trees、public-neutral contract 与平台状态没有变化；
-3. reviewer 清零直接相关、可复现且 in-scope 的 P0/P1/P2；有 finding 则在新 proposal SHA 重审；
-4. 单独后续提交记录 review/refreeze 证据并更新本 ADR 状态；完成前不得开始 G0b 或声称治理 reopen 已关闭。
+独立治理复审任务 `019f91fe-0f5a-7d71-a216-46312ecf721e` 固定并核验 proposal SHA/tree/parent、父链、完整三文件
+docs diff、Phase 3 owned trees、工具链/fixture generator、无 public ABI 状态和三平台分级；独立运行 links 221/43、
+repository guards、parent/baseline/worktree diff checks 和 Git object/fsck 检查均通过，最终 P0/P1/P2 为空。该复审
+按 docs/governance 范围没有重复 native 矩阵，并明确继续引用 proposal 阶段的完整实际证据。
+
+本次 refreeze 提交仅修改 ADR 与索引，不影响可执行行为；本次实际运行结果：
+
+- `python tools/check_markdown_links.py`：Passed，221 references / 43 files；
+- `python tools/check_repository_guards.py`：Passed；
+- `git diff --check`：Passed。
 
 ## 关联
 
