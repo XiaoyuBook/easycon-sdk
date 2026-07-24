@@ -3,9 +3,12 @@
 - 状态：Proposed / Not Effective
 - 提议日期：2026-07-24
 - 治理起点：[ADR-0016](0016-phase-3-downstream-reopen-boundary.md) 的 `Refrozen Governance Boundary`
-- 固定起点：`38ef0dc301a2cdadafe91846b4a1b80918b54297`，tree
+- G0a governance predecessor：`38ef0dc301a2cdadafe91846b4a1b80918b54297`，tree
   `e0766c62277e16763fd6af79c7622a2f29a93e70`，parent
   `e3f0df9865119877b95732d2a6100ef15ed7ab9b`
+- 初始 G0b proposal / REWORK 起点：`6468da576471975a05458767f14a55a31926e169`，tree
+  `4b7f641090bd261acf39bf5570840c8b0776475e`，parent
+  `38ef0dc301a2cdadafe91846b4a1b80918b54297`
 - proposal chain 来源：`origin/main@bc24f0bfe65a34ba54ffacad62dd41905c77f952`
 - legacy 只读证据：`EasyCon@11c4b992b9bce0ff977e9c587a6c0bb0d302853e`
 - 编号说明：ADR-0015 保留给 Phase 2B；落盘前扫描全部本地 refs 与 worktrees，ADR-0016 已占用，0017 无冲突
@@ -21,6 +24,11 @@
 在第三步完成前，不得启动 R0、W0、S0、D0 或任何 Phase 4/5 实现。本 proposal 的提交 SHA/tree 只由提交后的
 Git 对象、固定 ref 与外部结构化 `TASK_REPORT` 记录；未来 acceptance commit 也不得在 tracked 文件中记录或预言
 自身 SHA/tree。任一步发生语义修订，都必须固定新的 proposal SHA 并重新接受完整独立审查。
+
+初始 proposal `6468da5` 的独立 design review 任务 `019f922d-192f-7e70-b32a-6b76eeb3ee8b` 结论为
+`REWORK`（P0=0、P1=3、P2=2）。本次 docs-only 修订只关闭该轮五项 finding，不是 acceptance/freeze，状态仍为
+`Proposed / Not Effective`。修订提交必须作为新的 fixed-SHA proposal 接受一次完整独立 re-review；不得把对
+`6468da5` 的审查结论沿用为对修订后对象的批准。
 
 本提议吸收了 architecture input 任务 `019f8e7d-67ee-7920-9e0c-c05b803c7415`、独立 `REWORK` review
 任务 `019f8e9a-6c58-71e0-8f2b-8a45c36c1526` 的 `0 P0 / 7 P1 / 3 P2` 修订，以及 product decision
@@ -77,10 +85,18 @@ R0 只扩展一个内部共同 terminal permit/cleanup primitive，并固定以�
 - 原执行 Success 且 cleanup 成功，generic operation `Succeeded(Unit)`；
 - 原执行 Success 且 cleanup 返回错误，generic operation 改为 `Failed`；
 - 原执行 Failed、Cancelled、Deadline 或 ParentClose 时，原 primary/first reason 保持权威，cleanup 错误只作为
-  `RunCompletion` 的 secondary diagnostic；ParentClose 的 secondary diagnostic 同时进入 `CloseReport`；
+  immutable `RunCompletion` 的 secondary diagnostic；包括 ParentClose 在内，secondary 不进入 `CloseReport`；
 - cleanup panic 由 panic boundary 转为 `Internal`，不得 unwind 穿过 Runtime 或留下半终态；若已有 primary
   failure/cancellation，其领域记录保留 primary，并把 panic 记录为 secondary；
 - generic result 仍是 `OperationValue::Unit`。
+
+这是 R0 的明确所有权边界，而不是遗漏的 error projection。Runtime close 继续完全遵守 ADR-0006 的中立
+`CloseOutcome`/`CloseReport` 规则：`CloseReport` 只记录 Runtime 自身 close start、resource、task、event、operation
+finalization 或 registry close failure，不读取、不存储 ECS 类型，也不设置 Automation diagnostic collector。ParentClose 下的
+Automation cleanup secondary 不会单独把 `CloseOutcome::Closed` 改为 `Failed`，不会替换已经保存的 Runtime failure，
+也不会在 operation 已 terminal 后回写不可变 report；即使 Runtime 因较早的中立 close failure 已保存 report、而
+Automation owner cleanup 此后才 settled，该 secondary 仍只在 owner 冻结的 `RunCompletion` 中可见。R0 因此不扩大
+`CloseReport` schema、settle protocol、failure priority 或多错误模型。
 
 R0 不扩 `ErrorDomain`、`ErrorCode`、Runtime `Event` 或 `OperationValue`，也不把 ECS payload 写入 `Event.detail`、
 `Bytes` 或 JSON。R0 完成其 RED/model、完整 Phase 1 门禁、独立 review 与 refreeze 之前只阻断 E2；它不阻断 W0、
@@ -211,10 +227,23 @@ role/id、BOM 处理后的 source bytes、semantics version 与完整 limits pro
 | Vector | 输入 | framed bytes | SHA-256 |
 | --- | --- | ---: | --- |
 | A | main id `main.ecs`，empty source，无 lib | 202 | `14194633f5b81dc0bfe9c674990c0126126a01c39ef3142c482bc1b178a8e10a` |
-| B | main `EFBBBF5052494E5420224F4B220D0A`；输入 libs 为 `lib/z.ecs:5A3D310A`、`lib/a.ecs:413D320A` | 274 | `aa86e95ac3def7b3022f4a415cf2312169562f3455a291bc9c9e6b2d4ce2ee12` |
-| C | main `EFBBBF5052494E5420224F4B220A`；输入 libs 已按 a、z 排列，内容同 B | 273 | `c192953c0745bbb04b555d8ee6e4b4657d3b014ae443cac6c68ae59af4fd1916` |
+| B | main id `main.ecs`、source `EFBBBF5052494E5420224F4B220D0A`；输入 libs 为 `lib/z.ecs:5A3D310A`、`lib/a.ecs:413D320A` | 274 | `aa86e95ac3def7b3022f4a415cf2312169562f3455a291bc9c9e6b2d4ce2ee12` |
+| C | main id `main.ecs`、source `EFBBBF5052494E5420224F4B220A`；输入 libs 已按 a、z 排列，内容同 B | 273 | `c192953c0745bbb04b555d8ee6e4b4657d3b014ae443cac6c68ae59af4fd1916` |
 
-B 的 libs 交换输入顺序必须得到同一 digest；B 与 C 必须不同。Vector A 的完整 framed bytes 为：
+B 与以下每个 isolation case 必须各自形成独立 golden assertion，不得只由组合测试间接覆盖。除明确指出的单一
+mutation 外，mutation cases 的全部输入都与 B 相同；它们只验证 framing/hash 敏感度，不把
+`profile_version=2` 宣告为受支持 profile：
+
+| Assertion | 与 B 的唯一差异 | framed bytes | SHA-256 |
+| --- | --- | ---: | --- |
+| BOM equivalence | main source 删除开头 `EFBBBF` | 274 | `aa86e95ac3def7b3022f4a415cf2312169562f3455a291bc9c9e6b2d4ce2ee12` |
+| Lib input-order invariance | 输入 libs 从 z、a 交换为 a、z | 274 | `aa86e95ac3def7b3022f4a415cf2312169562f3455a291bc9c9e6b2d4ce2ee12` |
+| Source-id sensitivity | main `source_id` 从 `main.ecs` 改为 `Main.ecs` | 274 | `9e47433943992be6596b53feb7697a8218d3bdbb680ce15bf676d052351c9760` |
+| Profile-field sensitivity | 只把 `profile_version` 从 1 编码为 2 | 274 | `e7deac9052f78b742269ad3fcf8544126589a9f5f1436db055ab4e532880fbf2` |
+| Source-byte sensitivity | main source 最后一个 byte 从 `0A` 改为 `0B` | 274 | `92e3250d93c87fddedaef09dad5c5df8c18cbf5fbe5554dff13f36d4e2b70642` |
+
+因此 B without BOM 与 B with swapped input libs 都必须 byte-for-byte 形成与 B 相同的 canonical frame 和 digest；
+B 与 C 必须不同。Vector A 的完整 framed bytes 为：
 
 ```text
 65617379636F6E2D73646B3A6563732D70726F6772616D3A7631000000000100000001000000010000004000000000000400000000000000100000000000000000010000000000000000800000002000000020000000400000010000001000000400000002000000040000000400000004000000000040000002000000000100000080000040000000000000040000000000000200000000000000000080000000002000000000001000000000000000010000000000000000086D61696E2E6563730000000000000000
@@ -280,6 +309,29 @@ OutputPort 必须 fallible、bounded、支持 backpressure，且等待可由 run
 pending queue 不超过 32，总 payload 不超过 1 MiB。它不得承载 RunStarted/terminal lifecycle、cleanup warning、
 `RunFailure` 或 secondary diagnostic，避免 cleanup 失败通过正在 cleanup 的 port 递归发布。
 
+`output_payload_bytes = 1048576` 的唯一 v1 含义是 OutputPort **当前 pending queue** 中 payload 的 aggregate
+UTF-8 byte count，不是 run 从开始至今累计产生或交付的 bytes。`output_queue_pending` 同样只计当前 pending items；
+一个已取得 slot、正在执行 owned copy、尚未对 consumer ready 的 reservation 也属于 pending ledger，以保证并发实现
+不能越过上限。字段计费固定如下：
+
+- `PrintFragment.text` 的 exact UTF-8 bytes 计入 aggregate，`starts_new_line` 不计 bytes；
+- `Alert.text` 的 exact UTF-8 bytes 计入 aggregate；
+- `Beep.frequency_hz` 与 `Beep.duration_ms` 都不计 payload bytes，但该 Beep 仍占一个 pending item；
+- `output_fragment_bytes` 同时约束单个 `PrintFragment.text` 或 `Alert.text`；Beep 的 payload length 为 0。
+
+enqueue ledger 固定为 reserve-before-copy：先 checked 计算 item bytes，并同时取得一个 pending slot 与对应 byte
+reservation，再进行任何 OutputPort-owned copy，最后才把 item 标成 consumer-ready。算术 overflow、单个 text 超过
+`output_fragment_bytes`，或 item 即使在空队列中也不能容纳，立即返回稳定 output limit failure，且不等待、不复制、
+不产生可见 item。若 item 本身可容纳、只是当前 pending count 或 aggregate bytes 暂时没有余量，则这是 backpressure，
+不是 limit failure；producer 等待 dequeue，直到 enqueue、first cancel、deadline 或 port close 的既有线性化点之一胜出。
+
+owned copy、enqueue 或其故障注入失败时，slot 与 bytes 全部 rollback，不能留下 partial item。consumer 在 dequeue
+线性化点移除 item 时立即释放其 slot/bytes，即使 consumer 随后仍持有自己的值；cleanup、run cancel 或 port close
+若移除/drop queued item，也在同一移除点恰好释放一次。尚未取得 reservation 的 backpressure waiter 被取消时不释放
+虚构额度；已取得但尚未 ready 的 reservation 被取消时完整 rollback。正常 delivery 不得静默 drop。因而 production
+没有累计 output-count 或 output-bytes ceiling：只要 consumer 持续 dequeue，合法 run 可以无限地产生输出，最终仍由
+deadline/cancel 终止。
+
 ## EcsLimitsV1 与证据门槛
 
 上表数值是用户选择的显式、保守 product profile，不是现有 corpus 或 CI 已 evidence-backed 的 ceiling。当前 SDK
@@ -295,12 +347,45 @@ pending queue 不超过 32，总 payload 不超过 1 MiB。它不得承载 RunSt
 - diagnostic 正常项最多 64/source、511 total；下一项将越界时停止该 phase，并用预留槽写一个 bundle-level
   `ECS_DIAGNOSTIC_LIMIT`，最终不超过 512，且不再产生不稳定的尾部诊断；
 - single string 以 UTF-8 bytes 计，single array 以 direct cells 计；live logical heap 使用 semantics-v1 的稳定领域
-  ledger 而不是 allocator RSS：每个 live ECS-owned string buffer 按 exact logical UTF-8 bytes、每个 live array storage
-  按 `8 * direct cell capacity` charge，nested owned buffers 另计；alias 继承同一 reservation，logical copy 取得新
-  reservation，sharing optimization 不得降低语言层应付 charge；
+  ledger 而不是 allocator RSS：每个 live logical string allocation 按 exact UTF-8 bytes、每个 live logical array
+  allocation 按 `8 * direct cell length` charge，nested logical allocations 另计；
 - production 不设置 total instruction fuel 或 output-count ceiling；deadline/cancel 负责终止合法无限 run，fuzz/model
   可以使用不会进入 production profile/hash 的 test-only fuel；
 - profile 的全部字段进入 ProgramHash 和 run metadata；任何数值或 charging semantics 调整都必须新建 profile/version。
+
+### v1 live logical heap ledger
+
+array direct-cell charge 与 host representation 无关：Vec/List capacity、allocator size class、pointer width、header、refcount、
+small-object optimization、persistent-tree node 和预留但未成为元素的 capacity 一律计 0。长度为 `N` 的每个 live
+logical array allocation 精确 charge checked `N * 8` bytes；cell 引用的 nested string/array allocation 再按自身 ledger
+计费。不同实现即使采用不同增长策略或结构共享，同一 ProgramHash/profile 也必须在相同 semantic checkpoint 得到
+相同 `live_logical_heap_bytes` 与终态。
+
+array reservation ownership 固定如下：
+
+- array literal 创建一个长度等于元素数的新 logical allocation；assignment、parameter binding、argument passing 和
+  return 只 alias/transfer 同一个不可变 logical allocation 与 reservation，不按 alias 数重复 charge；
+- array slice、array concat/`+` 与 `APPEND` 都是 semantic copy，创建长度分别为 slice length、左右长度之和、原长度
+  加一的新 logical allocation；即使 backing storage 被共享，也必须取得完整新 direct-cell reservation，源 allocation
+  在仍 live 时继续全额计费；
+- string assignment/argument/return 使用同一 alias/transfer 规则；string slice/concat 产生按结果 exact UTF-8 bytes
+  计费的新 logical allocation；实现层 copy-on-write 或 interning 不得改变 ledger；
+- expression temporary 从创建到被 binding/return 接管或在该 expression/statement 结束后销毁期间都算 live；binding
+  replacement 必须先完成 RHS 及其全部新 reservations，再原子替换 binding，最后只在旧值最后一个 logical alias
+  消失时释放旧 reservation；self-assignment 不创建 semantic copy；
+- scope exit、function-frame unwind、temporary discard、binding replacement、run success/failure/cancel cleanup 都在最后
+  logical alias 不再可达的点释放一次；nested alias 只延长其已有 reservation 的 lifetime，不重复 charge。
+
+所有 literal、slice、concat、`APPEND` 和 string copy 都先 checked 计算 result length、`array_cells`/`string_bytes`、
+`delta` 及 `live + delta`，在任何 allocation/copy 前原子 reserve。reservation 失败时不 allocation、不复制、不改 binding；
+reservation 后的 allocation/copy/fault failure 必须撤销该 expression 新取得的全部 reservations，并保持原数组、binding、
+temporaries 和 ledger 可观察状态不变。concat/`APPEND` 的 result 计算和 replacement 因此会在提交前同时计入仍 live 的
+source 与新 result，这是规范峰值，不允许先释放 source 来规避上限。
+
+`array_cells` 的 N/N+1 证据按单个结果的 direct cell length 计；`live_logical_heap_bytes` 的 N/N+1 证据按上述 canonical
+ledger 在同一 semantic checkpoint 计。恰好 `limit` 可在其他条件满足时成功，`limit + 1` 必须在 allocation/copy 前以
+稳定 limit code 失败并证明 rollback；测试、runner telemetry 与 ProgramHash profile 全部使用这一口径，不得用 capacity、
+RSS 或 allocator-reported bytes 替代。
 
 Phase 4 最终 source freeze 的必要证据包括：逐层 instrumentation 得到 source/token/AST/bound/lowered/instruction/
 diagnostic/symbol、call/string/array/logical-heap/output maxima；每个 limit 的 N 与 N+1；charge-before-copy/allocation 与
@@ -311,8 +396,8 @@ rollback fault injection；在 pinned Required runner 上记录 dense/adversaria
 ## Legacy provenance 与 fixture 分类
 
 S0 必须把最小、可审计 fixture 自包含地收进 SDK。每项 manifest 记录 provenance class、legacy
-`EasyCon@11c4b992b9bce0ff977e9c587a6c0bb0d302853e`、仓库内相对 path、输入/expected 的 SHA-256 和修订理由；
-CI 只读 SDK fixture，绝不读取 ignored `EasyCon/`。
+`EasyCon@11c4b992b9bce0ff977e9c587a6c0bb0d302853e`、仓库内相对 path、input/legacy-observed/v1-expected 的
+SHA-256 和修订理由；CI 只读 SDK fixture，绝不读取 ignored `EasyCon/`。
 
 三类 provenance 不得混用：
 
@@ -321,6 +406,44 @@ CI 只读 SDK fixture，绝不读取 ignored `EasyCon/`。
 | Legacy Exact | `\` 为 double quotient 后 midpoint-away-from-zero 的整数商（如 `5\2=3`、`-5\2=-3`）；`^` 为 integer XOR；`and/or` short-circuit；普通 i32 wrap/shift；IMPORT bind NOP、无 IMPORT 仍加载 bundle libs、shared lib scope、lib/main visibility 与 lib globals 先执行；可达的 array/string/control-flow 成功路径 |
 | Corrected | `FOR i32::MAX` stop-after-upper；可执行 TRUE/FALSE；libs raw-UTF-8 排序；LF/CRLF/CR；typed diagnostic/failure 取代 host panic；UTF-8 byte span 与 Unicode-scalar string；PRINT continuation、label floor；effect 前后 cancellation 与五路 cleanup settled-before-terminal |
 | v1-native | SourceBundle/restricted loader、BOM 与 ProgramHash、PCG/replay、monotonic TIME/absolute WAIT、EcsLimits、immutable Program/RunCompletion、typed ports/RecordingPorts、generic error projection、Runtime five-way terminal race |
+
+Corrected provenance 不能只引用 evaluator test mock。S0 必须为下表每一行创建独立、SDK-local、自包含的 manifest
+record 与 input/legacy-observed/v1-expected artifacts；相同 observed value 也不能合并 production oracle。Q0 必须逐行建立
+v1 executable assertion。这里仅冻结未来 fixture 合同，不在 G0b proposal/rework 中创建 fixture：
+
+| Fixture obligation | Oracle kind | `EasyCon@11c4b992b9bce0ff977e9c587a6c0bb0d302853e` legacy path/symbol | 必须保留的冲突与 v1 expected |
+| --- | --- | --- | --- |
+| `corrected.print.cli` | Production CLI | `src/EasyCon.Script/Binding/BuiltinCallable.cs::ImplPrint`；`src/EasyCon2.CLI/ConsoleOutAdapter.cs::Print` | legacy 把 bool 当作写入前换行并加入 timestamp/ANSI；保留其 token trace，v1 为下述四个 `PrintFragment` |
+| `corrected.print.winforms` | Production WinForms | `src/EasyCon.Script/Binding/BuiltinCallable.cs::ImplPrint`；`src/EasyCon2/App/EasyConForm.cs::Print`；`src/EasyCon2/Controls/RichLogBox.cs::Print` | legacy 把 bool 当作写入前 `Environment.NewLine` 并加入 timestamp；保留 UI queue token trace，v1 为同一四个 fragments |
+| `corrected.print.avalonia` | Production Avalonia | `src/EasyCon.Script/Binding/BuiltinCallable.cs::ImplPrint`；`src/EasyCon2.Avalonia/Services/LogService.cs::Print`；`src/EasyCon2.Avalonia.Core/Services/LogService.cs::Print` | legacy 把 bool 当作 payload 后 LF 并在 true 分支加入 timestamp；两个 production implementation 都须保留，v1 为同一四个 fragments |
+| `corrected.print.test-mock` | Test oracle，非 production | `test/EasyCon.Tests/EvaluatorTests.cs::MockOutputAdapter.Print` | 单独记录 legacy mock 的 trailing-LF list；不得用它替代或证明任一 production row，v1 expected 仍是同一 fragments |
+| `corrected.label.cli` | Production CLI | `src/EasyCon.Capture/ImgLabel.cs::Search`；`src/EasyCon2.CLI/Program.cs` external getter | legacy `md *= 100` 后 `(int)md` truncation；canonical normalized score `0.4225` observed 42，v1 `floor(clamp(score,0,1)*100)` 为 42 |
+| `corrected.label.avalonia` | Production Avalonia | `src/EasyCon.Capture/ImgLabel.cs::Search`；`src/EasyCon2.Avalonia/Services/ScriptService.cs` external getter | legacy `md *= 100` 后 `(int)md` truncation；同一 canonical input observed 42，v1 expected 42；仍与 CLI 分开留证 |
+| `corrected.label.winforms` | Production WinForms | `src/EasyCon.Capture/ImgLabel.cs::Search`；`src/EasyCon2/Services/CaptureService.cs::BuildExternalGetters` | legacy `md *= 100` 后 `Math.Ceiling(md)` observed 43；同一 canonical input 的 v1 expected 为 42 |
+
+PRINT canonical probe 是 UTF-8、无 BOM、LF 分隔且末尾有 LF 的以下 exact source；legacy capture 必须保留四次 adapter
+调用及 frontend rendering token，不得通过删除 timestamp/newline 差异把三个 production oracle 归一成同一 observed：
+
+```ecs
+PRINT "A\"
+PRINT "B\"
+PRINT "C"
+PRINT "D"
+```
+
+v1 expected 是 exact ordered trace
+`[("A", true), ("B", false), ("C", false), ("D", true)]`，其中 tuple 对应
+`PrintFragment { text, starts_new_line }`，不含 timestamp、ANSI 或 host newline。动态 timestamp 必须在 legacy observed
+artifact 中编码为明确的 `Timestamp` token；ANSI、LF、`Environment.NewLine`、payload 与 UI enqueue 必须使用有类型 token，
+normalization schema/version 写入 manifest，不能把 token 丢掉后只 hash 拼接文本。
+
+每个 record 至少固定：`provenance_class=Corrected`、稳定 fixture ID、`oracle_kind`、完整 legacy commit、上述每个
+legacy repo-relative path 与 symbol、SDK-local exact input path + lowercase SHA-256、SDK-local legacy observed path +
+lowercase SHA-256、SDK-local v1 expected path + lowercase SHA-256、capture/normalization schema version，以及逐项
+`revision_reason`。label record 的 input 必须明确区分 normalized `0.0..1.0` score 与 legacy `md *= 100` 后的值；PRINT
+record 的 observed hash 必须覆盖 ordered typed tokens。S0 的 static validator 验证 schema、路径、hash、obligation 完整性、
+duplicate/unknown-field/tamper fail-closed；Q0 只从 SDK-local artifacts 建立 executable assertions。两者都不得读取、构建或
+运行 ignored `EasyCon/`，legacy commit/path 只是不可变 provenance metadata。
 
 Exact fixture 同时保存 legacy observed 与 v1 expected；Corrected fixture 同时保存旧观察、v1 expected 和修订理由；
 v1-native 只验证本 ADR 合同，不伪称 differential legacy evidence。Python/Lua/FFI、bytecode/firmware、selective
@@ -331,7 +454,7 @@ IMPORT/AS、FOR STEP 语义、float/hex/exponent、STRUCT/FOR-IN、dynamic label
 治理与实现 DAG 固定为：
 
 ```text
-G0b proposal (本提交)
+G0b fixed-SHA proposal (含 REWORK 修订)
   -> independent design review，P0/P1/P2 清零
   -> separate G0b target acceptance/freeze
        -> R0: ADR-0007 narrow reopen -> RED/models -> minimal terminal API
@@ -398,13 +521,16 @@ Q0/Q1 运行当前完整 repository gates 和全部已落盘 Phase 4 gates。若
 ADR 的完整门禁并接受新的独立 review；纯 Phase 4 docs/code 不把 hardware/COM 或尚不存在的 coverage/fuzz 命令伪称为
 现有证据。
 
-## 本 proposal 的验证边界
+## Proposal chain 的验证边界
 
-本提交只允许新增本 ADR 并更新两处索引。它不修改 code、Cargo、workflow、Ruleset、fixture、support matrix 或
-architecture/source map，不运行 hardware/COM，也不执行 R0/W0/S0/D0。本 proposal 仅运行 AGENTS.md 要求的
-docs-only links、repository guards 与 diff checks。提交前实测结果为：Markdown links Passed，239 references / 44
-files；repository guards Passed；working/new-file diff checks Passed。结果同时由提交后的 Git 对象与外部结构化
-`TASK_REPORT` 固定。本次没有运行 Rust、Loom、spec、native、coverage 或 fuzz，不能把未来 gate 描述成当前已通过。
+初始 proposal `6468da5` 只新增本 ADR 并更新两处索引；其提交前实测结果为 Markdown links Passed（239
+references / 44 files）、repository guards Passed、working/new-file diff checks Passed。本次 REWORK 仍只允许修改本
+ADR 与同两处索引，用于关闭固定 review 的五项 finding；不修改 code、Cargo、workflow、Ruleset、fixture、support
+matrix 或 architecture/source map，不运行 hardware/COM，也不执行 R0/W0/S0/D0。
+
+REWORK 修订只运行 AGENTS.md 要求的 docs-only links、repository guards 与 diff checks，精确结果由修订后的 Git
+对象和外部结构化 `TASK_REPORT` 固定。proposal chain 没有运行 Rust、Loom、spec、native、coverage 或 fuzz，不能把
+未来 gate 描述成当前已通过，也不能把 docs-only 通过描述为 design acceptance。
 
 ## 关联
 
