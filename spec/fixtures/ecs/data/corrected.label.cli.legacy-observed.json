@@ -1,0 +1,8 @@
+{
+  "schema": "easycon-sdk:legacy-label-projection:v1",
+  "schema_version": 1,
+  "fixture_id": "corrected.label.cli",
+  "legacy_scaled_score": 42.25,
+  "conversion": "truncate-toward-zero",
+  "observed_integer": 42
+}

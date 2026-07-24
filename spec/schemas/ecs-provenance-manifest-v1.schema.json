@@ -1,0 +1,237 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://easycon.invalid/schemas/ecs-provenance-manifest-v1.schema.json",
+  "title": "EasyCon Phase 4 S0 provenance manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "milestone",
+    "license",
+    "legacy_reference_commit",
+    "classification_contracts",
+    "program_hash_profile",
+    "legacy_source_catalog",
+    "records"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "milestone": { "const": "phase-4-s0-provenance-fixtures" },
+    "license": { "const": "GPL-3.0-only" },
+    "legacy_reference_commit": {
+      "const": "11c4b992b9bce0ff977e9c587a6c0bb0d302853e"
+    },
+    "classification_contracts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["Legacy Exact", "Corrected", "v1-native"],
+      "properties": {
+        "Legacy Exact": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string" }
+        },
+        "Corrected": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string" }
+        },
+        "v1-native": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "program_hash_profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "bytes", "sha256"],
+      "properties": {
+        "path": { "type": "string" },
+        "bytes": { "type": "integer", "minimum": 1, "maximum": 1048576 },
+        "sha256": { "type": "string" }
+      }
+    },
+    "legacy_source_catalog": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "bytes", "sha256"],
+      "properties": {
+        "path": { "type": "string" },
+        "bytes": { "type": "integer", "minimum": 1, "maximum": 1048576 },
+        "sha256": { "type": "string" }
+      }
+    },
+    "records": {
+      "type": "array",
+      "minItems": 11,
+      "maxItems": 11,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "fixture_id",
+          "provenance_class",
+          "oracle_kind",
+          "capture_schema",
+          "capture_schema_version",
+          "normalization_schema",
+          "normalization_schema_version",
+          "input",
+          "v1_expected",
+          "covered_contracts",
+          "revision_reason"
+        ],
+        "properties": {
+          "fixture_id": { "type": "string" },
+          "provenance_class": {
+            "enum": ["Legacy Exact", "Corrected", "v1-native"]
+          },
+          "oracle_kind": {
+            "enum": [
+              "production-source",
+              "production-cli",
+              "production-winforms",
+              "production-winforms-lite",
+              "production-avalonia",
+              "test-oracle",
+              "adr-v1-contract"
+            ]
+          },
+          "legacy_commit": {
+            "const": "11c4b992b9bce0ff977e9c587a6c0bb0d302853e"
+          },
+          "legacy_sources": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "repo_relative_path",
+                "symbols",
+                "source_blob_bytes",
+                "source_blob_sha256",
+                "git_blob_sha1",
+                "snapshot_ids"
+              ],
+              "properties": {
+                "repo_relative_path": { "type": "string" },
+                "symbols": {
+                  "type": "array",
+                  "minItems": 1,
+                  "uniqueItems": true,
+                  "items": { "type": "string" }
+                },
+                "source_blob_bytes": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 1048576
+                },
+                "source_blob_sha256": { "type": "string" },
+                "git_blob_sha1": { "type": "string" },
+                "snapshot_ids": {
+                  "type": "array",
+                  "minItems": 1,
+                  "uniqueItems": true,
+                  "items": { "type": "string" }
+                }
+              }
+            }
+          },
+          "contract_source": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "section"],
+            "properties": {
+              "path": {
+                "const": "docs/decisions/0017-phase-4-ecs-automation-target.md"
+              },
+              "section": { "const": "v1 live logical heap ledger" }
+            }
+          },
+          "source_identity": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["role", "source_id"],
+            "properties": {
+              "role": { "const": "Main" },
+              "source_id": { "const": "main.ecs" }
+            }
+          },
+          "program_hash_v1": { "type": "string" },
+          "program_hash_profile": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "bytes", "sha256"],
+            "properties": {
+              "path": { "type": "string" },
+              "bytes": { "type": "integer", "minimum": 1, "maximum": 1048576 },
+              "sha256": { "type": "string" }
+            }
+          },
+          "capture_schema": {
+            "enum": [
+              "easycon-sdk:legacy-evaluation-source:v1",
+              "easycon-sdk:legacy-print-token-trace:v1",
+              "easycon-sdk:legacy-label-projection:v1",
+              "easycon-sdk:ecs-heap-ledger:v1"
+            ]
+          },
+          "capture_schema_version": { "const": 1 },
+          "normalization_schema": {
+            "enum": [
+              "easycon-sdk:ecs-value-trace:v1",
+              "easycon-sdk:print-fragments:v1",
+              "easycon-sdk:label-floor:v1",
+              "easycon-sdk:ecs-heap-ledger:v1"
+            ]
+          },
+          "normalization_schema_version": { "const": 1 },
+          "input": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "bytes", "sha256"],
+            "properties": {
+              "path": { "type": "string" },
+              "bytes": { "type": "integer", "minimum": 1, "maximum": 1048576 },
+              "sha256": { "type": "string" }
+            }
+          },
+          "legacy_observed": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "bytes", "sha256"],
+            "properties": {
+              "path": { "type": "string" },
+              "bytes": { "type": "integer", "minimum": 1, "maximum": 1048576 },
+              "sha256": { "type": "string" }
+            }
+          },
+          "v1_expected": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "bytes", "sha256"],
+            "properties": {
+              "path": { "type": "string" },
+              "bytes": { "type": "integer", "minimum": 1, "maximum": 1048576 },
+              "sha256": { "type": "string" }
+            }
+          },
+          "covered_contracts": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": { "type": "string" }
+          },
+          "expected_outcome": { "enum": ["success", "limit-failure"] },
+          "revision_reason": { "type": "string" }
+        }
+      }
+    }
+  }
+}

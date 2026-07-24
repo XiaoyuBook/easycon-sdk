@@ -1,0 +1,152 @@
+{
+  "schema": "easycon-sdk:legacy-print-token-trace:v1",
+  "schema_version": 1,
+  "fixture_id": "corrected.print.cli",
+  "implementations": [
+    {
+      "implementation": "src/EasyCon2.CLI/ConsoleOutAdapter.cs::ConsoleOutAdapter.Print",
+      "adapter_calls": [
+        {
+          "ordinal": 1,
+          "message": "A",
+          "newline": true,
+          "emissions": [
+            {
+              "transport": "Console.Write",
+              "tokens": [
+                {
+                  "kind": "Ansi",
+                  "value": "\u001b[90m"
+                },
+                {
+                  "kind": "Timestamp",
+                  "value": "[HH:mm:ss.fff] "
+                },
+                {
+                  "kind": "Ansi",
+                  "value": "\u001b[0m"
+                }
+              ]
+            },
+            {
+              "transport": "Console.Write",
+              "tokens": [
+                {
+                  "kind": "Ansi",
+                  "value": "\u001b[0m"
+                },
+                {
+                  "kind": "Payload",
+                  "value": "A"
+                },
+                {
+                  "kind": "Ansi",
+                  "value": "\u001b[0m"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "ordinal": 2,
+          "message": "B",
+          "newline": false,
+          "emissions": [
+            {
+              "transport": "Console.Write",
+              "tokens": [
+                {
+                  "kind": "Ansi",
+                  "value": "\u001b[0m"
+                },
+                {
+                  "kind": "Payload",
+                  "value": "B"
+                },
+                {
+                  "kind": "Ansi",
+                  "value": "\u001b[0m"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "ordinal": 3,
+          "message": "C",
+          "newline": false,
+          "emissions": [
+            {
+              "transport": "Console.Write",
+              "tokens": [
+                {
+                  "kind": "Ansi",
+                  "value": "\u001b[0m"
+                },
+                {
+                  "kind": "Payload",
+                  "value": "C"
+                },
+                {
+                  "kind": "Ansi",
+                  "value": "\u001b[0m"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "ordinal": 4,
+          "message": "D",
+          "newline": true,
+          "emissions": [
+            {
+              "transport": "Console.WriteLine",
+              "tokens": [
+                {
+                  "kind": "HostNewLine",
+                  "value": "platform-newline"
+                }
+              ]
+            },
+            {
+              "transport": "Console.Write",
+              "tokens": [
+                {
+                  "kind": "Ansi",
+                  "value": "\u001b[90m"
+                },
+                {
+                  "kind": "Timestamp",
+                  "value": "[HH:mm:ss.fff] "
+                },
+                {
+                  "kind": "Ansi",
+                  "value": "\u001b[0m"
+                }
+              ]
+            },
+            {
+              "transport": "Console.Write",
+              "tokens": [
+                {
+                  "kind": "Ansi",
+                  "value": "\u001b[0m"
+                },
+                {
+                  "kind": "Payload",
+                  "value": "D"
+                },
+                {
+                  "kind": "Ansi",
+                  "value": "\u001b[0m"
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "flush": []
+    }
+  ]
+}

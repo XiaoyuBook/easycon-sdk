@@ -1,0 +1,61 @@
+{
+  "schema": "easycon-sdk:ecs-heap-ledger:v1",
+  "schema_version": 1,
+  "fixture_id": "v1-native.heap-order.left-medium",
+  "limit": 33554432,
+  "baseline": {
+    "distinct_string_allocations": 132,
+    "string_bytes_each": 251000,
+    "string_bytes_total": 33132000,
+    "array_direct_cells": 132,
+    "array_direct_cell_bytes": 1056,
+    "live_bytes": 33133056
+  },
+  "source_order": [
+    "LEFT($template)",
+    "MEDIUM($template)"
+  ],
+  "checkpoints": [
+    {
+      "id": "baseline",
+      "live_bytes": 33133056,
+      "decision": "continue"
+    },
+    {
+      "id": "left-full-copy",
+      "live_bytes": 33384056,
+      "decision": "continue"
+    },
+    {
+      "id": "left-one-byte-slice",
+      "live_bytes": 33384057,
+      "decision": "continue"
+    },
+    {
+      "id": "left-full-release",
+      "live_bytes": 33133057,
+      "decision": "continue"
+    },
+    {
+      "id": "medium-copy",
+      "live_bytes": 33333057,
+      "decision": "continue"
+    },
+    {
+      "id": "concat-reserve",
+      "live_bytes": 33533058,
+      "decision": "continue"
+    }
+  ],
+  "canonical_peak": 33533058,
+  "outcome": {
+    "kind": "success",
+    "result_utf8_bytes": 200001
+  },
+  "counterfactual_right_first": {
+    "classification": "forbidden-negative-oracle",
+    "medium_live_bytes": 33333056,
+    "left_full_reserve_attempt_bytes": 33584056,
+    "decision": "reject-live-logical-heap-limit"
+  }
+}

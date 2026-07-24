@@ -1,0 +1,8 @@
+{
+  "schema": "easycon-sdk:label-floor:v1",
+  "schema_version": 1,
+  "fixture_id": "corrected.label.cli",
+  "normalized_score": 0.4225,
+  "formula": "floor(clamp(score, 0, 1) * 100)",
+  "expected_integer": 42
+}

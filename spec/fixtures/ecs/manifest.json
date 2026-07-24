@@ -1,0 +1,759 @@
+{
+  "schema_version": 1,
+  "milestone": "phase-4-s0-provenance-fixtures",
+  "license": "GPL-3.0-only",
+  "legacy_reference_commit": "11c4b992b9bce0ff977e9c587a6c0bb0d302853e",
+  "classification_contracts": {
+    "Legacy Exact": [
+      "round-div-midpoint-away-from-zero",
+      "integer-xor",
+      "logical-and-or-short-circuit",
+      "ordinary-i32-wrap-and-shift",
+      "import-bind-nop",
+      "bundle-libs-loaded-without-import",
+      "shared-lib-scope",
+      "lib-main-visibility-and-lib-globals-first",
+      "reachable-array-string-control-flow-success"
+    ],
+    "Corrected": [
+      "for-i32-max-stop-after-upper",
+      "boolean-literals-executable",
+      "libs-raw-utf8-sort",
+      "lf-crlf-cr-newline",
+      "typed-diagnostic-failure",
+      "utf8-byte-span-and-unicode-scalar-string",
+      "print-continuation",
+      "label-floor",
+      "effect-checkpoints-and-five-way-cleanup-before-terminal"
+    ],
+    "v1-native": [
+      "source-bundle-and-restricted-loader",
+      "bom-and-program-hash",
+      "pcg-and-replay",
+      "monotonic-time-and-absolute-wait",
+      "ecs-limits",
+      "immutable-program-and-run-completion",
+      "typed-and-recording-ports",
+      "generic-error-projection",
+      "runtime-five-way-terminal-race"
+    ]
+  },
+  "program_hash_profile": {
+    "path": "data/v1-profile.json",
+    "bytes": 3231,
+    "sha256": "e979b30f665e6b204711d3236fbfd56e8cf529200db3da7a9719b9b1ee24071c"
+  },
+  "legacy_source_catalog": {
+    "path": "data/legacy-source-snapshots-v1.json",
+    "bytes": 24614,
+    "sha256": "f4548107d6d2186d64868e0899629895457d627133d297e57481b8d7ad4eb199"
+  },
+  "records": [
+    {
+      "fixture_id": "legacy-exact.integer-operators",
+      "provenance_class": "Legacy Exact",
+      "oracle_kind": "production-source",
+      "legacy_commit": "11c4b992b9bce0ff977e9c587a6c0bb0d302853e",
+      "legacy_sources": [
+        {
+          "repo_relative_path": "src/EasyCon.Script/Binding/BoundBinaryOperator.cs",
+          "symbols": [
+            "BoundBinaryOperator._operators"
+          ],
+          "source_blob_bytes": 6069,
+          "source_blob_sha256": "6ab58cc6c9444cd6ab11d0718a4a5439ee14fa9c203ee492dda031e3d2c7e3b6",
+          "git_blob_sha1": "db324120720288a8f2c7cd0e3f3a3b82bfb43860",
+          "snapshot_ids": [
+            "exact-round-div",
+            "exact-xor",
+            "exact-logical-operators"
+          ]
+        },
+        {
+          "repo_relative_path": "src/EasyCon.Script/Evaluator.cs",
+          "symbols": [
+            "Evaluator.EvaluateBinaryExpression"
+          ],
+          "source_blob_bytes": 13442,
+          "source_blob_sha256": "5a4303a911edb352de3547db338dc54388ecd2cd83f8b68837df7f8f26c88639",
+          "git_blob_sha1": "bd56ff85168fe2ba1019478b96949e436a1fb1ab",
+          "snapshot_ids": [
+            "exact-short-circuit"
+          ]
+        }
+      ],
+      "source_identity": {
+        "role": "Main",
+        "source_id": "main.ecs"
+      },
+      "program_hash_v1": "d9106739fd6e1f664fc9807a4b2549d83362350e4626a15c9e0f48a0a241678b",
+      "program_hash_profile": {
+        "path": "data/v1-profile.json",
+        "bytes": 3231,
+        "sha256": "e979b30f665e6b204711d3236fbfd56e8cf529200db3da7a9719b9b1ee24071c"
+      },
+      "capture_schema": "easycon-sdk:legacy-evaluation-source:v1",
+      "capture_schema_version": 1,
+      "normalization_schema": "easycon-sdk:ecs-value-trace:v1",
+      "normalization_schema_version": 1,
+      "input": {
+        "path": "data/legacy-exact.integer-operators.input.ecs",
+        "bytes": 136,
+        "sha256": "5d8276eab558b32820d8616027bf194667bca4c19ac62f9f1b40036a359c4263"
+      },
+      "legacy_observed": {
+        "path": "data/legacy-exact.integer-operators.legacy-observed.json",
+        "bytes": 244,
+        "sha256": "31d9ca6ffba59ddefc723f80457e9781a217fd91380f9841a5fd7c5fe7d4b16c"
+      },
+      "v1_expected": {
+        "path": "data/legacy-exact.integer-operators.v1-expected.json",
+        "bytes": 280,
+        "sha256": "c8b677c705761fd860ae091560ce96be333016e87827f2b9a0f17dc1f9c2f9d3"
+      },
+      "covered_contracts": [
+        "round-div-midpoint-away-from-zero",
+        "integer-xor",
+        "logical-and-or-short-circuit"
+      ],
+      "revision_reason": "No correction: v1 preserves the fixed production integer and short-circuit semantics."
+    },
+    {
+      "fixture_id": "corrected.print.cli",
+      "provenance_class": "Corrected",
+      "oracle_kind": "production-cli",
+      "legacy_commit": "11c4b992b9bce0ff977e9c587a6c0bb0d302853e",
+      "legacy_sources": [
+        {
+          "repo_relative_path": "src/EasyCon.Script/Binding/BuiltinCallable.cs",
+          "symbols": [
+            "BuiltinCallable.ImplPrint"
+          ],
+          "source_blob_bytes": 3863,
+          "source_blob_sha256": "7f71eecb43e559d5158df9892419e4c7fbf71f67e3bd8eba8d83274a27a140b3",
+          "git_blob_sha1": "3184191c2f95ff30becd55ffb4700b98ebf423e7",
+          "snapshot_ids": [
+            "builtin-print"
+          ]
+        },
+        {
+          "repo_relative_path": "src/EasyCon2.CLI/ConsoleOutAdapter.cs",
+          "symbols": [
+            "ConsoleOutAdapter.Print",
+            "ColorfulConsole.Write",
+            "AnsiColors.Reset",
+            "AnsiColors.White",
+            "AnsiColors.Gray"
+          ],
+          "source_blob_bytes": 2795,
+          "source_blob_sha256": "b664e380a5da45483c02267a0255f53ca786a86e6585426ffa9e1c59a59c2980",
+          "git_blob_sha1": "39087e9093bf596f1a3c1d44dc340dca48b20dd6",
+          "snapshot_ids": [
+            "cli-print-state",
+            "cli-print-render",
+            "cli-color-write",
+            "cli-gray"
+          ]
+        }
+      ],
+      "source_identity": {
+        "role": "Main",
+        "source_id": "main.ecs"
+      },
+      "program_hash_v1": "bb9121e382ac1bb02bb4b1ca6f3e826c7a59defd3358e1b67bd6061ac5de80d8",
+      "program_hash_profile": {
+        "path": "data/v1-profile.json",
+        "bytes": 3231,
+        "sha256": "e979b30f665e6b204711d3236fbfd56e8cf529200db3da7a9719b9b1ee24071c"
+      },
+      "capture_schema": "easycon-sdk:legacy-print-token-trace:v1",
+      "capture_schema_version": 1,
+      "normalization_schema": "easycon-sdk:print-fragments:v1",
+      "normalization_schema_version": 1,
+      "input": {
+        "path": "data/corrected.print.cli.input.ecs",
+        "bytes": 42,
+        "sha256": "f7162011fb86fdd1dc9f673a8d7f7dbbc2ce955e8ca4f9b1a1ab8318d306995a"
+      },
+      "legacy_observed": {
+        "path": "data/corrected.print.cli.legacy-observed.json",
+        "bytes": 3749,
+        "sha256": "870ee4a63ceded53ce027ca81b9582bda589babcb91ba2f616e5e64e3478c343"
+      },
+      "v1_expected": {
+        "path": "data/corrected.print.cli.v1-expected.json",
+        "bytes": 382,
+        "sha256": "8a0e800b482408773d5a6037f29656a72d477ec59c6ec91f137541fc3123a636"
+      },
+      "covered_contracts": [
+        "print-continuation"
+      ],
+      "revision_reason": "Legacy CLI interprets the boolean as a pre-write line boundary and emits timestamp and ANSI tokens; v1 exposes four timestamp-free typed fragments."
+    },
+    {
+      "fixture_id": "corrected.print.winforms",
+      "provenance_class": "Corrected",
+      "oracle_kind": "production-winforms",
+      "legacy_commit": "11c4b992b9bce0ff977e9c587a6c0bb0d302853e",
+      "legacy_sources": [
+        {
+          "repo_relative_path": "src/EasyCon.Script/Binding/BuiltinCallable.cs",
+          "symbols": [
+            "BuiltinCallable.ImplPrint"
+          ],
+          "source_blob_bytes": 3863,
+          "source_blob_sha256": "7f71eecb43e559d5158df9892419e4c7fbf71f67e3bd8eba8d83274a27a140b3",
+          "git_blob_sha1": "3184191c2f95ff30becd55ffb4700b98ebf423e7",
+          "snapshot_ids": [
+            "builtin-print"
+          ]
+        },
+        {
+          "repo_relative_path": "src/EasyCon2/App/EasyConForm.cs",
+          "symbols": [
+            "EasyConForm.Print"
+          ],
+          "source_blob_bytes": 48149,
+          "source_blob_sha256": "b809f9a0f7094be5ce7b4f52c398eb66a35ce99c058da63871e632ebc194f477",
+          "git_blob_sha1": "abf5b3ca6100dd8bb889f522ade32563f9a17707",
+          "snapshot_ids": [
+            "easyconform-print"
+          ]
+        },
+        {
+          "repo_relative_path": "src/EasyCon2/Controls/RichLogBox.cs",
+          "symbols": [
+            "RichLogBox.Print"
+          ],
+          "source_blob_bytes": 3110,
+          "source_blob_sha256": "5e4a4c9f332cbb420824a46d49a54547ddd9ed41fb9b7fa3b82c346f737517e2",
+          "git_blob_sha1": "1a3868b805e38428dc894b06d14c252fc4a44b05",
+          "snapshot_ids": [
+            "richlog-state",
+            "richlog-print"
+          ]
+        }
+      ],
+      "source_identity": {
+        "role": "Main",
+        "source_id": "main.ecs"
+      },
+      "program_hash_v1": "bb9121e382ac1bb02bb4b1ca6f3e826c7a59defd3358e1b67bd6061ac5de80d8",
+      "program_hash_profile": {
+        "path": "data/v1-profile.json",
+        "bytes": 3231,
+        "sha256": "e979b30f665e6b204711d3236fbfd56e8cf529200db3da7a9719b9b1ee24071c"
+      },
+      "capture_schema": "easycon-sdk:legacy-print-token-trace:v1",
+      "capture_schema_version": 1,
+      "normalization_schema": "easycon-sdk:print-fragments:v1",
+      "normalization_schema_version": 1,
+      "input": {
+        "path": "data/corrected.print.winforms.input.ecs",
+        "bytes": 42,
+        "sha256": "f7162011fb86fdd1dc9f673a8d7f7dbbc2ce955e8ca4f9b1a1ab8318d306995a"
+      },
+      "legacy_observed": {
+        "path": "data/corrected.print.winforms.legacy-observed.json",
+        "bytes": 3350,
+        "sha256": "e981b9cf3f1c89774d9f66cfef1a6ff9d6e569fb4d043d20afc69a0bcdc9b112"
+      },
+      "v1_expected": {
+        "path": "data/corrected.print.winforms.v1-expected.json",
+        "bytes": 387,
+        "sha256": "47c6bd6182d132fe1cd14e833c7acb4b2bc48ad1fab95e9595e1cc80e9fbd313"
+      },
+      "covered_contracts": [
+        "print-continuation"
+      ],
+      "revision_reason": "Legacy WinForms interprets the boolean as pre-write Environment.NewLine, timestamp, and UI queue emissions; v1 exposes the frozen typed fragments."
+    },
+    {
+      "fixture_id": "corrected.print.winforms-lite",
+      "provenance_class": "Corrected",
+      "oracle_kind": "production-winforms-lite",
+      "legacy_commit": "11c4b992b9bce0ff977e9c587a6c0bb0d302853e",
+      "legacy_sources": [
+        {
+          "repo_relative_path": "src/EasyCon.Script/Binding/BuiltinCallable.cs",
+          "symbols": [
+            "BuiltinCallable.ImplPrint"
+          ],
+          "source_blob_bytes": 3863,
+          "source_blob_sha256": "7f71eecb43e559d5158df9892419e4c7fbf71f67e3bd8eba8d83274a27a140b3",
+          "git_blob_sha1": "3184191c2f95ff30becd55ffb4700b98ebf423e7",
+          "snapshot_ids": [
+            "builtin-print"
+          ]
+        },
+        {
+          "repo_relative_path": "src/EasyCon2/Program.cs",
+          "symbols": [
+            "Program.Main"
+          ],
+          "source_blob_bytes": 1862,
+          "source_blob_sha256": "9acd391ffd8437fb2e673bd1f795727f2f4b443049f7d8e95d114d4bf8a2bb41",
+          "git_blob_sha1": "db97fd22153503605a199dd9f486e85364916976",
+          "snapshot_ids": [
+            "program-main",
+            "program-lite-branch"
+          ]
+        },
+        {
+          "repo_relative_path": "src/EasyCon2/App/MainForm.cs",
+          "symbols": [
+            "MainForm.runStopBtn_Click",
+            "MainForm.Print"
+          ],
+          "source_blob_bytes": 38588,
+          "source_blob_sha256": "3598e6fe51402605ea96a68f9d2f94eb7e72404ec8924bdd06479abf20a92956",
+          "git_blob_sha1": "8eb46cdadda3bba8541d75f0cc0aa1adfc5ac0a5",
+          "snapshot_ids": [
+            "mainform-run-entry",
+            "mainform-run-adapter",
+            "mainform-print"
+          ]
+        },
+        {
+          "repo_relative_path": "src/EasyCon2/Controls/RichLogBox.cs",
+          "symbols": [
+            "RichLogBox.Print"
+          ],
+          "source_blob_bytes": 3110,
+          "source_blob_sha256": "5e4a4c9f332cbb420824a46d49a54547ddd9ed41fb9b7fa3b82c346f737517e2",
+          "git_blob_sha1": "1a3868b805e38428dc894b06d14c252fc4a44b05",
+          "snapshot_ids": [
+            "richlog-state",
+            "richlog-print"
+          ]
+        }
+      ],
+      "source_identity": {
+        "role": "Main",
+        "source_id": "main.ecs"
+      },
+      "program_hash_v1": "bb9121e382ac1bb02bb4b1ca6f3e826c7a59defd3358e1b67bd6061ac5de80d8",
+      "program_hash_profile": {
+        "path": "data/v1-profile.json",
+        "bytes": 3231,
+        "sha256": "e979b30f665e6b204711d3236fbfd56e8cf529200db3da7a9719b9b1ee24071c"
+      },
+      "capture_schema": "easycon-sdk:legacy-print-token-trace:v1",
+      "capture_schema_version": 1,
+      "normalization_schema": "easycon-sdk:print-fragments:v1",
+      "normalization_schema_version": 1,
+      "input": {
+        "path": "data/corrected.print.winforms-lite.input.ecs",
+        "bytes": 42,
+        "sha256": "f7162011fb86fdd1dc9f673a8d7f7dbbc2ce955e8ca4f9b1a1ab8318d306995a"
+      },
+      "legacy_observed": {
+        "path": "data/corrected.print.winforms-lite.legacy-observed.json",
+        "bytes": 3349,
+        "sha256": "abff3fe2fa2b431cb61a520d7c1b7b09318de42a830d8d7cdeffc626a4c7bd4d"
+      },
+      "v1_expected": {
+        "path": "data/corrected.print.winforms-lite.v1-expected.json",
+        "bytes": 392,
+        "sha256": "ea2c17dac3231b1eba6f8909ba0408937ed21c03920734d80715a171a80a0a83"
+      },
+      "covered_contracts": [
+        "print-continuation"
+      ],
+      "revision_reason": "The *lite entry point selects MainForm, the runner passes MainForm as output, and MainForm delegates to RichLogBox's pre-write Environment.NewLine, timestamp, and UI queue rendering; v1 uses the frozen typed fragments, while this observed artifact remains independent."
+    },
+    {
+      "fixture_id": "corrected.print.avalonia",
+      "provenance_class": "Corrected",
+      "oracle_kind": "production-avalonia",
+      "legacy_commit": "11c4b992b9bce0ff977e9c587a6c0bb0d302853e",
+      "legacy_sources": [
+        {
+          "repo_relative_path": "src/EasyCon.Script/Binding/BuiltinCallable.cs",
+          "symbols": [
+            "BuiltinCallable.ImplPrint"
+          ],
+          "source_blob_bytes": 3863,
+          "source_blob_sha256": "7f71eecb43e559d5158df9892419e4c7fbf71f67e3bd8eba8d83274a27a140b3",
+          "git_blob_sha1": "3184191c2f95ff30becd55ffb4700b98ebf423e7",
+          "snapshot_ids": [
+            "builtin-print"
+          ]
+        },
+        {
+          "repo_relative_path": "src/EasyCon2.Avalonia/Services/LogService.cs",
+          "symbols": [
+            "LogService.Print",
+            "LogService.Append",
+            "LogService.Flush"
+          ],
+          "source_blob_bytes": 1481,
+          "source_blob_sha256": "1e3193c547116acdea951c2954bd400820999f329ef514d0d816cafee05e4c75",
+          "git_blob_sha1": "cd6da28f87aac42fcb48059c7c37213453444280",
+          "snapshot_ids": [
+            "avalonia-print",
+            "avalonia-buffer-flush"
+          ]
+        },
+        {
+          "repo_relative_path": "src/EasyCon2.Avalonia.Core/Services/LogService.cs",
+          "symbols": [
+            "LogService.Print",
+            "LogService.Flush"
+          ],
+          "source_blob_bytes": 1633,
+          "source_blob_sha256": "da7cba3985bc0dc7b4f2aadb3a32946cb69057a1872752a3fa0ac6219975aca4",
+          "git_blob_sha1": "02eb774520641dca116d918568d57dec1f393e04",
+          "snapshot_ids": [
+            "avalonia-core-print",
+            "avalonia-core-flush"
+          ]
+        }
+      ],
+      "source_identity": {
+        "role": "Main",
+        "source_id": "main.ecs"
+      },
+      "program_hash_v1": "bb9121e382ac1bb02bb4b1ca6f3e826c7a59defd3358e1b67bd6061ac5de80d8",
+      "program_hash_profile": {
+        "path": "data/v1-profile.json",
+        "bytes": 3231,
+        "sha256": "e979b30f665e6b204711d3236fbfd56e8cf529200db3da7a9719b9b1ee24071c"
+      },
+      "capture_schema": "easycon-sdk:legacy-print-token-trace:v1",
+      "capture_schema_version": 1,
+      "normalization_schema": "easycon-sdk:print-fragments:v1",
+      "normalization_schema_version": 1,
+      "input": {
+        "path": "data/corrected.print.avalonia.input.ecs",
+        "bytes": 42,
+        "sha256": "f7162011fb86fdd1dc9f673a8d7f7dbbc2ce955e8ca4f9b1a1ab8318d306995a"
+      },
+      "legacy_observed": {
+        "path": "data/corrected.print.avalonia.legacy-observed.json",
+        "bytes": 5562,
+        "sha256": "533d609530fa41957f5c282d099301c5ea8e465344e4936c555621f81c1cec43"
+      },
+      "v1_expected": {
+        "path": "data/corrected.print.avalonia.v1-expected.json",
+        "bytes": 387,
+        "sha256": "f71ce646d35740facb819764f74bcdb4c4e87adda520b14901560aff9218bc71"
+      },
+      "covered_contracts": [
+        "print-continuation"
+      ],
+      "revision_reason": "Both Avalonia production implementations append LF after payload and add a timestamp only on true; v1 removes frontend rendering from typed fragments."
+    },
+    {
+      "fixture_id": "corrected.print.test-mock",
+      "provenance_class": "Corrected",
+      "oracle_kind": "test-oracle",
+      "legacy_commit": "11c4b992b9bce0ff977e9c587a6c0bb0d302853e",
+      "legacy_sources": [
+        {
+          "repo_relative_path": "src/EasyCon.Script/Binding/BuiltinCallable.cs",
+          "symbols": [
+            "BuiltinCallable.ImplPrint"
+          ],
+          "source_blob_bytes": 3863,
+          "source_blob_sha256": "7f71eecb43e559d5158df9892419e4c7fbf71f67e3bd8eba8d83274a27a140b3",
+          "git_blob_sha1": "3184191c2f95ff30becd55ffb4700b98ebf423e7",
+          "snapshot_ids": [
+            "builtin-print"
+          ]
+        },
+        {
+          "repo_relative_path": "test/EasyCon.Tests/EvaluatorTests.cs",
+          "symbols": [
+            "MockOutputAdapter.Print"
+          ],
+          "source_blob_bytes": 5660,
+          "source_blob_sha256": "8520a35e7ee3c6bc20692c6246b55460c97487737eaa687d578bfe19e13e5d76",
+          "git_blob_sha1": "093bd61b1868b98c3ae2b807d7a4feb634fcf55d",
+          "snapshot_ids": [
+            "test-mock"
+          ]
+        }
+      ],
+      "source_identity": {
+        "role": "Main",
+        "source_id": "main.ecs"
+      },
+      "program_hash_v1": "bb9121e382ac1bb02bb4b1ca6f3e826c7a59defd3358e1b67bd6061ac5de80d8",
+      "program_hash_profile": {
+        "path": "data/v1-profile.json",
+        "bytes": 3231,
+        "sha256": "e979b30f665e6b204711d3236fbfd56e8cf529200db3da7a9719b9b1ee24071c"
+      },
+      "capture_schema": "easycon-sdk:legacy-print-token-trace:v1",
+      "capture_schema_version": 1,
+      "normalization_schema": "easycon-sdk:print-fragments:v1",
+      "normalization_schema_version": 1,
+      "input": {
+        "path": "data/corrected.print.test-mock.input.ecs",
+        "bytes": 42,
+        "sha256": "f7162011fb86fdd1dc9f673a8d7f7dbbc2ce955e8ca4f9b1a1ab8318d306995a"
+      },
+      "legacy_observed": {
+        "path": "data/corrected.print.test-mock.legacy-observed.json",
+        "bytes": 1910,
+        "sha256": "de09a8b928f1fb95133d0e3e2fdfa7bfecf22d167dc7b282726f1244ba626ad1"
+      },
+      "v1_expected": {
+        "path": "data/corrected.print.test-mock.v1-expected.json",
+        "bytes": 388,
+        "sha256": "1c86106107cebe06c52deb52b456940491f31edc66155dc4c7fec831a2de9390"
+      },
+      "covered_contracts": [
+        "print-continuation"
+      ],
+      "revision_reason": "The legacy test mock stores trailing LF in a list and is retained only as a test oracle; v1 uses the frozen typed fragments, and the mock does not substitute for any production frontend trace."
+    },
+    {
+      "fixture_id": "corrected.label.cli",
+      "provenance_class": "Corrected",
+      "oracle_kind": "production-cli",
+      "legacy_commit": "11c4b992b9bce0ff977e9c587a6c0bb0d302853e",
+      "legacy_sources": [
+        {
+          "repo_relative_path": "src/EasyCon.Capture/ImgLabel.cs",
+          "symbols": [
+            "ImgLabel.Search"
+          ],
+          "source_blob_bytes": 6307,
+          "source_blob_sha256": "c6192e10ce09dd6e760ca22bc96d01856577756c55948f45bff5afe3a32123d4",
+          "git_blob_sha1": "9dcaa2e09b33faf55b532e5062041be314877834",
+          "snapshot_ids": [
+            "imglabel-search",
+            "imglabel-scale"
+          ]
+        },
+        {
+          "repo_relative_path": "src/EasyCon2.CLI/Program.cs",
+          "symbols": [
+            "externalGetters"
+          ],
+          "source_blob_bytes": 9171,
+          "source_blob_sha256": "a772b4f9707e253b0f5df6fdb043e28e5738db29c38ea847e633f72dc4f593e3",
+          "git_blob_sha1": "f0b76002ad9517297f7406502e13f694fe71fe6d",
+          "snapshot_ids": [
+            "cli-label-start",
+            "cli-label-conversion"
+          ]
+        }
+      ],
+      "capture_schema": "easycon-sdk:legacy-label-projection:v1",
+      "capture_schema_version": 1,
+      "normalization_schema": "easycon-sdk:label-floor:v1",
+      "normalization_schema_version": 1,
+      "input": {
+        "path": "data/corrected.label.cli.input.json",
+        "bytes": 216,
+        "sha256": "b17d2a8eb6ab097e0ac23f291ab869c70ac02a97ce0ba5a2b1e0475550079324"
+      },
+      "legacy_observed": {
+        "path": "data/corrected.label.cli.legacy-observed.json",
+        "bytes": 217,
+        "sha256": "96977ff9db8bfbc971f4cd87a5a4207fa17a45655373b78382d11c584c050e06"
+      },
+      "v1_expected": {
+        "path": "data/corrected.label.cli.v1-expected.json",
+        "bytes": 211,
+        "sha256": "16f73a4d681d87bb22657e0c312105ae2ec695480c576f6908f98cf3284567b0"
+      },
+      "covered_contracts": [
+        "label-floor"
+      ],
+      "revision_reason": "CLI truncates the 42.25 legacy scaled value to 42; v1 explicitly floors the clamped normalized 0.4225 score to 42."
+    },
+    {
+      "fixture_id": "corrected.label.avalonia",
+      "provenance_class": "Corrected",
+      "oracle_kind": "production-avalonia",
+      "legacy_commit": "11c4b992b9bce0ff977e9c587a6c0bb0d302853e",
+      "legacy_sources": [
+        {
+          "repo_relative_path": "src/EasyCon.Capture/ImgLabel.cs",
+          "symbols": [
+            "ImgLabel.Search"
+          ],
+          "source_blob_bytes": 6307,
+          "source_blob_sha256": "c6192e10ce09dd6e760ca22bc96d01856577756c55948f45bff5afe3a32123d4",
+          "git_blob_sha1": "9dcaa2e09b33faf55b532e5062041be314877834",
+          "snapshot_ids": [
+            "imglabel-search",
+            "imglabel-scale"
+          ]
+        },
+        {
+          "repo_relative_path": "src/EasyCon2.Avalonia/Services/ScriptService.cs",
+          "symbols": [
+            "ScriptService.Run externalGetters"
+          ],
+          "source_blob_bytes": 3847,
+          "source_blob_sha256": "360df4655bf41c3c878123a0da78301bc276c0f4c50e6e00fca9f31dfe4a6b13",
+          "git_blob_sha1": "380e7213e45b1e84b5b65606bf9027904c17d91b",
+          "snapshot_ids": [
+            "avalonia-label-start",
+            "avalonia-label-conversion"
+          ]
+        }
+      ],
+      "capture_schema": "easycon-sdk:legacy-label-projection:v1",
+      "capture_schema_version": 1,
+      "normalization_schema": "easycon-sdk:label-floor:v1",
+      "normalization_schema_version": 1,
+      "input": {
+        "path": "data/corrected.label.avalonia.input.json",
+        "bytes": 221,
+        "sha256": "32aa7adef5fcfbb14a6079f995902f623470df702202650a1961837c01ce23ba"
+      },
+      "legacy_observed": {
+        "path": "data/corrected.label.avalonia.legacy-observed.json",
+        "bytes": 222,
+        "sha256": "92f471da3aba75c32e23f1c7dd6bb8c45c2cb88c625928e3570fc2f11876b7a9"
+      },
+      "v1_expected": {
+        "path": "data/corrected.label.avalonia.v1-expected.json",
+        "bytes": 216,
+        "sha256": "cfac377c0cf0c0220fa20bf9aa2100c4c3c5bb3c24fdffca1b570057efc3770f"
+      },
+      "covered_contracts": [
+        "label-floor"
+      ],
+      "revision_reason": "Avalonia truncates the 42.25 legacy scaled value to 42; its production provenance remains separate from CLI even though v1 also expects 42."
+    },
+    {
+      "fixture_id": "corrected.label.winforms",
+      "provenance_class": "Corrected",
+      "oracle_kind": "production-winforms",
+      "legacy_commit": "11c4b992b9bce0ff977e9c587a6c0bb0d302853e",
+      "legacy_sources": [
+        {
+          "repo_relative_path": "src/EasyCon.Capture/ImgLabel.cs",
+          "symbols": [
+            "ImgLabel.Search"
+          ],
+          "source_blob_bytes": 6307,
+          "source_blob_sha256": "c6192e10ce09dd6e760ca22bc96d01856577756c55948f45bff5afe3a32123d4",
+          "git_blob_sha1": "9dcaa2e09b33faf55b532e5062041be314877834",
+          "snapshot_ids": [
+            "imglabel-search",
+            "imglabel-scale"
+          ]
+        },
+        {
+          "repo_relative_path": "src/EasyCon2/Services/CaptureService.cs",
+          "symbols": [
+            "CaptureService.BuildExternalGetters"
+          ],
+          "source_blob_bytes": 3201,
+          "source_blob_sha256": "dc308f672e0c70fd9a3383f4a2a6b05710bba50e26097b1c48651158f9608be6",
+          "git_blob_sha1": "9d16b923b7eaf1fb27e39029c46950553383a346",
+          "snapshot_ids": [
+            "winforms-label"
+          ]
+        }
+      ],
+      "capture_schema": "easycon-sdk:legacy-label-projection:v1",
+      "capture_schema_version": 1,
+      "normalization_schema": "easycon-sdk:label-floor:v1",
+      "normalization_schema_version": 1,
+      "input": {
+        "path": "data/corrected.label.winforms.input.json",
+        "bytes": 221,
+        "sha256": "9e8a7c83e531a8b5d148d49d23f034706b2100aea1b4735b8779a015501e5c13"
+      },
+      "legacy_observed": {
+        "path": "data/corrected.label.winforms.legacy-observed.json",
+        "bytes": 209,
+        "sha256": "2621a4cec18fef556df061b28481609f6f48d3e0ab9b5d540e8a816bdaa1547d"
+      },
+      "v1_expected": {
+        "path": "data/corrected.label.winforms.v1-expected.json",
+        "bytes": 216,
+        "sha256": "ec78b829542d73921208ff3b221de5192b5ce27c330fea71430f39bb620c7990"
+      },
+      "covered_contracts": [
+        "label-floor"
+      ],
+      "revision_reason": "WinForms applies Math.Ceiling to the 42.25 legacy scaled value and observes 43; v1 instead floors the clamped normalized 0.4225 score to 42."
+    },
+    {
+      "fixture_id": "v1-native.heap-order.left-medium",
+      "provenance_class": "v1-native",
+      "oracle_kind": "adr-v1-contract",
+      "contract_source": {
+        "path": "docs/decisions/0017-phase-4-ecs-automation-target.md",
+        "section": "v1 live logical heap ledger"
+      },
+      "source_identity": {
+        "role": "Main",
+        "source_id": "main.ecs"
+      },
+      "program_hash_v1": "c000c49eceea2d592bc1787347b10aef88d3834624b9c64ac8df3866dd7ff8bb",
+      "program_hash_profile": {
+        "path": "data/v1-profile.json",
+        "bytes": 3231,
+        "sha256": "e979b30f665e6b204711d3236fbfd56e8cf529200db3da7a9719b9b1ee24071c"
+      },
+      "capture_schema": "easycon-sdk:ecs-heap-ledger:v1",
+      "capture_schema_version": 1,
+      "normalization_schema": "easycon-sdk:ecs-heap-ledger:v1",
+      "normalization_schema_version": 1,
+      "input": {
+        "path": "data/v1-native.heap-order.left-medium.input.ecs",
+        "bytes": 251321,
+        "sha256": "12e61485f770a624f4575fc5c99b2d079afce6a1ea25d0e6c73a25cdaef82d4f"
+      },
+      "v1_expected": {
+        "path": "data/v1-native.heap-order.left-medium.v1-expected.json",
+        "bytes": 1404,
+        "sha256": "7201da3ac42f428f2c6865472631dec5fe053a08f6fa86ddb13fdc2ac0f05430"
+      },
+      "covered_contracts": [
+        "ecs-limits"
+      ],
+      "expected_outcome": "success",
+      "revision_reason": "No legacy comparison: ADR-0017 fixes strict left-first evaluation, the 33,533,058-byte canonical peak, and success as the only v1 outcome."
+    },
+    {
+      "fixture_id": "v1-native.heap-order.medium-left",
+      "provenance_class": "v1-native",
+      "oracle_kind": "adr-v1-contract",
+      "contract_source": {
+        "path": "docs/decisions/0017-phase-4-ecs-automation-target.md",
+        "section": "v1 live logical heap ledger"
+      },
+      "source_identity": {
+        "role": "Main",
+        "source_id": "main.ecs"
+      },
+      "program_hash_v1": "83734a419b0df485cee09a365952e0f3b255948285eb220202740121c7c5a570",
+      "program_hash_profile": {
+        "path": "data/v1-profile.json",
+        "bytes": 3231,
+        "sha256": "e979b30f665e6b204711d3236fbfd56e8cf529200db3da7a9719b9b1ee24071c"
+      },
+      "capture_schema": "easycon-sdk:ecs-heap-ledger:v1",
+      "capture_schema_version": 1,
+      "normalization_schema": "easycon-sdk:ecs-heap-ledger:v1",
+      "normalization_schema_version": 1,
+      "input": {
+        "path": "data/v1-native.heap-order.medium-left.input.ecs",
+        "bytes": 251321,
+        "sha256": "1094bfede150bafc6d9396487c705e46973999000b640a3ecebc4a6d9e51c922"
+      },
+      "v1_expected": {
+        "path": "data/v1-native.heap-order.medium-left.v1-expected.json",
+        "bytes": 1046,
+        "sha256": "9002a2d8f2917a07843146bd8b1d04c6bb3b6bb029a320688d524cfda7aa8e17"
+      },
+      "covered_contracts": [
+        "ecs-limits"
+      ],
+      "expected_outcome": "limit-failure",
+      "revision_reason": "No legacy comparison: swapping only the operands makes the 33,584,056-byte reserve attempt exceed the v1 live logical heap limit."
+    }
+  ]
+}

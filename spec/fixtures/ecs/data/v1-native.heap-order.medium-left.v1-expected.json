@@ -1,0 +1,45 @@
+{
+  "schema": "easycon-sdk:ecs-heap-ledger:v1",
+  "schema_version": 1,
+  "fixture_id": "v1-native.heap-order.medium-left",
+  "limit": 33554432,
+  "baseline": {
+    "distinct_string_allocations": 132,
+    "string_bytes_each": 251000,
+    "string_bytes_total": 33132000,
+    "array_direct_cells": 132,
+    "array_direct_cell_bytes": 1056,
+    "live_bytes": 33133056
+  },
+  "source_order": [
+    "MEDIUM($template)",
+    "LEFT($template)"
+  ],
+  "checkpoints": [
+    {
+      "id": "baseline",
+      "live_bytes": 33133056,
+      "decision": "continue"
+    },
+    {
+      "id": "medium-copy",
+      "live_bytes": 33333056,
+      "decision": "continue"
+    },
+    {
+      "id": "left-full-reserve-attempt",
+      "live_bytes": 33584056,
+      "decision": "reject-live-logical-heap-limit"
+    },
+    {
+      "id": "expression-unwind",
+      "live_bytes": 33133056,
+      "decision": "rollback-to-entry-checkpoint"
+    }
+  ],
+  "canonical_peak_attempt": 33584056,
+  "outcome": {
+    "kind": "limit-failure",
+    "limit": "live_logical_heap_bytes"
+  }
+}

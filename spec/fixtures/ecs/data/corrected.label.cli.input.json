@@ -1,0 +1,8 @@
+{
+  "schema": "easycon-sdk:label-score-input:v1",
+  "schema_version": 1,
+  "fixture_id": "corrected.label.cli",
+  "normalized_score": 0.4225,
+  "legacy_scale_operation": "md *= 100",
+  "legacy_scaled_score": 42.25
+}
