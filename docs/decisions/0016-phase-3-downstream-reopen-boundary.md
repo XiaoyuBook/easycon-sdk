@@ -23,8 +23,9 @@ ADR-0014 原本允许该例外。
 - 本提议不授权 Phase 4 target、workspace scaffold、Runtime 或 Controller 实现；
 - 后续提交不得把本文件的 `Proposed Refreeze` 状态描述为最终 freeze/refreeze。
 
-独立审查通过后的后续提交才可把本 ADR 更新为最终 refreeze 状态，记录 proposal SHA、review task、精确门禁结果
-和最终治理 SHA，并把“当前 Phase 3 治理记录”的索引从 ADR-0014 推进到本 ADR。
+独立审查通过后的后续 tracked 提交才可把本 ADR 更新为最终 refreeze 状态；该 tracked 提交只在本 ADR 中记录
+固定的 proposal SHA、review task、精确门禁结果、最终状态与索引推进。该 refreeze commit/tree 只能在提交后由
+Git 对象和外部结构化 `TASK_REPORT`/handoff 固定，不写回任何 tracked ADR。
 
 ## 已核验且不变的 Phase 3 基线
 
