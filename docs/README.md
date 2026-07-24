@@ -67,7 +67,7 @@
 - [ADR-0013：冻结 Phase 3 Vision 跨平台源码候选](decisions/0013-phase-3-vision-cross-platform-source-candidate-freeze.md)
 - [ADR-0014：Phase 3 NativePool admission 修复后重新冻结](decisions/0014-phase-3-native-pool-admission-refreeze.md)
 - [ADR-0016：重新冻结 Phase 3 候选的下游阶段重新打开边界](decisions/0016-phase-3-downstream-reopen-boundary.md)
-- [ADR-0017：提议冻结 Phase 4 ECS 与 Automation 目标（Proposed / Not Effective）](decisions/0017-phase-4-ecs-automation-target.md)
+- [ADR-0017：冻结 Phase 4 ECS 与 Automation 目标（Accepted / Frozen Target）](decisions/0017-phase-4-ecs-automation-target.md)
 
 ## v1 固定范围
 
@@ -110,12 +110,15 @@ C ABI、Phase 4、Controller serial、四语言、package 或完整跨平台 SDK
 refreeze 之后，纯下游阶段增加本身不再自动重开 Phase 3，只有实际改变其冻结面时才重开。Phase 3 的同一
 implementation/tree 与平台状态保持不变；该治理决定本身不授权 Phase 4 target 或实现。
 
-[ADR-0017](decisions/0017-phase-4-ecs-automation-target.md) 现为 `Proposed / Not Effective`。它提议冻结 Phase 4
+[ADR-0017](decisions/0017-phase-4-ecs-automation-target.md) 现已作为
+`Accepted / Frozen Phase 4 ECS/Automation Target` 生效，固定接受候选为 `fa265dff`。该 target 冻结
 ECS/Automation 的 ownership、产品语义、ProgramHash/PCG golden、`EcsLimitsV1`、抽象 ports、Runtime 窄重开和
-安全实施 DAG。初始 fixed proposal `6468da5` 的独立 design review 结论为 `REWORK`（P0=0、P1=3、P2=2）；
-第一轮 fixed 修订 `9983d42` 的独立 full re-review 仍为 `REWORK`（P0=0、P1=1、P2=1）。当前第二轮 docs-only
-修订只关闭后一轮 finding，仍为未生效 proposal。在修订后的新 fixed SHA 完成独立 full re-review、清零 finding，
-且后续单独 acceptance/freeze commit 完成前，不授权 R0/W0/S0/D0 或实现。
+安全实施 DAG。
+
+治理链从 G0a/design base `38ef0dc` 依次经过初始 proposal `6468da5`、第一轮修订 `9983d42` 与第二轮修订
+`fa265dff`；最终独立 full review 任务 `019f9348-1fb0-7130-86b6-57d69a0db31c` 结论为 `APPROVE`，
+P0/P1/P2=`0/0/0`。现在只授权按冻结 DAG 分别启动 R0、W0、S0；各节点仍须独立实现、验证和提交。D0 继续作为
+独立 Phase 5 Controller 支线另行授权。本 acceptance 不代表实现、测试、fixture、CI、硬件、支持或发布完成。
 
 ## 首发基线
 

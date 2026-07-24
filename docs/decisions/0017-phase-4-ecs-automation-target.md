@@ -1,7 +1,8 @@
-# 0017：提议冻结 Phase 4 ECS 与 Automation 目标
+# 0017：冻结 Phase 4 ECS 与 Automation 目标
 
-- 状态：Proposed / Not Effective
+- 状态：Accepted / Frozen Phase 4 ECS/Automation Target
 - 提议日期：2026-07-24
+- 接受与冻结日期：2026-07-24
 - 治理起点：[ADR-0016](0016-phase-3-downstream-reopen-boundary.md) 的 `Refrozen Governance Boundary`
 - G0a governance predecessor：`38ef0dc301a2cdadafe91846b4a1b80918b54297`，tree
   `e0766c62277e16763fd6af79c7622a2f29a93e70`，parent
@@ -9,33 +10,48 @@
 - 初始 G0b proposal / REWORK 起点：`6468da576471975a05458767f14a55a31926e169`，tree
   `4b7f641090bd261acf39bf5570840c8b0776475e`，parent
   `38ef0dc301a2cdadafe91846b4a1b80918b54297`
+- 第一轮修订：`9983d42c4ecba0080e8fcdacab93fd5b73dc9b50`，tree
+  `a753b2fe42bd895e84221ffa4e80a873140dfc78`，parent
+  `6468da576471975a05458767f14a55a31926e169`
+- 固定接受候选 / 第二轮修订：`fa265dffdb8d70641fda92220101c3a34669d288`，tree
+  `e25b251dfdd475275a94d50c0180b721bb032737`，parent
+  `9983d42c4ecba0080e8fcdacab93fd5b73dc9b50`
+- 最终独立 full review：任务 `019f9348-1fb0-7130-86b6-57d69a0db31c`，结论 `APPROVE`，
+  P0/P1/P2=`0/0/0`
 - proposal chain 来源：`origin/main@bc24f0bfe65a34ba54ffacad62dd41905c77f952`
 - legacy 只读证据：`EasyCon@11c4b992b9bce0ff977e9c587a6c0bb0d302853e`
 - 编号说明：ADR-0015 保留给 Phase 2B；落盘前扫描全部本地 refs 与 worktrees，ADR-0016 已占用，0017 无冲突
 
-## 状态、生效条件与审查链
+## 状态、接受决定与审查链
 
-本文件只是 Phase 4 target proposal，不是已接受决定，也不授权实现。必须依次完成以下步骤：
+固定接受候选 `fa265dffdb8d70641fda92220101c3a34669d288` 的完整 target 合同已经通过独立 full review，
+本 ADR 现接受并冻结该候选。此次 docs-only acceptance 只推进状态、治理链、证据和索引，不改变候选中已经审查通过的
+ownership、产品语义、ProgramHash/PCG、limits、ports、Runtime 边界、provenance 或 Safe DAG 合同。
 
-1. 将本文件所在的固定 proposal Git 对象交给新的独立 design reviewer；
-2. 清零全部可复现、可行动且 in-scope 的 P0/P1/P2 finding；
-3. 由后续单独的 docs-only acceptance/freeze commit 把状态推进为已接受。
+审查链依次为：
 
-在第三步完成前，不得启动 R0、W0、S0、D0 或任何 Phase 4/5 实现。本 proposal 的提交 SHA/tree 只由提交后的
-Git 对象、固定 ref 与外部结构化 `TASK_REPORT` 记录；未来 acceptance commit 也不得在 tracked 文件中记录或预言
-自身 SHA/tree。任一步发生语义修订，都必须固定新的 proposal SHA 并重新接受完整独立审查。
+1. G0a/design base `38ef0dc301a2cdadafe91846b4a1b80918b54297` 闭合 Phase 3 下游治理 reopen，但不授权
+   Phase 4 target 或实现；
+2. 初始 proposal `6468da576471975a05458767f14a55a31926e169` 的独立 design review 任务
+   `019f922d-192f-7e70-b32a-6b76eeb3ee8b` 给出 `REWORK`，P0/P1/P2=`0/3/2`；
+3. 第一轮修订 `9983d42c4ecba0080e8fcdacab93fd5b73dc9b50` 关闭上述五项 finding，独立 full re-review
+   任务 `019f9324-c32f-7af3-8928-a003ff7f051d` 仍给出 `REWORK`，P0/P1/P2=`0/1/1`；
+4. 第二轮修订 writer 任务 `019f9339-1a32-74d1-990d-4623b1a8b3c9` 只关闭后一轮两项 finding，形成固定
+   接受候选 `fa265dffdb8d70641fda92220101c3a34669d288`；
+5. 最终独立 full review 任务 `019f9348-1fb0-7130-86b6-57d69a0db31c` 对 `38ef0dc..fa265dff`
+   的完整三文档 target 和固定 EasyCon provenance 进行只读复审，结论为
+   `APPROVE for later separately authorized acceptance`，P0/P1/P2=`0/0/0`。本次单独 acceptance 完成该授权。
 
-初始 proposal `6468da5` 的独立 design review 任务 `019f922d-192f-7e70-b32a-6b76eeb3ee8b` 结论为
-`REWORK`（P0=0、P1=3、P2=2）。第一轮 docs-only 修订只关闭该轮五项 finding，不是 acceptance/freeze，固定为
-`9983d42c4ecba0080e8fcdacab93fd5b73dc9b50`，tree `a753b2fe42bd895e84221ffa4e80a873140dfc78`，parent
-`6468da576471975a05458767f14a55a31926e169`。独立 full re-review 任务
-`019f9324-c32f-7af3-8928-a003ff7f051d` 对该 fixed SHA 的结论仍为 `REWORK`（P0=0、P1=1、P2=1）。
+从本次 tracked acceptance 提交之后，仅授权按下文冻结 DAG 分别启动 R0、W0、S0；三者仍须各自形成独立、
+可验证、可提交的节点，不得合并启动或沿用本次 docs-only 门禁充当实现证据。D0 仍是独立 Phase 5 Controller 支线，
+须另行授权并按 D0-D2 自身合同推进，不进入 Phase 4 节点。本 acceptance 没有启动这些节点，也不表示实现、测试、
+fixture、CI、Ruleset、硬件、COM、支持或发布已经完成。
 
-本次第二轮 docs-only 修订只关闭该轮一项 P1 与一项 P2，不是 acceptance/freeze，状态仍为
-`Proposed / Not Effective`。它必须作为新的 fixed-SHA proposal 接受一次完整独立 re-review；不得把对
-`6468da5` 或 `9983d42` 的审查结论沿用为对修订后对象的批准。
+固定接受候选的 SHA/tree/parent 在上文记录；本 acceptance 提交自身的 SHA/tree 不在任何 tracked 文件中记录或
+预言，只能在提交后由 Git 对象、最终 ref 与外部结构化 `TASK_REPORT` 固定。后续任何语义修订都必须固定新的候选
+对象，并按受影响冻结面重新接受独立审查与单独 refreeze。
 
-本提议吸收了 architecture input 任务 `019f8e7d-67ee-7920-9e0c-c05b803c7415`、独立 `REWORK` review
+本 target 吸收了 architecture input 任务 `019f8e7d-67ee-7920-9e0c-c05b803c7415`、独立 `REWORK` review
 任务 `019f8e9a-6c58-71e0-8f2b-8a45c36c1526` 的 `0 P0 / 7 P1 / 3 P2` 修订，以及 product decision
 evidence 任务 `019f8eba-de1d-7042-aa83-c6c989de5e54`。产品方已对 Q1-Q3 全部选择推荐默认；这些选择在下文
 明确标成 v1 产品合同，而不是 legacy 或现有 CI 已证明的事实。ADR-0016 已由任务
@@ -575,7 +591,7 @@ Q0/Q1 运行当前完整 repository gates 和全部已落盘 Phase 4 gates。若
 ADR 的完整门禁并接受新的独立 review；纯 Phase 4 docs/code 不把 hardware/COM 或尚不存在的 coverage/fuzz 命令伪称为
 现有证据。
 
-## Proposal chain 的验证边界
+## Proposal、REWORK、review 与 acceptance 的验证边界
 
 初始 proposal `6468da5` 只新增本 ADR 并更新两处索引；其提交前实测结果为 Markdown links Passed（239
 references / 44 files）、repository guards Passed、working/new-file diff checks Passed。第一轮 REWORK 只修改本 ADR
@@ -583,9 +599,23 @@ references / 44 files）、repository guards Passed、working/new-file diff chec
 两轮都不修改 code、Cargo、workflow、Ruleset、fixture、support matrix 或 architecture/source map，不运行
 hardware/COM，也不执行 R0/W0/S0/D0。
 
-REWORK 修订只运行 AGENTS.md 要求的 docs-only links、repository guards 与 diff checks，精确结果由各轮修订后的 Git
-对象和外部结构化 `TASK_REPORT` 固定。proposal chain 没有运行 Rust、Loom、spec、native、coverage 或 fuzz，不能把
-未来 gate 描述成当前已通过，也不能把 docs-only 通过描述为 design acceptance。
+第一轮 writer 任务 `019f9314-a99d-7dc1-a139-f6c6173faa02` 的 parent delta 为三文档 `+150/-21`；提交前与
+fixed-SHA 提交后均通过 links 239/44、repository guards 和 diff checks。第二轮 writer 任务
+`019f9339-1a32-74d1-990d-4623b1a8b3c9` 的 parent delta 为同三文档 `+72/-15`；提交前通过 links 239/44、
+repository guards、working/staged diff checks，提交后完成 commit diff 与 clean/ref 核验。这些是 proposal writer 的
+docs-only 证据，不是独立 review，也不证明设计或可执行行为。
+
+最终独立 review 任务 `019f9348-1fb0-7130-86b6-57d69a0db31c` 全程只读：重新固定 candidate/tree/parent/ref、
+merge-base、旧 refs、SDK/EasyCon clean 与三文档 scope，独立运行 links 239/44、repository guards、
+`git diff --check 38ef0dc301a2cdadafe91846b4a1b80918b54297 fa265dffdb8d70641fda92220101c3a34669d288`，
+并独立复算 ProgramHash/PCG 与 heap 反例。该 review 没有编辑文件、索引、commit、branch/ref 或 CI，最终
+`APPROVE`、P0/P1/P2=`0/0/0`；这项 design approval 仍需本次单独 acceptance 才生效。
+
+本次 acceptance writer 仍只运行 AGENTS.md 的 docs-only 门禁：`python tools/check_markdown_links.py`、
+`python tools/check_repository_guards.py` 与 `git diff --check`。提交前实际结果为 links Passed（239 references /
+44 files）、repository guards Passed、diff check Passed；最终 acceptance 对象、提交后同组门禁与 clean/ref 结果只由
+Git 和外部 `TASK_REPORT` 固定，不把自身身份写回 tracked 文件。proposal、REWORK、review 与 acceptance 均未运行
+Rust、Loom、spec、native、coverage、fuzz、hardware 或 COM，也未 dispatch CI；这些未执行项不得描述为通过。
 
 ## 关联
 
