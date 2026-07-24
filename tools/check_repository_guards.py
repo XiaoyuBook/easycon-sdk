@@ -121,7 +121,7 @@ def managed_crate_roots(tracked):
     for path in tracked:
         parts = PurePosixPath(path).parts
         is_workspace_crate = (
-            len(parts) == 3 and parts[0] == "crates" and parts[2] == "Cargo.toml"
+            len(parts) >= 2 and parts[0] == "crates" and parts[-1] == "Cargo.toml"
         )
         is_test_support = parts == ("tests", "support", "Cargo.toml")
         if is_workspace_crate or is_test_support:
@@ -172,7 +172,7 @@ def repository_guard_regression_failures():
         if bool(case_failures) != should_fail:
             failures.append("repository guard regression failed: {}".format(label))
 
-    expect("candidate zero dependencies", valid_tracked, [], False)
+    expect("exact valid managed roots", valid_tracked, [], False)
     expect(
         "external normal dependency",
         valid_tracked,
@@ -203,6 +203,26 @@ def repository_guard_regression_failures():
         | {
             "crates/unexpected/Cargo.toml",
             "crates/unexpected/src/lib.rs",
+        },
+        [],
+        True,
+    )
+    expect(
+        "nested crate under unknown root",
+        valid_tracked
+        | {
+            "crates/unexpected/nested/Cargo.toml",
+            "crates/unexpected/nested/src/lib.rs",
+        },
+        [],
+        True,
+    )
+    expect(
+        "nested crate under managed root",
+        valid_tracked
+        | {
+            "crates/easycon-ecs/nested/Cargo.toml",
+            "crates/easycon-ecs/nested/src/lib.rs",
         },
         [],
         True,
