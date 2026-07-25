@@ -66,6 +66,8 @@
 - [ADR-0012：冻结 Phase 3 Vision 与跨平台私有 native bridge 开发目标](decisions/0012-phase-3-vision-native-target.md)
 - [ADR-0013：冻结 Phase 3 Vision 跨平台源码候选](decisions/0013-phase-3-vision-cross-platform-source-candidate-freeze.md)
 - [ADR-0014：Phase 3 NativePool admission 修复后重新冻结](decisions/0014-phase-3-native-pool-admission-refreeze.md)
+- [ADR-0016：重新冻结 Phase 3 候选的下游阶段重新打开边界](decisions/0016-phase-3-downstream-reopen-boundary.md)
+- [ADR-0017：冻结 Phase 4 ECS 与 Automation 目标（Accepted / Frozen Target）](decisions/0017-phase-4-ecs-automation-target.md)
 
 ## v1 固定范围
 
@@ -102,6 +104,21 @@ Windows software/native gates 已通过，capture hardware 保持
 `Hardware Unverified`；Linux x64 保持 `Candidate / Build Unverified`；macOS Apple Silicon arm64 保持
 `Experimental Source Candidate / Build Unverified / Hardware Unverified / Not Shipped`。该冻结不包含 public
 C ABI、Phase 4、Controller serial、四语言、package 或完整跨平台 SDK 支持。
+
+[ADR-0016](decisions/0016-phase-3-downstream-reopen-boundary.md) 现以 `Refrozen Governance Boundary` 状态接受：
+准备增加 Phase 4 按 ADR-0014 的现行字面规则确实重新打开该候选，本次 refreeze 已闭合该治理 reopen。从本次
+refreeze 之后，纯下游阶段增加本身不再自动重开 Phase 3，只有实际改变其冻结面时才重开。Phase 3 的同一
+implementation/tree 与平台状态保持不变；该治理决定本身不授权 Phase 4 target 或实现。
+
+[ADR-0017](decisions/0017-phase-4-ecs-automation-target.md) 现已作为
+`Accepted / Frozen Phase 4 ECS/Automation Target` 生效，固定接受候选为 `fa265dff`。该 target 冻结
+ECS/Automation 的 ownership、产品语义、ProgramHash/PCG golden、`EcsLimitsV1`、抽象 ports、Runtime 窄重开和
+安全实施 DAG。
+
+治理链从 G0a/design base `38ef0dc` 依次经过初始 proposal `6468da5`、第一轮修订 `9983d42` 与第二轮修订
+`fa265dff`；最终独立 full review 任务 `019f9348-1fb0-7130-86b6-57d69a0db31c` 结论为 `APPROVE`，
+P0/P1/P2=`0/0/0`。现在只授权按冻结 DAG 分别启动 R0、W0、S0；各节点仍须独立实现、验证和提交。D0 继续作为
+独立 Phase 5 Controller 支线另行授权。本 acceptance 不代表实现、测试、fixture、CI、硬件、支持或发布完成。
 
 ## 首发基线
 

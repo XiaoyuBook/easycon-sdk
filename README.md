@@ -25,6 +25,22 @@ Phase 3 私有 Vision 跨平台源码候选在旧候选因 NativePool admission 
 macOS 只形成 Apple Silicon arm64 `Experimental Source Candidate / Build Unverified / Hardware Unverified /
 Not Shipped`。三者均不等于完整 SDK 发布，且未冻结 public C ABI、Phase 4、四语言或 package。
 
+[ADR-0016](docs/decisions/0016-phase-3-downstream-reopen-boundary.md) 已以 `Refrozen Governance Boundary` 接受：
+准备增加 Phase 4 按 ADR-0014 的现行字面规则确实触发治理 reopen，本次 refreeze 已闭合该治理 reopen。从本次
+refreeze 之后，纯下游 Phase 4/5/6 增加本身不再自动重开 Phase 3，只有实际改变其冻结面时才重开。Phase 3
+implementation、public-neutral contract 和平台/支持状态均未改变；该治理决定本身不授权 Phase 4 target 或实现。
+
+[ADR-0017](docs/decisions/0017-phase-4-ecs-automation-target.md) 现已作为
+`Accepted / Frozen Phase 4 ECS/Automation Target` 生效，固定接受候选为 `fa265dff`。它冻结 Phase 4
+`easycon-ecs` 的 compiler、不可变 Program、Automation Run、抽象 ports、确定性语义、limits、Runtime 窄重开边界
+与安全实施 DAG。
+
+治理链从 G0a/design base `38ef0dc` 依次经过初始 proposal `6468da5`、第一轮修订 `9983d42` 和第二轮修订
+`fa265dff`；最终独立 full review 任务 `019f9348-1fb0-7130-86b6-57d69a0db31c` 对固定接受候选给出
+`APPROVE`，P0/P1/P2=`0/0/0`。本次 acceptance 只使 target 合同生效：现在可按冻结 DAG 分别启动 R0、W0、S0，
+但每个节点仍须独立实现、验证和提交；D0 仍是独立的 Phase 5 Controller 支线，须另行授权。本状态不表示实现、
+测试、fixture、CI、硬件、支持或发布已经完成。
+
 此前的实验性共享运行基线已经移除，不再作为本项目的产品架构或兼容性约束。后续 public C ABI 和各语言绑定
 将在当前 Rust 共享核心之上按 Phase 5/6 的独立门禁实现。
 

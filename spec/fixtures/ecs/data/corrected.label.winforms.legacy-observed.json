@@ -1,0 +1,8 @@
+{
+  "schema": "easycon-sdk:legacy-label-projection:v1",
+  "schema_version": 1,
+  "fixture_id": "corrected.label.winforms",
+  "legacy_scaled_score": 42.25,
+  "conversion": "ceiling",
+  "observed_integer": 43
+}

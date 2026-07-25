@@ -5,7 +5,7 @@ import json
 import re
 import subprocess
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -13,11 +13,13 @@ EXPECTED_MEMBERS = {
     "crates/easycon-model",
     "crates/easycon-runtime",
     "crates/easycon-controller",
+    "crates/easycon-ecs",
     "crates/easycon-serial",
     "crates/easycon-native-sys",
     "crates/easycon-vision",
     "tests/support",
 }
+W0_ZERO_DEPENDENCY_MANIFEST = "crates/easycon-ecs/Cargo.toml"
 FORBIDDEN_PREFIXES = (
     "bindings/",
     "ci/",
@@ -25,7 +27,6 @@ FORBIDDEN_PREFIXES = (
     "services/",
     "ui/",
     "crates/easycon-capi/",
-    "crates/easycon-ecs/",
     "crates/easycon-sdk/",
 )
 FORBIDDEN_RUNTIME_PATTERNS = {
@@ -108,6 +109,145 @@ def workspace_dependencies(metadata, path):
     }
 
 
+def package_dependency_entries(metadata, path):
+    package = next(
+        package for package in metadata["packages"] if relative_manifest(package) == path
+    )
+    return package["dependencies"]
+
+
+def managed_crate_roots(tracked):
+    roots = set()
+    for path in tracked:
+        parts = PurePosixPath(path).parts
+        is_workspace_crate = (
+            len(parts) >= 2 and parts[0] == "crates" and parts[-1] == "Cargo.toml"
+        )
+        is_test_support = parts == ("tests", "support", "Cargo.toml")
+        if is_workspace_crate or is_test_support:
+            roots.add(PurePosixPath(path).parent.as_posix())
+    return roots
+
+
+def w0_boundary_failures(tracked, metadata):
+    failures = []
+    roots = managed_crate_roots(tracked)
+    missing = EXPECTED_MEMBERS - roots
+    unexpected = roots - EXPECTED_MEMBERS
+    if missing:
+        failures.append(
+            "missing managed crate root: {}".format(", ".join(sorted(missing)))
+        )
+    if unexpected:
+        failures.append(
+            "unexpected managed crate root: {}".format(", ".join(sorted(unexpected)))
+        )
+    if package_dependency_entries(metadata, W0_ZERO_DEPENDENCY_MANIFEST):
+        failures.append("W0 easycon-ecs dependency list must remain empty")
+    return failures
+
+
+def repository_guard_regression_failures():
+    failures = []
+    valid_tracked = {
+        "{}/Cargo.toml".format(root) for root in EXPECTED_MEMBERS
+    } | {
+        "Cargo.toml",
+        "crates/README.md",
+        "tests/hardware/Cargo.toml",
+    }
+
+    def metadata_with(dependencies):
+        return {
+            "packages": [
+                {
+                    "manifest_path": str(ROOT / W0_ZERO_DEPENDENCY_MANIFEST),
+                    "dependencies": dependencies,
+                }
+            ]
+        }
+
+    def expect(label, tracked, dependencies, should_fail):
+        case_failures = w0_boundary_failures(tracked, metadata_with(dependencies))
+        if bool(case_failures) != should_fail:
+            failures.append("repository guard regression failed: {}".format(label))
+
+    expect("exact valid managed roots", valid_tracked, [], False)
+    expect(
+        "external normal dependency",
+        valid_tracked,
+        [{"name": "serde", "kind": None}],
+        True,
+    )
+    expect(
+        "external build dependency",
+        valid_tracked,
+        [{"name": "cc", "kind": "build"}],
+        True,
+    )
+    expect(
+        "external dev dependency",
+        valid_tracked,
+        [{"name": "serde", "kind": "dev"}],
+        True,
+    )
+    expect(
+        "internal build dependency",
+        valid_tracked,
+        [{"name": "easycon-controller", "kind": "build"}],
+        True,
+    )
+    expect(
+        "unknown tracked crate",
+        valid_tracked
+        | {
+            "crates/unexpected/Cargo.toml",
+            "crates/unexpected/src/lib.rs",
+        },
+        [],
+        True,
+    )
+    expect(
+        "nested crate under unknown root",
+        valid_tracked
+        | {
+            "crates/unexpected/nested/Cargo.toml",
+            "crates/unexpected/nested/src/lib.rs",
+        },
+        [],
+        True,
+    )
+    expect(
+        "nested crate under managed root",
+        valid_tracked
+        | {
+            "crates/easycon-ecs/nested/Cargo.toml",
+            "crates/easycon-ecs/nested/src/lib.rs",
+        },
+        [],
+        True,
+    )
+    expect(
+        "extra managed crate root",
+        valid_tracked | {"crates/extra/Cargo.toml"},
+        [],
+        True,
+    )
+    expect(
+        "missing expected crate root",
+        valid_tracked - {"crates/easycon-ecs/Cargo.toml"},
+        [],
+        True,
+    )
+    expect(
+        "non-crate tracked path",
+        valid_tracked | {"crates/unexpected/src/lib.rs"},
+        [],
+        False,
+    )
+    return failures
+
+
 def required_ci_failures(workflow):
     failures = []
     jobs = {
@@ -183,7 +323,7 @@ def required_ci_failures(workflow):
 
 
 def main():
-    failures = []
+    failures = repository_guard_regression_failures()
     tracked = git_files()
     tracked_set = set(tracked)
     if any(path == "EasyCon" or path.startswith("EasyCon/") for path in tracked):
@@ -199,8 +339,9 @@ def main():
         failures.append("traineddata must not be tracked")
 
     metadata = cargo_metadata()
+    failures.extend(w0_boundary_failures(tracked, metadata))
     if workspace_members(metadata) != EXPECTED_MEMBERS:
-        failures.append("workspace members differ from frozen Phase 2A plus Phase 3 packages")
+        failures.append("workspace members differ from frozen workspace packages")
     for package in metadata["packages"]:
         if package["id"] in metadata["workspace_members"] and package["license"] != "GPL-3.0-only":
             failures.append("{} is not GPL-3.0-only".format(package["name"]))
@@ -209,6 +350,7 @@ def main():
         "crates/easycon-model/Cargo.toml": set(),
         "crates/easycon-runtime/Cargo.toml": {"easycon-model"},
         "crates/easycon-controller/Cargo.toml": {"easycon-model", "easycon-runtime"},
+        "crates/easycon-ecs/Cargo.toml": set(),
         "crates/easycon-serial/Cargo.toml": {
             "easycon-controller",
             "easycon-model",
@@ -297,7 +439,7 @@ def main():
             print("  " + failure, file=sys.stderr)
         return 1
     print(
-        "repository guards passed: frozen workspace, Phase 3 dependency direction, GPL license, "
+        "repository guards passed: frozen workspace and dependency direction, GPL license, "
         "private native boundary, source boundary, Drop finalizer ban, legacy process scan, and "
         "Required CI execution ownership"
     )

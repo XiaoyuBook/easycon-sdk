@@ -1,0 +1,23 @@
+{
+  "schema": "easycon-sdk:print-fragments:v1",
+  "schema_version": 1,
+  "fixture_id": "corrected.print.cli",
+  "fragments": [
+    {
+      "text": "A",
+      "starts_new_line": true
+    },
+    {
+      "text": "B",
+      "starts_new_line": false
+    },
+    {
+      "text": "C",
+      "starts_new_line": false
+    },
+    {
+      "text": "D",
+      "starts_new_line": true
+    }
+  ]
+}

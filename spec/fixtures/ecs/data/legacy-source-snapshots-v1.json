@@ -1,0 +1,416 @@
+{
+  "schema": "easycon-sdk:legacy-source-snapshots:v1",
+  "schema_version": 1,
+  "legacy_commit": "11c4b992b9bce0ff977e9c587a6c0bb0d302853e",
+  "entries": [
+    {
+      "snapshot_id": "builtin-print",
+      "repo_relative_path": "src/EasyCon.Script/Binding/BuiltinCallable.cs",
+      "symbols": [
+        "BuiltinCallable.ImplPrint"
+      ],
+      "source_blob_bytes": 3863,
+      "source_blob_sha256": "7f71eecb43e559d5158df9892419e4c7fbf71f67e3bd8eba8d83274a27a140b3",
+      "git_blob_sha1": "3184191c2f95ff30becd55ffb4700b98ebf423e7",
+      "line_start": 27,
+      "line_end": 34,
+      "content": "    public static Value ImplPrint(ImmutableArray<Value> args, IEvalContext ctx, CancellationToken token)\n    {\n        var s = args[0].AsString();\n        var output = s.EndsWith('\\\\') ? s[..^1] : s;\n        ctx.Output?.Print(output, !ctx.CancelLineBreak);\n        ctx.CancelLineBreak = s.EndsWith('\\\\');\n        return Value.Void;\n    }\n",
+      "content_sha256": "8243befae39a39761221ee53f118f064d80a47bfffb11e5edfc4b0e3fbb67cf1"
+    },
+    {
+      "snapshot_id": "cli-print-state",
+      "repo_relative_path": "src/EasyCon2.CLI/ConsoleOutAdapter.cs",
+      "symbols": [
+        "ConsoleOutAdapter.Print"
+      ],
+      "source_blob_bytes": 2795,
+      "source_blob_sha256": "b664e380a5da45483c02267a0255f53ca786a86e6585426ffa9e1c59a59c2980",
+      "git_blob_sha1": "39087e9093bf596f1a3c1d44dc340dca48b20dd6",
+      "line_start": 8,
+      "line_end": 16,
+      "content": "\n    private bool _msgNewLine = true;\n    private bool _msgFirstLine = true;\n\n    public void Print(string message, bool newline = true)\n    {\n        _msgNewLine = _msgNewLine && newline;\n        Print(message, null);\n    }\n",
+      "content_sha256": "eef70b167aaed380391fce1fefd374929735c2c5589ca3db377b423d0beaf07e"
+    },
+    {
+      "snapshot_id": "cli-print-render",
+      "repo_relative_path": "src/EasyCon2.CLI/ConsoleOutAdapter.cs",
+      "symbols": [
+        "ConsoleOutAdapter.Print"
+      ],
+      "source_blob_bytes": 2795,
+      "source_blob_sha256": "b664e380a5da45483c02267a0255f53ca786a86e6585426ffa9e1c59a59c2980",
+      "git_blob_sha1": "39087e9093bf596f1a3c1d44dc340dca48b20dd6",
+      "line_start": 35,
+      "line_end": 47,
+      "content": "    private void Print(string message, Color? color, bool timestamp = true)\n    {\n        if (_msgNewLine)\n        {\n            if (!_msgFirstLine)\n                Console.WriteLine();\n            _msgFirstLine = false;\n            if (timestamp)\n                ColorfulConsole.Write(DateTime.Now.ToString(\"[HH:mm:ss.fff] \"), Color.Gray);\n        }\n        ColorfulConsole.Write(message, color ?? Color.White);\n        _msgNewLine = true;\n    }\n",
+      "content_sha256": "9c99a80c212c5b30c3069759b04938912ee4eed0f86ed02e4dcc367c1a43a247"
+    },
+    {
+      "snapshot_id": "cli-color-write",
+      "repo_relative_path": "src/EasyCon2.CLI/ConsoleOutAdapter.cs",
+      "symbols": [
+        "ColorfulConsole.Write",
+        "AnsiColors.Reset",
+        "AnsiColors.White"
+      ],
+      "source_blob_bytes": 2795,
+      "source_blob_sha256": "b664e380a5da45483c02267a0255f53ca786a86e6585426ffa9e1c59a59c2980",
+      "git_blob_sha1": "39087e9093bf596f1a3c1d44dc340dca48b20dd6",
+      "line_start": 66,
+      "line_end": 88,
+      "content": "public static class ColorfulConsole\n{\n    public static void Write(string message, Color color)\n    {\n        var ac = AnsiColors.White;\n        if (color == Color.Gray)\n            ac = AnsiColors.Gray;\n        else if (color == Color.Green)\n            ac = AnsiColors.Green;\n        else if (color == Color.Orange)\n            ac = AnsiColors.Orange;\n        else if (color == Color.Red)\n            ac = AnsiColors.Red;\n\n\n        Console.Write($\"{ac}{message}{AnsiColors.Reset}\");\n    }\n}\n\npublic static class AnsiColors\n{\n    public const string Reset = \"\\u001b[0m\";\n    public const string White = Reset;\n",
+      "content_sha256": "c79bf418b49fd82a6bae8376d822e81ab9b369570df21e9e326d3700cd3c6458"
+    },
+    {
+      "snapshot_id": "cli-gray",
+      "repo_relative_path": "src/EasyCon2.CLI/ConsoleOutAdapter.cs",
+      "symbols": [
+        "AnsiColors.Gray"
+      ],
+      "source_blob_bytes": 2795,
+      "source_blob_sha256": "b664e380a5da45483c02267a0255f53ca786a86e6585426ffa9e1c59a59c2980",
+      "git_blob_sha1": "39087e9093bf596f1a3c1d44dc340dca48b20dd6",
+      "line_start": 94,
+      "line_end": 94,
+      "content": "    public const string Gray = \"\\u001b[90m\";\n",
+      "content_sha256": "26ebc6affdce10268e12fa51100745bd67a629d388bc507267ee673261de38da"
+    },
+    {
+      "snapshot_id": "easyconform-print",
+      "repo_relative_path": "src/EasyCon2/App/EasyConForm.cs",
+      "symbols": [
+        "EasyConForm.Print"
+      ],
+      "source_blob_bytes": 48149,
+      "source_blob_sha256": "b809f9a0f7094be5ce7b4f52c398eb66a35ce99c058da63871e632ebc194f477",
+      "git_blob_sha1": "abf5b3ca6100dd8bb889f522ade32563f9a17707",
+      "line_start": 289,
+      "line_end": 293,
+      "content": "        #region IOutputAdapter / IControllerAdapter\n\n        public async void Print(string message, bool newline = true) =>\n            logTxtBox.Print(message, newline);\n\n",
+      "content_sha256": "155819fedb579462774d39705781bd44d66a521e970a7c9300f41ce76168e04c"
+    },
+    {
+      "snapshot_id": "richlog-state",
+      "repo_relative_path": "src/EasyCon2/Controls/RichLogBox.cs",
+      "symbols": [
+        "RichLogBox.Print"
+      ],
+      "source_blob_bytes": 3110,
+      "source_blob_sha256": "5e4a4c9f332cbb420824a46d49a54547ddd9ed41fb9b7fa3b82c346f737517e2",
+      "git_blob_sha1": "1a3868b805e38428dc894b06d14c252fc4a44b05",
+      "line_start": 5,
+      "line_end": 12,
+      "content": "internal class RichLogBox : RichTextBox\n{\n    private readonly ConcurrentQueue<Tuple<object, Color?>> _messages = new();\n    private readonly AutoResetEvent _wake = new(false);\n\n    private bool _msgNewLine = true;\n    private bool _msgFirstLine = true;\n    private const int MaxTextLength = 500_000;\n",
+      "content_sha256": "9d54e27fa12c3f9547f629cf7a03b03c70f658582874bbf8703a925fcaa95611"
+    },
+    {
+      "snapshot_id": "richlog-print",
+      "repo_relative_path": "src/EasyCon2/Controls/RichLogBox.cs",
+      "symbols": [
+        "RichLogBox.Print"
+      ],
+      "source_blob_bytes": 3110,
+      "source_blob_sha256": "5e4a4c9f332cbb420824a46d49a54547ddd9ed41fb9b7fa3b82c346f737517e2",
+      "git_blob_sha1": "1a3868b805e38428dc894b06d14c252fc4a44b05",
+      "line_start": 78,
+      "line_end": 100,
+      "content": "    public async void Print(string message, bool newline = true, bool timestamp = true)\n    {\n        _msgNewLine = _msgNewLine && newline;\n        Print(message, null, timestamp);\n    }\n\n    public void Print(string message, Color? color, bool timestamp = true)\n    {\n        lock (_messages)\n        {\n            if (_msgNewLine)\n            {\n                if (!_msgFirstLine)\n                    _messages.Enqueue(new(Environment.NewLine, null));\n                _msgFirstLine = false;\n                if (timestamp)\n                    _messages.Enqueue(new(DateTime.Now.ToString(\"[HH:mm:ss.fff] \"), Color.Gray));\n            }\n            _messages.Enqueue(new(message, color));\n            _msgNewLine = true;\n        }\n        _wake.Set();\n    }\n",
+      "content_sha256": "f89bfd4bfe8962fd74425554d126bfd9186ecd0efcb1933d38535b6e3263273b"
+    },
+    {
+      "snapshot_id": "program-main",
+      "repo_relative_path": "src/EasyCon2/Program.cs",
+      "symbols": [
+        "Program.Main"
+      ],
+      "source_blob_bytes": 1862,
+      "source_blob_sha256": "9acd391ffd8437fb2e673bd1f795727f2f4b443049f7d8e95d114d4bf8a2bb41",
+      "git_blob_sha1": "db97fd22153503605a199dd9f486e85364916976",
+      "line_start": 11,
+      "line_end": 18,
+      "content": "        [STAThread]\n        static void Main(string[] args)\n        {\n            // To customize application configuration such as set high DPI settings or default font,\n            // see https://aka.ms/applicationconfiguration.\n            ApplicationConfiguration.Initialize();\n            AvaloniaRuntime.EnsureInitialized();\n\n",
+      "content_sha256": "33f2a0428683885949075c58578dbb0e59bc2c03dbc6eebc9f734793fbb0d799"
+    },
+    {
+      "snapshot_id": "program-lite-branch",
+      "repo_relative_path": "src/EasyCon2/Program.cs",
+      "symbols": [
+        "Program.Main"
+      ],
+      "source_blob_bytes": 1862,
+      "source_blob_sha256": "9acd391ffd8437fb2e673bd1f795727f2f4b443049f7d8e95d114d4bf8a2bb41",
+      "git_blob_sha1": "db97fd22153503605a199dd9f486e85364916976",
+      "line_start": 25,
+      "line_end": 29,
+      "content": "            try\n            {\n                var exeName = Path.GetFileNameWithoutExtension(Application.ExecutablePath);\n                if (exeName.EndsWith(\"lite\", StringComparison.OrdinalIgnoreCase))\n                    Application.Run(new App.MainForm());\n",
+      "content_sha256": "e7f2406eb4e87b078bc5b7f4e2b366edbafa119496a0dd643f82a23ad8cb3929"
+    },
+    {
+      "snapshot_id": "mainform-run-entry",
+      "repo_relative_path": "src/EasyCon2/App/MainForm.cs",
+      "symbols": [
+        "MainForm.runStopBtn_Click"
+      ],
+      "source_blob_bytes": 38588,
+      "source_blob_sha256": "3598e6fe51402605ea96a68f9d2f94eb7e72404ec8924bdd06479abf20a92956",
+      "git_blob_sha1": "8eb46cdadda3bba8541d75f0cc0aa1adfc5ac0a5",
+      "line_start": 258,
+      "line_end": 264,
+      "content": "    #region Script Operations\n\n    private async void runStopBtn_Click(object sender, EventArgs e)\n    {\n        runStopBtn.Enabled = false;\n\n        if (!_scriptService.IsRunning)\n",
+      "content_sha256": "1ae2fa04bf3b76f30ce778c8b5a2588e2e80a2f48601b910231fe5965840f578"
+    },
+    {
+      "snapshot_id": "mainform-run-adapter",
+      "repo_relative_path": "src/EasyCon2/App/MainForm.cs",
+      "symbols": [
+        "MainForm.runStopBtn_Click"
+      ],
+      "source_blob_bytes": 38588,
+      "source_blob_sha256": "3598e6fe51402605ea96a68f9d2f94eb7e72404ec8924bdd06479abf20a92956",
+      "git_blob_sha1": "8eb46cdadda3bba8541d75f0cc0aa1adfc5ac0a5",
+      "line_start": 308,
+      "line_end": 314,
+      "content": "            _state.ScriptStartTime = DateTime.Now;\n            _state.ScriptRunning = true;\n            _vpadService?.Deactivate();\n\n            var pad = new GamePadAdapter(_deviceService.Device);\n            _scriptService.Run(this, pad);\n        }\n",
+      "content_sha256": "cd936769d1aa515bb8166a2c8f2fef2f444179b9b4570f886ef953fd0eb2f6e9"
+    },
+    {
+      "snapshot_id": "mainform-print",
+      "repo_relative_path": "src/EasyCon2/App/MainForm.cs",
+      "symbols": [
+        "MainForm.Print"
+      ],
+      "source_blob_bytes": 38588,
+      "source_blob_sha256": "3598e6fe51402605ea96a68f9d2f94eb7e72404ec8924bdd06479abf20a92956",
+      "git_blob_sha1": "8eb46cdadda3bba8541d75f0cc0aa1adfc5ac0a5",
+      "line_start": 1112,
+      "line_end": 1115,
+      "content": "    #region IOutputAdapter\n\n    public void Print(string message, bool newline = true) =>\n        logTxtBox.Print(message, newline);\n",
+      "content_sha256": "dd16e7a3d65b31ab3d5e1120a5eacba00fd0b87d3ed135a13a60030aeea4e955"
+    },
+    {
+      "snapshot_id": "avalonia-print",
+      "repo_relative_path": "src/EasyCon2.Avalonia/Services/LogService.cs",
+      "symbols": [
+        "LogService.Print"
+      ],
+      "source_blob_bytes": 1481,
+      "source_blob_sha256": "1e3193c547116acdea951c2954bd400820999f329ef514d0d816cafee05e4c75",
+      "git_blob_sha1": "cd6da28f87aac42fcb48059c7c37213453444280",
+      "line_start": 20,
+      "line_end": 24,
+      "content": "    public void Print(string message, bool newline)\n    {\n        var text = newline ? $\"[{DateTime.Now:HH:mm:ss}] {message}\\n\" : message;\n        Append(text);\n    }\n",
+      "content_sha256": "576b573ac732275749d7f213a3a99f0aa07e9f25dd1cc06e10c377017c8be652"
+    },
+    {
+      "snapshot_id": "avalonia-buffer-flush",
+      "repo_relative_path": "src/EasyCon2.Avalonia/Services/LogService.cs",
+      "symbols": [
+        "LogService.Append",
+        "LogService.Flush"
+      ],
+      "source_blob_bytes": 1481,
+      "source_blob_sha256": "1e3193c547116acdea951c2954bd400820999f329ef514d0d816cafee05e4c75",
+      "git_blob_sha1": "cd6da28f87aac42fcb48059c7c37213453444280",
+      "line_start": 47,
+      "line_end": 65,
+      "content": "    private void Append(string text)\n    {\n        lock (_lock)\n        {\n            _buffer.Append(text);\n        }\n    }\n\n    private void Flush(object? state)\n    {\n        string chunk;\n        lock (_lock)\n        {\n            if (_buffer.Length == 0) return;\n            chunk = _buffer.ToString();\n            _buffer.Clear();\n        }\n        Dispatcher.UIThread.Post(() => LogAppended?.Invoke(chunk));\n    }\n",
+      "content_sha256": "fd5045de28d8214804a04789ce3fb761c20fe99bb9e0289a1c9c192edd41c757"
+    },
+    {
+      "snapshot_id": "avalonia-core-print",
+      "repo_relative_path": "src/EasyCon2.Avalonia.Core/Services/LogService.cs",
+      "symbols": [
+        "LogService.Print"
+      ],
+      "source_blob_bytes": 1633,
+      "source_blob_sha256": "da7cba3985bc0dc7b4f2aadb3a32946cb69057a1872752a3fa0ac6219975aca4",
+      "git_blob_sha1": "02eb774520641dca116d918568d57dec1f393e04",
+      "line_start": 19,
+      "line_end": 23,
+      "content": "    public void Print(string message, bool newline)\n    {\n        var text = newline ? $\"[{DateTime.Now:HH:mm:ss}] {message}\\n\" : message;\n        lock (_lock) { _entries.Add((text, null)); }\n    }\n",
+      "content_sha256": "f2f8411e68cd7b8088738d58d2d51b89d0cb8e26496c9745c846ecb1ed648320"
+    },
+    {
+      "snapshot_id": "avalonia-core-flush",
+      "repo_relative_path": "src/EasyCon2.Avalonia.Core/Services/LogService.cs",
+      "symbols": [
+        "LogService.Flush"
+      ],
+      "source_blob_bytes": 1633,
+      "source_blob_sha256": "da7cba3985bc0dc7b4f2aadb3a32946cb69057a1872752a3fa0ac6219975aca4",
+      "git_blob_sha1": "02eb774520641dca116d918568d57dec1f393e04",
+      "line_start": 43,
+      "line_end": 57,
+      "content": "    private void Flush(object? state)\n    {\n        (string text, string? color)[] batch;\n        lock (_lock)\n        {\n            if (_entries.Count == 0) return;\n            batch = _entries.ToArray();\n            _entries.Clear();\n        }\n        Dispatcher.UIThread.Post(() =>\n        {\n            foreach (var (text, color) in batch)\n                LogAppended?.Invoke(text, color);\n        });\n    }\n",
+      "content_sha256": "17fb2cd57b2bb4b244cad43bcb4d28066624f49d5eeacfcd7709ce0ed10d830c"
+    },
+    {
+      "snapshot_id": "test-mock",
+      "repo_relative_path": "test/EasyCon.Tests/EvaluatorTests.cs",
+      "symbols": [
+        "MockOutputAdapter.Print"
+      ],
+      "source_blob_bytes": 5660,
+      "source_blob_sha256": "8520a35e7ee3c6bc20692c6246b55460c97487737eaa687d578bfe19e13e5d76",
+      "git_blob_sha1": "093bd61b1868b98c3ae2b807d7a4feb634fcf55d",
+      "line_start": 12,
+      "line_end": 22,
+      "content": "internal sealed class MockOutputAdapter : IOutputAdapter\n{\n    public List<string> Printed { get; } = [];\n    public List<string> Alerted { get; } = [];\n\n    public void Print(string message, bool newline)\n    {\n        Printed.Add(newline ? message + \"\\n\" : message);\n    }\n\n    public void Alert(string message)\n",
+      "content_sha256": "3e63af3a5e5dd06c764b689730691d2105faf7b120323b1718a6ad1b47ab3831"
+    },
+    {
+      "snapshot_id": "imglabel-search",
+      "repo_relative_path": "src/EasyCon.Capture/ImgLabel.cs",
+      "symbols": [
+        "ImgLabel.Search"
+      ],
+      "source_blob_bytes": 6307,
+      "source_blob_sha256": "c6192e10ce09dd6e760ca22bc96d01856577756c55948f45bff5afe3a32123d4",
+      "git_blob_sha1": "9dcaa2e09b33faf55b532e5062041be314877834",
+      "line_start": 159,
+      "line_end": 161,
+      "content": "    public static List<Point> Search(this ImgLabel self, Mat ss, out double md)\n    {\n        if (self.TargetWidth > self.RangeWidth || self.TargetHeight > self.RangeHeight)\n",
+      "content_sha256": "45a51819ec56f5cbaab267ba09c9af305fd81e8d89d946d1a5282788e32831d3"
+    },
+    {
+      "snapshot_id": "imglabel-scale",
+      "repo_relative_path": "src/EasyCon.Capture/ImgLabel.cs",
+      "symbols": [
+        "ImgLabel.Search"
+      ],
+      "source_blob_bytes": 6307,
+      "source_blob_sha256": "c6192e10ce09dd6e760ca22bc96d01856577756c55948f45bff5afe3a32123d4",
+      "git_blob_sha1": "9dcaa2e09b33faf55b532e5062041be314877834",
+      "line_start": 174,
+      "line_end": 188,
+      "content": "            List<Point> result = new();\n            if (self.searchMethod == SearchMethod.TesserDetect)\n            {\n                using var target = new Mat(ss, self._target);\n                var rlttxt = ECSearch.FindOCR(self.ImgBase64, target, out md);\n                result = [new Point(self.TargetX - self.RangeX, self.TargetY - self.RangeY)];\n            }\n            else\n            {\n                byte[] imageBytes = Convert.FromBase64String(self.ImgBase64);\n                using var target = imageBytes.ToMat();\n                result = ECSearch.FindPic(range, target, self.searchMethod, out md);\n            }\n            md *= 100;\n\n",
+      "content_sha256": "6e2a681aa847ef8da89d5e586c1dbc53acf854037f8554841a7a731a4e266d98"
+    },
+    {
+      "snapshot_id": "cli-label-start",
+      "repo_relative_path": "src/EasyCon2.CLI/Program.cs",
+      "symbols": [
+        "externalGetters"
+      ],
+      "source_blob_bytes": 9171,
+      "source_blob_sha256": "a772b4f9707e253b0f5df6fdb043e28e5738db29c38ea847e633f72dc4f593e3",
+      "git_blob_sha1": "f0b76002ad9517297f7406502e13f694fe71fe6d",
+      "line_start": 175,
+      "line_end": 176,
+      "content": "    var externalGetters = label.ToDictionary(il => il.name, il => (Func<int>)(() =>\n    {\n",
+      "content_sha256": "ad05cbfcd193f5350eab302609de0d069feabd630127ac65267746c3b97e5f78"
+    },
+    {
+      "snapshot_id": "cli-label-conversion",
+      "repo_relative_path": "src/EasyCon2.CLI/Program.cs",
+      "symbols": [
+        "externalGetters"
+      ],
+      "source_blob_bytes": 9171,
+      "source_blob_sha256": "a772b4f9707e253b0f5df6fdb043e28e5738db29c38ea847e633f72dc4f593e3",
+      "git_blob_sha1": "f0b76002ad9517297f7406502e13f694fe71fe6d",
+      "line_start": 178,
+      "line_end": 180,
+      "content": "        il.Search(cvcap!.GetMatFrame(), out var md);\n        return (int)md;\n    }));\n",
+      "content_sha256": "fc583d623826eed1f51b80ba7bd0e9b2208530a132f86674e9cbcb7421fcbb58"
+    },
+    {
+      "snapshot_id": "avalonia-label-start",
+      "repo_relative_path": "src/EasyCon2.Avalonia/Services/ScriptService.cs",
+      "symbols": [
+        "ScriptService.Run externalGetters"
+      ],
+      "source_blob_bytes": 3847,
+      "source_blob_sha256": "360df4655bf41c3c878123a0da78301bc276c0f4c50e6e00fca9f31dfe4a6b13",
+      "git_blob_sha1": "380e7213e45b1e84b5b65606bf9027904c17d91b",
+      "line_start": 77,
+      "line_end": 78,
+      "content": "                var externalGetters = label.ToDictionary(il => il.name, il => (Func<int>)(() =>\n                {\n",
+      "content_sha256": "aa7b79e6cc58a684ab28d08f86685c8676323a9966c9c8cce6286e4df47651e9"
+    },
+    {
+      "snapshot_id": "avalonia-label-conversion",
+      "repo_relative_path": "src/EasyCon2.Avalonia/Services/ScriptService.cs",
+      "symbols": [
+        "ScriptService.Run externalGetters"
+      ],
+      "source_blob_bytes": 3847,
+      "source_blob_sha256": "360df4655bf41c3c878123a0da78301bc276c0f4c50e6e00fca9f31dfe4a6b13",
+      "git_blob_sha1": "380e7213e45b1e84b5b65606bf9027904c17d91b",
+      "line_start": 80,
+      "line_end": 84,
+      "content": "                    il.Search(mat, out var md);\n                    return (int)md;\n                }));\n\n                _runner.Run(_logService, pad, externalGetters, token);\n",
+      "content_sha256": "20d25c00a65892a813f7a6ec6229efb2f0aa500b905da484afce3455dda57ab0"
+    },
+    {
+      "snapshot_id": "winforms-label",
+      "repo_relative_path": "src/EasyCon2/Services/CaptureService.cs",
+      "symbols": [
+        "CaptureService.BuildExternalGetters"
+      ],
+      "source_blob_bytes": 3201,
+      "source_blob_sha256": "dc308f672e0c70fd9a3383f4a2a6b05710bba50e26097b1c48651158f9608be6",
+      "git_blob_sha1": "9d16b923b7eaf1fb27e39029c46950553383a346",
+      "line_start": 100,
+      "line_end": 115,
+      "content": "    public Dictionary<string, Func<int>> BuildExternalGetters()\n    {\n        if (_captureForm == null)\n            return [];\n\n        return _captureForm.LoadedLabels.ToDictionary(\n            il => il.name,\n            il => (Func<int>)(() =>\n            {\n                var bmp = GetCurrentFrame();\n                if (bmp == null) return 0;\n                using var mat = BitmapConverter.ToMat(bmp);\n                il.Search(mat, out var md);\n                return (int)Math.Ceiling(md);\n            }));\n    }\n",
+      "content_sha256": "f909fc2637ffef8b3c4b41331f6bb2e7492edc82f52f9dc90b35c822584ef994"
+    },
+    {
+      "snapshot_id": "exact-round-div",
+      "repo_relative_path": "src/EasyCon.Script/Binding/BoundBinaryOperator.cs",
+      "symbols": [
+        "BoundBinaryOperator._operators"
+      ],
+      "source_blob_bytes": 6069,
+      "source_blob_sha256": "6ab58cc6c9444cd6ab11d0718a4a5439ee14fa9c203ee492dda031e3d2c7e3b6",
+      "git_blob_sha1": "db324120720288a8f2c7cd0e3f3a3b82bfb43860",
+      "line_start": 42,
+      "line_end": 42,
+      "content": "        new(TokenType.SlashI,BoundBinaryOperatorKind.RoundDiv, ScriptType.Int, (a, b) => (int)Math.Round((double)a.AsInt() / b.AsInt(), MidpointRounding.AwayFromZero)),\n",
+      "content_sha256": "3c7b8d19232c3b39ce949a976f764fec2e1c0b53c90fb525c2796f52bd4e7c14"
+    },
+    {
+      "snapshot_id": "exact-xor",
+      "repo_relative_path": "src/EasyCon.Script/Binding/BoundBinaryOperator.cs",
+      "symbols": [
+        "BoundBinaryOperator._operators"
+      ],
+      "source_blob_bytes": 6069,
+      "source_blob_sha256": "6ab58cc6c9444cd6ab11d0718a4a5439ee14fa9c203ee492dda031e3d2c7e3b6",
+      "git_blob_sha1": "db324120720288a8f2c7cd0e3f3a3b82bfb43860",
+      "line_start": 46,
+      "line_end": 46,
+      "content": "        new(TokenType.XOR,BoundBinaryOperatorKind.BitwiseXor, ScriptType.Int, (a, b) => a.AsInt() ^ b.AsInt()),\n",
+      "content_sha256": "7decb1f7a3cd1c9900ffd6b86f7ea83a53153f14490e7f5d7947be4839f9e05a"
+    },
+    {
+      "snapshot_id": "exact-logical-operators",
+      "repo_relative_path": "src/EasyCon.Script/Binding/BoundBinaryOperator.cs",
+      "symbols": [
+        "BoundBinaryOperator._operators"
+      ],
+      "source_blob_bytes": 6069,
+      "source_blob_sha256": "6ab58cc6c9444cd6ab11d0718a4a5439ee14fa9c203ee492dda031e3d2c7e3b6",
+      "git_blob_sha1": "db324120720288a8f2c7cd0e3f3a3b82bfb43860",
+      "line_start": 61,
+      "line_end": 66,
+      "content": "        new(TokenType.LogicAnd, BoundBinaryOperatorKind.LogicalAnd,ScriptType.Bool, (v0, v1) => {\n            if(!v0.AsBool()) { return false; } return v1.AsBool();\n        }),\n        new(TokenType.LogicOr, BoundBinaryOperatorKind.LogicalOr,ScriptType.Bool, (v0, v1) => {\n            if(v0.AsBool()) { return true; } return v1.AsBool();\n        }),\n",
+      "content_sha256": "6749583c6e8b3e2d51e49075707c90d5d92ae8849ec98ebb04ada89572749baf"
+    },
+    {
+      "snapshot_id": "exact-short-circuit",
+      "repo_relative_path": "src/EasyCon.Script/Evaluator.cs",
+      "symbols": [
+        "Evaluator.EvaluateBinaryExpression"
+      ],
+      "source_blob_bytes": 13442,
+      "source_blob_sha256": "5a4303a911edb352de3547db338dc54388ecd2cd83f8b68837df7f8f26c88639",
+      "git_blob_sha1": "bd56ff85168fe2ba1019478b96949e436a1fb1ab",
+      "line_start": 294,
+      "line_end": 304,
+      "content": "    private Value EvaluateBinaryExpression(BoundBinaryExpression b)\n    {\n        var left = EvaluateExpression(b.Left);\n        if (b.Op.Kind == BoundBinaryOperatorKind.LogicalAnd && !left.AsBool()) return false;\n        if (b.Op.Kind == BoundBinaryOperatorKind.LogicalOr && left.AsBool()) return true;\n        var right = EvaluateExpression(b.Right);\n\n        Debug.Assert(left != Value.Void && right != Value.Void);\n\n        return Value.From(b.Op.Operate(left, right));\n    }\n",
+      "content_sha256": "61589164d27de8d12ea698c7f6c17cefa0f80a58e58f69262f63babe7d00fd33"
+    }
+  ]
+}

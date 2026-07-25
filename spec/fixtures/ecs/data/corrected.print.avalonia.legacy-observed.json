@@ -1,0 +1,244 @@
+{
+  "schema": "easycon-sdk:legacy-print-token-trace:v1",
+  "schema_version": 1,
+  "fixture_id": "corrected.print.avalonia",
+  "implementations": [
+    {
+      "implementation": "src/EasyCon2.Avalonia/Services/LogService.cs::LogService.Print",
+      "adapter_calls": [
+        {
+          "ordinal": 1,
+          "message": "A",
+          "newline": true,
+          "emissions": [
+            {
+              "transport": "BufferAppend",
+              "tokens": [
+                {
+                  "kind": "Timestamp",
+                  "value": "[HH:mm:ss] "
+                },
+                {
+                  "kind": "Payload",
+                  "value": "A"
+                },
+                {
+                  "kind": "LF",
+                  "value": "\n"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "ordinal": 2,
+          "message": "B",
+          "newline": false,
+          "emissions": [
+            {
+              "transport": "BufferAppend",
+              "tokens": [
+                {
+                  "kind": "Payload",
+                  "value": "B"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "ordinal": 3,
+          "message": "C",
+          "newline": false,
+          "emissions": [
+            {
+              "transport": "BufferAppend",
+              "tokens": [
+                {
+                  "kind": "Payload",
+                  "value": "C"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "ordinal": 4,
+          "message": "D",
+          "newline": true,
+          "emissions": [
+            {
+              "transport": "BufferAppend",
+              "tokens": [
+                {
+                  "kind": "Timestamp",
+                  "value": "[HH:mm:ss] "
+                },
+                {
+                  "kind": "Payload",
+                  "value": "D"
+                },
+                {
+                  "kind": "LF",
+                  "value": "\n"
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "flush": [
+        {
+          "transport": "Dispatcher.UIThread.Post",
+          "tokens": [
+            {
+              "kind": "UiPost",
+              "value": "combined-buffer"
+            }
+          ]
+        },
+        {
+          "transport": "LogAppended.Invoke",
+          "tokens": [
+            {
+              "kind": "Callback",
+              "value": "combined-buffer"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "implementation": "src/EasyCon2.Avalonia.Core/Services/LogService.cs::LogService.Print",
+      "adapter_calls": [
+        {
+          "ordinal": 1,
+          "message": "A",
+          "newline": true,
+          "emissions": [
+            {
+              "transport": "EntryEnqueue",
+              "tokens": [
+                {
+                  "kind": "Timestamp",
+                  "value": "[HH:mm:ss] "
+                },
+                {
+                  "kind": "Payload",
+                  "value": "A"
+                },
+                {
+                  "kind": "LF",
+                  "value": "\n"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "ordinal": 2,
+          "message": "B",
+          "newline": false,
+          "emissions": [
+            {
+              "transport": "EntryEnqueue",
+              "tokens": [
+                {
+                  "kind": "Payload",
+                  "value": "B"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "ordinal": 3,
+          "message": "C",
+          "newline": false,
+          "emissions": [
+            {
+              "transport": "EntryEnqueue",
+              "tokens": [
+                {
+                  "kind": "Payload",
+                  "value": "C"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "ordinal": 4,
+          "message": "D",
+          "newline": true,
+          "emissions": [
+            {
+              "transport": "EntryEnqueue",
+              "tokens": [
+                {
+                  "kind": "Timestamp",
+                  "value": "[HH:mm:ss] "
+                },
+                {
+                  "kind": "Payload",
+                  "value": "D"
+                },
+                {
+                  "kind": "LF",
+                  "value": "\n"
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "flush": [
+        {
+          "transport": "Dispatcher.UIThread.Post",
+          "tokens": [
+            {
+              "kind": "UiPost",
+              "value": "entry-batch"
+            }
+          ]
+        },
+        {
+          "transport": "LogAppended.Invoke",
+          "tokens": [
+            {
+              "kind": "Callback",
+              "value": "entry-1"
+            }
+          ]
+        },
+        {
+          "transport": "LogAppended.Invoke",
+          "tokens": [
+            {
+              "kind": "Callback",
+              "value": "entry-2"
+            }
+          ]
+        },
+        {
+          "transport": "LogAppended.Invoke",
+          "tokens": [
+            {
+              "kind": "Callback",
+              "value": "entry-3"
+            }
+          ]
+        },
+        {
+          "transport": "LogAppended.Invoke",
+          "tokens": [
+            {
+              "kind": "Callback",
+              "value": "entry-4"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

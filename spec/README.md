@@ -1,8 +1,9 @@
 # EasyCon SDK v1 milestone specifications
 
 This directory contains the machine-checkable behavior and conformance baseline for the Phase 1
-Runtime plus the Phase 2A Controller/Serial Candidate. Phase 2A is `Hardware Unverified` and remains
-narrower than the complete v1 architecture.
+Runtime, the Phase 2A Controller/Serial Candidate, and the static Phase 4 S0 ECS provenance
+foundation. Phase 2A is `Hardware Unverified` and remains narrower than the complete v1
+architecture.
 
 - `behavior/runtime-controller-v1.json` fixes operation, timeout, event, shutdown, serial,
   Controller, Amiibo, sequence, timing, and Hardware Unverified behavior.
@@ -16,6 +17,10 @@ narrower than the complete v1 architecture.
   scenarios. Every step and assertion has a stable ID. Each scenario declares the exact executable
   Rust test suite covering its assertions, and every assertion maps through a matching
   `// conformance:` source marker.
+- `fixtures/ecs/manifest.json` separates Legacy Exact, Corrected, and v1-native provenance. Its 11
+  records own 33 SDK-local input, observed, expected, source-snapshot, and profile artifacts. The
+  Corrected records preserve every ADR-0017 PRINT and label production/test oracle independently;
+  the v1-native records preserve the fixed heap-order pair without claiming legacy evidence.
 - `schemas/` contains JSON Schema Draft 2020-12 documents for every asset shape. The local validator
   applies the schema subset used here to each concrete instance rather than only parsing the schema
   documents.
@@ -24,6 +29,10 @@ Protocol fixtures were transcribed from the source evidence named in each file; 
 is a dated local measurement with an explicit software-only scope. Controller golden-vector and
 precise-sequence tests read their tracked files directly. Tests and validation do not open, build,
 download, or otherwise depend on `EasyCon/`.
+
+`tools/generate_ecs_provenance_fixtures.py --check` deterministically verifies the tracked ECS file
+set. Its legacy commit, full source blob identities, and exact source excerpts are fixed data; the
+generator performs no checkout discovery, network access, or external source read.
 
 `tools/validate_specs.py` compares the complete assertion and Rust marker sets, checks each scenario
 suite for exact assertion coverage, resolves every mapped source through Cargo metadata to one

@@ -25,6 +25,7 @@ Cargo.lock text eol=lf
 *.yaml text eol=lf
 *.def text eol=lf
 *.hex text eol=lf
+spec/fixtures/ecs/data/*.ecs text eol=lf
 
 *.bin binary
 *.dll binary
