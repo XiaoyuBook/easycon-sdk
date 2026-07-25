@@ -1,0 +1,16 @@
+{
+  "schema": "easycon-sdk:ecs-value-trace:v1",
+  "schema_version": 1,
+  "fixture_id": "legacy-exact.integer-operators",
+  "result": [
+    3,
+    -3,
+    6,
+    false,
+    true
+  ],
+  "short_circuit_rhs_evaluated": [
+    false,
+    false
+  ]
+}

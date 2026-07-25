@@ -9,7 +9,7 @@ import re
 import shutil
 import subprocess
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,13 +20,29 @@ class ValidationError(Exception):
     """Raised when a tracked specification violates the milestone contract."""
 
 
+def reject_duplicate_object(pairs):
+    result = {}
+    for name, value in pairs:
+        if name in result:
+            raise ValidationError("duplicate JSON object key: {}".format(name))
+        result[name] = value
+    return result
+
+
+def load_json_text(text, source):
+    try:
+        return json.loads(text, object_pairs_hook=reject_duplicate_object)
+    except json.JSONDecodeError as error:
+        raise ValidationError("{}: {}".format(source, error))
+
+
 def load_json(relative_path):
     path = SPEC / relative_path
     try:
-        with path.open("r", encoding="utf-8") as stream:
-            return json.load(stream)
-    except (OSError, json.JSONDecodeError) as error:
+        text = path.read_text(encoding="utf-8")
+    except OSError as error:
         raise ValidationError("{}: {}".format(path, error))
+    return load_json_text(text, path)
 
 
 def require(condition, message):
@@ -183,6 +199,7 @@ def validate_schemas():
         ("schemas/conformance-v1.schema.json", "conformance/runtime-controller-v1.json"),
         ("schemas/sequence-trace-v1.schema.json", "fixtures/controller/sequence-traces-v1.json"),
         ("schemas/latency-result-v1.schema.json", "fixtures/controller/phase2a-latency-result-v1.json"),
+        ("schemas/ecs-provenance-manifest-v1.schema.json", "fixtures/ecs/manifest.json"),
     ]
     for schema_name, instance_name in mappings:
         schema = load_json(schema_name)
@@ -207,7 +224,19 @@ def require_rejected(instance, schema, message):
     raise ValidationError(message)
 
 
+def require_json_rejected(text, message):
+    try:
+        load_json_text(text, "validator regression")
+    except ValidationError:
+        return
+    raise ValidationError(message)
+
+
 def validate_validator_regressions():
+    require_json_rejected(
+        '{"fixture_id":"first","fixture_id":"second"}',
+        "duplicate JSON object keys were not rejected",
+    )
     sequence_schema = load_json("schemas/sequence-trace-v1.schema.json")
     trace_schema = sequence_schema["properties"]["traces"]["items"]
     step_schema = trace_schema["properties"]["steps"]["items"]
@@ -221,6 +250,1110 @@ def validate_validator_regressions():
                          "sequence action fields were not rejected: {!r}".format(step))
     require_rejected(True, {"const": 1},
                      "JSON boolean must not satisfy a numeric const")
+
+
+ECS_FIXTURE_ROOT = SPEC / "fixtures" / "ecs"
+ECS_LEGACY_COMMIT = "11c4b992b9bce0ff977e9c587a6c0bb0d302853e"
+LOWER_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+LOWER_SHA1 = re.compile(r"[0-9a-f]{40}\Z")
+
+ECS_RECORDS = [
+    ("legacy-exact.integer-operators", "Legacy Exact", "production-source"),
+    ("corrected.print.cli", "Corrected", "production-cli"),
+    ("corrected.print.winforms", "Corrected", "production-winforms"),
+    ("corrected.print.winforms-lite", "Corrected", "production-winforms-lite"),
+    ("corrected.print.avalonia", "Corrected", "production-avalonia"),
+    ("corrected.print.test-mock", "Corrected", "test-oracle"),
+    ("corrected.label.cli", "Corrected", "production-cli"),
+    ("corrected.label.avalonia", "Corrected", "production-avalonia"),
+    ("corrected.label.winforms", "Corrected", "production-winforms"),
+    ("v1-native.heap-order.left-medium", "v1-native", "adr-v1-contract"),
+    ("v1-native.heap-order.medium-left", "v1-native", "adr-v1-contract"),
+]
+
+ECS_PROGRAM_HASHES = {
+    "legacy-exact.integer-operators": (
+        "d9106739fd6e1f664fc9807a4b2549d83362350e4626a15c9e0f48a0a241678b"
+    ),
+    "corrected.print.cli": (
+        "bb9121e382ac1bb02bb4b1ca6f3e826c7a59defd3358e1b67bd6061ac5de80d8"
+    ),
+    "corrected.print.winforms": (
+        "bb9121e382ac1bb02bb4b1ca6f3e826c7a59defd3358e1b67bd6061ac5de80d8"
+    ),
+    "corrected.print.winforms-lite": (
+        "bb9121e382ac1bb02bb4b1ca6f3e826c7a59defd3358e1b67bd6061ac5de80d8"
+    ),
+    "corrected.print.avalonia": (
+        "bb9121e382ac1bb02bb4b1ca6f3e826c7a59defd3358e1b67bd6061ac5de80d8"
+    ),
+    "corrected.print.test-mock": (
+        "bb9121e382ac1bb02bb4b1ca6f3e826c7a59defd3358e1b67bd6061ac5de80d8"
+    ),
+    "v1-native.heap-order.left-medium": (
+        "c000c49eceea2d592bc1787347b10aef88d3834624b9c64ac8df3866dd7ff8bb"
+    ),
+    "v1-native.heap-order.medium-left": (
+        "83734a419b0df485cee09a365952e0f3b255948285eb220202740121c7c5a570"
+    ),
+}
+
+ECS_INPUT_HASHES = {
+    "legacy-exact.integer-operators": (
+        "5d8276eab558b32820d8616027bf194667bca4c19ac62f9f1b40036a359c4263"
+    ),
+    "corrected.print.cli": (
+        "f7162011fb86fdd1dc9f673a8d7f7dbbc2ce955e8ca4f9b1a1ab8318d306995a"
+    ),
+    "corrected.print.winforms": (
+        "f7162011fb86fdd1dc9f673a8d7f7dbbc2ce955e8ca4f9b1a1ab8318d306995a"
+    ),
+    "corrected.print.winforms-lite": (
+        "f7162011fb86fdd1dc9f673a8d7f7dbbc2ce955e8ca4f9b1a1ab8318d306995a"
+    ),
+    "corrected.print.avalonia": (
+        "f7162011fb86fdd1dc9f673a8d7f7dbbc2ce955e8ca4f9b1a1ab8318d306995a"
+    ),
+    "corrected.print.test-mock": (
+        "f7162011fb86fdd1dc9f673a8d7f7dbbc2ce955e8ca4f9b1a1ab8318d306995a"
+    ),
+    "v1-native.heap-order.left-medium": (
+        "12e61485f770a624f4575fc5c99b2d079afce6a1ea25d0e6c73a25cdaef82d4f"
+    ),
+    "v1-native.heap-order.medium-left": (
+        "1094bfede150bafc6d9396487c705e46973999000b640a3ecebc4a6d9e51c922"
+    ),
+}
+
+ECS_LIMITS = [
+    (1, "profile_version", "u32", 1),
+    (2, "source_units", "u32", 64),
+    (3, "per_source_bytes", "u64", 262144),
+    (4, "bundle_bytes", "u64", 1048576),
+    (5, "source_id_bytes", "u64", 256),
+    (6, "identifier_bytes", "u64", 128),
+    (7, "parameters", "u32", 32),
+    (8, "arguments", "u32", 32),
+    (9, "syntax_nesting", "u32", 64),
+    (10, "functions", "u32", 256),
+    (11, "symbols", "u32", 4096),
+    (12, "tokens", "u32", 262144),
+    (13, "ast_nodes", "u32", 131072),
+    (14, "bound_nodes", "u32", 262144),
+    (15, "lowered_nodes", "u32", 262144),
+    (16, "instructions", "u32", 262144),
+    (17, "diagnostics_per_source", "u32", 64),
+    (18, "diagnostics_total", "u32", 512),
+    (19, "reserved_limit_diagnostics", "u32", 1),
+    (20, "call_depth", "u32", 128),
+    (21, "array_cells", "u32", 16384),
+    (22, "string_bytes", "u64", 262144),
+    (23, "live_logical_heap_bytes", "u64", 33554432),
+    (24, "output_fragment_bytes", "u64", 32768),
+    (25, "output_queue_pending", "u32", 32),
+    (26, "output_payload_bytes", "u64", 1048576),
+    (27, "production_instruction_fuel_present", "u8", 0),
+    (28, "production_output_count_present", "u8", 0),
+]
+
+ECS_CLASSIFICATIONS = {
+    "Legacy Exact": [
+        "round-div-midpoint-away-from-zero",
+        "integer-xor",
+        "logical-and-or-short-circuit",
+        "ordinary-i32-wrap-and-shift",
+        "import-bind-nop",
+        "bundle-libs-loaded-without-import",
+        "shared-lib-scope",
+        "lib-main-visibility-and-lib-globals-first",
+        "reachable-array-string-control-flow-success",
+    ],
+    "Corrected": [
+        "for-i32-max-stop-after-upper",
+        "boolean-literals-executable",
+        "libs-raw-utf8-sort",
+        "lf-crlf-cr-newline",
+        "typed-diagnostic-failure",
+        "utf8-byte-span-and-unicode-scalar-string",
+        "print-continuation",
+        "label-floor",
+        "effect-checkpoints-and-five-way-cleanup-before-terminal",
+    ],
+    "v1-native": [
+        "source-bundle-and-restricted-loader",
+        "bom-and-program-hash",
+        "pcg-and-replay",
+        "monotonic-time-and-absolute-wait",
+        "ecs-limits",
+        "immutable-program-and-run-completion",
+        "typed-and-recording-ports",
+        "generic-error-projection",
+        "runtime-five-way-terminal-race",
+    ],
+}
+
+ECS_REQUIRED_SOURCES = {
+    "legacy-exact.integer-operators": {
+        "src/EasyCon.Script/Binding/BoundBinaryOperator.cs": {
+            "BoundBinaryOperator._operators"
+        },
+        "src/EasyCon.Script/Evaluator.cs": {
+            "Evaluator.EvaluateBinaryExpression"
+        },
+    },
+    "corrected.print.cli": {
+        "src/EasyCon.Script/Binding/BuiltinCallable.cs": {
+            "BuiltinCallable.ImplPrint"
+        },
+        "src/EasyCon2.CLI/ConsoleOutAdapter.cs": {
+            "ConsoleOutAdapter.Print",
+            "ColorfulConsole.Write",
+            "AnsiColors.Reset",
+            "AnsiColors.White",
+            "AnsiColors.Gray",
+        },
+    },
+    "corrected.print.winforms": {
+        "src/EasyCon.Script/Binding/BuiltinCallable.cs": {
+            "BuiltinCallable.ImplPrint"
+        },
+        "src/EasyCon2/App/EasyConForm.cs": {"EasyConForm.Print"},
+        "src/EasyCon2/Controls/RichLogBox.cs": {"RichLogBox.Print"},
+    },
+    "corrected.print.winforms-lite": {
+        "src/EasyCon.Script/Binding/BuiltinCallable.cs": {
+            "BuiltinCallable.ImplPrint"
+        },
+        "src/EasyCon2/Program.cs": {"Program.Main"},
+        "src/EasyCon2/App/MainForm.cs": {
+            "MainForm.runStopBtn_Click",
+            "MainForm.Print",
+        },
+        "src/EasyCon2/Controls/RichLogBox.cs": {"RichLogBox.Print"},
+    },
+    "corrected.print.avalonia": {
+        "src/EasyCon.Script/Binding/BuiltinCallable.cs": {
+            "BuiltinCallable.ImplPrint"
+        },
+        "src/EasyCon2.Avalonia/Services/LogService.cs": {
+            "LogService.Print",
+            "LogService.Append",
+            "LogService.Flush",
+        },
+        "src/EasyCon2.Avalonia.Core/Services/LogService.cs": {
+            "LogService.Print",
+            "LogService.Flush",
+        },
+    },
+    "corrected.print.test-mock": {
+        "src/EasyCon.Script/Binding/BuiltinCallable.cs": {
+            "BuiltinCallable.ImplPrint"
+        },
+        "test/EasyCon.Tests/EvaluatorTests.cs": {"MockOutputAdapter.Print"},
+    },
+    "corrected.label.cli": {
+        "src/EasyCon.Capture/ImgLabel.cs": {"ImgLabel.Search"},
+        "src/EasyCon2.CLI/Program.cs": {"externalGetters"},
+    },
+    "corrected.label.avalonia": {
+        "src/EasyCon.Capture/ImgLabel.cs": {"ImgLabel.Search"},
+        "src/EasyCon2.Avalonia/Services/ScriptService.cs": {
+            "ScriptService.Run externalGetters"
+        },
+    },
+    "corrected.label.winforms": {
+        "src/EasyCon.Capture/ImgLabel.cs": {"ImgLabel.Search"},
+        "src/EasyCon2/Services/CaptureService.cs": {
+            "CaptureService.BuildExternalGetters"
+        },
+    },
+}
+
+ECS_PRINT_IMPLEMENTATIONS = {
+    "corrected.print.cli": {
+        "src/EasyCon2.CLI/ConsoleOutAdapter.cs::ConsoleOutAdapter.Print"
+    },
+    "corrected.print.winforms": {
+        "src/EasyCon2/App/EasyConForm.cs::EasyConForm.Print"
+    },
+    "corrected.print.winforms-lite": {
+        "src/EasyCon2/App/MainForm.cs::MainForm.Print"
+    },
+    "corrected.print.avalonia": {
+        "src/EasyCon2.Avalonia/Services/LogService.cs::LogService.Print",
+        "src/EasyCon2.Avalonia.Core/Services/LogService.cs::LogService.Print",
+    },
+    "corrected.print.test-mock": {
+        "test/EasyCon.Tests/EvaluatorTests.cs::MockOutputAdapter.Print"
+    },
+}
+
+
+def require_keys(value, expected, label):
+    require(isinstance(value, dict), "{} must be an object".format(label))
+    actual = set(value)
+    require(
+        actual == set(expected),
+        "{} fields differ: missing={!r}, unknown={!r}".format(
+            label, sorted(set(expected) - actual), sorted(actual - set(expected))
+        ),
+    )
+
+
+def validate_relative_path(value, label, prefix=None):
+    require(isinstance(value, str) and value, "{} must be a non-empty string".format(label))
+    require("\\" not in value and "\0" not in value, "{} is not slash-relative".format(label))
+    require("://" not in value and ":" not in value, "{} is not a local relative path".format(label))
+    parsed = PurePosixPath(value)
+    require(not parsed.is_absolute(), "{} must not be absolute".format(label))
+    require(
+        all(part not in ("", ".", "..") for part in parsed.parts),
+        "{} contains an unsafe path segment".format(label),
+    )
+    require(parsed.as_posix() == value, "{} is not normalized".format(label))
+    if prefix is not None:
+        require(value.startswith(prefix), "{} must remain under {}".format(label, prefix))
+    return parsed
+
+
+def validate_artifact_payload(reference, data, label):
+    require(
+        LOWER_SHA256.fullmatch(reference["sha256"]) is not None,
+        "{} SHA-256 must be lowercase hexadecimal".format(label),
+    )
+    require(len(data) == reference["bytes"], "{} byte count mismatch".format(label))
+    require(
+        hashlib.sha256(data).hexdigest() == reference["sha256"],
+        "{} SHA-256 mismatch".format(label),
+    )
+
+
+def read_artifact(reference, fixture_root, seen, label):
+    relative = validate_relative_path(reference["path"], label + ".path", "data/")
+    current = fixture_root
+    for part in relative.parts:
+        current = current / part
+        require(not current.is_symlink(), "{} traverses a symlink".format(label))
+    resolved_root = fixture_root.resolve()
+    resolved = current.resolve()
+    try:
+        resolved.relative_to(resolved_root)
+    except ValueError:
+        raise ValidationError("{} escapes the SDK fixture root".format(label))
+    require(resolved.is_file(), "{} does not name an SDK-local file".format(label))
+    try:
+        data = resolved.read_bytes()
+    except OSError as error:
+        raise ValidationError("{}: {}".format(label, error))
+    validate_artifact_payload(reference, data, label)
+    previous = seen.get(reference["path"])
+    identity = (reference["bytes"], reference["sha256"])
+    require(
+        previous is None or previous == identity,
+        "conflicting artifact identity for {}".format(reference["path"]),
+    )
+    seen[reference["path"]] = identity
+    return data
+
+
+def load_artifact_json(data, label):
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValidationError("{} is not UTF-8: {}".format(label, error))
+    return load_json_text(text, label)
+
+
+def expected_profile_document():
+    return {
+        "schema": "easycon-sdk:ecs-limits-profile:v1",
+        "schema_version": 1,
+        "hash_format_version": 1,
+        "ecs_semantics_version": 1,
+        "limits": [
+            {"order": order, "name": name, "encoding": encoding, "value": value}
+            for order, name, encoding, value in ECS_LIMITS
+        ],
+    }
+
+
+def validate_source_catalog(document):
+    require_keys(
+        document,
+        {"schema", "schema_version", "legacy_commit", "entries"},
+        "ECS legacy source catalog",
+    )
+    require(
+        document["schema"] == "easycon-sdk:legacy-source-snapshots:v1"
+        and document["schema_version"] == 1
+        and document["legacy_commit"] == ECS_LEGACY_COMMIT,
+        "ECS legacy source catalog identity changed",
+    )
+    require(isinstance(document["entries"], list) and document["entries"],
+            "ECS legacy source catalog has no entries")
+    snapshots = {}
+    files = {}
+    for index, entry in enumerate(document["entries"]):
+        label = "ECS source catalog entry {}".format(index)
+        require_keys(
+            entry,
+            {
+                "snapshot_id", "repo_relative_path", "symbols", "source_blob_bytes",
+                "source_blob_sha256", "git_blob_sha1", "line_start", "line_end",
+                "content", "content_sha256",
+            },
+            label,
+        )
+        snapshot_id = entry["snapshot_id"]
+        require(isinstance(snapshot_id, str) and snapshot_id,
+                "{} has an invalid snapshot ID".format(label))
+        require(snapshot_id not in snapshots,
+                "duplicate ECS source snapshot ID: {}".format(snapshot_id))
+        validate_relative_path(entry["repo_relative_path"], label + ".repo_relative_path")
+        require(
+            entry["repo_relative_path"].startswith(("src/", "test/")),
+            "{} is not legacy repository metadata".format(label),
+        )
+        require(
+            isinstance(entry["symbols"], list)
+            and entry["symbols"]
+            and all(isinstance(symbol, str) and symbol for symbol in entry["symbols"])
+            and len(entry["symbols"]) == len(set(entry["symbols"])),
+            "{} symbols are invalid or duplicated".format(label),
+        )
+        require(
+            isinstance(entry["source_blob_bytes"], int)
+            and not isinstance(entry["source_blob_bytes"], bool)
+            and entry["source_blob_bytes"] > 0,
+            "{} source byte count is invalid".format(label),
+        )
+        require(LOWER_SHA256.fullmatch(entry["source_blob_sha256"]) is not None,
+                "{} source SHA-256 is malformed".format(label))
+        require(LOWER_SHA1.fullmatch(entry["git_blob_sha1"]) is not None,
+                "{} Git blob SHA-1 is malformed".format(label))
+        require(
+            isinstance(entry["line_start"], int)
+            and not isinstance(entry["line_start"], bool)
+            and isinstance(entry["line_end"], int)
+            and not isinstance(entry["line_end"], bool)
+            and 1 <= entry["line_start"] <= entry["line_end"],
+            "{} line range is invalid".format(label),
+        )
+        require(isinstance(entry["content"], str), "{} content must be text".format(label))
+        content = entry["content"].encode("utf-8")
+        require(
+            content.count(b"\n") == entry["line_end"] - entry["line_start"] + 1,
+            "{} content does not match its line range".format(label),
+        )
+        require(
+            LOWER_SHA256.fullmatch(entry["content_sha256"]) is not None
+            and hashlib.sha256(content).hexdigest() == entry["content_sha256"],
+            "{} content SHA-256 mismatch".format(label),
+        )
+        file_identity = (
+            entry["source_blob_bytes"],
+            entry["source_blob_sha256"],
+            entry["git_blob_sha1"],
+        )
+        prior = files.get(entry["repo_relative_path"])
+        require(
+            prior is None or prior == file_identity,
+            "conflicting legacy source identity for {}".format(entry["repo_relative_path"]),
+        )
+        files[entry["repo_relative_path"]] = file_identity
+        snapshots[snapshot_id] = entry
+    return snapshots, files
+
+
+def expected_print_source():
+    slash = "\\"
+    return (
+        "\n".join(
+            [
+                'PRINT "A{}"'.format(slash),
+                'PRINT "B{}"'.format(slash),
+                'PRINT "C"',
+                'PRINT "D"',
+            ]
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def expected_print_fragments(fixture_id):
+    return {
+        "schema": "easycon-sdk:print-fragments:v1",
+        "schema_version": 1,
+        "fixture_id": fixture_id,
+        "fragments": [
+            {"text": "A", "starts_new_line": True},
+            {"text": "B", "starts_new_line": False},
+            {"text": "C", "starts_new_line": False},
+            {"text": "D", "starts_new_line": True},
+        ],
+    }
+
+
+def validate_print_artifacts(record, input_data, observed_data, expected_data):
+    fixture_id = record["fixture_id"]
+    require(input_data == expected_print_source(),
+            "{} PRINT input bytes changed".format(fixture_id))
+    expected = load_artifact_json(expected_data, fixture_id + " v1 expected")
+    require(expected == expected_print_fragments(fixture_id),
+            "{} v1 PrintFragment trace changed".format(fixture_id))
+    observed = load_artifact_json(observed_data, fixture_id + " legacy observed")
+    require_keys(
+        observed,
+        {"schema", "schema_version", "fixture_id", "implementations"},
+        fixture_id + " legacy observed",
+    )
+    require(
+        observed["schema"] == "easycon-sdk:legacy-print-token-trace:v1"
+        and observed["schema_version"] == 1
+        and observed["fixture_id"] == fixture_id,
+        "{} legacy PRINT trace identity changed".format(fixture_id),
+    )
+    require(isinstance(observed["implementations"], list),
+            "{} implementations must be an array".format(fixture_id))
+    names = []
+    token_kinds = set()
+    transports = set()
+    for implementation in observed["implementations"]:
+        require_keys(
+            implementation,
+            {"implementation", "adapter_calls", "flush"},
+            fixture_id + " implementation",
+        )
+        names.append(implementation["implementation"])
+        calls = implementation["adapter_calls"]
+        require(isinstance(calls, list) and len(calls) == 4,
+                "{} must preserve four adapter calls".format(fixture_id))
+        observed_calls = []
+        for call in calls:
+            require_keys(
+                call,
+                {"ordinal", "message", "newline", "emissions"},
+                fixture_id + " adapter call",
+            )
+            observed_calls.append((call["ordinal"], call["message"], call["newline"]))
+            require(isinstance(call["emissions"], list) and call["emissions"],
+                    "{} adapter call has no frontend emissions".format(fixture_id))
+            for item in call["emissions"]:
+                validate_print_emission(item, fixture_id, token_kinds, transports)
+        require(
+            observed_calls == [(1, "A", True), (2, "B", False),
+                               (3, "C", False), (4, "D", True)],
+            "{} adapter call sequence changed".format(fixture_id),
+        )
+        require(isinstance(implementation["flush"], list),
+                "{} flush trace must be an array".format(fixture_id))
+        for item in implementation["flush"]:
+            validate_print_emission(item, fixture_id, token_kinds, transports)
+    require(len(names) == len(set(names)),
+            "{} duplicates a production implementation".format(fixture_id))
+    require(set(names) == ECS_PRINT_IMPLEMENTATIONS[fixture_id],
+            "{} production/test implementation set is incomplete".format(fixture_id))
+
+    if fixture_id == "corrected.print.cli":
+        require({"Timestamp", "Ansi", "HostNewLine", "Payload"} <= token_kinds,
+                "CLI PRINT tokens are incomplete")
+        require({"Console.Write", "Console.WriteLine"} <= transports,
+                "CLI PRINT rendering trace is incomplete")
+    elif fixture_id in ("corrected.print.winforms", "corrected.print.winforms-lite"):
+        require({"Timestamp", "HostNewLine", "Payload", "WakeSignal"} <= token_kinds,
+                "WinForms PRINT tokens are incomplete")
+        require("UiQueueEnqueue" in transports,
+                "WinForms PRINT UI queue trace is missing")
+    elif fixture_id == "corrected.print.avalonia":
+        require({"Timestamp", "LF", "Payload", "UiPost", "Callback"} <= token_kinds,
+                "Avalonia PRINT tokens are incomplete")
+        require({"BufferAppend", "EntryEnqueue", "Dispatcher.UIThread.Post"} <= transports,
+                "both Avalonia production traces are required")
+    else:
+        require(token_kinds == {"Payload", "LF"} and transports == {"ListAppend"},
+                "test mock must remain a trailing-LF list oracle")
+
+
+def validate_print_emission(item, fixture_id, token_kinds, transports):
+    require_keys(item, {"transport", "tokens"}, fixture_id + " emission")
+    require(isinstance(item["transport"], str) and item["transport"],
+            "{} emission transport is invalid".format(fixture_id))
+    require(isinstance(item["tokens"], list) and item["tokens"],
+            "{} emission has no typed tokens".format(fixture_id))
+    transports.add(item["transport"])
+    for item_token in item["tokens"]:
+        require_keys(item_token, {"kind", "value"}, fixture_id + " token")
+        require(
+            item_token["kind"] in {
+                "Timestamp", "Ansi", "Payload", "HostNewLine", "LF",
+                "WakeSignal", "UiPost", "Callback",
+            }
+            and isinstance(item_token["value"], str),
+            "{} contains an unknown or malformed token".format(fixture_id),
+        )
+        if item_token["kind"] == "Timestamp":
+            require(item_token["value"] in {"[HH:mm:ss.fff] ", "[HH:mm:ss] "},
+                    "{} timestamp token was concretized or changed".format(fixture_id))
+        token_kinds.add(item_token["kind"])
+
+
+def validate_label_artifacts(record, input_data, observed_data, expected_data):
+    fixture_id = record["fixture_id"]
+    input_document = load_artifact_json(input_data, fixture_id + " input")
+    observed = load_artifact_json(observed_data, fixture_id + " legacy observed")
+    expected = load_artifact_json(expected_data, fixture_id + " v1 expected")
+    require(
+        input_document
+        == {
+            "schema": "easycon-sdk:label-score-input:v1",
+            "schema_version": 1,
+            "fixture_id": fixture_id,
+            "normalized_score": 0.4225,
+            "legacy_scale_operation": "md *= 100",
+            "legacy_scaled_score": 42.25,
+        },
+        "{} normalized and legacy-scaled input changed".format(fixture_id),
+    )
+    conversion, observed_integer = (
+        ("ceiling", 43)
+        if fixture_id == "corrected.label.winforms"
+        else ("truncate-toward-zero", 42)
+    )
+    require(
+        observed
+        == {
+            "schema": "easycon-sdk:legacy-label-projection:v1",
+            "schema_version": 1,
+            "fixture_id": fixture_id,
+            "legacy_scaled_score": 42.25,
+            "conversion": conversion,
+            "observed_integer": observed_integer,
+        },
+        "{} legacy label projection changed".format(fixture_id),
+    )
+    require(
+        expected
+        == {
+            "schema": "easycon-sdk:label-floor:v1",
+            "schema_version": 1,
+            "fixture_id": fixture_id,
+            "normalized_score": 0.4225,
+            "formula": "floor(clamp(score, 0, 1) * 100)",
+            "expected_integer": 42,
+        },
+        "{} v1 label floor projection changed".format(fixture_id),
+    )
+
+
+def validate_exact_artifacts(record, observed_data, expected_data):
+    fixture_id = record["fixture_id"]
+    observed = load_artifact_json(observed_data, fixture_id + " legacy observed")
+    expected = load_artifact_json(expected_data, fixture_id + " v1 expected")
+    base = {
+        "schema": "easycon-sdk:ecs-value-trace:v1",
+        "schema_version": 1,
+        "fixture_id": fixture_id,
+        "result": [3, -3, 6, False, True],
+        "short_circuit_rhs_evaluated": [False, False],
+    }
+    require(observed == base, "Legacy Exact observed values changed")
+    expected_base = dict(base)
+    expected_base["classification"] = "Legacy Exact"
+    require(expected == expected_base, "Legacy Exact v1 expected values changed")
+
+
+def validate_heap_artifact(record, expected_data):
+    fixture_id = record["fixture_id"]
+    document = load_artifact_json(expected_data, fixture_id + " v1 expected")
+    common_keys = {
+        "schema", "schema_version", "fixture_id", "limit", "baseline",
+        "source_order", "checkpoints", "outcome",
+    }
+    if fixture_id.endswith("left-medium"):
+        required = common_keys | {"canonical_peak", "counterfactual_right_first"}
+    else:
+        required = common_keys | {"canonical_peak_attempt"}
+    require_keys(document, required, fixture_id + " heap ledger")
+    require(
+        document["schema"] == "easycon-sdk:ecs-heap-ledger:v1"
+        and document["schema_version"] == 1
+        and document["fixture_id"] == fixture_id
+        and document["limit"] == 33554432,
+        "{} heap ledger identity or limit changed".format(fixture_id),
+    )
+    require(
+        document["baseline"]
+        == {
+            "distinct_string_allocations": 132,
+            "string_bytes_each": 251000,
+            "string_bytes_total": 33132000,
+            "array_direct_cells": 132,
+            "array_direct_cell_bytes": 1056,
+            "live_bytes": 33133056,
+        },
+        "{} heap baseline changed".format(fixture_id),
+    )
+    require(isinstance(document["checkpoints"], list) and document["checkpoints"],
+            "{} has no heap ledger checkpoints".format(fixture_id))
+    for checkpoint in document["checkpoints"]:
+        require_keys(checkpoint, {"id", "live_bytes", "decision"},
+                     fixture_id + " heap checkpoint")
+        require(
+            isinstance(checkpoint["live_bytes"], int)
+            and not isinstance(checkpoint["live_bytes"], bool),
+            "{} checkpoint bytes have the wrong type".format(fixture_id),
+        )
+    if fixture_id == "v1-native.heap-order.left-medium":
+        require(
+            document["source_order"] == ["LEFT($template)", "MEDIUM($template)"]
+            and document["canonical_peak"] == 33533058
+            and document["canonical_peak"] < document["limit"]
+            and document["outcome"]
+            == {"kind": "success", "result_utf8_bytes": 200001},
+            "left-medium canonical success changed",
+        )
+        require(
+            document["counterfactual_right_first"]
+            == {
+                "classification": "forbidden-negative-oracle",
+                "medium_live_bytes": 33333056,
+                "left_full_reserve_attempt_bytes": 33584056,
+                "decision": "reject-live-logical-heap-limit",
+            },
+            "right-first counterfactual must remain a forbidden negative oracle",
+        )
+    else:
+        require(
+            document["source_order"] == ["MEDIUM($template)", "LEFT($template)"]
+            and document["canonical_peak_attempt"] == 33584056
+            and document["canonical_peak_attempt"] > document["limit"]
+            and document["outcome"]
+            == {"kind": "limit-failure", "limit": "live_logical_heap_bytes"},
+            "medium-left canonical limit failure changed",
+        )
+
+
+def validate_record_sources(record, snapshots, source_files, used_snapshots):
+    fixture_id = record["fixture_id"]
+    observed_sources = {}
+    for source in record["legacy_sources"]:
+        path = source["repo_relative_path"]
+        validate_relative_path(path, fixture_id + " legacy source")
+        require(path.startswith(("src/", "test/")),
+                "{} source metadata escaped the legacy repository".format(fixture_id))
+        require(path not in observed_sources,
+                "{} duplicates legacy source {}".format(fixture_id, path))
+        require(LOWER_SHA256.fullmatch(source["source_blob_sha256"]) is not None,
+                "{} source SHA-256 is malformed".format(fixture_id))
+        require(LOWER_SHA1.fullmatch(source["git_blob_sha1"]) is not None,
+                "{} Git blob identity is malformed".format(fixture_id))
+        identity = (
+            source["source_blob_bytes"],
+            source["source_blob_sha256"],
+            source["git_blob_sha1"],
+        )
+        require(source_files.get(path) == identity,
+                "{} source identity conflicts with its SDK snapshot".format(fixture_id))
+        require(len(source["symbols"]) == len(set(source["symbols"])),
+                "{} duplicates a source symbol".format(fixture_id))
+        require(len(source["snapshot_ids"]) == len(set(source["snapshot_ids"])),
+                "{} duplicates a source snapshot".format(fixture_id))
+        snapshot_symbols = set()
+        for snapshot_id in source["snapshot_ids"]:
+            require(snapshot_id in snapshots,
+                    "{} references a missing source snapshot".format(fixture_id))
+            snapshot = snapshots[snapshot_id]
+            require(snapshot["repo_relative_path"] == path,
+                    "{} source snapshot path conflicts".format(fixture_id))
+            snapshot_symbols.update(snapshot["symbols"])
+            used_snapshots.add(snapshot_id)
+        require(set(source["symbols"]) == snapshot_symbols,
+                "{} source symbols are not fully backed by snapshot content".format(fixture_id))
+        observed_sources[path] = set(source["symbols"])
+    require(observed_sources == ECS_REQUIRED_SOURCES[fixture_id],
+            "{} required production/test oracle sources are incomplete".format(fixture_id))
+
+
+def validate_source_identity(record, input_reference, profile_reference, hash_identities):
+    fixture_id = record["fixture_id"]
+    identity = record["source_identity"]
+    require(
+        identity == {"role": "Main", "source_id": "main.ecs"},
+        "{} source identity changed".format(fixture_id),
+    )
+    source_id = identity["source_id"].encode("utf-8")
+    require(0 < len(source_id) <= 256,
+            "{} source ID violates the v1 profile".format(fixture_id))
+    program_hash = record["program_hash_v1"]
+    require(LOWER_SHA256.fullmatch(program_hash) is not None,
+            "{} ProgramHash is malformed".format(fixture_id))
+    require(program_hash == ECS_PROGRAM_HASHES[fixture_id],
+            "{} static ProgramHash golden changed".format(fixture_id))
+    require(record["program_hash_profile"] == profile_reference,
+            "{} ProgramHash profile identity changed".format(fixture_id))
+    program_identity = (
+        identity["role"],
+        identity["source_id"],
+        input_reference["sha256"],
+        profile_reference["sha256"],
+    )
+    previous = hash_identities.get(program_hash)
+    require(
+        previous is None or previous == program_identity,
+        "conflicting source identity shares ProgramHash {}".format(program_hash),
+    )
+    hash_identities[program_hash] = program_identity
+
+
+def validate_ecs_provenance_document(manifest, schema):
+    validate_instance(
+        manifest,
+        schema,
+        schema_name="schemas/ecs-provenance-manifest-v1.schema.json",
+    )
+    require(manifest["legacy_reference_commit"] == ECS_LEGACY_COMMIT,
+            "ECS legacy reference commit changed")
+    require(manifest["classification_contracts"] == ECS_CLASSIFICATIONS,
+            "ECS provenance classifications changed or were mixed")
+
+    seen_artifacts = {}
+    profile_data = read_artifact(
+        manifest["program_hash_profile"],
+        ECS_FIXTURE_ROOT,
+        seen_artifacts,
+        "ECS ProgramHash profile",
+    )
+    profile = load_artifact_json(profile_data, "ECS ProgramHash profile")
+    require(profile == expected_profile_document(),
+            "EcsLimitsV1 profile or canonical field order changed")
+
+    catalog_data = read_artifact(
+        manifest["legacy_source_catalog"],
+        ECS_FIXTURE_ROOT,
+        seen_artifacts,
+        "ECS legacy source catalog",
+    )
+    snapshots, source_files = validate_source_catalog(
+        load_artifact_json(catalog_data, "ECS legacy source catalog")
+    )
+
+    identities = [(item["fixture_id"], item["provenance_class"], item["oracle_kind"])
+                  for item in manifest["records"]]
+    require(identities == ECS_RECORDS,
+            "ECS fixture obligations changed, were reordered, or are incomplete")
+    require(len({item[0] for item in identities}) == len(identities),
+            "duplicate ECS fixture identity")
+
+    used_snapshots = set()
+    owned_artifact_paths = set()
+    hash_identities = {}
+    source_inputs = {}
+    for record in manifest["records"]:
+        fixture_id = record["fixture_id"]
+        provenance_class = record["provenance_class"]
+        require(isinstance(record["revision_reason"], str) and record["revision_reason"].strip(),
+                "{} has no revision/classification reason".format(fixture_id))
+        require(
+            set(record["covered_contracts"]).issubset(
+                set(manifest["classification_contracts"][provenance_class])
+            ),
+            "{} maps a contract from another provenance class".format(fixture_id),
+        )
+
+        is_program = fixture_id in ECS_PROGRAM_HASHES
+        is_print = fixture_id.startswith("corrected.print.")
+        is_label = fixture_id.startswith("corrected.label.")
+        if provenance_class in ("Legacy Exact", "Corrected"):
+            require(record.get("legacy_commit") == ECS_LEGACY_COMMIT,
+                    "{} lost its full legacy commit".format(fixture_id))
+            require("legacy_sources" in record and "legacy_observed" in record,
+                    "{} lost legacy source or observed evidence".format(fixture_id))
+            require("contract_source" not in record and "expected_outcome" not in record,
+                    "{} mixes legacy provenance with v1-native fields".format(fixture_id))
+            validate_record_sources(record, snapshots, source_files, used_snapshots)
+        else:
+            require(
+                "legacy_commit" not in record
+                and "legacy_sources" not in record
+                and "legacy_observed" not in record,
+                "{} falsely claims differential legacy evidence".format(fixture_id),
+            )
+            require(
+                record.get("contract_source")
+                == {
+                    "path": "docs/decisions/0017-phase-4-ecs-automation-target.md",
+                    "section": "v1 live logical heap ledger",
+                },
+                "{} ADR contract source changed".format(fixture_id),
+            )
+            contract_path = validate_relative_path(
+                record["contract_source"]["path"], fixture_id + " contract source"
+            )
+            require((ROOT / contract_path).resolve().is_file(),
+                    "{} contract source is not SDK-local".format(fixture_id))
+            expected_outcome = (
+                "success" if fixture_id.endswith("left-medium") else "limit-failure"
+            )
+            require(record.get("expected_outcome") == expected_outcome,
+                    "{} has an ambiguous or wrong outcome".format(fixture_id))
+
+        if is_program:
+            require(
+                all(name in record for name in
+                    ("source_identity", "program_hash_v1", "program_hash_profile")),
+                "{} lost source identity or ProgramHash provenance".format(fixture_id),
+            )
+            require(record["input"]["sha256"] == ECS_INPUT_HASHES[fixture_id],
+                    "{} exact source SHA-256 changed".format(fixture_id))
+            validate_source_identity(
+                record,
+                record["input"],
+                manifest["program_hash_profile"],
+                hash_identities,
+            )
+        else:
+            require(
+                all(name not in record for name in
+                    ("source_identity", "program_hash_v1", "program_hash_profile")),
+                "{} label provenance acquired ECS source identity fields".format(fixture_id),
+            )
+
+        role_names = ["input", "v1_expected"]
+        if "legacy_observed" in record:
+            role_names.append("legacy_observed")
+        role_paths = [record[name]["path"] for name in role_names]
+        require(len(role_paths) == len(set(role_paths)),
+                "{} reuses one artifact for conflicting roles".format(fixture_id))
+        require(not (set(role_paths) & owned_artifact_paths),
+                "{} reuses another fixture's artifact".format(fixture_id))
+        owned_artifact_paths.update(role_paths)
+
+        input_data = read_artifact(
+            record["input"], ECS_FIXTURE_ROOT, seen_artifacts, fixture_id + " input"
+        )
+        expected_data = read_artifact(
+            record["v1_expected"],
+            ECS_FIXTURE_ROOT,
+            seen_artifacts,
+            fixture_id + " v1 expected",
+        )
+        observed_data = None
+        if "legacy_observed" in record:
+            observed_data = read_artifact(
+                record["legacy_observed"],
+                ECS_FIXTURE_ROOT,
+                seen_artifacts,
+                fixture_id + " legacy observed",
+            )
+
+        if is_program:
+            require(record["input"]["path"].endswith(".input.ecs"),
+                    "{} source artifact extension changed".format(fixture_id))
+            require(len(input_data) <= 262144,
+                    "{} exceeds EcsLimitsV1 per_source_bytes".format(fixture_id))
+            try:
+                input_data.decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise ValidationError("{} source is not UTF-8: {}".format(fixture_id, error))
+            source_inputs[fixture_id] = input_data
+        elif is_label:
+            require(record["input"]["path"].endswith(".input.json"),
+                    "{} label input extension changed".format(fixture_id))
+
+        if fixture_id == "legacy-exact.integer-operators":
+            validate_exact_artifacts(record, observed_data, expected_data)
+        elif is_print:
+            validate_print_artifacts(
+                record, input_data, observed_data, expected_data
+            )
+        elif is_label:
+            validate_label_artifacts(
+                record, input_data, observed_data, expected_data
+            )
+        else:
+            validate_heap_artifact(record, expected_data)
+
+    require(used_snapshots == set(snapshots),
+            "legacy source catalog contains missing or unreferenced snapshot evidence")
+    left = source_inputs["v1-native.heap-order.left-medium"]
+    right = source_inputs["v1-native.heap-order.medium-left"]
+    require(len(left) == 251321 and len(right) == 251321,
+            "heap-order exact source size changed")
+    require(left.splitlines()[:-1] == right.splitlines()[:-1],
+            "heap-order pair differs outside the swapped operand line")
+    require(
+        left.splitlines()[-1] == b"$result = LEFT($template) + MEDIUM($template)"
+        and right.splitlines()[-1] == b"$result = MEDIUM($template) + LEFT($template)",
+        "heap-order pair no longer swaps only LEFT and MEDIUM",
+    )
+
+    actual_files = {
+        path.relative_to(ECS_FIXTURE_ROOT).as_posix()
+        for path in ECS_FIXTURE_ROOT.rglob("*")
+        if path.is_file()
+    }
+    expected_files = {"manifest.json"} | set(seen_artifacts)
+    require(actual_files == expected_files,
+            "ECS fixture file set is not exactly manifest-owned")
+    require(len(seen_artifacts) == 33,
+            "ECS manifest must own exactly 33 self-contained artifacts")
+
+
+def require_ecs_provenance_rejected(manifest, schema, message):
+    try:
+        validate_ecs_provenance_document(manifest, schema)
+    except ValidationError:
+        return
+    raise ValidationError(message)
+
+
+def require_artifact_payload_rejected(reference, data, message):
+    try:
+        validate_artifact_payload(reference, data, "validator regression")
+    except ValidationError:
+        return
+    raise ValidationError(message)
+
+
+def validate_ecs_provenance_regressions():
+    schema = load_json("schemas/ecs-provenance-manifest-v1.schema.json")
+    manifest = load_json("fixtures/ecs/manifest.json")
+
+    missing = copy.deepcopy(manifest)
+    del missing["records"][0]["revision_reason"]
+    require_ecs_provenance_rejected(
+        missing, schema, "a missing ECS provenance field was not rejected"
+    )
+
+    unknown = copy.deepcopy(manifest)
+    unknown["records"][0]["unexpected"] = True
+    require_ecs_provenance_rejected(
+        unknown, schema, "an unknown ECS provenance field was not rejected"
+    )
+
+    unknown_enum = copy.deepcopy(manifest)
+    unknown_enum["records"][0]["provenance_class"] = "LegacyExact"
+    require_ecs_provenance_rejected(
+        unknown_enum, schema, "an unknown ECS provenance class was not rejected"
+    )
+
+    wrong_type = copy.deepcopy(manifest)
+    wrong_type["records"][0]["input"]["bytes"] = True
+    require_ecs_provenance_rejected(
+        wrong_type, schema, "a wrong ECS provenance field type was not rejected"
+    )
+
+    tampered = copy.deepcopy(manifest)
+    tampered["records"][0]["input"]["sha256"] = "0" * 64
+    require_ecs_provenance_rejected(
+        tampered,
+        schema,
+        "an ECS provenance artifact hash mismatch was not rejected",
+    )
+
+    input_reference = manifest["records"][0]["input"]
+    input_data = (ECS_FIXTURE_ROOT / input_reference["path"]).read_bytes()
+    require_artifact_payload_rejected(
+        input_reference,
+        input_data + b"tamper",
+        "tampered ECS artifact bytes were not rejected",
+    )
+
+    duplicate = copy.deepcopy(manifest)
+    duplicate["records"][1]["fixture_id"] = duplicate["records"][0]["fixture_id"]
+    require_ecs_provenance_rejected(
+        duplicate, schema, "a duplicate ECS fixture identity was not rejected"
+    )
+
+    conflicting_source = copy.deepcopy(manifest)
+    conflicting_source["records"][1]["legacy_sources"][0][
+        "source_blob_sha256"
+    ] = "1" * 64
+    require_ecs_provenance_rejected(
+        conflicting_source,
+        schema,
+        "a conflicting legacy source identity was not rejected",
+    )
+
+    traversal = copy.deepcopy(manifest)
+    traversal["records"][0]["input"]["path"] = "../outside.ecs"
+    require_ecs_provenance_rejected(
+        traversal, schema, "an ECS artifact path traversal was not rejected"
+    )
+
+    external = copy.deepcopy(manifest)
+    external["records"][0]["input"]["path"] = "EasyCon/input.ecs"
+    require_ecs_provenance_rejected(
+        external, schema, "a non-SDK-local ECS dependency was not rejected"
+    )
+
+    missing_oracle = copy.deepcopy(manifest)
+    missing_oracle["records"][8]["fixture_id"] = "corrected.label.missing"
+    require_ecs_provenance_rejected(
+        missing_oracle, schema, "an omitted corrected oracle was not rejected"
+    )
+
+    missing_production_source = copy.deepcopy(manifest)
+    missing_production_source["records"][1]["legacy_sources"].pop()
+    require_ecs_provenance_rejected(
+        missing_production_source,
+        schema,
+        "a corrected production source oracle was not rejected when omitted",
+    )
+
+    shared_observed = copy.deepcopy(manifest)
+    shared_observed["records"][3]["legacy_observed"] = copy.deepcopy(
+        shared_observed["records"][2]["legacy_observed"]
+    )
+    require_ecs_provenance_rejected(
+        shared_observed,
+        schema,
+        "WinForms-lite reused the WinForms legacy observed artifact",
+    )
+
+
+def validate_generated_ecs_fixtures(runner=subprocess.run):
+    generator = ROOT / "tools" / "generate_ecs_provenance_fixtures.py"
+    completed = runner(
+        [sys.executable, str(generator), "--check"],
+        cwd=ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    require(
+        completed.returncode == 0,
+        "ECS provenance fixture validation failed:\n{}".format(
+            completed.stderr.strip() or completed.stdout.strip()
+        ),
+    )
+
+
+def validate_ecs_fixture_validator_regression():
+    class FailedResult:
+        returncode = 1
+        stdout = ""
+        stderr = "synthetic generator failure"
+
+    def failing_runner(*_args, **_kwargs):
+        return FailedResult()
+
+    try:
+        validate_generated_ecs_fixtures(runner=failing_runner)
+    except ValidationError:
+        return
+    raise ValidationError("ECS fixture validator accepted a failed generator")
+
+
+def validate_ecs_provenance():
+    validate_ecs_fixture_validator_regression()
+    validate_generated_ecs_fixtures()
+    schema = load_json("schemas/ecs-provenance-manifest-v1.schema.json")
+    manifest = load_json("fixtures/ecs/manifest.json")
+    validate_ecs_provenance_document(manifest, schema)
+    validate_ecs_provenance_regressions()
+    return len(manifest["records"])
 
 
 def validate_behavior():
@@ -1118,6 +2251,7 @@ def validate_vision_fixture_validator_regressions():
 def main():
     validate_schemas()
     validate_validator_regressions()
+    ecs_record_count = validate_ecs_provenance()
     validate_behavior()
     validate_controller_fixture()
     validate_traces()
@@ -1132,11 +2266,11 @@ def main():
     validate_vision_model_provisioner_regressions()
     test_count = validate_conformance()
     print(
-        "validated 5 schemas, 1 behavior spec, 3 controller fixtures, "
+        "validated 6 schemas, 1 behavior spec, 3 controller fixtures, "
         "15 vision binary fixtures, 1 capture manifest, 24 label corpus entries, "
-        "9 conformance scenarios, "
-        "and {} exact Rust tests".format(
-            test_count
+        "{} ECS provenance records with 33 SDK-local artifacts, "
+        "9 conformance scenarios, and {} exact Rust tests".format(
+            ecs_record_count, test_count
         )
     )
     return 0

@@ -1,0 +1,176 @@
+{
+  "schema": "easycon-sdk:ecs-limits-profile:v1",
+  "schema_version": 1,
+  "hash_format_version": 1,
+  "ecs_semantics_version": 1,
+  "limits": [
+    {
+      "order": 1,
+      "name": "profile_version",
+      "encoding": "u32",
+      "value": 1
+    },
+    {
+      "order": 2,
+      "name": "source_units",
+      "encoding": "u32",
+      "value": 64
+    },
+    {
+      "order": 3,
+      "name": "per_source_bytes",
+      "encoding": "u64",
+      "value": 262144
+    },
+    {
+      "order": 4,
+      "name": "bundle_bytes",
+      "encoding": "u64",
+      "value": 1048576
+    },
+    {
+      "order": 5,
+      "name": "source_id_bytes",
+      "encoding": "u64",
+      "value": 256
+    },
+    {
+      "order": 6,
+      "name": "identifier_bytes",
+      "encoding": "u64",
+      "value": 128
+    },
+    {
+      "order": 7,
+      "name": "parameters",
+      "encoding": "u32",
+      "value": 32
+    },
+    {
+      "order": 8,
+      "name": "arguments",
+      "encoding": "u32",
+      "value": 32
+    },
+    {
+      "order": 9,
+      "name": "syntax_nesting",
+      "encoding": "u32",
+      "value": 64
+    },
+    {
+      "order": 10,
+      "name": "functions",
+      "encoding": "u32",
+      "value": 256
+    },
+    {
+      "order": 11,
+      "name": "symbols",
+      "encoding": "u32",
+      "value": 4096
+    },
+    {
+      "order": 12,
+      "name": "tokens",
+      "encoding": "u32",
+      "value": 262144
+    },
+    {
+      "order": 13,
+      "name": "ast_nodes",
+      "encoding": "u32",
+      "value": 131072
+    },
+    {
+      "order": 14,
+      "name": "bound_nodes",
+      "encoding": "u32",
+      "value": 262144
+    },
+    {
+      "order": 15,
+      "name": "lowered_nodes",
+      "encoding": "u32",
+      "value": 262144
+    },
+    {
+      "order": 16,
+      "name": "instructions",
+      "encoding": "u32",
+      "value": 262144
+    },
+    {
+      "order": 17,
+      "name": "diagnostics_per_source",
+      "encoding": "u32",
+      "value": 64
+    },
+    {
+      "order": 18,
+      "name": "diagnostics_total",
+      "encoding": "u32",
+      "value": 512
+    },
+    {
+      "order": 19,
+      "name": "reserved_limit_diagnostics",
+      "encoding": "u32",
+      "value": 1
+    },
+    {
+      "order": 20,
+      "name": "call_depth",
+      "encoding": "u32",
+      "value": 128
+    },
+    {
+      "order": 21,
+      "name": "array_cells",
+      "encoding": "u32",
+      "value": 16384
+    },
+    {
+      "order": 22,
+      "name": "string_bytes",
+      "encoding": "u64",
+      "value": 262144
+    },
+    {
+      "order": 23,
+      "name": "live_logical_heap_bytes",
+      "encoding": "u64",
+      "value": 33554432
+    },
+    {
+      "order": 24,
+      "name": "output_fragment_bytes",
+      "encoding": "u64",
+      "value": 32768
+    },
+    {
+      "order": 25,
+      "name": "output_queue_pending",
+      "encoding": "u32",
+      "value": 32
+    },
+    {
+      "order": 26,
+      "name": "output_payload_bytes",
+      "encoding": "u64",
+      "value": 1048576
+    },
+    {
+      "order": 27,
+      "name": "production_instruction_fuel_present",
+      "encoding": "u8",
+      "value": 0
+    },
+    {
+      "order": 28,
+      "name": "production_output_count_present",
+      "encoding": "u8",
+      "value": 0
+    }
+  ]
+}

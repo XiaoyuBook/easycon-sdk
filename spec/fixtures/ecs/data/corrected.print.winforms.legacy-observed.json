@@ -1,0 +1,140 @@
+{
+  "schema": "easycon-sdk:legacy-print-token-trace:v1",
+  "schema_version": 1,
+  "fixture_id": "corrected.print.winforms",
+  "implementations": [
+    {
+      "implementation": "src/EasyCon2/App/EasyConForm.cs::EasyConForm.Print",
+      "adapter_calls": [
+        {
+          "ordinal": 1,
+          "message": "A",
+          "newline": true,
+          "emissions": [
+            {
+              "transport": "UiQueueEnqueue",
+              "tokens": [
+                {
+                  "kind": "Timestamp",
+                  "value": "[HH:mm:ss.fff] "
+                }
+              ]
+            },
+            {
+              "transport": "UiQueueEnqueue",
+              "tokens": [
+                {
+                  "kind": "Payload",
+                  "value": "A"
+                }
+              ]
+            },
+            {
+              "transport": "AutoResetEvent.Set",
+              "tokens": [
+                {
+                  "kind": "WakeSignal",
+                  "value": "_wake"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "ordinal": 2,
+          "message": "B",
+          "newline": false,
+          "emissions": [
+            {
+              "transport": "UiQueueEnqueue",
+              "tokens": [
+                {
+                  "kind": "Payload",
+                  "value": "B"
+                }
+              ]
+            },
+            {
+              "transport": "AutoResetEvent.Set",
+              "tokens": [
+                {
+                  "kind": "WakeSignal",
+                  "value": "_wake"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "ordinal": 3,
+          "message": "C",
+          "newline": false,
+          "emissions": [
+            {
+              "transport": "UiQueueEnqueue",
+              "tokens": [
+                {
+                  "kind": "Payload",
+                  "value": "C"
+                }
+              ]
+            },
+            {
+              "transport": "AutoResetEvent.Set",
+              "tokens": [
+                {
+                  "kind": "WakeSignal",
+                  "value": "_wake"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "ordinal": 4,
+          "message": "D",
+          "newline": true,
+          "emissions": [
+            {
+              "transport": "UiQueueEnqueue",
+              "tokens": [
+                {
+                  "kind": "HostNewLine",
+                  "value": "Environment.NewLine"
+                }
+              ]
+            },
+            {
+              "transport": "UiQueueEnqueue",
+              "tokens": [
+                {
+                  "kind": "Timestamp",
+                  "value": "[HH:mm:ss.fff] "
+                }
+              ]
+            },
+            {
+              "transport": "UiQueueEnqueue",
+              "tokens": [
+                {
+                  "kind": "Payload",
+                  "value": "D"
+                }
+              ]
+            },
+            {
+              "transport": "AutoResetEvent.Set",
+              "tokens": [
+                {
+                  "kind": "WakeSignal",
+                  "value": "_wake"
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "flush": []
+    }
+  ]
+}
