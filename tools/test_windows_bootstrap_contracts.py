@@ -82,6 +82,68 @@ class RequiredCiContracts(unittest.TestCase):
                 self.assertNotEqual(mutated, self.workflow)
                 self.assert_rejected(mutated, label)
 
+    def test_job_level_runner_context_is_rejected(self):
+        illegal_environment = (
+            "    env:\n"
+            "      EASYCON_BUILD_CACHE_ROOT: "
+            "${{ runner.temp }}/easycon-windows-workspace\n"
+        )
+        mutated = self.workflow
+        if illegal_environment not in mutated:
+            marker = "    timeout-minutes: 180\n"
+            mutated = mutated.replace(marker, marker + illegal_environment, 1)
+            self.assertNotEqual(mutated, self.workflow)
+        self.assert_rejected(mutated, "runner context in job-level env")
+
+    def test_cache_root_initialization_is_exact_and_ordered(self):
+        mutations = {
+            "ambient temporary root": (
+                '$cacheRoot = Join-Path $env:RUNNER_TEMP "easycon-windows-workspace"',
+                '$cacheRoot = Join-Path $env:TEMP "easycon-windows-workspace"',
+            ),
+            "wrong environment sink": (
+                "Add-Content -LiteralPath $env:GITHUB_ENV",
+                "Add-Content -LiteralPath $env:GITHUB_OUTPUT",
+            ),
+            "wrong cache environment name": (
+                '"EASYCON_BUILD_CACHE_ROOT=$cacheRoot"',
+                '"EASYCON_OTHER_CACHE_ROOT=$cacheRoot"',
+            ),
+            "Setup cache override": (
+                "      - name: Set up the pinned Windows build environment\n"
+                "        shell: pwsh\n",
+                "      - name: Set up the pinned Windows build environment\n"
+                "        env:\n"
+                "          EASYCON_BUILD_CACHE_ROOT: elsewhere\n"
+                "        shell: pwsh\n",
+            ),
+            "Workspace cache override": (
+                "      - name: Run the complete Windows workspace gates\n"
+                "        shell: pwsh\n"
+                "        env:\n"
+                "          BASE_SHA:",
+                "      - name: Run the complete Windows workspace gates\n"
+                "        shell: pwsh\n"
+                "        env:\n"
+                "          EASYCON_BUILD_CACHE_ROOT: elsewhere\n"
+                "          BASE_SHA:",
+            ),
+        }
+        for label, (original, replacement) in mutations.items():
+            with self.subTest(label=label):
+                mutated = self.workflow.replace(original, replacement, 1)
+                self.assertNotEqual(mutated, self.workflow)
+                self.assert_rejected(mutated, label)
+
+        initialize_name = "      - name: Initialize the controlled cache root\n"
+        restore_name = "      - name: Restore Cargo downloads\n"
+        placeholder = "      - name: __CACHE_ROOT_INITIALIZATION__\n"
+        reordered = self.workflow.replace(initialize_name, placeholder, 1)
+        reordered = reordered.replace(restore_name, initialize_name, 1)
+        reordered = reordered.replace(placeholder, restore_name, 1)
+        self.assertNotEqual(reordered, self.workflow)
+        self.assert_rejected(reordered, "cache root initialization after restore")
+
     def test_yaml_and_actions_are_fail_closed(self):
         duplicate = self.workflow.replace(
             "permissions:\n  contents: read",

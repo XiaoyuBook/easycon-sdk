@@ -155,14 +155,22 @@ jobs:
     name: Required / Windows Workspace
     runs-on: windows-2022
     timeout-minutes: 180
-    env:
-      EASYCON_BUILD_CACHE_ROOT: ${{ runner.temp }}/easycon-windows-workspace
     steps:
       - name: Check out the candidate
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Initialize the controlled cache root
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP)) {
+            throw "RUNNER_TEMP is not available"
+          }
+          $cacheRoot = Join-Path $env:RUNNER_TEMP "easycon-windows-workspace"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "EASYCON_BUILD_CACHE_ROOT=$cacheRoot" -Encoding utf8
 
       - name: Restore Cargo downloads
         id: cargo_cache

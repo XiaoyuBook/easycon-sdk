@@ -82,6 +82,15 @@ WORKSPACE_INVOCATION = (
     "./tools/run_windows_workspace.ps1 -Mode Workspace -RequireCleanTree"
 )
 SETUP_INVOCATION = "./tools/run_windows_workspace.ps1 -Mode Setup"
+WINDOWS_CACHE_ROOT_INITIALIZATION = """$ErrorActionPreference = "Stop"
+if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP)) {
+  throw "RUNNER_TEMP is not available"
+}
+$cacheRoot = Join-Path $env:RUNNER_TEMP "easycon-windows-workspace"
+Add-Content -LiteralPath $env:GITHUB_ENV -Value "EASYCON_BUILD_CACHE_ROOT=$cacheRoot" -Encoding utf8"""
+JOB_LEVEL_RUNNER_CONTEXT = re.compile(
+    r"\$\{\{(?:(?!\}\}).)*\brunner\s*\.", re.IGNORECASE
+)
 POLICY_RUN_SHA256 = {
     "Isolate generated outputs": "774f504e5fdcdfb96cfb68e74e803d2e228f4df65a7846b305fbb76359bb3292",
     "Load the MSVC x64 developer environment": "738056873e87faf3bc1ee900547897413b0e462c67fa48b2b4b2dc14cda414fc",
@@ -585,6 +594,17 @@ def required_ci_failures(workflow):
     jobs = document.get("jobs")
     if not _exact_keys(jobs, {"policy", "windows-workspace"}, "Required CI jobs", failures):
         return failures
+    for job_name, job in jobs.items():
+        environment = job.get("env") if isinstance(job, dict) else None
+        if not isinstance(environment, dict):
+            continue
+        for variable, value in environment.items():
+            if isinstance(value, str) and JOB_LEVEL_RUNNER_CONTEXT.search(value):
+                failures.append(
+                    "Required CI job {!r} environment {!r} uses unavailable runner context".format(
+                        job_name, variable
+                    )
+                )
     policy = jobs["policy"]
     windows_workspace = jobs["windows-workspace"]
     if _exact_keys(
@@ -646,7 +666,7 @@ def required_ci_failures(workflow):
 
     if _exact_keys(
         windows_workspace,
-        {"name", "runs-on", "timeout-minutes", "env", "steps"},
+        {"name", "runs-on", "timeout-minutes", "steps"},
         "Required / Windows Workspace job",
         failures,
     ):
@@ -656,13 +676,10 @@ def required_ci_failures(workflow):
             failures.append("Required / Windows Workspace must run on windows-2022")
         if windows_workspace["timeout-minutes"] != 180:
             failures.append("Required / Windows Workspace timeout changed")
-        if windows_workspace["env"] != {
-            "EASYCON_BUILD_CACHE_ROOT": "${{ runner.temp }}/easycon-windows-workspace"
-        }:
-            failures.append("Required / Windows Workspace cache root changed")
 
     workspace_names = [
         "Check out the candidate",
+        "Initialize the controlled cache root",
         "Restore Cargo downloads",
         "Restore vcpkg binary cache",
         "Set up the pinned Windows build environment",
@@ -679,6 +696,20 @@ def required_ci_failures(workflow):
             "Required / Windows Workspace checkout",
             failures,
         )
+
+    cache_root_step = workspace_steps.get("Initialize the controlled cache root", {})
+    if _exact_keys(
+        cache_root_step,
+        {"name", "shell", "run"},
+        "Windows workspace cache root initialization step",
+        failures,
+    ):
+        if cache_root_step["shell"] != "pwsh":
+            failures.append("Windows workspace cache root initialization shell changed")
+        if cache_root_step["run"].strip() != WINDOWS_CACHE_ROOT_INITIALIZATION:
+            failures.append(
+                "Windows workspace cache root must be initialized from RUNNER_TEMP through GITHUB_ENV"
+            )
 
     restore_contracts = {
         "Restore Cargo downloads": (

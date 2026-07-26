@@ -102,7 +102,9 @@ Setup 的宿主前置条件；Setup 把实际使用的宿主可执行文件路�
 系统工具，也不修改 user/machine PATH、持久环境变量或 Git 全局配置。
 
 默认环境根为 `LocalApplicationData/EasyConSdk/be2`，其下按 fingerprint 与 canonical worktree
-路径 hash 分隔。`-CacheRoot` 可选择另一个受控根，CI 用 `EASYCON_BUILD_CACHE_ROOT` 指向 `runner.temp`。短 Cargo
+路径 hash 分隔。`-CacheRoot` 可选择另一个受控根。Required Windows job 在 checkout 后、cache restore 和 Setup 前，
+用 step 可用的 `RUNNER_TEMP` 计算受控根并通过 `GITHUB_ENV` 设置 `EASYCON_BUILD_CACHE_ROOT`；job-level env 不引用该处
+不可用的 `runner` expression context。restore/save 路径与 Setup/Workspace 都使用同一个 runner temp 根。短 Cargo
 target 路径保持不同 worktree 的 source-bound CMake cache 隔离；脚本拒绝 reparse point、环境根逃逸、过长 object
 path、外部 vcpkg overlay/chainload/install 输入和脏 scripts checkout。
 
