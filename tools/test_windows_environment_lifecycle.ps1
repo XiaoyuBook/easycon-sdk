@@ -258,6 +258,7 @@ $workspaceAction = {
     $events.Add("workspace") | Out-Null
 }.GetNewClosure()
 
+$contractFailure = $null
 try {
     Invoke-PrivateEnvironmentLifecycle -Mode Setup -Location $location `
         -SetupAction $setupAction -VerifyAction $verifyAction `
@@ -410,10 +411,29 @@ try {
     }.GetNewClosure() -WorkspaceAction { param($Summary) } `
         -FailurePattern "synthetic setup restore failure"
 }
+catch {
+    $contractFailure = $_
+    throw
+}
 finally {
-    Remove-Module windows_workspace -ErrorAction SilentlyContinue
-    if (Test-Path -LiteralPath $temporaryRoot) {
-        Remove-Item -LiteralPath $temporaryRoot -Recurse -Force
+    $cleanupFailure = $null
+    try {
+        Remove-Module windows_workspace -ErrorAction Stop
+        if (Test-Path -LiteralPath $temporaryRoot) {
+            Remove-Item -LiteralPath $temporaryRoot -Recurse -Force -ErrorAction Stop
+        }
+    }
+    catch {
+        $cleanupFailure = $_
+    }
+    if ($null -ne $cleanupFailure) {
+        if ($null -ne $contractFailure) {
+            $contractFailure.Exception.Data["EasyConLifecycleContractCleanupFailure"] = `
+                $cleanupFailure.Exception.ToString()
+        }
+        else {
+            throw $cleanupFailure
+        }
     }
 }
 

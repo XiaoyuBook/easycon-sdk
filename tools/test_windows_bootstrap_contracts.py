@@ -187,6 +187,8 @@ class WindowsBuildEnvironmentContracts(unittest.TestCase):
             "unfrozen target": lambda value: value.update(target="x86_64-unknown-linux-gnu"),
             "fingerprint order": lambda value: value["fingerprintInputs"].reverse(),
             "fingerprint kind": lambda value: value["fingerprintInputs"][0].update(kind="auto"),
+            "fingerprint Windows case alias": lambda value: value["fingerprintInputs"][-1].update(path="TOOLS/WINDOWS_BUILD_ENVIRONMENT.JSON"),
+            "fingerprint dot component": lambda value: value["fingerprintInputs"][-1].update(path="tools/./provision_vision_test_model.py"),
             "uppercase scripts commit": lambda value: value["vcpkg"].update(scriptsCommit="C" * 40),
             "registry divergence": lambda value: value["vcpkg"].update(registryBaseline="0" * 40),
             "uppercase SHA-512": lambda value: value["vcpkg"]["internalTools"][0].update(sha512="A" * 128),

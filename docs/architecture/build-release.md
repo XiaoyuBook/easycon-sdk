@@ -52,7 +52,9 @@ backend 或合并大段平台专属生产代码。
 `tools/windows_build_environment.json` 是当前 Windows 开发构建环境的结构化固定清单，记录 vcpkg
 scripts/tool/registry、CMake、Ninja、7-Zip、直接 native ports 的版本、来源和 hash 证据；Rust、triplet、preset 与
 OCR 分别由 fingerprint 中列出的 tracked 文件共同约束。清单显式区分 text 与 binary 输入；text 先严格按 UTF-8
-解码并把 CRLF/独立 CR 规范化为 LF，binary 则 hash 原始 bytes。升级任一固定输入都必须经过显式变更并重新运行 Setup。
+解码并把 CRLF/独立 CR 规范化为 LF，binary 则 hash 原始 bytes。PowerShell parser 在任何 provision 前强制固定输入
+exact path/kind/order、规范相对 path 和 Windows 大小写不敏感 identity；Python guard 独立执行同一严格合同，防止两者
+漂移。升级任一固定输入都必须经过显式变更并重新运行 Setup。
 
 ### Windows 开发环境生命周期
 
@@ -76,6 +78,10 @@ fingerprint 对应且未损坏的 stamp，缺失或失配时要求重新运行 S
 只做有限 publish/cleanup 重试。cleanup 成功时删除 partial destination；若外部句柄令删除暂时不可能，则返回以原始
 publish failure 为主、附带 cleanup failure 与残留状态的诊断，且残留绝不视为有效 checkout。句柄释放后，下一次
 Setup 在独占 lease 下删除旧环境树并安全恢复。
+
+工具、vcpkg.exe 和环境 stamp 的 download/write temporary 也使用 trusted-root 内的有限 cleanup。文件仍被外部句柄
+持有时不承诺当前调用物理删除；诊断保留原始 download/hash/publish failure，并附加 cleanup failure 与 residual 状态。
+残留 temporary 不能通过固定 hash 或成为最终 stamp；句柄释放后新的完整下载可发布，下一次 Setup 也可删除旧环境树。
 
 Verify 在执行任何 gate 前清除 ambient `RUSTC*`/wrapper/rustflags、Cargo target linker/profile/registry overrides、
 cc-rs target compiler、`CL`/`_CL_`、MSVC Developer Shell 残留、CMake/package roots、vcpkg overrides 和 proxy，并用

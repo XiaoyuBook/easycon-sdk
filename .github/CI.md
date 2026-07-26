@@ -47,7 +47,9 @@ Linux job 是 non-required Vision build candidate。只有四个 Linux native �
 configuration、triplet、CMake preset、OCR manifest/provisioner 共同组成 fingerprint；任一输入变化都会选择新的环境
 目录并要求重新 Setup。清单为每项 fingerprint 输入显式声明 `text` 或 `binary`：text 必须是严格 UTF-8，并在 hash
 前把 CRLF 和独立 CR 规范化为 LF；binary 始终按原始 bytes 计算。repository guard 将该清单与 Required CI、vcpkg
-配置及独立 native-quality pins 交叉核对。
+配置及独立 native-quality pins 交叉核对。PowerShell Setup parser 在 provision 前强制 exact schema 键、固定
+path/kind/顺序、无 `.`/`..` component 的规范相对路径和 Windows 大小写不敏感 path identity；任一偏差直接拒绝，
+不能等到后置 repository gate 才发现。Python guard 独立执行同一严格合同，防止清单与 Setup parser 漂移。
 
 ## Windows Setup、Verify 与 Workspace
 
@@ -66,6 +68,9 @@ hash 验证；完成后写入 `environment-stamp.json`，记录 fingerprint、wo
 staging 目录做原子 rename；Windows sharing violation 使用有限 publish/cleanup 重试。若外部句柄阻止删除，原始
 publish failure 始终是主错误，诊断同时记录 cleanup failure 并把残留 destination 标记为不可用；释放句柄后，下一次
 Setup 在独占 lease 下删除旧环境树并恢复。脚本不把无法删除的 partial destination 伪装成有效 checkout。
+通用工具、vcpkg.exe 与 stamp 的 `.download-*`/`.write-*` 临时文件也使用有界 cleanup；外部句柄阻止删除时，诊断以
+原始 download/hash/publish failure 为主并附带 cleanup 与 residual 状态，临时文件永不作为固定 asset 或 stamp 接受。
+句柄释放后，后续下载可以使用新的完整 temporary 恢复，下一次 Setup 也会在独占 lease 下清理旧环境树。
 
 日常只验证或运行完整门禁：
 

@@ -837,9 +837,23 @@ def parse_windows_build_environment(text):
             FINGERPRINT_INPUT_KEYS,
             "fingerprint input {}".format(index),
         )
-        _require_string(fingerprint_input["path"], "fingerprint input path")
-        if fingerprint_input["kind"] not in ("text", "binary"):
+        path = _require_string(fingerprint_input["path"], "fingerprint input path")
+        components = path.split("/")
+        if (
+            not re.fullmatch(r"[A-Za-z0-9._/-]+", path)
+            or path.startswith("/")
+            or "//" in path
+            or any(component in ("", ".", "..") for component in components)
+        ):
+            raise ValueError(
+                "fingerprint input must be one normalized repository-relative path"
+            )
+        kind = _require_string(fingerprint_input["kind"], "fingerprint input kind")
+        if kind not in ("text", "binary"):
             raise ValueError("fingerprint input kind must be exactly text or binary")
+    identities = [item["path"].casefold() for item in fingerprint_inputs]
+    if len(identities) != len(set(identities)):
+        raise ValueError("fingerprintInputs contains duplicate Windows path identity")
     expected_fingerprint_paths = [
         "tools/windows_build_environment.json",
         "tools/windows_workspace.psm1",

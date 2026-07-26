@@ -137,6 +137,47 @@ function Publish-PrivateDirectoryAtomically {
     } $Parameters
 }
 
+function Invoke-PrivateCommandWithNativeCapture {
+    param(
+        [Parameter(Mandatory)]
+        [string]$CommandName,
+
+        [Parameter(Mandatory)]
+        [hashtable]$Parameters,
+
+        [Parameter(Mandatory)]
+        [scriptblock]$NativeCapture
+    )
+
+    & $script:workspaceModule {
+        param($Name, $Arguments, $Capture)
+        $original = ${function:Invoke-EasyConNativeCapture}
+        try {
+            Set-Item -LiteralPath Function:script:Invoke-EasyConNativeCapture -Value $Capture
+            & $Name @Arguments
+        }
+        finally {
+            Set-Item -LiteralPath Function:script:Invoke-EasyConNativeCapture -Value $original
+        }
+    } $CommandName $Parameters $NativeCapture
+}
+
+function Invoke-PrivateCommand {
+    param(
+        [Parameter(Mandatory)]
+        [string]$CommandName,
+
+        [Parameter(Mandatory)]
+        [hashtable]$Parameters
+    )
+
+    & $script:workspaceModule {
+        param($Name, $Arguments)
+        & $Name @Arguments
+    } $CommandName $Parameters
+}
+
+$contractFailure = $null
 try {
     Invoke-ContractCase -Name "strict-environment-configuration" -Action {
         $configurationText = Get-Content -Raw -LiteralPath $configurationPath
@@ -150,6 +191,10 @@ try {
             "Cargo.lock must invalidate the prepared dependency environment"
         Assert-Contract ($configuration.fingerprintInputs.path -ccontains "tools/windows_workspace.psm1") `
             "environment implementation changes must invalidate the prepared environment"
+
+        $reversedConfiguration = $configurationText | ConvertFrom-Json -Depth 32
+        [array]::Reverse($reversedConfiguration.fingerprintInputs)
+        $reversedFingerprintInputs = $reversedConfiguration | ConvertTo-Json -Depth 32
 
         $mutations = [ordered]@{
             "duplicate key" = $configurationText.Replace(
@@ -167,6 +212,15 @@ try {
                 '"path": "Cargo.lock", "kind": "text"',
                 '"path": "Cargo.lock", "kind": "auto"'
             )
+            "reversed fingerprint inputs" = $reversedFingerprintInputs
+            "Windows case alias duplicate" = $configurationText.Replace(
+                '"path": "tools/provision_vision_test_model.py"',
+                '"path": "TOOLS/WINDOWS_BUILD_ENVIRONMENT.JSON"'
+            )
+            "dot component fingerprint path" = $configurationText.Replace(
+                '"path": "tools/provision_vision_test_model.py"',
+                '"path": "tools/./provision_vision_test_model.py"'
+            )
             "internal tool hash" = $configurationText.Replace(
                 '55d3d891e8fc6c8ad7f92e172125319896761e57c5125944613d9bbfa5b9374387e9fc1468ad5bcb31464f43fb1c455ea251343942595f42955dc67090aa12ee',
                 ('A' * 128)
@@ -179,9 +233,23 @@ try {
         foreach ($entry in $mutations.GetEnumerator()) {
             $path = Join-Path $temporaryRoot ("configuration-{0}.json" -f $entry.Key)
             Set-ContractFile -Path $path -Value $entry.Value
-            Assert-Throws -Pattern "config|version|target|fingerprint|SHA|git tree|duplicate" -Action {
-                Get-EasyConWindowsBuildConfiguration -Path $path
+            try {
+                Assert-Throws -Pattern "config|version|target|fingerprint|SHA|git tree|duplicate" `
+                    -Action {
+                        Get-EasyConWindowsBuildConfiguration -Path $path
+                    }
             }
+            catch {
+                throw "configuration mutation '$($entry.Key)' was accepted: $($_.Exception.Message)"
+            }
+            $setupCache = Join-Path $temporaryRoot ("setup-cache-{0}" -f $entry.Key)
+            Assert-Throws -Pattern "config|version|target|fingerprint|SHA|git tree|duplicate" `
+                -Action {
+                    Invoke-EasyConWindowsSetup -RepositoryRoot $repository `
+                        -ConfigurationPath $path -CacheRoot $setupCache
+                }
+            Assert-Contract (-not (Test-Path -LiteralPath $setupCache)) `
+                "configuration mutation '$($entry.Key)' must fail before Setup creates its cache root"
         }
     }
 
@@ -461,6 +529,236 @@ try {
         ) "the persistent tool copy must retain the audited hash"
     }
 
+    Invoke-ContractCase -Name "locked-pinned-download-preserves-primary-failure" -Action {
+        $destination = Join-Path $temporaryRoot "downloads/pinned-tool.zip"
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
+        $payload = [System.Text.Encoding]::UTF8.GetBytes("complete pinned download")
+        $expectedHash = [Convert]::ToHexString(
+            [System.Security.Cryptography.SHA512]::HashData($payload)
+        ).ToLowerInvariant()
+        $state = [pscustomobject]@{ Handle = $null; Temporary = $null }
+        $failingCapture = {
+            param($Program, $Arguments, $Description, $WorkingDirectory, $StreamOutput)
+            $null = $Program, $Description, $WorkingDirectory, $StreamOutput
+            $outputIndex = [Array]::IndexOf([string[]]$Arguments, "--output")
+            $state.Temporary = [string]$Arguments[$outputIndex + 1]
+            [System.IO.File]::WriteAllBytes($state.Temporary, [byte[]](1, 2, 3))
+            $state.Handle = [System.IO.File]::Open(
+                $state.Temporary,
+                [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::Read,
+                [System.IO.FileShare]::None
+            )
+            throw [System.IO.IOException]::new("synthetic pinned download primary failure")
+        }.GetNewClosure()
+
+        $failure = $null
+        try {
+            try {
+                Invoke-PrivateCommandWithNativeCapture `
+                    -CommandName "Get-EasyConPinnedDownload" -Parameters @{
+                        Destination = $destination
+                        Url = "https://example.invalid/pinned-tool.zip"
+                        Sha512 = $expectedHash
+                        TrustedRoot = $temporaryRoot
+                        Description = "contract pinned tool"
+                    } -NativeCapture $failingCapture
+            }
+            catch {
+                $failure = $_
+            }
+            Assert-Contract ($null -ne $failure) "locked pinned download must fail"
+            Assert-Contract (
+                $failure.Exception.Message -match "synthetic pinned download primary failure"
+            ) "pinned download cleanup must not replace the primary failure; got: $($failure.Exception.Message)"
+            Assert-Contract (
+                $failure.Exception.Message -match "cleanup" -and
+                $failure.Exception.Message -match "temporary.*remains|residual"
+            ) "pinned download failure must report cleanup and residual state"
+            Assert-Contract (-not (Test-Path -LiteralPath $destination)) `
+                "a locked temporary must never be accepted as the pinned destination"
+            Assert-Contract (Test-Path -LiteralPath $state.Temporary -PathType Leaf) `
+                "an externally locked download temporary may remain after cleanup"
+        }
+        finally {
+            if ($null -ne $state.Handle) {
+                $state.Handle.Dispose()
+            }
+        }
+
+        $successfulCapture = {
+            param($Program, $Arguments, $Description, $WorkingDirectory, $StreamOutput)
+            $null = $Program, $Description, $WorkingDirectory, $StreamOutput
+            $outputIndex = [Array]::IndexOf([string[]]$Arguments, "--output")
+            [System.IO.File]::WriteAllBytes(
+                [string]$Arguments[$outputIndex + 1],
+                $payload
+            )
+        }.GetNewClosure()
+        $downloaded = Invoke-PrivateCommandWithNativeCapture `
+            -CommandName "Get-EasyConPinnedDownload" -Parameters @{
+                Destination = $destination
+                Url = "https://example.invalid/pinned-tool.zip"
+                Sha512 = $expectedHash
+                TrustedRoot = $temporaryRoot
+                Description = "contract pinned tool"
+            } -NativeCapture $successfulCapture
+        Assert-Contract ($downloaded -ceq $destination) `
+            "a later pinned download must recover after the handle is released"
+        Assert-Contract (
+            (Get-FileHash -LiteralPath $destination -Algorithm SHA512).Hash.ToLowerInvariant() `
+                -ceq $expectedHash
+        ) "the recovered pinned download must pass its frozen hash"
+        Remove-Item -LiteralPath $state.Temporary -Force
+    }
+
+    Invoke-ContractCase -Name "locked-vcpkg-asset-download-preserves-primary-failure" -Action {
+        $cache = Join-Path $temporaryRoot "vcpkg asset cache"
+        $payload = [System.Text.Encoding]::UTF8.GetBytes("complete vcpkg asset")
+        $expectedHash = [Convert]::ToHexString(
+            [System.Security.Cryptography.SHA256]::HashData($payload)
+        ).ToLowerInvariant()
+        $configuration = [pscustomobject]@{
+            vcpkg = [pscustomobject]@{
+                toolRelease = "contract"
+                windowsAsset = [pscustomobject]@{
+                    url = "https://example.invalid/vcpkg.exe"
+                    bytes = $payload.Length
+                    sha256 = $expectedHash
+                }
+            }
+        }
+        $state = [pscustomobject]@{ Handle = $null; Temporary = $null }
+        $failingCapture = {
+            param($Program, $Arguments, $Description, $WorkingDirectory, $StreamOutput)
+            $null = $Program, $Description, $WorkingDirectory, $StreamOutput
+            $outputIndex = [Array]::IndexOf([string[]]$Arguments, "--output")
+            $state.Temporary = [string]$Arguments[$outputIndex + 1]
+            [System.IO.File]::WriteAllBytes($state.Temporary, [byte[]](4, 5, 6))
+            $state.Handle = [System.IO.File]::Open(
+                $state.Temporary,
+                [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::Read,
+                [System.IO.FileShare]::None
+            )
+            throw [System.IO.IOException]::new("synthetic vcpkg asset primary failure")
+        }.GetNewClosure()
+
+        $failure = $null
+        try {
+            try {
+                Invoke-PrivateCommandWithNativeCapture -CommandName "Get-EasyConVcpkgAsset" `
+                    -Parameters @{
+                        CacheRoot = $cache
+                        Configuration = $configuration
+                    } -NativeCapture $failingCapture
+            }
+            catch {
+                $failure = $_
+            }
+            Assert-Contract ($null -ne $failure) "locked vcpkg asset download must fail"
+            Assert-Contract (
+                $failure.Exception.Message -match "synthetic vcpkg asset primary failure"
+            ) "vcpkg asset cleanup must not replace the primary failure; got: $($failure.Exception.Message)"
+            Assert-Contract (
+                $failure.Exception.Message -match "cleanup" -and
+                $failure.Exception.Message -match "temporary.*remains|residual"
+            ) "vcpkg asset failure must report cleanup and residual state"
+            $cachedAsset = Join-Path $cache "downloads/vcpkg-contract-windows.exe"
+            Assert-Contract (-not (Test-Path -LiteralPath $cachedAsset)) `
+                "a locked vcpkg temporary must never be accepted as the cached asset"
+            Assert-Contract (Test-Path -LiteralPath $state.Temporary -PathType Leaf) `
+                "an externally locked vcpkg temporary may remain after cleanup"
+        }
+        finally {
+            if ($null -ne $state.Handle) {
+                $state.Handle.Dispose()
+            }
+        }
+
+        $successfulCapture = {
+            param($Program, $Arguments, $Description, $WorkingDirectory, $StreamOutput)
+            $null = $Program, $Description, $WorkingDirectory, $StreamOutput
+            $outputIndex = [Array]::IndexOf([string[]]$Arguments, "--output")
+            [System.IO.File]::WriteAllBytes(
+                [string]$Arguments[$outputIndex + 1],
+                $payload
+            )
+        }.GetNewClosure()
+        $asset = Invoke-PrivateCommandWithNativeCapture -CommandName "Get-EasyConVcpkgAsset" `
+            -Parameters @{
+                CacheRoot = $cache
+                Configuration = $configuration
+            } -NativeCapture $successfulCapture
+        Assert-Contract (
+            (Get-FileHash -LiteralPath $asset -Algorithm SHA256).Hash.ToLowerInvariant() `
+                -ceq $expectedHash
+        ) "a later vcpkg asset download must recover with the frozen hash"
+        Remove-Item -LiteralPath $state.Temporary -Force
+    }
+
+    Invoke-ContractCase -Name "locked-stamp-temporary-preserves-primary-failure" -Action {
+        $environment = Join-Path $temporaryRoot "stamp publish environment"
+        New-Item -ItemType Directory -Force -Path $environment | Out-Null
+        $stamp = Join-Path $environment "environment-stamp.json"
+        $state = [pscustomobject]@{ Handle = $null; Temporary = $null }
+        $failingMove = {
+            param($Source, $Destination)
+            $null = $Destination
+            $state.Temporary = $Source
+            $state.Handle = [System.IO.File]::Open(
+                $Source,
+                [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::Read,
+                [System.IO.FileShare]::None
+            )
+            throw [System.IO.IOException]::new("synthetic stamp publish primary failure")
+        }.GetNewClosure()
+
+        $failure = $null
+        try {
+            try {
+                Invoke-PrivateCommand -CommandName "Write-EasyConEnvironmentStamp" `
+                    -Parameters @{
+                        Path = $stamp
+                        Value = [ordered]@{ status = "partial" }
+                        EnvironmentRoot = $environment
+                        MoveAction = $failingMove
+                    }
+            }
+            catch {
+                $failure = $_
+            }
+            Assert-Contract ($null -ne $failure) "locked stamp publish must fail"
+            Assert-Contract (
+                $failure.Exception.Message -match "synthetic stamp publish primary failure"
+            ) "stamp cleanup must preserve the primary failure; got: $($failure.Exception.Message)"
+            Assert-Contract (
+                $failure.Exception.Message -match "cleanup" -and
+                $failure.Exception.Message -match "temporary.*remains|residual"
+            ) "stamp failure must report cleanup and residual state"
+            Assert-Contract (-not (Test-Path -LiteralPath $stamp)) `
+                "a locked temporary stamp must never become the published Verify input"
+            Assert-Contract (Test-Path -LiteralPath $state.Temporary -PathType Leaf) `
+                "an externally locked stamp temporary may remain after cleanup"
+        }
+        finally {
+            if ($null -ne $state.Handle) {
+                $state.Handle.Dispose()
+            }
+        }
+
+        Invoke-PrivateCommand -CommandName "Write-EasyConEnvironmentStamp" -Parameters @{
+            Path = $stamp
+            Value = [ordered]@{ status = "ready" }
+            EnvironmentRoot = $environment
+        }
+        $published = Get-Content -Raw -LiteralPath $stamp | ConvertFrom-Json
+        Assert-Contract ([string]$published.status -ceq "ready") `
+            "a later stamp write must recover with complete published JSON"
+        Remove-Item -LiteralPath $state.Temporary -Force
+    }
+
     Invoke-ContractCase -Name "msvc-developer-shell-reinitializes-after-sanitization" -Action {
         $configuration = Get-EasyConWindowsBuildConfiguration -Path $configurationPath
         Initialize-EasyConMsvcEnvironment `
@@ -731,14 +1029,33 @@ try {
         }
     }
 }
+catch {
+    $contractFailure = $_
+    throw
+}
 finally {
-    Remove-Module windows_workspace -ErrorAction SilentlyContinue
-    $resolvedTemporary = [System.IO.Path]::GetFullPath($temporaryRoot)
-    $systemTemporary = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath())
-    Assert-Contract ($resolvedTemporary.StartsWith(
-        $systemTemporary, [System.StringComparison]::OrdinalIgnoreCase
-    )) "temporary contract root must remain under the system temporary directory"
-    Remove-Item -LiteralPath $resolvedTemporary -Recurse -Force
+    $cleanupFailure = $null
+    try {
+        Remove-Module windows_workspace -ErrorAction Stop
+        $resolvedTemporary = [System.IO.Path]::GetFullPath($temporaryRoot)
+        $systemTemporary = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath())
+        Assert-Contract ($resolvedTemporary.StartsWith(
+            $systemTemporary, [System.StringComparison]::OrdinalIgnoreCase
+        )) "temporary contract root must remain under the system temporary directory"
+        Remove-Item -LiteralPath $resolvedTemporary -Recurse -Force -ErrorAction Stop
+    }
+    catch {
+        $cleanupFailure = $_
+    }
+    if ($null -ne $cleanupFailure) {
+        if ($null -ne $contractFailure) {
+            $contractFailure.Exception.Data["EasyConContractCleanupFailure"] = `
+                $cleanupFailure.Exception.ToString()
+        }
+        else {
+            throw $cleanupFailure
+        }
+    }
 }
 
-Write-Output "Windows workspace contracts passed: 16 cases"
+Write-Output "Windows workspace contracts passed: 19 cases"

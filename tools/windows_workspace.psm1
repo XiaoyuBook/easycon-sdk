@@ -337,6 +337,100 @@ function Get-EasyConFingerprintInputHash {
     return [System.Convert]::ToHexString($digest).ToLowerInvariant()
 }
 
+function Complete-EasyConTemporaryFileCleanup {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [string]$TrustedRoot,
+
+        [Parameter(Mandatory)]
+        [string]$Description,
+
+        [object]$PrimaryFailure,
+
+        [ValidateRange(1, 10)]
+        [int]$MaxAttempts = 4,
+
+        [ValidateRange(0, 5000)]
+        [int]$RetryMilliseconds = 250,
+
+        [scriptblock]$RetryAction
+    )
+
+    if ($null -eq $RetryAction) {
+        $RetryAction = {
+            param($Attempt, $Failure)
+            $null = $Attempt, $Failure
+            if ($RetryMilliseconds -gt 0) {
+                Start-Sleep -Milliseconds $RetryMilliseconds
+            }
+        }.GetNewClosure()
+    }
+
+    $cleanupFailure = $null
+    $cleanupAttempts = 0
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        $cleanupAttempts = $attempt
+        try {
+            $temporary = Assert-EasyConPhysicalPath -Path $Path -TrustedRoot $TrustedRoot
+            if (-not (Test-Path -LiteralPath $temporary)) {
+                return
+            }
+            Remove-Item -LiteralPath $temporary -Force -ErrorAction Stop
+            if (Test-Path -LiteralPath $temporary) {
+                throw [System.IO.IOException]::new(
+                    "temporary file still exists after cleanup"
+                )
+            }
+            return
+        }
+        catch {
+            $cleanupFailure = $_.Exception
+            if (-not (Test-Path -LiteralPath $Path)) {
+                return
+            }
+            if ($attempt -lt $MaxAttempts) {
+                try {
+                    & $RetryAction $attempt $cleanupFailure
+                }
+                catch {
+                    $cleanupFailure = $_.Exception
+                    break
+                }
+            }
+        }
+    }
+
+    $cleanupMessage = (
+        "temporary file cleanup failed after $cleanupAttempts attempt(s): " +
+        "$($cleanupFailure.Message); temporary file remains incomplete and must not be used; " +
+        "release external handles and rerun Setup"
+    )
+    if ($null -eq $PrimaryFailure) {
+        throw [System.IO.IOException]::new("$Description $cleanupMessage", $cleanupFailure)
+    }
+
+    $primaryException = if ($PrimaryFailure -is [System.Management.Automation.ErrorRecord]) {
+        $PrimaryFailure.Exception
+    }
+    elseif ($PrimaryFailure -is [System.Exception]) {
+        $PrimaryFailure
+    }
+    else {
+        [System.Exception]::new([string]$PrimaryFailure)
+    }
+    $diagnostic = [System.IO.IOException]::new(
+        "$Description failed: $($primaryException.Message); $cleanupMessage",
+        $primaryException
+    )
+    $diagnostic.Data["EasyConTemporaryCleanupFailure"] = $cleanupFailure.ToString()
+    $diagnostic.Data["EasyConResidualTemporary"] = $Path
+    throw $diagnostic
+}
+
 function Get-EasyConPinnedDownload {
     [CmdletBinding()]
     param(
@@ -367,6 +461,7 @@ function Get-EasyConPinnedDownload {
 
     $temporary = "$destinationPath.download-$PID-$([guid]::NewGuid().ToString('N'))"
     Assert-EasyConPhysicalPath -Path $temporary -TrustedRoot $TrustedRoot | Out-Null
+    $primaryFailure = $null
     try {
         $curl = Get-EasyConCommandPath -Name "curl.exe"
         Invoke-EasyConNativeCapture -Program $curl -Arguments @(
@@ -382,11 +477,13 @@ function Get-EasyConPinnedDownload {
         }
         Move-Item -LiteralPath $temporary -Destination $destinationPath
     }
+    catch {
+        $primaryFailure = $_
+        throw
+    }
     finally {
-        if (Test-Path -LiteralPath $temporary) {
-            Assert-EasyConPhysicalPath -Path $temporary -TrustedRoot $TrustedRoot | Out-Null
-            Remove-Item -LiteralPath $temporary -Force
-        }
+        Complete-EasyConTemporaryFileCleanup -Path $temporary -TrustedRoot $TrustedRoot `
+            -Description "$Description download" -PrimaryFailure $primaryFailure
     }
     return $destinationPath
 }
@@ -641,6 +738,7 @@ function Get-EasyConWindowsBuildConfiguration {
     catch {
         throw "Windows build environment config is invalid: $($_.Exception.Message)"
     }
+    $primaryFailure = $null
     try {
         $getObject = {
             param(
@@ -696,29 +794,64 @@ function Get-EasyConWindowsBuildConfiguration {
         if ($root.fingerprintInputs.ValueKind -ne [System.Text.Json.JsonValueKind]::Array) {
             throw "fingerprintInputs must be a JSON array"
         }
-        $fingerprintPaths = @()
+        $expectedFingerprintPaths = @(
+            "tools/windows_build_environment.json",
+            "tools/windows_workspace.psm1",
+            "tools/run_windows_workspace.ps1",
+            "rust-toolchain.toml",
+            "Cargo.toml",
+            "Cargo.lock",
+            "crates/easycon-model/Cargo.toml",
+            "crates/easycon-runtime/Cargo.toml",
+            "crates/easycon-controller/Cargo.toml",
+            "crates/easycon-ecs/Cargo.toml",
+            "crates/easycon-serial/Cargo.toml",
+            "crates/easycon-native-sys/Cargo.toml",
+            "crates/easycon-vision/Cargo.toml",
+            "tests/support/Cargo.toml",
+            "vcpkg.json",
+            "vcpkg-configuration.json",
+            "cmake/triplets/x64-windows-static-md.cmake",
+            "CMakePresets.json",
+            "spec/fixtures/vision/ocr-model.json",
+            "tools/provision_vision_test_model.py"
+        )
+        $fingerprintPaths = [System.Collections.Generic.HashSet[string]]::new(
+            [System.StringComparer]::OrdinalIgnoreCase
+        )
+        $fingerprintIndex = 0
         foreach ($element in $root.fingerprintInputs.EnumerateArray()) {
             $input = & $getObject $element @("path", "kind") "fingerprint input"
             $relative = & $getString $input.path "fingerprint input path"
+            $components = @($relative.Split('/'))
             if (
                 $relative -cnotmatch '^[A-Za-z0-9._/-]+$' -or
                 $relative.StartsWith('/') -or
                 $relative.Contains('//') -or
-                @($relative.Split('/')) -contains '..'
+                $components -ccontains '.' -or
+                $components -ccontains '..' -or
+                $components -contains ''
             ) {
                 throw "fingerprint input must be one normalized repository-relative path"
             }
-            if ($fingerprintPaths -ccontains $relative) {
-                throw "fingerprintInputs contains duplicate path '$relative'"
+            if (-not $fingerprintPaths.Add($relative)) {
+                throw "fingerprintInputs contains duplicate Windows path identity '$relative'"
             }
-            $fingerprintPaths += $relative
             $kind = & $getString $input.kind "fingerprint input kind"
             if ($kind -cnotin @("text", "binary")) {
                 throw "fingerprint input kind must be exactly text or binary"
             }
+            if (
+                $fingerprintIndex -ge $expectedFingerprintPaths.Count -or
+                $relative -cne $expectedFingerprintPaths[$fingerprintIndex] -or
+                $kind -cne "text"
+            ) {
+                throw "Windows environment fingerprint input set, kind, or order changed"
+            }
+            $fingerprintIndex++
         }
-        if ($fingerprintPaths.Count -eq 0) {
-            throw "fingerprintInputs must not be empty"
+        if ($fingerprintIndex -ne $expectedFingerprintPaths.Count) {
+            throw "Windows environment fingerprint input set, kind, or order changed"
         }
         $visionDirectory = & $getString $root.visionModelDirectory "OCR model directory"
         if ($visionDirectory -notmatch '^[A-Za-z0-9._-]+$') {
@@ -912,8 +1045,23 @@ function Get-EasyConWindowsBuildConfiguration {
         }
         return $json | ConvertFrom-Json -Depth 16
     }
+    catch {
+        $primaryFailure = $_
+        throw
+    }
     finally {
-        $document.Dispose()
+        try {
+            $document.Dispose()
+        }
+        catch {
+            if ($null -ne $primaryFailure) {
+                $primaryFailure.Exception.Data["EasyConJsonDocumentCleanupFailure"] = `
+                    $_.Exception.ToString()
+            }
+            else {
+                throw
+            }
+        }
     }
 }
 
@@ -997,6 +1145,7 @@ function Invoke-EasyConNativeCapture {
 
     $Program = Assert-EasyConPhysicalPath -Path $Program
     $previousLocation = $null
+    $primaryFailure = $null
     try {
         if (-not [string]::IsNullOrWhiteSpace($WorkingDirectory)) {
             $previousLocation = Get-Location
@@ -1010,9 +1159,24 @@ function Invoke-EasyConNativeCapture {
         })
         $exitCode = $LASTEXITCODE
     }
+    catch {
+        $primaryFailure = $_
+        throw
+    }
     finally {
         if ($null -ne $previousLocation) {
-            Set-Location -LiteralPath $previousLocation.Path
+            try {
+                Set-Location -LiteralPath $previousLocation.Path
+            }
+            catch {
+                if ($null -ne $primaryFailure) {
+                    $primaryFailure.Exception.Data["EasyConLocationCleanupFailure"] = `
+                        $_.Exception.ToString()
+                }
+                else {
+                    throw
+                }
+            }
         }
     }
     if ($exitCode -ne 0) {
@@ -1507,6 +1671,7 @@ function Get-EasyConVcpkgAsset {
         throw "temporary vcpkg download escaped the controlled cache root"
     }
     Assert-EasyConPhysicalPath -Path $temporary -TrustedRoot $cache | Out-Null
+    $primaryFailure = $null
     try {
         $curl = Get-EasyConCommandPath -Name "curl.exe"
         Invoke-EasyConNativeCapture -Program $curl -Arguments @(
@@ -1536,14 +1701,13 @@ function Get-EasyConVcpkgAsset {
         Move-Item -LiteralPath $temporary -Destination $cachedAsset
         Assert-EasyConPhysicalPath -Path $cachedAsset -TrustedRoot $cache | Out-Null
     }
+    catch {
+        $primaryFailure = $_
+        throw
+    }
     finally {
-        if (Test-Path -LiteralPath $temporary) {
-            if (-not (Test-EasyConPathWithin -Path $temporary -Root $cache)) {
-                throw "refusing to clean a temporary download outside the controlled cache root"
-            }
-            Assert-EasyConPhysicalPath -Path $temporary -TrustedRoot $cache | Out-Null
-            Remove-Item -LiteralPath $temporary -Force
-        }
+        Complete-EasyConTemporaryFileCleanup -Path $temporary -TrustedRoot $cache `
+            -Description "vcpkg asset download" -PrimaryFailure $primaryFailure
     }
     Assert-EasyConPinnedFile -Path $cachedAsset -Bytes ([long]$asset.bytes) `
         -Sha256 ([string]$asset.sha256) -Description "cached vcpkg.exe"
@@ -1630,6 +1794,7 @@ function Install-EasyConVcpkgCheckout {
                 if ($null -ne $primaryFailure) {
                     $primaryFailure.Exception.Data["EasyConVcpkgStagingCleanupFailure"] = `
                         $_.Exception.ToString()
+                    $primaryFailure.Exception.Data["EasyConResidualVcpkgStaging"] = $temporary
                 }
                 else {
                     throw
@@ -1970,22 +2135,34 @@ function Write-EasyConEnvironmentStamp {
         [object]$Value,
 
         [Parameter(Mandatory)]
-        [string]$EnvironmentRoot
+        [string]$EnvironmentRoot,
+
+        [scriptblock]$MoveAction
     )
 
     $environment = Assert-EasyConPhysicalPath -Path $EnvironmentRoot
     $stamp = Assert-EasyConPhysicalPath -Path $Path -TrustedRoot $environment
     $temporary = "$stamp.write-$PID-$([guid]::NewGuid().ToString('N'))"
     Assert-EasyConPhysicalPath -Path $temporary -TrustedRoot $environment | Out-Null
+    if ($null -eq $MoveAction) {
+        $MoveAction = {
+            param($Source, $Destination)
+            Move-Item -Force -LiteralPath $Source -Destination $Destination
+        }
+    }
+    $primaryFailure = $null
     try {
         $json = $Value | ConvertTo-Json -Depth 32
         [System.IO.File]::WriteAllText($temporary, $json + "`n", [System.Text.UTF8Encoding]::new($false))
-        Move-Item -Force -LiteralPath $temporary -Destination $stamp
+        & $MoveAction $temporary $stamp
+    }
+    catch {
+        $primaryFailure = $_
+        throw
     }
     finally {
-        if (Test-Path -LiteralPath $temporary) {
-            Remove-Item -LiteralPath $temporary -Force
-        }
+        Complete-EasyConTemporaryFileCleanup -Path $temporary -TrustedRoot $environment `
+            -Description "environment stamp write" -PrimaryFailure $primaryFailure
     }
 }
 
@@ -2330,6 +2507,7 @@ function Install-EasyConCargoSources {
     Assert-EasyConPhysicalPath -Path $vendorRoot -TrustedRoot $environment | Out-Null
 
     $previousCargoHome = [Environment]::GetEnvironmentVariable("CARGO_HOME", "Process")
+    $primaryFailure = $null
     try {
         $env:CARGO_HOME = $downloadCache
         Invoke-EasyConNativeCapture -Program $CargoPath -Arguments @(
@@ -2337,8 +2515,23 @@ function Install-EasyConCargoSources {
         ) -Description "install locked Cargo sources" -WorkingDirectory $repository `
             -StreamOutput | Out-Null
     }
+    catch {
+        $primaryFailure = $_
+        throw
+    }
     finally {
-        [Environment]::SetEnvironmentVariable("CARGO_HOME", $previousCargoHome, "Process")
+        try {
+            [Environment]::SetEnvironmentVariable("CARGO_HOME", $previousCargoHome, "Process")
+        }
+        catch {
+            if ($null -ne $primaryFailure) {
+                $primaryFailure.Exception.Data["EasyConCargoHomeCleanupFailure"] = `
+                    $_.Exception.ToString()
+            }
+            else {
+                throw
+            }
+        }
     }
 
     $vendor = Assert-EasyConPhysicalTree -Path $vendorRoot -TrustedRoot $environment
@@ -3275,13 +3468,29 @@ function Invoke-EasyConGate {
     $RepositoryRoot = Assert-EasyConPhysicalPath -Path $RepositoryRoot
     $timer = [System.Diagnostics.Stopwatch]::StartNew()
     $previous = Get-Location
+    $primaryFailure = $null
     try {
         Set-Location -LiteralPath $RepositoryRoot
         & $Program @Arguments
         $exitCode = $LASTEXITCODE
     }
+    catch {
+        $primaryFailure = $_
+        throw
+    }
     finally {
-        Set-Location -LiteralPath $previous.Path
+        try {
+            Set-Location -LiteralPath $previous.Path
+        }
+        catch {
+            if ($null -ne $primaryFailure) {
+                $primaryFailure.Exception.Data["EasyConGateLocationCleanupFailure"] = `
+                    $_.Exception.ToString()
+            }
+            else {
+                throw
+            }
+        }
     }
     if ($exitCode -ne 0) {
         throw "gate failed with exit code ${exitCode}: $Name"
