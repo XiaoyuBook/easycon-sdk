@@ -69,6 +69,16 @@ hash、Cargo vendor tree hash 和 native tree hash 的 stamp。Setup 使用 `car
 workspace manifests 对应的 crate sources 安装进环境。`Verify` 与 `Workspace` 不安装或下载；两者只接受当前
 fingerprint 对应且未损坏的 stamp，缺失或失配时要求重新运行 Setup。`Workspace` 在 Verify 后运行完整仓库门禁。
 
+同一 fingerprint/worktree identity 使用环境目录外的跨进程 reader/writer lease：Setup 独占 stamp 检查、旧树删除、
+安装、stamp 发布与最终 Verify；普通 Verify 共享读取；Workspace 的共享 lease 从 Verify 连续覆盖到最后一个 gate。
+所有异常路径释放 lease。vcpkg checkout 先在同卷不可见 staging 中完成并验证，再用原子目录 rename 发布；访问冲突
+只做有限重试，任何失败都回滚 partial destination，使后续 Setup 能从干净目的路径恢复。
+
+Verify 在执行任何 gate 前清除 ambient `RUSTC*`/wrapper/rustflags、Cargo target linker/profile/registry overrides、
+cc-rs target compiler、`CL`/`_CL_`、MSVC Developer Shell 残留、CMake/package roots、vcpkg overrides 和 proxy，并用
+stamp 核验后的工具目录构造 PATH，显式恢复 pinned Developer Shell 生成的 include/lib 路径并设置 MSVC linker、Cargo
+home/target、vcpkg tree 与 OCR 路径。代理只属于在线 Setup，不进入 Verify/Workspace 子进程。
+
 下载包、工具二进制、native install tree 与编译缓存只存在于用户的受控环境根或 CI 临时目录，不进入 Git。
 Cargo/vcpkg cache 只提速，cache miss 不改变正确性合同。本职责拆分不是离线构建承诺，开发电脑与首次 CI Setup
 允许联网。PowerShell、Git、Python、rustup、VS Installer/vswhere 与 VS Build Tools 是运行 Setup 所需的宿主启动条件；

@@ -401,6 +401,85 @@ function Install-EasyConPinnedExecutable {
     return $installed
 }
 
+function Publish-EasyConDirectoryAtomically {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Source,
+
+        [Parameter(Mandatory)]
+        [string]$Destination,
+
+        [Parameter(Mandatory)]
+        [string]$TrustedRoot,
+
+        [ValidateRange(1, 10)]
+        [int]$MaxAttempts = 4,
+
+        [ValidateRange(0, 5000)]
+        [int]$RetryMilliseconds = 250,
+
+        [scriptblock]$MoveAction,
+
+        [scriptblock]$RetryAction
+    )
+
+    $trusted = Assert-EasyConPhysicalPath -Path $TrustedRoot
+    $sourcePath = Assert-EasyConPhysicalTree -Path $Source -TrustedRoot $trusted
+    $destinationPath = Assert-EasyConPhysicalPath -Path $Destination -TrustedRoot $trusted
+    if (-not (Test-Path -LiteralPath $sourcePath -PathType Container)) {
+        throw "atomic directory publish source is missing: $sourcePath"
+    }
+    if (Test-Path -LiteralPath $destinationPath) {
+        throw "atomic directory publish refuses an existing destination: $destinationPath"
+    }
+    if ($null -eq $MoveAction) {
+        $MoveAction = {
+            param($PublishSource, $PublishDestination)
+            [System.IO.Directory]::Move($PublishSource, $PublishDestination)
+        }
+    }
+    if ($null -eq $RetryAction) {
+        $RetryAction = {
+            param($Attempt, $Failure)
+            $null = $Attempt
+            $null = $Failure
+            if ($RetryMilliseconds -gt 0) {
+                Start-Sleep -Milliseconds $RetryMilliseconds
+            }
+        }.GetNewClosure()
+    }
+
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            & $MoveAction $sourcePath $destinationPath
+            if (
+                (Test-Path -LiteralPath $sourcePath) -or
+                -not (Test-Path -LiteralPath $destinationPath -PathType Container)
+            ) {
+                throw [System.IO.IOException]::new(
+                    "atomic directory rename returned an incomplete publish state"
+                )
+            }
+            Assert-EasyConPhysicalTree -Path $destinationPath -TrustedRoot $trusted | Out-Null
+            return $destinationPath
+        }
+        catch {
+            $failure = $_.Exception
+            if (Test-Path -LiteralPath $destinationPath) {
+                Remove-EasyConSafeTree -Path $destinationPath -TrustedRoot $trusted
+            }
+            if (-not (Test-Path -LiteralPath $sourcePath -PathType Container)) {
+                throw "atomic directory publish lost its complete staging tree: $($failure.Message)"
+            }
+            if ($failure -isnot [System.IO.IOException] -or $attempt -eq $MaxAttempts) {
+                throw "atomic directory publish failed after $attempt attempt(s): $($failure.Message)"
+            }
+            & $RetryAction $attempt $failure
+        }
+    }
+}
+
 function Get-EasyConTreeFingerprint {
     [CmdletBinding()]
     param(
@@ -1189,6 +1268,92 @@ function Assert-EasyConVcpkgEnvironmentInputs {
     }
 }
 
+function Clear-EasyConUntrustedBuildEnvironment {
+    [CmdletBinding()]
+    param(
+        [switch]$AllowProxy
+    )
+
+    $exactNames = @(
+        "AR", "CC", "CFLAGS", "CL", "_CL_", "CXX", "CXXFLAGS", "LINK", "_LINK_",
+        "EXTERNAL_INCLUDE", "INCLUDE", "LIB", "LIBPATH", "UCRTCONTENTROOT", "UCRTVERSION",
+        "UNIVERSALCRTSDKDIR", "VCINSTALLDIR", "VCTOOLSINSTALLDIR", "VCTOOLSVERSION",
+        "VSCMD_ARG_HOST_ARCH", "VSCMD_ARG_TGT_ARCH", "VSINSTALLDIR", "WINDOWSLIBPATH",
+        "WINDOWSSDKBINPATH", "WINDOWSSDKDIR", "WINDOWSSDKVERBINPATH", "WINDOWSSDKVERSION",
+        "RUSTC", "RUSTC_BOOTSTRAP", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "RUSTFLAGS",
+        "CARGO_BUILD_TARGET", "CARGO_ENCODED_RUSTFLAGS", "CARGO_HOME", "CARGO_INCREMENTAL",
+        "CARGO_TARGET_DIR", "RUSTDOCFLAGS", "RUSTUP_DIST_SERVER", "RUSTUP_HOME",
+        "RUSTUP_TOOLCHAIN", "RUSTUP_UPDATE_ROOT",
+        "VCPKG_ROOT", "VCPKG_BINARY_SOURCES", "VCPKG_DOWNLOADS",
+        "VCPKG_DISABLE_METRICS", "VCPKG_FEATURE_FLAGS", "VCPKG_OVERLAY_PORTS",
+        "VCPKG_OVERLAY_TRIPLETS", "VCPKG_CHAINLOAD_TOOLCHAIN_FILE",
+        "VCPKG_INSTALL_OPTIONS", "VCPKG_BOOTSTRAP_OPTIONS"
+    )
+    if (-not $AllowProxy) {
+        $exactNames += @(
+            "ALL_PROXY", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+            "all_proxy", "http_proxy", "https_proxy", "no_proxy"
+        )
+    }
+    foreach ($entry in @(Get-ChildItem Env:)) {
+        $name = [string]$entry.Name
+        if (
+            $exactNames -contains $name -or
+            $name -match '^CARGO_(BUILD|NET|PROFILE|REGISTRIES|TARGET)_' -or
+            (-not $AllowProxy -and $name -match '^CARGO_HTTP_') -or
+            $name -match '^CMAKE_' -or
+            $name -match '^PKG_CONFIG' -or
+            $name -match '^RUSTC_' -or
+            $name -match '^RUSTDOC' -or
+            $name -match '^(__)?VSCMD_' -or
+            $name -match '^(HOST_|TARGET_)?(AR|CC|CFLAGS|CXX|CXXFLAGS)(_|$)' -or
+            $name -match '^(X_)?VCPKG_' -or
+            $name -match '^[A-Z0-9][A-Z0-9_]*_(ROOT|DIR)$'
+        ) {
+            Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Set-EasyConVerifiedProcessEnvironment {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [string[]]$PathDirectories,
+
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary]$Variables
+    )
+
+    Clear-EasyConUntrustedBuildEnvironment
+    $resolvedDirectories = [System.Collections.Generic.List[string]]::new()
+    foreach ($directory in $PathDirectories) {
+        $resolved = Assert-EasyConPhysicalPath -Path $directory
+        if (-not (Test-Path -LiteralPath $resolved -PathType Container)) {
+            throw "verified PATH directory is missing: $resolved"
+        }
+        if (-not @($resolvedDirectories | Where-Object {
+            $_.Equals($resolved, [System.StringComparison]::OrdinalIgnoreCase)
+        })) {
+            $resolvedDirectories.Add($resolved)
+        }
+    }
+    foreach ($entry in $Variables.GetEnumerator()) {
+        $name = [string]$entry.Key
+        $value = [string]$entry.Value
+        if ($name -cnotmatch '^[A-Z][A-Z0-9_]*$' -or [string]::IsNullOrWhiteSpace($value)) {
+            throw "verified environment variables require uppercase names and non-empty values"
+        }
+        [Environment]::SetEnvironmentVariable($name, $value, "Process")
+    }
+    [Environment]::SetEnvironmentVariable(
+        "PATH",
+        ($resolvedDirectories.ToArray() -join [System.IO.Path]::PathSeparator),
+        "Process"
+    )
+}
+
 function Get-EasyConVcpkgAsset {
     [CmdletBinding()]
     param(
@@ -1332,7 +1497,8 @@ function Install-EasyConVcpkgCheckout {
             -Configuration $Configuration -VcpkgExecutable $VcpkgExecutable | Out-Null
         Assert-EasyConPhysicalTree -Path $temporary -TrustedRoot $cache | Out-Null
         Assert-EasyConPhysicalPath -Path $root -TrustedRoot $cache | Out-Null
-        Move-Item -LiteralPath $temporary -Destination $root
+        Publish-EasyConDirectoryAtomically -Source $temporary -Destination $root `
+            -TrustedRoot $cache | Out-Null
         Assert-EasyConPhysicalPath -Path $root -TrustedRoot $cache | Out-Null
         $completed = $true
     }
@@ -1429,11 +1595,78 @@ function Get-EasyConEnvironmentLocation {
     $identityDigest = [System.Security.Cryptography.SHA256]::HashData($identityBytes)
     $identityKey = [System.Convert]::ToHexString($identityDigest).Substring(0, 24).ToLowerInvariant()
     $environment = Join-Path $cache (Join-Path "e" $identityKey)
+    $lockPath = Join-Path $cache (Join-Path "locks" "$identityKey.lock")
     return [pscustomobject]@{
         CacheRoot = $cache
         EnvironmentRoot = Resolve-EasyConFullPath -Path $environment
         StampPath = Resolve-EasyConFullPath -Path (Join-Path $environment "environment-stamp.json")
+        LockPath = Resolve-EasyConFullPath -Path $lockPath
+        IdentityKey = $identityKey
         WorkspaceKey = $workspaceKey
+    }
+}
+
+function Enter-EasyConEnvironmentLease {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object]$Location,
+
+        [ValidateSet("Shared", "Exclusive")]
+        [string]$Access,
+
+        [ValidateRange(0, 7200000)]
+        [int]$TimeoutMilliseconds = 1800000,
+
+        [ValidateRange(0, 1000)]
+        [int]$RetryMilliseconds = 100
+    )
+
+    $cache = Resolve-EasyConFullPath -Path ([string]$Location.CacheRoot)
+    New-EasyConSafeDirectory -Path $cache -TrustedRoot $cache | Out-Null
+    $lockPath = Assert-EasyConPhysicalPath -Path ([string]$Location.LockPath) `
+        -TrustedRoot $cache
+    New-EasyConSafeDirectory -Path (Split-Path -Parent $lockPath) `
+        -TrustedRoot $cache | Out-Null
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    $lastFailure = $null
+    while ($true) {
+        try {
+            if ($Access -ceq "Shared") {
+                if (-not (Test-Path -LiteralPath $lockPath -PathType Leaf)) {
+                    $initializer = [System.IO.FileStream]::new(
+                        $lockPath,
+                        [System.IO.FileMode]::OpenOrCreate,
+                        [System.IO.FileAccess]::ReadWrite,
+                        [System.IO.FileShare]::ReadWrite
+                    )
+                    $initializer.Dispose()
+                }
+                return [System.IO.FileStream]::new(
+                    $lockPath,
+                    [System.IO.FileMode]::Open,
+                    [System.IO.FileAccess]::Read,
+                    [System.IO.FileShare]::Read
+                )
+            }
+            return [System.IO.FileStream]::new(
+                $lockPath,
+                [System.IO.FileMode]::OpenOrCreate,
+                [System.IO.FileAccess]::ReadWrite,
+                [System.IO.FileShare]::None
+            )
+        }
+        catch [System.IO.IOException] {
+            $lastFailure = $_.Exception
+        }
+        if ($timer.ElapsedMilliseconds -ge $TimeoutMilliseconds) {
+            throw "Windows build environment ownership is busy for identity $($Location.IdentityKey) ($Access): $($lastFailure.Message)"
+        }
+        $remaining = $TimeoutMilliseconds - [int]$timer.ElapsedMilliseconds
+        $delay = [Math]::Min($RetryMilliseconds, $remaining)
+        if ($delay -gt 0) {
+            Start-Sleep -Milliseconds $delay
+        }
     }
 }
 
@@ -2079,6 +2312,7 @@ function Install-EasyConWindowsEnvironment {
     $cache = Resolve-EasyConFullPath -Path $EnvironmentRoot
     New-EasyConSafeDirectory -Path $cache -TrustedRoot $cache | Out-Null
     Assert-EasyConVcpkgEnvironmentInputs
+    Clear-EasyConUntrustedBuildEnvironment -AllowProxy
 
     $msvc = Initialize-EasyConMsvcEnvironment -VsWherePath $VsWherePath `
         -MsvcToolsVersion ([string]$configuration.hostTools.msvcToolsVersion) `
@@ -2267,7 +2501,7 @@ function Install-EasyConWindowsEnvironment {
     return [pscustomobject]$summary
 }
 
-function Invoke-EasyConWindowsSetup {
+function Invoke-EasyConWindowsSetupCore {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
@@ -2278,42 +2512,20 @@ function Invoke-EasyConWindowsSetup {
 
         [string]$CacheRoot,
 
-        [string]$VsWherePath
+        [string]$VsWherePath,
+
+        [object]$Context
     )
 
-    $repository = Assert-EasyConPhysicalPath -Path $RepositoryRoot
-    $configuration = Get-EasyConWindowsBuildConfiguration -Path $ConfigurationPath
-    $fingerprint = Get-EasyConEnvironmentFingerprint -RepositoryRoot $repository `
-        -Configuration $configuration
-    $location = Get-EasyConEnvironmentLocation -RepositoryRoot $repository `
-        -Fingerprint $fingerprint.Value -CacheRoot $CacheRoot
-
-    if (Test-Path -LiteralPath $location.StampPath -PathType Leaf) {
-        try {
-            $verified = Invoke-EasyConWindowsVerify -RepositoryRoot $repository `
-                -ConfigurationPath $ConfigurationPath -CacheRoot $location.CacheRoot `
-                -VsWherePath $VsWherePath
-            Write-EasyConStructuredRecord -Kind "setup" -Value ([ordered]@{
-                status = "already-ready"
-                fingerprint = $fingerprint.Value
-                environmentRoot = $location.EnvironmentRoot
-            })
-            return $verified
-        }
-        catch {
-            Write-Host "Existing prepared environment failed verification and will be rebuilt by Setup: $($_.Exception.Message)"
-        }
+    if ($null -eq $Context) {
+        $Context = Get-EasyConWindowsEnvironmentContext -RepositoryRoot $RepositoryRoot `
+            -ConfigurationPath $ConfigurationPath -CacheRoot $CacheRoot
     }
-
-    New-EasyConSafeDirectory -Path $location.CacheRoot -TrustedRoot $location.CacheRoot | Out-Null
-    if (Test-Path -LiteralPath $location.EnvironmentRoot) {
-        if ($location.EnvironmentRoot.Equals($location.CacheRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
-            throw "refusing to rebuild the broad environment cache root"
-        }
-        Remove-EasyConSafeTree -Path $location.EnvironmentRoot -TrustedRoot $location.CacheRoot
-    }
-    New-EasyConSafeDirectory -Path $location.EnvironmentRoot `
-        -TrustedRoot $location.CacheRoot | Out-Null
+    Assert-EasyConWindowsEnvironmentContextCurrent -Context $Context
+    $repository = $Context.Repository
+    $configuration = $Context.Configuration
+    $fingerprint = $Context.Fingerprint
+    $location = $Context.Location
 
     $installed = Install-EasyConWindowsEnvironment -RepositoryRoot $repository `
         -ConfigurationPath $ConfigurationPath -EnvironmentRoot $location.EnvironmentRoot `
@@ -2392,6 +2604,7 @@ function Invoke-EasyConWindowsSetup {
             sha256 = $installed.cargoVendorSha256
         }
     }
+    Assert-EasyConWindowsEnvironmentContextCurrent -Context $Context
     Write-EasyConEnvironmentStamp -Path $location.StampPath -Value $stamp `
         -EnvironmentRoot $location.EnvironmentRoot
     return [pscustomobject]@{
@@ -2401,7 +2614,7 @@ function Invoke-EasyConWindowsSetup {
     }
 }
 
-function Invoke-EasyConWindowsVerify {
+function Invoke-EasyConWindowsVerifyCore {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
@@ -2412,16 +2625,24 @@ function Invoke-EasyConWindowsVerify {
 
         [string]$CacheRoot,
 
-        [string]$VsWherePath
+        [string]$VsWherePath,
+
+        [switch]$AllowProxy,
+
+        [object]$Context
     )
 
+    Clear-EasyConUntrustedBuildEnvironment -AllowProxy:$AllowProxy
     $started = [System.Diagnostics.Stopwatch]::StartNew()
-    $repository = Assert-EasyConPhysicalPath -Path $RepositoryRoot
-    $configuration = Get-EasyConWindowsBuildConfiguration -Path $ConfigurationPath
-    $fingerprint = Get-EasyConEnvironmentFingerprint -RepositoryRoot $repository `
-        -Configuration $configuration
-    $location = Get-EasyConEnvironmentLocation -RepositoryRoot $repository `
-        -Fingerprint $fingerprint.Value -CacheRoot $CacheRoot
+    if ($null -eq $Context) {
+        $Context = Get-EasyConWindowsEnvironmentContext -RepositoryRoot $RepositoryRoot `
+            -ConfigurationPath $ConfigurationPath -CacheRoot $CacheRoot
+    }
+    Assert-EasyConWindowsEnvironmentContextCurrent -Context $Context
+    $repository = $Context.Repository
+    $configuration = $Context.Configuration
+    $fingerprint = $Context.Fingerprint
+    $location = $Context.Location
     if (-not (Test-Path -LiteralPath $location.StampPath -PathType Leaf)) {
         throw "Windows build environment is not prepared for fingerprint $($fingerprint.Value). Run: pwsh -NoProfile -File tools/run_windows_workspace.ps1 -Mode Setup"
     }
@@ -2506,22 +2727,63 @@ function Invoke-EasyConWindowsVerify {
             throw "MSVC $name path changed since Setup. Rerun Setup."
         }
     }
+    $controlledMsvcEnvironment = [ordered]@{}
+    foreach ($name in @(
+        "EXTERNAL_INCLUDE", "INCLUDE", "LIB", "LIBPATH", "UCRTCONTENTROOT", "UCRTVERSION",
+        "UNIVERSALCRTSDKDIR", "VCINSTALLDIR", "VCTOOLSINSTALLDIR", "VCTOOLSVERSION",
+        "VSCMD_ARG_HOST_ARCH", "VSCMD_ARG_TGT_ARCH", "VSINSTALLDIR", "WINDOWSLIBPATH",
+        "WINDOWSSDKBINPATH", "WINDOWSSDKDIR", "WINDOWSSDKVERBINPATH", "WINDOWSSDKVERSION"
+    )) {
+        $value = [Environment]::GetEnvironmentVariable($name, "Process")
+        if (-not [string]::IsNullOrWhiteSpace($value)) {
+            $controlledMsvcEnvironment[$name] = $value
+        }
+    }
 
     $pathDirectories = @(
         Split-Path -Parent $tools.cmake
         Split-Path -Parent $tools.ninja
+        Split-Path -Parent $tools.vcpkg
+        Split-Path -Parent $tools.'7zip'
+        Split-Path -Parent $tools.'7zr'
         Split-Path -Parent $tools.rustup
         Split-Path -Parent $tools.cargo
         Split-Path -Parent $tools.python
         Split-Path -Parent $tools.git
         Split-Path -Parent $tools.pwsh
         Split-Path -Parent $tools.cl
+        Split-Path -Parent $tools.link
+        Split-Path -Parent $tools.lib
         Split-Path -Parent $tools.rc
+        Split-Path -Parent $tools.mt
     ) | Select-Object -Unique
-    $env:PATH = (($pathDirectories + @($env:PATH)) -join [System.IO.Path]::PathSeparator)
-    $env:CARGO_HOME = $preparedPaths.cargoHome
-
+    $systemRoot = [Environment]::GetEnvironmentVariable("SystemRoot", "Process")
+    if ([string]::IsNullOrWhiteSpace($systemRoot)) {
+        throw "SystemRoot is unavailable; cannot construct the verified process PATH"
+    }
+    $pathDirectories += @($systemRoot, (Join-Path $systemRoot "System32"))
     $rustPin = Get-EasyConRustToolchainPin -RepositoryRoot $repository
+    $verifiedVariables = [ordered]@{
+        AR = $tools.lib
+        CC = $tools.cl
+        CXX = $tools.cl
+        CARGO_HOME = $preparedPaths.cargoHome
+        CARGO_INCREMENTAL = "0"
+        CARGO_TARGET_DIR = $preparedPaths.cargoTarget
+        CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER = $tools.link
+        EASYCON_VISION_TEST_TESSDATA = $preparedPaths.ocrModel
+        RUSTUP_TOOLCHAIN = [string]$rustPin.Channel
+        VCPKG_BINARY_SOURCES = "clear"
+        VCPKG_DISABLE_METRICS = "1"
+        VCPKG_DOWNLOADS = $preparedPaths.vcpkgDownloads
+        VCPKG_FEATURE_FLAGS = "manifests,registries,versions"
+        VCPKG_ROOT = $preparedPaths.vcpkgExecutionRoot
+    }
+    foreach ($entry in $controlledMsvcEnvironment.GetEnumerator()) {
+        $verifiedVariables[$entry.Key] = $entry.Value
+    }
+    Set-EasyConVerifiedProcessEnvironment -PathDirectories $pathDirectories `
+        -Variables $verifiedVariables
     $rust = Assert-EasyConRustToolchain -Pin $rustPin
     if (
         -not $rust.RustupPath.Equals($tools.rustup, [System.StringComparison]::OrdinalIgnoreCase) -or
@@ -2567,19 +2829,12 @@ function Invoke-EasyConWindowsVerify {
 
     Assert-EasyConCMakeCacheIsolation -CargoTargetDirectory $preparedPaths.cargoTarget `
         -RepositoryRoot $repository
-    $env:VCPKG_ROOT = $preparedPaths.vcpkgExecutionRoot
-    $env:VCPKG_BINARY_SOURCES = "clear"
-    $env:VCPKG_DOWNLOADS = $preparedPaths.vcpkgDownloads
-    $env:VCPKG_DISABLE_METRICS = "1"
-    $env:VCPKG_FEATURE_FLAGS = "manifests,registries,versions"
-    $env:CXX = $tools.cl
-    $env:CARGO_TARGET_DIR = $preparedPaths.cargoTarget
-    $env:CARGO_INCREMENTAL = "0"
     $env:EASYCON_VISION_TEST_TESSDATA = $vision.Root
     $null = Set-EasyConCargoNativeLinkSearch `
         -InstalledRoot $preparedPaths.vcpkgInstalled `
         -CacheRoot $location.EnvironmentRoot
 
+    Assert-EasyConWindowsEnvironmentContextCurrent -Context $Context
     $started.Stop()
     $summary = [ordered]@{
         status = "ready"
@@ -2608,23 +2863,228 @@ function Invoke-EasyConEnvironmentLifecycle {
         [string]$Mode = "Workspace",
 
         [Parameter(Mandatory)]
+        [object]$Location,
+
+        [Parameter(Mandatory)]
         [scriptblock]$SetupAction,
 
         [Parameter(Mandatory)]
         [scriptblock]$VerifyAction,
 
         [Parameter(Mandatory)]
-        [scriptblock]$WorkspaceAction
+        [scriptblock]$WorkspaceAction,
+
+        [ValidateRange(0, 7200000)]
+        [int]$LeaseTimeoutMilliseconds = 1800000
     )
 
-    if ($Mode -ceq "Setup") {
-        & $SetupAction | Out-Null
+    $access = if ($Mode -ceq "Setup") { "Exclusive" } else { "Shared" }
+    $lease = Enter-EasyConEnvironmentLease -Location $Location -Access $access `
+        -TimeoutMilliseconds $LeaseTimeoutMilliseconds
+    try {
+        if ($Mode -ceq "Setup") {
+            try {
+                $verified = & $VerifyAction
+                Write-EasyConStructuredRecord -Kind "setup" -Value ([ordered]@{
+                    status = "already-ready"
+                    identity = [string]$Location.IdentityKey
+                    environmentRoot = [string]$Location.EnvironmentRoot
+                })
+                return $verified
+            }
+            catch {
+                if (Test-Path -LiteralPath $Location.EnvironmentRoot) {
+                    Write-Host "Existing prepared environment failed verification and will be rebuilt by Setup: $($_.Exception.Message)"
+                }
+            }
+
+            New-EasyConSafeDirectory -Path $Location.CacheRoot `
+                -TrustedRoot $Location.CacheRoot | Out-Null
+            if (Test-Path -LiteralPath $Location.EnvironmentRoot) {
+                if ($Location.EnvironmentRoot.Equals(
+                    $Location.CacheRoot,
+                    [System.StringComparison]::OrdinalIgnoreCase
+                )) {
+                    throw "refusing to rebuild the broad environment cache root"
+                }
+                Remove-EasyConSafeTree -Path $Location.EnvironmentRoot `
+                    -TrustedRoot $Location.CacheRoot
+            }
+            New-EasyConSafeDirectory -Path $Location.EnvironmentRoot `
+                -TrustedRoot $Location.CacheRoot | Out-Null
+            & $SetupAction | Out-Null
+            return & $VerifyAction
+        }
+
+        $summary = & $VerifyAction
+        if ($Mode -ceq "Workspace") {
+            & $WorkspaceAction $summary
+        }
+        return $summary
     }
-    $summary = & $VerifyAction
-    if ($Mode -ceq "Workspace") {
-        & $WorkspaceAction $summary
+    finally {
+        $lease.Dispose()
     }
-    return $summary
+}
+
+function Get-EasyConWindowsEnvironmentContext {
+    param(
+        [Parameter(Mandatory)]
+        [string]$RepositoryRoot,
+
+        [Parameter(Mandatory)]
+        [string]$ConfigurationPath,
+
+        [string]$CacheRoot
+    )
+
+    $repository = Assert-EasyConPhysicalPath -Path $RepositoryRoot
+    $configurationFile = Resolve-EasyConFullPath -Path $ConfigurationPath -BasePath $repository
+    $configuration = Get-EasyConWindowsBuildConfiguration -Path $configurationFile
+    $fingerprint = Get-EasyConEnvironmentFingerprint -RepositoryRoot $repository `
+        -Configuration $configuration
+    $location = Get-EasyConEnvironmentLocation -RepositoryRoot $repository `
+        -Fingerprint $fingerprint.Value -CacheRoot $CacheRoot
+    return [pscustomobject]@{
+        Repository = $repository
+        Configuration = $configuration
+        ConfigurationPath = $configurationFile
+        Fingerprint = $fingerprint
+        Location = $location
+    }
+}
+
+function Assert-EasyConWindowsEnvironmentContextCurrent {
+    param(
+        [Parameter(Mandatory)]
+        [object]$Context
+    )
+
+    $current = Get-EasyConEnvironmentFingerprint -RepositoryRoot $Context.Repository `
+        -Configuration $Context.Configuration
+    if ($current.Value -cne $Context.Fingerprint.Value) {
+        throw "Windows build environment fingerprint inputs changed while the identity was owned; rerun the command"
+    }
+}
+
+function Invoke-EasyConWindowsSetup {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$RepositoryRoot,
+
+        [Parameter(Mandatory)]
+        [string]$ConfigurationPath,
+
+        [string]$CacheRoot,
+
+        [string]$VsWherePath,
+
+        [ValidateRange(0, 7200000)]
+        [int]$LeaseTimeoutMilliseconds = 1800000
+    )
+
+    $context = Get-EasyConWindowsEnvironmentContext -RepositoryRoot $RepositoryRoot `
+        -ConfigurationPath $ConfigurationPath -CacheRoot $CacheRoot
+    $parameters = @{
+        RepositoryRoot = $context.Repository
+        ConfigurationPath = $context.ConfigurationPath
+        CacheRoot = $context.Location.CacheRoot
+        VsWherePath = $VsWherePath
+        Context = $context
+    }
+    $setupCore = ${function:Invoke-EasyConWindowsSetupCore}
+    $verifyCore = ${function:Invoke-EasyConWindowsVerifyCore}
+    $setupAction = { & $setupCore @parameters }.GetNewClosure()
+    $verifyAction = {
+        & $verifyCore @parameters -AllowProxy
+    }.GetNewClosure()
+    return Invoke-EasyConEnvironmentLifecycle -Mode Setup -Location $context.Location `
+        -SetupAction $setupAction -VerifyAction $verifyAction `
+        -WorkspaceAction { param($Summary) $null = $Summary } `
+        -LeaseTimeoutMilliseconds $LeaseTimeoutMilliseconds
+}
+
+function Invoke-EasyConWindowsVerify {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$RepositoryRoot,
+
+        [Parameter(Mandatory)]
+        [string]$ConfigurationPath,
+
+        [string]$CacheRoot,
+
+        [string]$VsWherePath,
+
+        [ValidateRange(0, 7200000)]
+        [int]$LeaseTimeoutMilliseconds = 1800000
+    )
+
+    $context = Get-EasyConWindowsEnvironmentContext -RepositoryRoot $RepositoryRoot `
+        -ConfigurationPath $ConfigurationPath -CacheRoot $CacheRoot
+    $parameters = @{
+        RepositoryRoot = $context.Repository
+        ConfigurationPath = $context.ConfigurationPath
+        CacheRoot = $context.Location.CacheRoot
+        VsWherePath = $VsWherePath
+        Context = $context
+    }
+    $verifyCore = ${function:Invoke-EasyConWindowsVerifyCore}
+    $verifyAction = { & $verifyCore @parameters }.GetNewClosure()
+    return Invoke-EasyConEnvironmentLifecycle -Mode Verify -Location $context.Location `
+        -SetupAction { throw "Verify cannot prepare the Windows build environment" } `
+        -VerifyAction $verifyAction -WorkspaceAction { param($Summary) $null = $Summary } `
+        -LeaseTimeoutMilliseconds $LeaseTimeoutMilliseconds
+}
+
+function Invoke-EasyConWindowsWorkspace {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$RepositoryRoot,
+
+        [Parameter(Mandatory)]
+        [string]$ConfigurationPath,
+
+        [string]$CacheRoot,
+
+        [string]$VsWherePath,
+
+        [string]$BaseSha,
+
+        [switch]$RequireCleanTree,
+
+        [scriptblock]$GateInvoker,
+
+        [ValidateRange(0, 7200000)]
+        [int]$LeaseTimeoutMilliseconds = 1800000
+    )
+
+    $context = Get-EasyConWindowsEnvironmentContext -RepositoryRoot $RepositoryRoot `
+        -ConfigurationPath $ConfigurationPath -CacheRoot $CacheRoot
+    $parameters = @{
+        RepositoryRoot = $context.Repository
+        ConfigurationPath = $context.ConfigurationPath
+        CacheRoot = $context.Location.CacheRoot
+        VsWherePath = $VsWherePath
+        Context = $context
+    }
+    $verifyCore = ${function:Invoke-EasyConWindowsVerifyCore}
+    $workspaceGates = ${function:Invoke-EasyConWindowsWorkspaceGates}
+    $verifyAction = { & $verifyCore @parameters }.GetNewClosure()
+    $workspaceAction = {
+        param($Summary)
+        $null = $Summary
+        & $workspaceGates -RepositoryRoot $context.Repository `
+            -BaseSha $BaseSha -RequireCleanTree:$RequireCleanTree `
+            -GateInvoker $GateInvoker
+    }.GetNewClosure()
+    return Invoke-EasyConEnvironmentLifecycle -Mode Workspace -Location $context.Location `
+        -SetupAction { throw "Workspace cannot prepare the Windows build environment" } `
+        -VerifyAction $verifyAction -WorkspaceAction $workspaceAction `
+        -LeaseTimeoutMilliseconds $LeaseTimeoutMilliseconds
 }
 
 function Invoke-EasyConGate {
@@ -2773,6 +3233,7 @@ Export-ModuleMember -Function @(
     "Assert-EasyConVcpkgCheckout",
     "Assert-EasyConVcpkgEnvironmentInputs",
     "Assert-EasyConVisionModel",
+    "Enter-EasyConEnvironmentLease",
     "Find-EasyConVisualStudio",
     "Get-EasyConBuildToolVersions",
     "Get-EasyConEnvironmentFingerprint",
@@ -2785,8 +3246,11 @@ Export-ModuleMember -Function @(
     "Invoke-EasyConEnvironmentLifecycle",
     "Invoke-EasyConWindowsSetup",
     "Invoke-EasyConWindowsVerify",
+    "Invoke-EasyConWindowsWorkspace",
     "Invoke-EasyConWindowsWorkspaceGates",
+    "Publish-EasyConDirectoryAtomically",
     "Resolve-EasyConFullPath",
+    "Set-EasyConVerifiedProcessEnvironment",
     "Test-EasyConVcpkgToolManifestRecord",
     "Test-EasyConVcpkgVersionRecord",
     "Test-EasyConPathWithin"

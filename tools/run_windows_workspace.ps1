@@ -38,18 +38,15 @@ foreach ($entry in @(
     }
 }
 
-$setupAction = {
-    Invoke-EasyConWindowsSetup @commonParameters
-}.GetNewClosure()
-$verifyAction = {
-    Invoke-EasyConWindowsVerify @commonParameters
-}.GetNewClosure()
-$workspaceAction = {
-    param($Summary)
-    $null = $Summary
-    Invoke-EasyConWindowsWorkspaceGates -RepositoryRoot $repositoryRoot `
-        -BaseSha $BaseSha -RequireCleanTree:$RequireCleanTree
-}.GetNewClosure()
-
-Invoke-EasyConEnvironmentLifecycle -Mode $Mode -SetupAction $setupAction `
-    -VerifyAction $verifyAction -WorkspaceAction $workspaceAction | Out-Null
+switch ($Mode) {
+    "Setup" {
+        Invoke-EasyConWindowsSetup @commonParameters | Out-Null
+    }
+    "Verify" {
+        Invoke-EasyConWindowsVerify @commonParameters | Out-Null
+    }
+    "Workspace" {
+        Invoke-EasyConWindowsWorkspace @commonParameters -BaseSha $BaseSha `
+            -RequireCleanTree:$RequireCleanTree | Out-Null
+    }
+}

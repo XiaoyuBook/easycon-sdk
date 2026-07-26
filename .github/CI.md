@@ -60,7 +60,9 @@ Rust toolchain、受控 CMake/Ninja、vcpkg scripts/tool/native dependencies、7
 hash 验证；完成后写入 `environment-stamp.json`，记录 fingerprint、workspace key、工具显式路径与 SHA-256、精确
 版本、Cargo vendor/native tree hash 和资产路径。Cargo crates 由 `Cargo.lock` 与全部 workspace manifests 驱动
 `cargo vendor --locked` 安装到该环境；下载缓存只用于加速生成 vendor tree。重复 Setup 先验证现有 stamp；环境完整时
-返回 `already-ready`，损坏时只重建该 fingerprint/worktree 的受控环境。
+返回 `already-ready`，损坏时只重建该 fingerprint/worktree 的受控环境。vcpkg scripts checkout 只从同卷完整
+staging 目录做原子 rename；Windows sharing violation 使用有限重试，失败时删除任何 partial destination，后续 Setup
+可从干净状态恢复。
 
 日常只验证或运行完整门禁：
 
@@ -74,6 +76,13 @@ Verify 与 Workspace 都不 provision、install 或 download。Verify 重新计�
 PATH、Cargo source replacement 和构建变量。Workspace 必须先通过同一 Verify，再执行 Cargo、Loom、规范、链接、
 repository contracts 与 diff 门禁。缺失、损坏、worktree 不匹配或 fingerprint 失配都在第一个 build gate 前失败，
 并明确要求重新运行 Setup。
+
+每个 fingerprint/worktree identity 在环境根外有一个 ownership lock。Setup 从检查 stamp、删除旧树、安装到发布并
+复验 stamp 全程持有独占 lease；Verify 持共享 lease；Workspace 的同一个共享 lease 覆盖 Verify 和全部 gates，因而
+Setup 不能与读取或构建竞争。异常路径总是释放 lease。Verify 在启动 gate 前清除 ambient Rust wrapper/compiler、
+Cargo target/linker/registry flags、cc-rs target compiler、`CL`/`_CL_`、MSVC Developer Shell 残留、CMake/package roots、
+vcpkg override 与代理变量，再用 stamp 中核验过的工具绝对路径、pinned Developer Shell include/lib 路径和受控变量重建
+当前进程环境；HTTP(S) proxy 只允许在线 Setup 使用。
 
 这一区分是生命周期职责，不是离线合同：Setup 可联网，Workspace 不负责准备环境，但不承诺零网络请求、
 air-gapped 构建或完整离线 cache。PowerShell、Git、Python、rustup、VS Installer/vswhere 与 VS Build Tools 是启动
