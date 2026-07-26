@@ -45,7 +45,9 @@ Linux job 是 non-required Vision build candidate。只有四个 Linux native �
 
 `tools/windows_build_environment.json` 是 Windows 环境审计清单。其自身与 `rust-toolchain.toml`、vcpkg manifest/
 configuration、triplet、CMake preset、OCR manifest/provisioner 共同组成 fingerprint；任一输入变化都会选择新的环境
-目录并要求重新 Setup。repository guard 将该清单与 Required CI、vcpkg 配置及独立 native-quality pins 交叉核对。
+目录并要求重新 Setup。清单为每项 fingerprint 输入显式声明 `text` 或 `binary`：text 必须是严格 UTF-8，并在 hash
+前把 CRLF 和独立 CR 规范化为 LF；binary 始终按原始 bytes 计算。repository guard 将该清单与 Required CI、vcpkg
+配置及独立 native-quality pins 交叉核对。
 
 ## Windows Setup、Verify 与 Workspace
 
@@ -61,8 +63,9 @@ hash 验证；完成后写入 `environment-stamp.json`，记录 fingerprint、wo
 版本、Cargo vendor/native tree hash 和资产路径。Cargo crates 由 `Cargo.lock` 与全部 workspace manifests 驱动
 `cargo vendor --locked` 安装到该环境；下载缓存只用于加速生成 vendor tree。重复 Setup 先验证现有 stamp；环境完整时
 返回 `already-ready`，损坏时只重建该 fingerprint/worktree 的受控环境。vcpkg scripts checkout 只从同卷完整
-staging 目录做原子 rename；Windows sharing violation 使用有限重试，失败时删除任何 partial destination，后续 Setup
-可从干净状态恢复。
+staging 目录做原子 rename；Windows sharing violation 使用有限 publish/cleanup 重试。若外部句柄阻止删除，原始
+publish failure 始终是主错误，诊断同时记录 cleanup failure 并把残留 destination 标记为不可用；释放句柄后，下一次
+Setup 在独占 lease 下删除旧环境树并恢复。脚本不把无法删除的 partial destination 伪装成有效 checkout。
 
 日常只验证或运行完整门禁：
 
@@ -82,7 +85,9 @@ repository contracts 与 diff 门禁。缺失、损坏、worktree 不匹配或 f
 Setup 不能与读取或构建竞争。异常路径总是释放 lease。Verify 在启动 gate 前清除 ambient Rust wrapper/compiler、
 Cargo target/linker/registry flags、cc-rs target compiler、`CL`/`_CL_`、MSVC Developer Shell 残留、CMake/package roots、
 vcpkg override 与代理变量，再用 stamp 中核验过的工具绝对路径、pinned Developer Shell include/lib 路径和受控变量重建
-当前进程环境；HTTP(S) proxy 只允许在线 Setup 使用。
+当前进程环境；HTTP(S) proxy 只允许在线 Setup 使用。模块不公开无锁 gate core，所有公开 gate 执行都必须先 Verify，
+并持有同一个 shared lease 到最后一个 gate。Setup/Verify/Workspace 返回时完整恢复调用进程原有环境（包括原先缺失、
+空值和名称大小写），成功和异常路径都不遗留临时受控变量。
 
 这一区分是生命周期职责，不是离线合同：Setup 可联网，Workspace 不负责准备环境，但不承诺零网络请求、
 air-gapped 构建或完整离线 cache。PowerShell、Git、Python、rustup、VS Installer/vswhere 与 VS Build Tools 是启动

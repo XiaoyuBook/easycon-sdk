@@ -437,7 +437,9 @@ Windows 环境生命周期另有无网络轻量合同：首次 Setup、`already-
 Setup-vs-Setup/Verify/Workspace ownership、Verify 失败时 gate 零启动，以及 Workspace 从 Verify 到全部 gates 持共享
 lease。环境测试必须启动真实子进程证明 ambient compiler/wrapper、target compiler/linker、MSVC include/lib、
 CMake/package-root/vcpkg/proxy 未被继承；vcpkg publish 测试通过注入访问冲突证明有限重试、partial destination
-回滚和后续恢复，不使用随机 sleep。
+可清理时的回滚，以及文件被独占句柄锁定时保留 publish 首错、附加 cleanup 状态并在句柄释放后恢复，不使用随机
+sleep。生命周期合同还必须证明公共 gate core 不可导出，并逐项覆盖 Setup/Verify/Workspace 成功与失败后完整恢复调用
+进程环境；Workspace gate 内仍只能看到受控环境。
 
 无论变更类型，都必须确认 `EasyCon/` 仍被根 `.gitignore` 忽略、第三方参考源码没有改动，且外层 tracked
 文件没有引入 `EasyCon/` 内容或项目依赖。

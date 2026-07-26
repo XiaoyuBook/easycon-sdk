@@ -51,7 +51,8 @@ backend 或合并大段平台专属生产代码。
 
 `tools/windows_build_environment.json` 是当前 Windows 开发构建环境的结构化固定清单，记录 vcpkg
 scripts/tool/registry、CMake、Ninja、7-Zip、直接 native ports 的版本、来源和 hash 证据；Rust、triplet、preset 与
-OCR 分别由 fingerprint 中列出的 tracked 文件共同约束。升级任一固定输入都必须经过显式变更并重新运行 Setup。
+OCR 分别由 fingerprint 中列出的 tracked 文件共同约束。清单显式区分 text 与 binary 输入；text 先严格按 UTF-8
+解码并把 CRLF/独立 CR 规范化为 LF，binary 则 hash 原始 bytes。升级任一固定输入都必须经过显式变更并重新运行 Setup。
 
 ### Windows 开发环境生命周期
 
@@ -72,12 +73,16 @@ fingerprint 对应且未损坏的 stamp，缺失或失配时要求重新运行 S
 同一 fingerprint/worktree identity 使用环境目录外的跨进程 reader/writer lease：Setup 独占 stamp 检查、旧树删除、
 安装、stamp 发布与最终 Verify；普通 Verify 共享读取；Workspace 的共享 lease 从 Verify 连续覆盖到最后一个 gate。
 所有异常路径释放 lease。vcpkg checkout 先在同卷不可见 staging 中完成并验证，再用原子目录 rename 发布；访问冲突
-只做有限重试，任何失败都回滚 partial destination，使后续 Setup 能从干净目的路径恢复。
+只做有限 publish/cleanup 重试。cleanup 成功时删除 partial destination；若外部句柄令删除暂时不可能，则返回以原始
+publish failure 为主、附带 cleanup failure 与残留状态的诊断，且残留绝不视为有效 checkout。句柄释放后，下一次
+Setup 在独占 lease 下删除旧环境树并安全恢复。
 
 Verify 在执行任何 gate 前清除 ambient `RUSTC*`/wrapper/rustflags、Cargo target linker/profile/registry overrides、
 cc-rs target compiler、`CL`/`_CL_`、MSVC Developer Shell 残留、CMake/package roots、vcpkg overrides 和 proxy，并用
 stamp 核验后的工具目录构造 PATH，显式恢复 pinned Developer Shell 生成的 include/lib 路径并设置 MSVC linker、Cargo
-home/target、vcpkg tree 与 OCR 路径。代理只属于在线 Setup，不进入 Verify/Workspace 子进程。
+home/target、vcpkg tree 与 OCR 路径。代理只属于在线 Setup，不进入 Verify/Workspace 子进程。无锁 gate core 保持模块
+私有，公开 Workspace 必须持同一个 shared lease 完成 Verify 和全部 gates；三个生命周期命令返回时完整恢复调用进程
+进入命令前的环境，异常不会把临时净化或受控变量留在调用 shell。
 
 下载包、工具二进制、native install tree 与编译缓存只存在于用户的受控环境根或 CI 临时目录，不进入 Git。
 Cargo/vcpkg cache 只提速，cache miss 不改变正确性合同。本职责拆分不是离线构建承诺，开发电脑与首次 CI Setup

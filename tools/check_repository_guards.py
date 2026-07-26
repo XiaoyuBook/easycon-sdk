@@ -92,11 +92,12 @@ POLICY_RUN_SHA256 = {
 WINDOWS_CONFIGURATION_KEYS = {
     "version",
     "target",
-    "fingerprintFiles",
+    "fingerprintInputs",
     "visionModelDirectory",
     "hostTools",
     "vcpkg",
 }
+FINGERPRINT_INPUT_KEYS = {"path", "kind"}
 VCPKG_CONFIGURATION_KEYS = {
     "scriptsRepository",
     "scriptsCommit",
@@ -823,12 +824,23 @@ def parse_windows_build_environment(text):
     _require_json_keys(
         configuration, WINDOWS_CONFIGURATION_KEYS, "Windows build environment root"
     )
-    if type(configuration["version"]) is not int or configuration["version"] != 2:
-        raise ValueError("Windows build environment version must be the JSON integer 2")
+    if type(configuration["version"]) is not int or configuration["version"] != 3:
+        raise ValueError("Windows build environment version must be the JSON integer 3")
     if configuration["target"] != "x86_64-pc-windows-msvc":
         raise ValueError("Windows build target must remain x86_64-pc-windows-msvc")
-    fingerprint_files = configuration["fingerprintFiles"]
-    expected_fingerprint_files = [
+    fingerprint_inputs = configuration["fingerprintInputs"]
+    if type(fingerprint_inputs) is not list:
+        raise ValueError("fingerprintInputs must be a JSON array")
+    for index, fingerprint_input in enumerate(fingerprint_inputs):
+        _require_json_keys(
+            fingerprint_input,
+            FINGERPRINT_INPUT_KEYS,
+            "fingerprint input {}".format(index),
+        )
+        _require_string(fingerprint_input["path"], "fingerprint input path")
+        if fingerprint_input["kind"] not in ("text", "binary"):
+            raise ValueError("fingerprint input kind must be exactly text or binary")
+    expected_fingerprint_paths = [
         "tools/windows_build_environment.json",
         "tools/windows_workspace.psm1",
         "tools/run_windows_workspace.ps1",
@@ -850,7 +862,10 @@ def parse_windows_build_environment(text):
         "spec/fixtures/vision/ocr-model.json",
         "tools/provision_vision_test_model.py",
     ]
-    if fingerprint_files != expected_fingerprint_files:
+    expected_fingerprint_inputs = [
+        {"path": path, "kind": "text"} for path in expected_fingerprint_paths
+    ]
+    if fingerprint_inputs != expected_fingerprint_inputs:
         raise ValueError("Windows environment fingerprint input set or order changed")
     model_directory = _require_string(
         configuration["visionModelDirectory"], "OCR model directory"

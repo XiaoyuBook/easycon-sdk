@@ -307,6 +307,36 @@ function Get-EasyConFileHash {
     return (Get-FileHash -LiteralPath $resolved -Algorithm $Algorithm).Hash.ToLowerInvariant()
 }
 
+function Get-EasyConFingerprintInputHash {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [ValidateSet("text", "binary")]
+        [string]$Kind
+    )
+
+    $resolved = Get-EasyConPhysicalFile -Path $Path
+    if ($Kind -ceq "binary") {
+        return Get-EasyConFileHash -Path $resolved -Algorithm SHA256
+    }
+
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes($resolved)
+        $strictUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
+        $text = $strictUtf8.GetString($bytes)
+    }
+    catch {
+        throw "text fingerprint input must be valid UTF-8: $resolved ($($_.Exception.Message))"
+    }
+    $canonical = $text.Replace("`r`n", "`n").Replace("`r", "`n")
+    $canonicalBytes = $strictUtf8.GetBytes($canonical)
+    $digest = [System.Security.Cryptography.SHA256]::HashData($canonicalBytes)
+    return [System.Convert]::ToHexString($digest).ToLowerInvariant()
+}
+
 function Get-EasyConPinnedDownload {
     [CmdletBinding()]
     param(
@@ -466,14 +496,65 @@ function Publish-EasyConDirectoryAtomically {
         }
         catch {
             $failure = $_.Exception
+            $cleanupFailure = $null
+            $cleanupAttempts = 0
             if (Test-Path -LiteralPath $destinationPath) {
-                Remove-EasyConSafeTree -Path $destinationPath -TrustedRoot $trusted
+                for ($cleanupAttempt = 1; $cleanupAttempt -le $MaxAttempts; $cleanupAttempt++) {
+                    $cleanupAttempts = $cleanupAttempt
+                    try {
+                        Remove-EasyConSafeTree -Path $destinationPath -TrustedRoot $trusted
+                        if (Test-Path -LiteralPath $destinationPath) {
+                            throw [System.IO.IOException]::new(
+                                "partial destination still exists after cleanup"
+                            )
+                        }
+                        $cleanupFailure = $null
+                        break
+                    }
+                    catch {
+                        $cleanupFailure = $_.Exception
+                        if (-not (Test-Path -LiteralPath $destinationPath)) {
+                            $cleanupFailure = $null
+                            break
+                        }
+                        if ($cleanupAttempt -lt $MaxAttempts) {
+                            try {
+                                & $RetryAction $cleanupAttempt $cleanupFailure
+                            }
+                            catch {
+                                $cleanupFailure = $_.Exception
+                                break
+                            }
+                        }
+                    }
+                }
+            }
+            if ($null -ne $cleanupFailure) {
+                $diagnostic = [System.IO.IOException]::new(
+                    (
+                        "atomic directory publish failed after $attempt attempt(s): " +
+                        "$($failure.Message); partial destination cleanup failed after " +
+                        "$cleanupAttempts attempt(s): $($cleanupFailure.Message); " +
+                        "destination remains incomplete and must not be used; release external " +
+                        "handles and rerun Setup"
+                    ),
+                    $failure
+                )
+                $diagnostic.Data["EasyConPublishCleanupFailure"] = $cleanupFailure.ToString()
+                $diagnostic.Data["EasyConPartialDestination"] = $destinationPath
+                throw $diagnostic
             }
             if (-not (Test-Path -LiteralPath $sourcePath -PathType Container)) {
-                throw "atomic directory publish lost its complete staging tree: $($failure.Message)"
+                throw [System.IO.IOException]::new(
+                    "atomic directory publish lost its complete staging tree: $($failure.Message)",
+                    $failure
+                )
             }
             if ($failure -isnot [System.IO.IOException] -or $attempt -eq $MaxAttempts) {
-                throw "atomic directory publish failed after $attempt attempt(s): $($failure.Message)"
+                throw [System.IO.IOException]::new(
+                    "atomic directory publish failed after $attempt attempt(s): $($failure.Message)",
+                    $failure
+                )
             }
             & $RetryAction $attempt $failure
         }
@@ -595,7 +676,7 @@ function Get-EasyConWindowsBuildConfiguration {
         $root = & $getObject $document.RootElement @(
             "version",
             "target",
-            "fingerprintFiles",
+            "fingerprintInputs",
             "visionModelDirectory",
             "hostTools",
             "vcpkg"
@@ -604,20 +685,21 @@ function Get-EasyConWindowsBuildConfiguration {
         if (
             $root.version.ValueKind -ne [System.Text.Json.JsonValueKind]::Number -or
             -not $root.version.TryGetInt32([ref]$version) -or
-            $version -ne 2
+            $version -ne 3
         ) {
-            throw "Windows build environment version must be the JSON integer 2"
+            throw "Windows build environment version must be the JSON integer 3"
         }
         $target = & $getString $root.target "Windows build target"
         if ($target -cne "x86_64-pc-windows-msvc") {
             throw "Windows build target must remain x86_64-pc-windows-msvc"
         }
-        if ($root.fingerprintFiles.ValueKind -ne [System.Text.Json.JsonValueKind]::Array) {
-            throw "fingerprintFiles must be a JSON array"
+        if ($root.fingerprintInputs.ValueKind -ne [System.Text.Json.JsonValueKind]::Array) {
+            throw "fingerprintInputs must be a JSON array"
         }
-        $fingerprintFiles = @()
-        foreach ($element in $root.fingerprintFiles.EnumerateArray()) {
-            $relative = & $getString $element "fingerprint input"
+        $fingerprintPaths = @()
+        foreach ($element in $root.fingerprintInputs.EnumerateArray()) {
+            $input = & $getObject $element @("path", "kind") "fingerprint input"
+            $relative = & $getString $input.path "fingerprint input path"
             if (
                 $relative -cnotmatch '^[A-Za-z0-9._/-]+$' -or
                 $relative.StartsWith('/') -or
@@ -626,13 +708,17 @@ function Get-EasyConWindowsBuildConfiguration {
             ) {
                 throw "fingerprint input must be one normalized repository-relative path"
             }
-            if ($fingerprintFiles -ccontains $relative) {
-                throw "fingerprintFiles contains duplicate path '$relative'"
+            if ($fingerprintPaths -ccontains $relative) {
+                throw "fingerprintInputs contains duplicate path '$relative'"
             }
-            $fingerprintFiles += $relative
+            $fingerprintPaths += $relative
+            $kind = & $getString $input.kind "fingerprint input kind"
+            if ($kind -cnotin @("text", "binary")) {
+                throw "fingerprint input kind must be exactly text or binary"
+            }
         }
-        if ($fingerprintFiles.Count -eq 0) {
-            throw "fingerprintFiles must not be empty"
+        if ($fingerprintPaths.Count -eq 0) {
+            throw "fingerprintInputs must not be empty"
         }
         $visionDirectory = & $getString $root.visionModelDirectory "OCR model directory"
         if ($visionDirectory -notmatch '^[A-Za-z0-9._-]+$') {
@@ -1354,6 +1440,31 @@ function Set-EasyConVerifiedProcessEnvironment {
     )
 }
 
+function Get-EasyConProcessEnvironmentSnapshot {
+    $snapshot = [System.Collections.Generic.List[object]]::new()
+    foreach ($entry in [Environment]::GetEnvironmentVariables("Process").GetEnumerator()) {
+        $snapshot.Add([pscustomobject]@{
+            Name = [string]$entry.Key
+            Value = [string]$entry.Value
+        })
+    }
+    return $snapshot.ToArray()
+}
+
+function Restore-EasyConProcessEnvironment {
+    param(
+        [Parameter(Mandatory)]
+        [object[]]$Snapshot
+    )
+
+    foreach ($entry in @([Environment]::GetEnvironmentVariables("Process").GetEnumerator())) {
+        Remove-Item -LiteralPath "Env:$([string]$entry.Key)" -ErrorAction SilentlyContinue
+    }
+    foreach ($entry in $Snapshot) {
+        Set-Item -LiteralPath "Env:$($entry.Name)" -Value ([string]$entry.Value)
+    }
+}
+
 function Get-EasyConVcpkgAsset {
     [CmdletBinding()]
     param(
@@ -1471,6 +1582,7 @@ function Install-EasyConVcpkgCheckout {
     }
     New-EasyConSafeDirectory -Path $temporary -TrustedRoot $cache | Out-Null
     $completed = $false
+    $primaryFailure = $null
     try {
         $git = Get-EasyConCommandPath -Name "git.exe"
         Invoke-EasyConNativeCapture -Program $git -Arguments @(
@@ -1502,12 +1614,27 @@ function Install-EasyConVcpkgCheckout {
         Assert-EasyConPhysicalPath -Path $root -TrustedRoot $cache | Out-Null
         $completed = $true
     }
+    catch {
+        $primaryFailure = $_
+        throw
+    }
     finally {
         if (-not $completed -and (Test-Path -LiteralPath $temporary)) {
-            if (-not (Test-EasyConPathWithin -Path $temporary -Root $cache)) {
-                throw "refusing to clean a temporary path outside the controlled cache root"
+            try {
+                if (-not (Test-EasyConPathWithin -Path $temporary -Root $cache)) {
+                    throw "refusing to clean a temporary path outside the controlled cache root"
+                }
+                Remove-EasyConSafeTree -Path $temporary -TrustedRoot $cache
             }
-            Remove-EasyConSafeTree -Path $temporary -TrustedRoot $cache
+            catch {
+                if ($null -ne $primaryFailure) {
+                    $primaryFailure.Exception.Data["EasyConVcpkgStagingCleanupFailure"] = `
+                        $_.Exception.ToString()
+                }
+                else {
+                    throw
+                }
+            }
         }
     }
 }
@@ -1544,12 +1671,19 @@ function Get-EasyConEnvironmentFingerprint {
     $repository = Assert-EasyConPhysicalPath -Path $RepositoryRoot
     $records = [System.Collections.Generic.List[object]]::new()
     $builder = [System.Text.StringBuilder]::new()
-    foreach ($relative in @($Configuration.fingerprintFiles)) {
+    foreach ($input in @($Configuration.fingerprintInputs)) {
+        $relative = [string]$input.path
+        $kind = [string]$input.kind
         $path = Get-EasyConPhysicalFile -Path (Join-Path $repository $relative) `
             -TrustedRoot $repository
-        $hash = Get-EasyConFileHash -Path $path -Algorithm SHA256
-        $records.Add([ordered]@{ path = [string]$relative; sha256 = $hash })
-        [void]$builder.Append([string]$relative).Append("`0").Append($hash).Append("`n")
+        $hash = Get-EasyConFingerprintInputHash -Path $path -Kind $kind
+        $records.Add([ordered]@{ path = $relative; kind = $kind; sha256 = $hash })
+        [void]$builder.Append($relative)
+        [void]$builder.Append("`0")
+        [void]$builder.Append($kind)
+        [void]$builder.Append("`0")
+        [void]$builder.Append($hash)
+        [void]$builder.Append("`n")
     }
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($builder.ToString())
     $digest = [System.Security.Cryptography.SHA256]::HashData($bytes)
@@ -2878,10 +3012,13 @@ function Invoke-EasyConEnvironmentLifecycle {
         [int]$LeaseTimeoutMilliseconds = 1800000
     )
 
-    $access = if ($Mode -ceq "Setup") { "Exclusive" } else { "Shared" }
-    $lease = Enter-EasyConEnvironmentLease -Location $Location -Access $access `
-        -TimeoutMilliseconds $LeaseTimeoutMilliseconds
+    $environmentSnapshot = Get-EasyConProcessEnvironmentSnapshot
+    $lease = $null
+    $primaryFailure = $null
     try {
+        $access = if ($Mode -ceq "Setup") { "Exclusive" } else { "Shared" }
+        $lease = Enter-EasyConEnvironmentLease -Location $Location -Access $access `
+            -TimeoutMilliseconds $LeaseTimeoutMilliseconds
         if ($Mode -ceq "Setup") {
             try {
                 $verified = & $VerifyAction
@@ -2922,8 +3059,41 @@ function Invoke-EasyConEnvironmentLifecycle {
         }
         return $summary
     }
+    catch {
+        $primaryFailure = $_
+        throw
+    }
     finally {
-        $lease.Dispose()
+        $cleanupFailures = [System.Collections.Generic.List[object]]::new()
+        if ($null -ne $lease) {
+            try {
+                $lease.Dispose()
+            }
+            catch {
+                $cleanupFailures.Add($_)
+            }
+        }
+        try {
+            Restore-EasyConProcessEnvironment -Snapshot $environmentSnapshot
+        }
+        catch {
+            $cleanupFailures.Add($_)
+        }
+        if ($cleanupFailures.Count -gt 0) {
+            if ($null -ne $primaryFailure) {
+                for ($index = 0; $index -lt $cleanupFailures.Count; $index++) {
+                    $primaryFailure.Exception.Data["EasyConCleanupFailure$index"] = `
+                        $cleanupFailures[$index].Exception.ToString()
+                }
+            }
+            else {
+                for ($index = 1; $index -lt $cleanupFailures.Count; $index++) {
+                    $cleanupFailures[0].Exception.Data["EasyConCleanupFailure$index"] = `
+                        $cleanupFailures[$index].Exception.ToString()
+                }
+                throw $cleanupFailures[0]
+            }
+        }
     }
 }
 
@@ -3233,7 +3403,6 @@ Export-ModuleMember -Function @(
     "Assert-EasyConVcpkgCheckout",
     "Assert-EasyConVcpkgEnvironmentInputs",
     "Assert-EasyConVisionModel",
-    "Enter-EasyConEnvironmentLease",
     "Find-EasyConVisualStudio",
     "Get-EasyConBuildToolVersions",
     "Get-EasyConEnvironmentFingerprint",
@@ -3243,14 +3412,10 @@ Export-ModuleMember -Function @(
     "Get-EasyConWorkspaceTargetDirectory",
     "Initialize-EasyConMsvcEnvironment",
     "Install-EasyConPinnedExecutable",
-    "Invoke-EasyConEnvironmentLifecycle",
     "Invoke-EasyConWindowsSetup",
     "Invoke-EasyConWindowsVerify",
     "Invoke-EasyConWindowsWorkspace",
-    "Invoke-EasyConWindowsWorkspaceGates",
-    "Publish-EasyConDirectoryAtomically",
     "Resolve-EasyConFullPath",
-    "Set-EasyConVerifiedProcessEnvironment",
     "Test-EasyConVcpkgToolManifestRecord",
     "Test-EasyConVcpkgVersionRecord",
     "Test-EasyConPathWithin"

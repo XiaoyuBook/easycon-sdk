@@ -92,7 +92,9 @@ pwsh -NoProfile -File tools/run_windows_workspace.ps1 -Mode Workspace
 Setup 安装并记录固定工具、Cargo vendor、native dependencies 与 OCR 资产；Verify/Workspace 不准备或修复环境。
 环境缺失、损坏、worktree/fingerprint 不匹配时会明确要求重新运行 Setup。下载包、工具二进制和缓存都位于受控的
 Git 外目录；cache 只用于提速。同一环境 identity 的 Setup 独占重建，Verify/Workspace 共享读取，且 Workspace 从
-Verify 到最后一个 gate 持续受保护；所有 gate 只继承核验后的编译环境。这一职责拆分不承诺离线或零网络请求。完整固定清单与 CI 边界见
+Verify 到最后一个 gate 持续受保护；无锁 gate core 不属于公共命令。所有 gate 只继承核验后的编译环境，命令返回后
+恢复调用 shell 原有环境。text fingerprint 对严格 UTF-8 内容规范化 CRLF/CR 为 LF，binary 输入按原始 bytes 计算，
+因此同一文本在不同 checkout 行尾下保持同一环境 identity。这一职责拆分不承诺离线或零网络请求。完整固定清单与 CI 边界见
 [GitHub CI 运维边界](.github/CI.md) 和 [构建、发布与合规](docs/architecture/build-release.md)。
 
 ## 许可证

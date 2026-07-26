@@ -68,6 +68,24 @@ function Set-ContractFile {
     Set-Content -LiteralPath $Path -Value $Value -Encoding utf8NoBOM -NoNewline
 }
 
+function Set-ContractUtf8Text {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [string]$Value
+    )
+
+    $parent = Split-Path -Parent $Path
+    New-Item -ItemType Directory -Force -Path $parent | Out-Null
+    [System.IO.File]::WriteAllText(
+        $Path,
+        $Value,
+        [System.Text.UTF8Encoding]::new($false, $true)
+    )
+}
+
 $modulePath = Join-Path $PSScriptRoot "windows_workspace.psm1"
 $repository = Resolve-Path (Join-Path $PSScriptRoot "..")
 $configurationPath = Join-Path $PSScriptRoot "windows_build_environment.json"
@@ -76,32 +94,78 @@ $temporaryRoot = Join-Path ([System.IO.Path]::GetTempPath()) (
 )
 New-Item -ItemType Directory -Path $temporaryRoot | Out-Null
 Import-Module -Name $modulePath -Force
+$workspaceModule = Get-Module windows_workspace
+
+function Invoke-PrivateWorkspaceGates {
+    param(
+        [Parameter(Mandatory)]
+        [string]$RepositoryRoot,
+
+        [scriptblock]$GateInvoker
+    )
+
+    & $script:workspaceModule {
+        param($Root, $Invoker)
+        Invoke-EasyConWindowsWorkspaceGates -RepositoryRoot $Root -GateInvoker $Invoker
+    } $RepositoryRoot $GateInvoker
+}
+
+function Set-PrivateVerifiedProcessEnvironment {
+    param(
+        [Parameter(Mandatory)]
+        [string[]]$PathDirectories,
+
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary]$Variables
+    )
+
+    & $script:workspaceModule {
+        param($Directories, $Values)
+        Set-EasyConVerifiedProcessEnvironment -PathDirectories $Directories -Variables $Values
+    } $PathDirectories $Variables
+}
+
+function Publish-PrivateDirectoryAtomically {
+    param(
+        [Parameter(Mandatory)]
+        [hashtable]$Parameters
+    )
+
+    & $script:workspaceModule {
+        param($Arguments)
+        Publish-EasyConDirectoryAtomically @Arguments
+    } $Parameters
+}
 
 try {
     Invoke-ContractCase -Name "strict-environment-configuration" -Action {
         $configurationText = Get-Content -Raw -LiteralPath $configurationPath
         $configuration = Get-EasyConWindowsBuildConfiguration -Path $configurationPath
-        Assert-Contract ($configuration.version -eq 2) "environment config schema must be v2"
+        Assert-Contract ($configuration.version -eq 3) "environment config schema must be v3"
         Assert-Contract ($configuration.vcpkg.internalTools.Count -eq 4) `
             "CMake, Ninja, 7-Zip, and its 7zr bootstrap must be audited"
         Assert-Contract ($configuration.vcpkg.nativeDependencies.Count -eq 3) `
             "direct native dependencies must be audited"
-        Assert-Contract ($configuration.fingerprintFiles -ccontains "Cargo.lock") `
+        Assert-Contract ($configuration.fingerprintInputs.path -ccontains "Cargo.lock") `
             "Cargo.lock must invalidate the prepared dependency environment"
-        Assert-Contract ($configuration.fingerprintFiles -ccontains "tools/windows_workspace.psm1") `
+        Assert-Contract ($configuration.fingerprintInputs.path -ccontains "tools/windows_workspace.psm1") `
             "environment implementation changes must invalidate the prepared environment"
 
         $mutations = [ordered]@{
             "duplicate key" = $configurationText.Replace(
-                '"version": 2', '"version": 2, "version": 2'
+                '"version": 3', '"version": 3, "version": 3'
             )
-            "old schema" = $configurationText.Replace('"version": 2', '"version": 1')
+            "old schema" = $configurationText.Replace('"version": 3', '"version": 2')
             "unfrozen target" = $configurationText.Replace(
                 '"x86_64-pc-windows-msvc"', '"x86_64-unknown-linux-gnu"'
             )
             "missing fingerprint input" = $configurationText.Replace(
-                '    "tools/provision_vision_test_model.py"',
-                '    "../outside.py"'
+                '"path": "tools/provision_vision_test_model.py"',
+                '"path": "../outside.py"'
+            )
+            "invalid fingerprint kind" = $configurationText.Replace(
+                '"path": "Cargo.lock", "kind": "text"',
+                '"path": "Cargo.lock", "kind": "auto"'
             )
             "internal tool hash" = $configurationText.Replace(
                 '55d3d891e8fc6c8ad7f92e172125319896761e57c5125944613d9bbfa5b9374387e9fc1468ad5bcb31464f43fb1c455ea251343942595f42955dc67090aa12ee',
@@ -119,6 +183,48 @@ try {
                 Get-EasyConWindowsBuildConfiguration -Path $path
             }
         }
+    }
+
+    Invoke-ContractCase -Name "public-module-surface-hides-lifecycle-bypasses" -Action {
+        foreach ($name in @(
+            "Enter-EasyConEnvironmentLease",
+            "Invoke-EasyConEnvironmentLifecycle",
+            "Invoke-EasyConWindowsWorkspaceGates",
+            "Publish-EasyConDirectoryAtomically",
+            "Set-EasyConVerifiedProcessEnvironment"
+        )) {
+            Assert-Contract ($null -eq (Get-Command -Name $name -Module windows_workspace `
+                -ErrorAction SilentlyContinue)) `
+                "private lifecycle helper must not be exported: $name"
+        }
+        Assert-Contract ($null -ne (Get-Command -Name "Invoke-EasyConWindowsWorkspace" `
+            -Module windows_workspace -ErrorAction SilentlyContinue)) `
+            "the verified public Workspace entry must remain exported"
+        $publicLifecycleCommands = @(Get-Command -Module windows_workspace | Where-Object {
+            $_.Name -match '^Invoke-EasyConWindows'
+        } | Select-Object -ExpandProperty Name | Sort-Object)
+        $expectedLifecycleCommands = @(
+            "Invoke-EasyConWindowsSetup",
+            "Invoke-EasyConWindowsVerify",
+            "Invoke-EasyConWindowsWorkspace"
+        )
+        Assert-Contract (
+            ($publicLifecycleCommands -join "`n") -ceq
+            ($expectedLifecycleCommands -join "`n")
+        ) "public Windows lifecycle surface must contain only Setup, Verify, and Workspace"
+
+        $started = [pscustomobject]@{ Gates = 0 }
+        Assert-Throws -Pattern "not prepared.*Mode Setup" -Action {
+            Invoke-EasyConWindowsWorkspace -RepositoryRoot $repository `
+                -ConfigurationPath $configurationPath `
+                -CacheRoot (Join-Path $temporaryRoot "public workspace bypass cache") `
+                -GateInvoker {
+                    param($Name, $Program, $Arguments, $Root)
+                    $started.Gates++
+                }.GetNewClosure()
+        }
+        Assert-Contract ($started.Gates -eq 0) `
+            "public Workspace must start zero gates before Verify succeeds"
     }
 
     Invoke-ContractCase -Name "vcpkg-version-record-shapes" -Action {
@@ -159,7 +265,7 @@ try {
     Invoke-ContractCase -Name "fingerprint-and-manifest-change" -Action {
         $configuration = Get-EasyConWindowsBuildConfiguration -Path $configurationPath
         $fixture = Join-Path $temporaryRoot "fingerprint repository"
-        foreach ($relative in @($configuration.fingerprintFiles)) {
+        foreach ($relative in @($configuration.fingerprintInputs.path)) {
             Set-ContractFile -Path (Join-Path $fixture $relative) -Value "fixture:$relative"
         }
         $first = Get-EasyConEnvironmentFingerprint -RepositoryRoot $fixture `
@@ -177,6 +283,64 @@ try {
             -Configuration $configuration
         Assert-Contract ($changed.Value -cne $lockChanged.Value) `
             "a Cargo lock change must require a different prepared environment"
+    }
+
+    Invoke-ContractCase -Name "text-fingerprint-canonicalizes-checkout-line-endings" -Action {
+        $configuration = Get-EasyConWindowsBuildConfiguration -Path $configurationPath
+        $fixtures = [ordered]@{
+            lf = "alpha`nbeta`ngamma`n"
+            crlf = "alpha`r`nbeta`r`ngamma`r`n"
+            mixed = "alpha`r`nbeta`rgamma`n"
+        }
+        $fingerprints = @{}
+        foreach ($fixture in $fixtures.GetEnumerator()) {
+            $root = Join-Path $temporaryRoot ("fingerprint line endings {0}" -f $fixture.Key)
+            foreach ($relative in @($configuration.fingerprintInputs.path)) {
+                Set-ContractUtf8Text -Path (Join-Path $root $relative) -Value $fixture.Value
+            }
+            $fingerprints[$fixture.Key] = (Get-EasyConEnvironmentFingerprint `
+                -RepositoryRoot $root -Configuration $configuration).Value
+        }
+        Assert-Contract ($fingerprints.lf -ceq $fingerprints.crlf) `
+            "LF and CRLF checkouts of identical text must share one fingerprint"
+        Assert-Contract ($fingerprints.lf -ceq $fingerprints.mixed) `
+            "mixed checkout line endings must canonicalize like LF"
+
+        $changedRoot = Join-Path $temporaryRoot "fingerprint changed text"
+        foreach ($relative in @($configuration.fingerprintInputs.path)) {
+            Set-ContractUtf8Text -Path (Join-Path $changedRoot $relative) `
+                -Value "alpha`nbeta`ngamma`n"
+        }
+        Set-ContractUtf8Text -Path (Join-Path $changedRoot "Cargo.lock") `
+            -Value "alpha`nchanged`ngamma`n"
+        $changed = Get-EasyConEnvironmentFingerprint -RepositoryRoot $changedRoot `
+            -Configuration $configuration
+        Assert-Contract ($fingerprints.lf -cne $changed.Value) `
+            "a real canonical text change must invalidate the fingerprint"
+
+        $binaryRoot = Join-Path $temporaryRoot "fingerprint binary bytes"
+        $binaryPath = Join-Path $binaryRoot "input.bin"
+        New-Item -ItemType Directory -Force -Path $binaryRoot | Out-Null
+        [System.IO.File]::WriteAllBytes($binaryPath, [byte[]](0x61, 0x0d, 0x0a, 0x62))
+        $binaryConfiguration = [pscustomobject]@{
+            fingerprintInputs = @([pscustomobject]@{ path = "input.bin"; kind = "binary" })
+        }
+        $binaryCrLf = Get-EasyConEnvironmentFingerprint -RepositoryRoot $binaryRoot `
+            -Configuration $binaryConfiguration
+        [System.IO.File]::WriteAllBytes($binaryPath, [byte[]](0x61, 0x0a, 0x62))
+        $binaryLf = Get-EasyConEnvironmentFingerprint -RepositoryRoot $binaryRoot `
+            -Configuration $binaryConfiguration
+        Assert-Contract ($binaryCrLf.Value -cne $binaryLf.Value) `
+            "binary fingerprint inputs must hash raw bytes without newline normalization"
+
+        [System.IO.File]::WriteAllBytes($binaryPath, [byte[]](0xc3, 0x28))
+        $textConfiguration = [pscustomobject]@{
+            fingerprintInputs = @([pscustomobject]@{ path = "input.bin"; kind = "text" })
+        }
+        Assert-Throws -Pattern "valid UTF-8" -Action {
+            Get-EasyConEnvironmentFingerprint -RepositoryRoot $binaryRoot `
+                -Configuration $textConfiguration
+        }
     }
 
     Invoke-ContractCase -Name "worktree-environment-isolation" -Action {
@@ -258,7 +422,7 @@ try {
 
     Invoke-ContractCase -Name "workspace-plan-does-not-provision" -Action {
         $gates = [System.Collections.Generic.List[object]]::new()
-        Invoke-EasyConWindowsWorkspaceGates -RepositoryRoot $repository -GateInvoker {
+        Invoke-PrivateWorkspaceGates -RepositoryRoot $repository -GateInvoker {
             param($Name, $Program, $Arguments, $Root)
             $gates.Add([pscustomobject]@{
                 Name = $Name
@@ -303,7 +467,7 @@ try {
             -MsvcToolsVersion ([string]$configuration.hostTools.msvcToolsVersion) `
             -WindowsSdkVersion ([string]$configuration.hostTools.windowsSdkVersion) | Out-Null
         $systemRoot = [Environment]::GetEnvironmentVariable("SystemRoot", "Process")
-        Set-EasyConVerifiedProcessEnvironment `
+        Set-PrivateVerifiedProcessEnvironment `
             -PathDirectories @($PSHOME, $systemRoot, (Join-Path $systemRoot "System32")) `
             -Variables ([ordered]@{ CARGO_INCREMENTAL = "0" })
         $reinitialized = Initialize-EasyConMsvcEnvironment `
@@ -350,7 +514,7 @@ try {
             foreach ($name in $poisonedNames) {
                 [Environment]::SetEnvironmentVariable($name, "poison-$name", "Process")
             }
-            Set-EasyConVerifiedProcessEnvironment -PathDirectories @($PSHOME) `
+            Set-PrivateVerifiedProcessEnvironment -PathDirectories @($PSHOME) `
                 -Variables $controlledValues
             $pwsh = Join-Path $PSHOME "pwsh.exe"
             $childScript = @'
@@ -446,9 +610,15 @@ try {
             throw [System.IO.IOException]::new("synthetic Windows sharing violation")
         }.GetNewClosure()
         Assert-Throws -Pattern "sharing violation|publish" -Action {
-            Publish-EasyConDirectoryAtomically -Source $source -Destination $destination `
-                -TrustedRoot $temporaryRoot -MaxAttempts 2 -RetryMilliseconds 0 `
-                -MoveAction $failingMove -RetryAction { param($Attempt, $Failure) }
+            Publish-PrivateDirectoryAtomically -Parameters @{
+                Source = $source
+                Destination = $destination
+                TrustedRoot = $temporaryRoot
+                MaxAttempts = 2
+                RetryMilliseconds = 0
+                MoveAction = $failingMove
+                RetryAction = { param($Attempt, $Failure) }
+            }
         }
         Assert-Contract ($publishState.Attempts -eq 2) `
             "publish must use a finite, deterministic retry budget"
@@ -458,13 +628,90 @@ try {
             Join-Path $source "scripts/buildsystems/vcpkg.cmake"
         ) -PathType Leaf) "failed atomic publish must preserve complete staging for cleanup or retry"
 
-        Publish-EasyConDirectoryAtomically -Source $source -Destination $destination `
-            -TrustedRoot $temporaryRoot -RetryMilliseconds 0 | Out-Null
+        Publish-PrivateDirectoryAtomically -Parameters @{
+            Source = $source
+            Destination = $destination
+            TrustedRoot = $temporaryRoot
+            RetryMilliseconds = 0
+        } | Out-Null
         Assert-Contract (-not (Test-Path -LiteralPath $source)) `
             "successful atomic publish must consume staging"
         Assert-Contract (Test-Path -LiteralPath (
             Join-Path $destination "scripts/buildsystems/vcpkg.cmake"
         ) -PathType Leaf) "a later publish must recover with the complete checkout"
+    }
+
+    Invoke-ContractCase -Name "vcpkg-locked-partial-preserves-primary-failure" -Action {
+        $source = Join-Path $temporaryRoot "vcpkg locked publish source"
+        $destination = Join-Path $temporaryRoot "vcpkg locked published"
+        Set-ContractFile -Path (Join-Path $source "scripts/buildsystems/vcpkg.cmake") `
+            -Value "complete checkout"
+        $publishState = [pscustomobject]@{
+            Handle = $null
+            Attempts = 0
+        }
+        $failingMove = {
+            param($PublishSource, $PublishDestination)
+            $publishState.Attempts++
+            New-Item -ItemType Directory -Force -Path $PublishDestination | Out-Null
+            $partial = Join-Path $PublishDestination "locked-partial.txt"
+            Set-ContractFile -Path $partial -Value "partial"
+            $publishState.Handle = [System.IO.File]::Open(
+                $partial,
+                [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::Read,
+                [System.IO.FileShare]::None
+            )
+            throw [System.IO.IOException]::new("synthetic primary publish failure")
+        }.GetNewClosure()
+
+        $failure = $null
+        try {
+            try {
+                Publish-PrivateDirectoryAtomically -Parameters @{
+                    Source = $source
+                    Destination = $destination
+                    TrustedRoot = $temporaryRoot
+                    MaxAttempts = 2
+                    RetryMilliseconds = 0
+                    MoveAction = $failingMove
+                    RetryAction = { param($Attempt, $Failure) }
+                }
+            }
+            catch {
+                $failure = $_
+            }
+            Assert-Contract ($null -ne $failure) "locked partial publish must fail"
+            Assert-Contract ($failure.Exception.Message -match "synthetic primary publish failure") `
+                "partial cleanup failure must not replace the primary publish failure"
+            Assert-Contract (
+                $failure.Exception.Message -match "cleanup" -and
+                $failure.Exception.Message -match "destination remains|partial destination"
+            ) "locked partial failure must report the incomplete cleanup state"
+            Assert-Contract ($publishState.Attempts -eq 1) `
+                "publish must stop when a partial destination cannot be removed"
+            Assert-Contract (Test-Path -LiteralPath $destination -PathType Container) `
+                "an externally locked partial destination may remain after bounded cleanup"
+            Assert-Contract (Test-Path -LiteralPath (
+                Join-Path $source "scripts/buildsystems/vcpkg.cmake"
+            ) -PathType Leaf) "locked cleanup failure must preserve complete staging"
+        }
+        finally {
+            if ($null -ne $publishState.Handle) {
+                $publishState.Handle.Dispose()
+            }
+        }
+
+        Remove-Item -LiteralPath $destination -Recurse -Force
+        Publish-PrivateDirectoryAtomically -Parameters @{
+            Source = $source
+            Destination = $destination
+            TrustedRoot = $temporaryRoot
+            RetryMilliseconds = 0
+        } | Out-Null
+        Assert-Contract (Test-Path -LiteralPath (
+            Join-Path $destination "scripts/buildsystems/vcpkg.cmake"
+        ) -PathType Leaf) "a later Setup can clean the remainder and publish after handle release"
     }
 
     Invoke-ContractCase -Name "physical-path-reparse-rejected" -Action {
@@ -494,4 +741,4 @@ finally {
     Remove-Item -LiteralPath $resolvedTemporary -Recurse -Force
 }
 
-Write-Output "Windows workspace contracts passed: 13 cases"
+Write-Output "Windows workspace contracts passed: 16 cases"

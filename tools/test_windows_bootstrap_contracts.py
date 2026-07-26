@@ -136,7 +136,7 @@ class WindowsBuildEnvironmentContracts(unittest.TestCase):
 
     def test_duplicate_json_keys_are_rejected(self):
         duplicate_root = self.configuration_text.replace(
-            '"version": 2', '"version": 2,\n  "version": 2', 1
+            '"version": 3', '"version": 3,\n  "version": 3', 1
         )
         self.assert_rejected(duplicate_root, "duplicate root key")
         duplicate_tool = self.configuration_text.replace(
@@ -146,10 +146,21 @@ class WindowsBuildEnvironmentContracts(unittest.TestCase):
 
     def test_exact_key_sets_are_required(self):
         mutations = []
-        for path in ("root", "host", "vcpkg", "asset", "tools", "internal", "native"):
+        for path in (
+            "root",
+            "fingerprint",
+            "host",
+            "vcpkg",
+            "asset",
+            "tools",
+            "internal",
+            "native",
+        ):
             mutated = copy.deepcopy(self.configuration)
             if path == "root":
                 mutated["unknown"] = 1
+            elif path == "fingerprint":
+                mutated["fingerprintInputs"][0]["unknown"] = 1
             elif path == "host":
                 mutated["hostTools"]["unknown"] = 1
             elif path == "vcpkg":
@@ -170,11 +181,12 @@ class WindowsBuildEnvironmentContracts(unittest.TestCase):
     def test_types_versions_hashes_and_sets_are_strict(self):
         mutations = {}
         for label, mutate in {
-            "string schema": lambda value: value.update(version="2"),
+            "string schema": lambda value: value.update(version="3"),
             "boolean bytes": lambda value: value["vcpkg"]["windowsAsset"].update(bytes=True),
             "old schema": lambda value: value.update(version=1),
             "unfrozen target": lambda value: value.update(target="x86_64-unknown-linux-gnu"),
-            "fingerprint order": lambda value: value["fingerprintFiles"].reverse(),
+            "fingerprint order": lambda value: value["fingerprintInputs"].reverse(),
+            "fingerprint kind": lambda value: value["fingerprintInputs"][0].update(kind="auto"),
             "uppercase scripts commit": lambda value: value["vcpkg"].update(scriptsCommit="C" * 40),
             "registry divergence": lambda value: value["vcpkg"].update(registryBaseline="0" * 40),
             "uppercase SHA-512": lambda value: value["vcpkg"]["internalTools"][0].update(sha512="A" * 128),
