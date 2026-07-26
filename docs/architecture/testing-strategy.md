@@ -28,6 +28,10 @@ spec/
 
 fixture 必须自包含、可审阅且注明来源。`EasyCon/` 只用于本地形成候选差分结果，不能成为 CI input。
 
+Phase 4 S0 已在 `main` 基线 `87544d9` 登记 11 条自包含 ECS provenance records 和 33 个 SDK-local artifacts，
+并由静态 validator 校验 schema、分类、来源与 hash。它们是后续 C1/E1 的输入证据，不是 parser/evaluator 的
+可执行 conformance 通过结论；R0 也仍未独立 review/refreeze。
+
 ## 3. 确定性测试后端
 
 ### VirtualClock

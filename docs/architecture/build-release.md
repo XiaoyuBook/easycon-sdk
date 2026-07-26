@@ -40,16 +40,39 @@ backend 或合并大段平台专属生产代码。
 
 | 层 | 基线 |
 | --- | --- |
-| Rust | stable toolchain，精确版本在实现开始时写入 `rust-toolchain.toml`；发布分支不跟随 channel 漂移 |
-| C++ | Visual Studio Build Tools 2022 17.10+、MSVC v143、C++20、Windows SDK 10.0.22621+ |
-| Build | CMake 3.30+、Ninja 1.11+、Cargo；统一由 CMake preset/xtask 编排，不维护四套 native build |
-| Native deps | manifest-mode vcpkg 或等价可审计 lock，固定 OpenCV 4.x、Tesseract 5.x、Leptonica 及传递依赖 |
+| Rust | `rust-toolchain.toml` 精确固定 `1.97.1` 与 `x86_64-pc-windows-msvc`、rustfmt、clippy；发布分支不跟随 channel 漂移 |
+| C++ | Visual Studio Build Tools 2022、MSVC `14.44.35207`、C++20、Windows SDK `10.0.26100.0` |
+| Build | 受控 CMake `4.3.3`、Ninja `1.13.2`、Cargo；统一由 CMake preset/xtask 编排，不维护四套 native build |
+| Native deps | vcpkg scripts/registry `cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3`、tool `2026-07-13`；OpenCV `4.12.0#5`、Tesseract `5.5.2#0`、Leptonica `1.87.0#0` 及传递依赖由同一 registry baseline 解析 |
 | .NET | .NET 8 SDK 最新 servicing；`dotnet pack` |
 | Python | Python 3.10-3.14 test matrix、build 1.x、twine；wheel repair/inspection 工具 |
 | Node | Node 22/24、npm、TypeScript、node-gyp/CMake.js 中选定一个 addon 构建入口 |
 | Quality | rustfmt/clippy、clang-format/clang-tidy、cargo-deny、SBOM 和 license scanner |
 
-**[推导]** 架构文档不猜测 2026-07-17 当天的 Rust patch 号。实施分支在第一次可重复构建时锁定精确 stable 版本，并把升级作为显式依赖 PR；这比文档中的浮动版本更可执行。
+`tools/windows_build_environment.json` 是当前 Windows 开发构建环境的结构化固定清单，记录 vcpkg
+scripts/tool/registry、CMake、Ninja、7-Zip、直接 native ports 的版本、来源和 hash 证据；Rust、triplet、preset 与
+OCR 分别由 fingerprint 中列出的 tracked 文件共同约束。升级任一固定输入都必须经过显式变更并重新运行 Setup。
+
+### Windows 开发环境生命周期
+
+Windows 构建流程分为两个职责：
+
+```powershell
+pwsh -NoProfile -File tools/run_windows_workspace.ps1 -Mode Setup
+pwsh -NoProfile -File tools/run_windows_workspace.ps1 -Mode Verify
+pwsh -NoProfile -File tools/run_windows_workspace.ps1 -Mode Workspace
+```
+
+`Setup` 是可重跑的一次性在线准备步骤，安装并核验固定 Rust toolchain、受控 CMake/Ninja、vcpkg
+scripts/tool/registry/native install tree、7-Zip 与测试 OCR 模型，然后写入包含 fingerprint、显式路径、版本、文件
+hash、Cargo vendor tree hash 和 native tree hash 的 stamp。Setup 使用 `cargo vendor --locked` 把 lockfile 与全部
+workspace manifests 对应的 crate sources 安装进环境。`Verify` 与 `Workspace` 不安装或下载；两者只接受当前
+fingerprint 对应且未损坏的 stamp，缺失或失配时要求重新运行 Setup。`Workspace` 在 Verify 后运行完整仓库门禁。
+
+下载包、工具二进制、native install tree 与编译缓存只存在于用户的受控环境根或 CI 临时目录，不进入 Git。
+Cargo/vcpkg cache 只提速，cache miss 不改变正确性合同。本职责拆分不是离线构建承诺，开发电脑与首次 CI Setup
+允许联网。PowerShell、Git、Python、rustup、VS Installer/vswhere 与 VS Build Tools 是运行 Setup 所需的宿主启动条件；
+Setup 会把实际解析到的可执行文件路径和 SHA-256 写入 stamp，日常 Verify 不会回退到另一个系统工具。
 
 ## 3. 单一原生构建
 

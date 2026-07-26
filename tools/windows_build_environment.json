@@ -1,0 +1,104 @@
+{
+  "version": 2,
+  "target": "x86_64-pc-windows-msvc",
+  "fingerprintFiles": [
+    "tools/windows_build_environment.json",
+    "tools/windows_workspace.psm1",
+    "tools/run_windows_workspace.ps1",
+    "rust-toolchain.toml",
+    "Cargo.toml",
+    "Cargo.lock",
+    "crates/easycon-model/Cargo.toml",
+    "crates/easycon-runtime/Cargo.toml",
+    "crates/easycon-controller/Cargo.toml",
+    "crates/easycon-ecs/Cargo.toml",
+    "crates/easycon-serial/Cargo.toml",
+    "crates/easycon-native-sys/Cargo.toml",
+    "crates/easycon-vision/Cargo.toml",
+    "tests/support/Cargo.toml",
+    "vcpkg.json",
+    "vcpkg-configuration.json",
+    "cmake/triplets/x64-windows-static-md.cmake",
+    "CMakePresets.json",
+    "spec/fixtures/vision/ocr-model.json",
+    "tools/provision_vision_test_model.py"
+  ],
+  "visionModelDirectory": "tessdata_fast-4.1.0",
+  "hostTools": {
+    "pythonMinimumVersion": "3.8.0",
+    "visualStudioMajorVersion": "17",
+    "msvcToolsVersion": "14.44.35207",
+    "windowsSdkVersion": "10.0.26100.0"
+  },
+  "vcpkg": {
+    "scriptsRepository": "https://github.com/microsoft/vcpkg.git",
+    "scriptsCommit": "cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3",
+    "registryBaseline": "cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3",
+    "toolRelease": "2026-07-13",
+    "toolCommit": "bf04c909169fdbb30821c02c6eb01f1cd1295d05",
+    "windowsAsset": {
+      "name": "vcpkg.exe",
+      "url": "https://github.com/microsoft/vcpkg-tool/releases/download/2026-07-13/vcpkg.exe",
+      "bytes": 6749536,
+      "sha256": "67958c6a13a35130ff8035bef33097ffe3376a6708577a826cfa41fa592db611"
+    },
+    "toolsManifest": {
+      "path": "scripts/vcpkg-tools.json",
+      "sha256": "7757067afc4839dd982eee8cfb68cb500c4255a64c37a7c150ee9244342595e6"
+    },
+    "internalTools": [
+      {
+        "name": "cmake",
+        "version": "4.3.3",
+        "url": "https://github.com/Kitware/CMake/releases/download/v4.3.3/cmake-4.3.3-windows-x86_64.zip",
+        "archive": "cmake-4.3.3-windows-x86_64.zip",
+        "executable": "cmake-4.3.3-windows-x86_64/bin/cmake.exe",
+        "sha512": "0df613db23b315d81895e672e8460f2b35f4c2dd2eb9f07e10b13389a675edcb09836a458b90d8c0211b3a2d6da38183714410769935a580b86a6177df691f6a"
+      },
+      {
+        "name": "ninja",
+        "version": "1.13.2",
+        "url": "https://github.com/ninja-build/ninja/releases/download/v1.13.2/ninja-win.zip",
+        "archive": "ninja-win-1.13.2.zip",
+        "executable": "ninja.exe",
+        "sha512": "55d3d891e8fc6c8ad7f92e172125319896761e57c5125944613d9bbfa5b9374387e9fc1468ad5bcb31464f43fb1c455ea251343942595f42955dc67090aa12ee"
+      },
+      {
+        "name": "7zip",
+        "version": "26.01",
+        "url": "https://github.com/ip7z/7zip/releases/download/26.01/7z2601-x64.exe",
+        "archive": "7z2601-x64.7z.exe",
+        "executable": "7z.exe",
+        "sha512": "e52d5050c8fe4c0a09bd482d36eb1377cf342c4739060d94094c4acb5aab1e53fa3842f64dec7b5df3b3bdc7394a8bc9a9cd7a88808342c1136dd9ce9fe5a0a2"
+      },
+      {
+        "name": "7zr",
+        "version": "26.01",
+        "url": "https://github.com/ip7z/7zip/releases/download/26.01/7zr.exe",
+        "archive": "f798fab8-7zr.exe",
+        "executable": "7zr.exe",
+        "sha512": "f798fab87c2bcdeeb43c1ec2f1976fcc6213f1cecb88d7da6410c6a0f4db3ffda4794f462af3525cb4c86ade0bf6ba410cd4c6a96299c4e695dfeb3b05d06baa"
+      }
+    ],
+    "nativeDependencies": [
+      {
+        "name": "opencv4",
+        "version": "4.12.0",
+        "portVersion": 5,
+        "gitTree": "0e28cd8713d7b810bef28ed0d7859dd761215854"
+      },
+      {
+        "name": "tesseract",
+        "version": "5.5.2",
+        "portVersion": 0,
+        "gitTree": "ed497e10dafba7808ea1f33bd10954d3923396a8"
+      },
+      {
+        "name": "leptonica",
+        "version": "1.87.0",
+        "portVersion": 0,
+        "gitTree": "68a12d4a7e128ae8deed60ec8758db92b02f4a08"
+      }
+    ]
+  }
+}

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Provision the frozen, test-only English Tesseract model into ignored storage."""
+"""Provision the frozen, test-only English Tesseract model into controlled storage."""
 
 import argparse
 import hashlib
@@ -151,8 +151,10 @@ def load_manifest(path):
     return manifest
 
 
-def provision(manifest, output):
-    cache_root = CACHE_ROOT.resolve()
+def provision(manifest, output, allowed_root=CACHE_ROOT):
+    if not allowed_root.is_absolute():
+        allowed_root = ROOT / allowed_root
+    cache_root = allowed_root.resolve()
     if not output.is_absolute():
         output = ROOT / output
     resolved_output = output.resolve()
@@ -160,7 +162,7 @@ def provision(manifest, output):
         resolved_output.relative_to(cache_root)
     except ValueError as error:
         raise ProvisionError(
-            "OCR model output must remain inside ignored .tools/vision-models"
+            "OCR model output must remain inside the controlled model root"
         ) from error
     output = resolved_output
     output.mkdir(parents=True, exist_ok=True)
@@ -179,9 +181,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--allowed-root", type=Path, default=CACHE_ROOT)
     arguments = parser.parse_args()
     manifest = load_manifest(arguments.manifest)
-    provision(manifest, arguments.output)
+    provision(manifest, arguments.output, allowed_root=arguments.allowed_root)
     return 0
 
 
