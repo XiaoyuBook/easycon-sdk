@@ -1158,6 +1158,13 @@ function Invoke-EasyConNativeCapture {
             $_
         })
         $exitCode = $LASTEXITCODE
+        if ($exitCode -ne 0) {
+            $details = ($output | ForEach-Object { $_.ToString() }) -join `
+                [Environment]::NewLine
+            throw [System.InvalidOperationException]::new(
+                "$Description failed with exit code $exitCode`n$details"
+            )
+        }
     }
     catch {
         $primaryFailure = $_
@@ -1178,10 +1185,6 @@ function Invoke-EasyConNativeCapture {
                 }
             }
         }
-    }
-    if ($exitCode -ne 0) {
-        $details = ($output | ForEach-Object { $_.ToString() }) -join [Environment]::NewLine
-        throw "$Description failed with exit code $exitCode`n$details"
     }
     return @($output | ForEach-Object { $_.ToString() })
 }
@@ -3473,6 +3476,11 @@ function Invoke-EasyConGate {
         Set-Location -LiteralPath $RepositoryRoot
         & $Program @Arguments
         $exitCode = $LASTEXITCODE
+        if ($exitCode -ne 0) {
+            throw [System.InvalidOperationException]::new(
+                "gate failed with exit code ${exitCode}: $Name"
+            )
+        }
     }
     catch {
         $primaryFailure = $_
@@ -3491,9 +3499,6 @@ function Invoke-EasyConGate {
                 throw
             }
         }
-    }
-    if ($exitCode -ne 0) {
-        throw "gate failed with exit code ${exitCode}: $Name"
     }
     $timer.Stop()
     Write-EasyConStructuredRecord -Kind "gate" -Value ([ordered]@{
@@ -3603,29 +3608,7 @@ function Invoke-EasyConWindowsWorkspaceGates {
 }
 
 Export-ModuleMember -Function @(
-    "Assert-EasyConCMakeCacheIsolation",
-    "Assert-EasyConCargoPathBudget",
-    "Assert-EasyConGitWorkingTreeClean",
-    "Assert-EasyConMsvcEnvironment",
-    "Assert-EasyConPhysicalPath",
-    "Assert-EasyConPinnedFile",
-    "Assert-EasyConVcpkgCheckout",
-    "Assert-EasyConVcpkgEnvironmentInputs",
-    "Assert-EasyConVisionModel",
-    "Find-EasyConVisualStudio",
-    "Get-EasyConBuildToolVersions",
-    "Get-EasyConEnvironmentFingerprint",
-    "Get-EasyConEnvironmentLocation",
-    "Get-EasyConVcpkgAsset",
-    "Get-EasyConWindowsBuildConfiguration",
-    "Get-EasyConWorkspaceTargetDirectory",
-    "Initialize-EasyConMsvcEnvironment",
-    "Install-EasyConPinnedExecutable",
     "Invoke-EasyConWindowsSetup",
     "Invoke-EasyConWindowsVerify",
-    "Invoke-EasyConWindowsWorkspace",
-    "Resolve-EasyConFullPath",
-    "Test-EasyConVcpkgToolManifestRecord",
-    "Test-EasyConVcpkgVersionRecord",
-    "Test-EasyConPathWithin"
+    "Invoke-EasyConWindowsWorkspace"
 )

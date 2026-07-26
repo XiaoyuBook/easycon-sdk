@@ -90,9 +90,11 @@ repository contracts 与 diff 门禁。缺失、损坏、worktree 不匹配或 f
 Setup 不能与读取或构建竞争。异常路径总是释放 lease。Verify 在启动 gate 前清除 ambient Rust wrapper/compiler、
 Cargo target/linker/registry flags、cc-rs target compiler、`CL`/`_CL_`、MSVC Developer Shell 残留、CMake/package roots、
 vcpkg override 与代理变量，再用 stamp 中核验过的工具绝对路径、pinned Developer Shell include/lib 路径和受控变量重建
-当前进程环境；HTTP(S) proxy 只允许在线 Setup 使用。模块不公开无锁 gate core，所有公开 gate 执行都必须先 Verify，
+当前进程环境；HTTP(S) proxy 只允许在线 Setup 使用。模块完整导出集合只有 Setup、Verify 与 Workspace；parser、下载、
+安装、环境修改和无锁 gate core 等 helper 全部保持私有。所有公开 gate 执行都必须先 Verify，
 并持有同一个 shared lease 到最后一个 gate。Setup/Verify/Workspace 返回时完整恢复调用进程原有环境（包括原先缺失、
-空值和名称大小写），成功和异常路径都不遗留临时受控变量。
+空值和名称大小写），成功和异常路径都不遗留临时受控变量。native command 或 gate 的非零退出在 cwd cleanup 前登记为
+主错误；若原 cwd 已被外部删除，location restore failure 只附加到诊断。子进程成功且 cwd 无法恢复时，恢复失败仍直接失败。
 
 这一区分是生命周期职责，不是离线合同：Setup 可联网，Workspace 不负责准备环境，但不承诺零网络请求、
 air-gapped 构建或完整离线 cache。PowerShell、Git、Python、rustup、VS Installer/vswhere 与 VS Build Tools 是启动

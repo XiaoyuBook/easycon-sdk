@@ -86,9 +86,12 @@ Setup 在独占 lease 下删除旧环境树并安全恢复。
 Verify 在执行任何 gate 前清除 ambient `RUSTC*`/wrapper/rustflags、Cargo target linker/profile/registry overrides、
 cc-rs target compiler、`CL`/`_CL_`、MSVC Developer Shell 残留、CMake/package roots、vcpkg overrides 和 proxy，并用
 stamp 核验后的工具目录构造 PATH，显式恢复 pinned Developer Shell 生成的 include/lib 路径并设置 MSVC linker、Cargo
-home/target、vcpkg tree 与 OCR 路径。代理只属于在线 Setup，不进入 Verify/Workspace 子进程。无锁 gate core 保持模块
-私有，公开 Workspace 必须持同一个 shared lease 完成 Verify 和全部 gates；三个生命周期命令返回时完整恢复调用进程
+home/target、vcpkg tree 与 OCR 路径。代理只属于在线 Setup，不进入 Verify/Workspace 子进程。模块只导出 Setup、Verify
+与 Workspace；parser、下载、安装、环境修改和无锁 gate core 等 helper 全部私有。公开 Workspace 必须持同一个 shared
+lease 完成 Verify 和全部 gates；三个生命周期命令返回时完整恢复调用进程
 进入命令前的环境，异常不会把临时净化或受控变量留在调用 shell。
+native command/gate 会在 cwd cleanup 前把非零退出登记为主错误；原 cwd 被外部删除而无法恢复时，cleanup failure 只作为
+附加诊断且不覆盖退出码、native 输出/描述或 gate 名称。若子进程成功，cwd restore failure 本身仍使调用失败。
 
 下载包、工具二进制、native install tree 与编译缓存只存在于用户的受控环境根或 CI 临时目录，不进入 Git。
 Cargo/vcpkg cache 只提速，cache miss 不改变正确性合同。本职责拆分不是离线构建承诺，开发电脑与首次 CI Setup

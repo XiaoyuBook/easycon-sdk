@@ -177,11 +177,333 @@ function Invoke-PrivateCommand {
     } $CommandName $Parameters
 }
 
+function Get-PrivateWindowsBuildConfiguration {
+    param([Parameter(Mandatory)][string]$Path)
+    Invoke-PrivateCommand -CommandName "Get-EasyConWindowsBuildConfiguration" `
+        -Parameters @{ Path = $Path }
+}
+
+function Get-PrivateEnvironmentFingerprint {
+    param(
+        [Parameter(Mandatory)][string]$RepositoryRoot,
+        [Parameter(Mandatory)][object]$Configuration
+    )
+    Invoke-PrivateCommand -CommandName "Get-EasyConEnvironmentFingerprint" `
+        -Parameters @{ RepositoryRoot = $RepositoryRoot; Configuration = $Configuration }
+}
+
+function Get-PrivateEnvironmentLocation {
+    param(
+        [Parameter(Mandatory)][string]$RepositoryRoot,
+        [Parameter(Mandatory)][string]$Fingerprint,
+        [Parameter(Mandatory)][string]$CacheRoot
+    )
+    Invoke-PrivateCommand -CommandName "Get-EasyConEnvironmentLocation" -Parameters @{
+        RepositoryRoot = $RepositoryRoot
+        Fingerprint = $Fingerprint
+        CacheRoot = $CacheRoot
+    }
+}
+
+function Test-PrivateVcpkgVersionRecord {
+    param(
+        [Parameter(Mandatory)][object]$Record,
+        [Parameter(Mandatory)][object]$Expected
+    )
+    Invoke-PrivateCommand -CommandName "Test-EasyConVcpkgVersionRecord" `
+        -Parameters @{ Record = $Record; Expected = $Expected }
+}
+
+function Test-PrivateVcpkgToolManifestRecord {
+    param(
+        [Parameter(Mandatory)][object]$Record,
+        [Parameter(Mandatory)][object]$Expected
+    )
+    Invoke-PrivateCommand -CommandName "Test-EasyConVcpkgToolManifestRecord" `
+        -Parameters @{ Record = $Record; Expected = $Expected }
+}
+
+function Install-PrivatePinnedExecutable {
+    param(
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$Destination,
+        [Parameter(Mandatory)][string]$Sha512,
+        [Parameter(Mandatory)][string]$TrustedRoot,
+        [Parameter(Mandatory)][string]$Description
+    )
+    Invoke-PrivateCommand -CommandName "Install-EasyConPinnedExecutable" -Parameters @{
+        Source = $Source
+        Destination = $Destination
+        Sha512 = $Sha512
+        TrustedRoot = $TrustedRoot
+        Description = $Description
+    }
+}
+
+function Initialize-PrivateMsvcEnvironment {
+    param(
+        [Parameter(Mandatory)][string]$MsvcToolsVersion,
+        [Parameter(Mandatory)][string]$WindowsSdkVersion
+    )
+    Invoke-PrivateCommand -CommandName "Initialize-EasyConMsvcEnvironment" -Parameters @{
+        MsvcToolsVersion = $MsvcToolsVersion
+        WindowsSdkVersion = $WindowsSdkVersion
+    }
+}
+
+function Assert-PrivatePhysicalPath {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$TrustedRoot,
+        [scriptblock]$ReparsePointClassifier
+    )
+    Invoke-PrivateCommand -CommandName "Assert-EasyConPhysicalPath" -Parameters @{
+        Path = $Path
+        TrustedRoot = $TrustedRoot
+        ReparsePointClassifier = $ReparsePointClassifier
+    }
+}
+
+function Invoke-PrivatePublicWrapperProbe {
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet("Setup", "Verify", "Workspace")]
+        [string]$Mode,
+
+        [switch]$LifecycleFailure
+    )
+
+    & $script:workspaceModule {
+        param($WrapperMode, $FailLifecycle)
+
+        $originalContext = ${function:Get-EasyConWindowsEnvironmentContext}
+        $originalSetupCore = ${function:Invoke-EasyConWindowsSetupCore}
+        $originalVerifyCore = ${function:Invoke-EasyConWindowsVerifyCore}
+        $originalWorkspaceGates = ${function:Invoke-EasyConWindowsWorkspaceGates}
+        $originalLifecycle = ${function:Invoke-EasyConEnvironmentLifecycle}
+        $location = [pscustomobject]@{
+            CacheRoot = "resolved-cache"
+            EnvironmentRoot = "resolved-environment"
+            IdentityKey = "resolved-identity"
+        }
+        $context = [pscustomobject]@{
+            Repository = "resolved-repository"
+            ConfigurationPath = "resolved-configuration"
+            Location = $location
+        }
+        $state = [pscustomobject]@{
+            ContextCall = $null
+            LifecycleCall = $null
+            ResolvedContext = $context
+            SetupCalls = [System.Collections.Generic.List[object]]::new()
+            VerifyCalls = [System.Collections.Generic.List[object]]::new()
+            WorkspaceCalls = [System.Collections.Generic.List[object]]::new()
+            InputGateInvoker = { param($Name, $Program, $Arguments, $Root) }
+        }
+
+        $contextProbe = {
+            param($RepositoryRoot, $ConfigurationPath, $CacheRoot)
+            $state.ContextCall = [pscustomobject]@{
+                RepositoryRoot = $RepositoryRoot
+                ConfigurationPath = $ConfigurationPath
+                CacheRoot = $CacheRoot
+            }
+            return $context
+        }.GetNewClosure()
+        $setupProbe = {
+            param($RepositoryRoot, $ConfigurationPath, $CacheRoot, $VsWherePath, $Context)
+            $state.SetupCalls.Add([pscustomobject]@{
+                RepositoryRoot = $RepositoryRoot
+                ConfigurationPath = $ConfigurationPath
+                CacheRoot = $CacheRoot
+                VsWherePath = $VsWherePath
+                Context = $Context
+            }) | Out-Null
+        }.GetNewClosure()
+        $verifyProbe = {
+            param(
+                $RepositoryRoot,
+                $ConfigurationPath,
+                $CacheRoot,
+                $VsWherePath,
+                $Context,
+                [switch]$AllowProxy
+            )
+            $state.VerifyCalls.Add([pscustomobject]@{
+                RepositoryRoot = $RepositoryRoot
+                ConfigurationPath = $ConfigurationPath
+                CacheRoot = $CacheRoot
+                VsWherePath = $VsWherePath
+                Context = $Context
+                AllowProxy = $AllowProxy.IsPresent
+            }) | Out-Null
+            return [pscustomobject]@{ Status = "probe-ready" }
+        }.GetNewClosure()
+        $workspaceProbe = {
+            param($RepositoryRoot, $BaseSha, [switch]$RequireCleanTree, $GateInvoker)
+            $state.WorkspaceCalls.Add([pscustomobject]@{
+                RepositoryRoot = $RepositoryRoot
+                BaseSha = $BaseSha
+                RequireCleanTree = $RequireCleanTree.IsPresent
+                GateInvoker = $GateInvoker
+            }) | Out-Null
+        }.GetNewClosure()
+        $lifecycleProbe = {
+            param(
+                $Mode,
+                $Location,
+                $SetupAction,
+                $VerifyAction,
+                $WorkspaceAction,
+                $LeaseTimeoutMilliseconds
+            )
+            $state.LifecycleCall = [pscustomobject]@{
+                Mode = $Mode
+                Location = $Location
+                LeaseTimeoutMilliseconds = $LeaseTimeoutMilliseconds
+            }
+            if ($FailLifecycle) {
+                throw "synthetic public $Mode lifecycle failure"
+            }
+            switch ($Mode) {
+                "Setup" {
+                    & $SetupAction | Out-Null
+                    return & $VerifyAction
+                }
+                "Verify" {
+                    return & $VerifyAction
+                }
+                "Workspace" {
+                    $summary = & $VerifyAction
+                    & $WorkspaceAction $summary | Out-Null
+                    return $summary
+                }
+            }
+        }.GetNewClosure()
+
+        try {
+            Set-Item -LiteralPath Function:script:Get-EasyConWindowsEnvironmentContext `
+                -Value $contextProbe
+            Set-Item -LiteralPath Function:script:Invoke-EasyConWindowsSetupCore `
+                -Value $setupProbe
+            Set-Item -LiteralPath Function:script:Invoke-EasyConWindowsVerifyCore `
+                -Value $verifyProbe
+            Set-Item -LiteralPath Function:script:Invoke-EasyConWindowsWorkspaceGates `
+                -Value $workspaceProbe
+            Set-Item -LiteralPath Function:script:Invoke-EasyConEnvironmentLifecycle `
+                -Value $lifecycleProbe
+            $parameters = @{
+                RepositoryRoot = "input-repository"
+                ConfigurationPath = "input-configuration"
+                CacheRoot = "input-cache"
+                VsWherePath = "input-vswhere"
+                LeaseTimeoutMilliseconds = 321
+            }
+            switch ($WrapperMode) {
+                "Setup" {
+                    Invoke-EasyConWindowsSetup @parameters | Out-Null
+                }
+                "Verify" {
+                    Invoke-EasyConWindowsVerify @parameters | Out-Null
+                }
+                "Workspace" {
+                    Invoke-EasyConWindowsWorkspace @parameters -BaseSha ("a" * 40) `
+                        -RequireCleanTree -GateInvoker $state.InputGateInvoker | Out-Null
+                }
+            }
+            return $state
+        }
+        finally {
+            Set-Item -LiteralPath Function:script:Get-EasyConWindowsEnvironmentContext `
+                -Value $originalContext
+            Set-Item -LiteralPath Function:script:Invoke-EasyConWindowsSetupCore `
+                -Value $originalSetupCore
+            Set-Item -LiteralPath Function:script:Invoke-EasyConWindowsVerifyCore `
+                -Value $originalVerifyCore
+            Set-Item -LiteralPath Function:script:Invoke-EasyConWindowsWorkspaceGates `
+                -Value $originalWorkspaceGates
+            Set-Item -LiteralPath Function:script:Invoke-EasyConEnvironmentLifecycle `
+                -Value $originalLifecycle
+        }
+    } $Mode $LifecycleFailure.IsPresent
+}
+
+function Invoke-LocationCleanupFailureProbe {
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet("Native", "Gate")]
+        [string]$Kind,
+
+        [Parameter(Mandatory)]
+        [int]$ExitCode,
+
+        [Parameter(Mandatory)]
+        [string]$Marker
+    )
+
+    $probeRoot = Join-Path $temporaryRoot (
+        "{0} location cleanup {1}" -f $Kind.ToLowerInvariant(), [guid]::NewGuid().ToString("N")
+    )
+    $previous = Join-Path $probeRoot "deleted previous"
+    $working = Join-Path $probeRoot "working"
+    New-Item -ItemType Directory -Force -Path $previous, $working | Out-Null
+    $childPath = Join-Path $probeRoot "delete-caller-location.ps1"
+    Set-ContractFile -Path $childPath -Value @'
+param(
+    [Parameter(Mandatory)][string]$DeletePath,
+    [Parameter(Mandatory)][string]$Marker,
+    [Parameter(Mandatory)][int]$ExitCode
+)
+Remove-Item -LiteralPath $DeletePath -Recurse -Force -ErrorAction Stop
+Write-Output $Marker
+exit $ExitCode
+'@
+    $program = Join-Path $PSHOME "pwsh.exe"
+    $arguments = @(
+        "-NoLogo", "-NoProfile", "-File", $childPath,
+        "-DeletePath", $previous, "-Marker", $Marker, "-ExitCode", [string]$ExitCode
+    )
+    $observed = [System.Collections.Generic.List[string]]::new()
+    $failure = $null
+    Set-Location -LiteralPath $previous
+    try {
+        try {
+            if ($Kind -ceq "Native") {
+                Invoke-PrivateCommand -CommandName "Invoke-EasyConNativeCapture" -Parameters @{
+                    Program = $program
+                    Arguments = $arguments
+                    Description = "contract native nonzero"
+                    WorkingDirectory = $working
+                } | ForEach-Object { $observed.Add([string]$_) | Out-Null }
+            }
+            else {
+                Invoke-PrivateCommand -CommandName "Invoke-EasyConGate" -Parameters @{
+                    Name = "contract gate nonzero"
+                    Program = $program
+                    Arguments = $arguments
+                    RepositoryRoot = $working
+                } | ForEach-Object { $observed.Add([string]$_) | Out-Null }
+            }
+        }
+        catch {
+            $failure = $_
+        }
+    }
+    finally {
+        Set-Location -LiteralPath $repository.Path
+    }
+    return [pscustomobject]@{
+        Failure = $failure
+        Marker = $Marker
+        Observed = @($observed)
+    }
+}
+
 $contractFailure = $null
 try {
     Invoke-ContractCase -Name "strict-environment-configuration" -Action {
         $configurationText = Get-Content -Raw -LiteralPath $configurationPath
-        $configuration = Get-EasyConWindowsBuildConfiguration -Path $configurationPath
+        $configuration = Get-PrivateWindowsBuildConfiguration -Path $configurationPath
         Assert-Contract ($configuration.version -eq 3) "environment config schema must be v3"
         Assert-Contract ($configuration.vcpkg.internalTools.Count -eq 4) `
             "CMake, Ninja, 7-Zip, and its 7zr bootstrap must be audited"
@@ -236,7 +558,7 @@ try {
             try {
                 Assert-Throws -Pattern "config|version|target|fingerprint|SHA|git tree|duplicate" `
                     -Action {
-                        Get-EasyConWindowsBuildConfiguration -Path $path
+                        Get-PrivateWindowsBuildConfiguration -Path $path
                     }
             }
             catch {
@@ -268,18 +590,17 @@ try {
         Assert-Contract ($null -ne (Get-Command -Name "Invoke-EasyConWindowsWorkspace" `
             -Module windows_workspace -ErrorAction SilentlyContinue)) `
             "the verified public Workspace entry must remain exported"
-        $publicLifecycleCommands = @(Get-Command -Module windows_workspace | Where-Object {
-            $_.Name -match '^Invoke-EasyConWindows'
-        } | Select-Object -ExpandProperty Name | Sort-Object)
-        $expectedLifecycleCommands = @(
+        $publicCommands = @(Get-Command -Module windows_workspace |
+            Select-Object -ExpandProperty Name | Sort-Object)
+        $expectedCommands = @(
             "Invoke-EasyConWindowsSetup",
             "Invoke-EasyConWindowsVerify",
             "Invoke-EasyConWindowsWorkspace"
         )
         Assert-Contract (
-            ($publicLifecycleCommands -join "`n") -ceq
-            ($expectedLifecycleCommands -join "`n")
-        ) "public Windows lifecycle surface must contain only Setup, Verify, and Workspace"
+            ($publicCommands -join "`n") -ceq
+            ($expectedCommands -join "`n")
+        ) "exported function set must contain exactly Setup, Verify, and Workspace; actual=$($publicCommands -join ',')"
 
         $started = [pscustomobject]@{ Gates = 0 }
         Assert-Throws -Pattern "not prepared.*Mode Setup" -Action {
@@ -295,6 +616,118 @@ try {
             "public Workspace must start zero gates before Verify succeeds"
     }
 
+    Invoke-ContractCase -Name "public-wrappers-forward-controlled-lifecycle" -Action {
+        foreach ($mode in @("Setup", "Verify", "Workspace")) {
+            $state = Invoke-PrivatePublicWrapperProbe -Mode $mode
+            Assert-Contract (
+                $state.ContextCall.RepositoryRoot -ceq "input-repository" -and
+                $state.ContextCall.ConfigurationPath -ceq "input-configuration" -and
+                $state.ContextCall.CacheRoot -ceq "input-cache"
+            ) "$mode must forward caller inputs to context resolution"
+            Assert-Contract (
+                $state.LifecycleCall.Mode -ceq $mode -and
+                $state.LifecycleCall.Location.IdentityKey -ceq "resolved-identity" -and
+                $state.LifecycleCall.LeaseTimeoutMilliseconds -eq 321
+            ) "$mode must forward the resolved identity and lease timeout"
+            Assert-Contract ($state.VerifyCalls.Count -eq 1) `
+                "$mode must execute exactly one controlled Verify action"
+            $verify = $state.VerifyCalls[0]
+            Assert-Contract (
+                $verify.RepositoryRoot -ceq "resolved-repository" -and
+                $verify.ConfigurationPath -ceq "resolved-configuration" -and
+                $verify.CacheRoot -ceq "resolved-cache" -and
+                $verify.VsWherePath -ceq "input-vswhere" -and
+                [object]::ReferenceEquals($verify.Context, $state.ResolvedContext)
+            ) "$mode must pass only resolved context values to its Verify core"
+            Assert-Contract ($verify.AllowProxy -eq ($mode -ceq "Setup")) `
+                "only Setup final verification may retain the online proxy environment"
+
+            if ($mode -ceq "Setup") {
+                Assert-Contract ($state.SetupCalls.Count -eq 1) `
+                    "Setup must execute exactly one controlled Setup action"
+                $setup = $state.SetupCalls[0]
+                Assert-Contract (
+                    $setup.RepositoryRoot -ceq "resolved-repository" -and
+                    $setup.ConfigurationPath -ceq "resolved-configuration" -and
+                    $setup.CacheRoot -ceq "resolved-cache" -and
+                    $setup.VsWherePath -ceq "input-vswhere" -and
+                    [object]::ReferenceEquals($setup.Context, $state.ResolvedContext)
+                ) "Setup must pass only resolved context values to its Setup core"
+            }
+            else {
+                Assert-Contract ($state.SetupCalls.Count -eq 0) `
+                    "$mode must not execute the Setup core"
+            }
+            if ($mode -ceq "Workspace") {
+                Assert-Contract ($state.WorkspaceCalls.Count -eq 1) `
+                    "Workspace must execute exactly one gate action after Verify"
+                $workspace = $state.WorkspaceCalls[0]
+                Assert-Contract (
+                    $workspace.RepositoryRoot -ceq "resolved-repository" -and
+                    $workspace.BaseSha -ceq ("a" * 40) -and
+                    $workspace.RequireCleanTree -and
+                    [object]::ReferenceEquals($workspace.GateInvoker, $state.InputGateInvoker)
+                ) "Workspace must forward base, clean-tree, and gate invoker parameters"
+            }
+            else {
+                Assert-Contract ($state.WorkspaceCalls.Count -eq 0) `
+                    "$mode must not execute Workspace gates"
+            }
+
+            Assert-Throws -Pattern "synthetic public $mode lifecycle failure" -Action {
+                Invoke-PrivatePublicWrapperProbe -Mode $mode -LifecycleFailure
+            }
+        }
+    }
+
+    Invoke-ContractCase -Name "nonzero-exit-preserves-primary-during-location-cleanup" -Action {
+        $native = Invoke-LocationCleanupFailureProbe -Kind Native -ExitCode 42 `
+            -Marker "native-output-42"
+        $gate = Invoke-LocationCleanupFailureProbe -Kind Gate -ExitCode 43 `
+            -Marker "gate-output-43"
+
+        Assert-Contract ($null -ne $native.Failure) `
+            "native nonzero plus location cleanup failure must fail"
+        Assert-Contract ($null -ne $gate.Failure) `
+            "gate nonzero plus location cleanup failure must fail"
+        $nativePrimary = (
+            $native.Failure.Exception.Message -match "contract native nonzero" -and
+            $native.Failure.Exception.Message -match "exit code 42" -and
+            $native.Failure.Exception.Message -match "native-output-42"
+        )
+        $gatePrimary = (
+            $gate.Failure.Exception.Message -match "contract gate nonzero" -and
+            $gate.Failure.Exception.Message -match "exit code 43"
+        )
+        Assert-Contract ($nativePrimary -and $gatePrimary) `
+            "nonzero exit must remain primary; native='$($native.Failure.Exception.Message)' gate='$($gate.Failure.Exception.Message)'"
+        Assert-Contract (
+            $native.Failure.Exception.Data.Contains("EasyConLocationCleanupFailure")
+        ) "native location restore failure must be attached as cleanup diagnostic"
+
+        Assert-Contract ($gate.Observed -ccontains "gate-output-43") `
+            "gate output emitted before failure must remain observable"
+        Assert-Contract (
+            $gate.Failure.Exception.Data.Contains("EasyConGateLocationCleanupFailure")
+        ) "gate location restore failure must be attached as cleanup diagnostic"
+
+        $nativeCleanup = Invoke-LocationCleanupFailureProbe -Kind Native -ExitCode 0 `
+            -Marker "native-output-success"
+        $gateCleanup = Invoke-LocationCleanupFailureProbe -Kind Gate -ExitCode 0 `
+            -Marker "gate-output-success"
+        foreach ($cleanup in @($nativeCleanup, $gateCleanup)) {
+            Assert-Contract ($null -ne $cleanup.Failure) `
+                "location restore failure without an earlier primary must still fail"
+            Assert-Contract (
+                $cleanup.Failure.Exception.Message -match "Cannot find path" -and
+                $cleanup.Failure.Exception.Message -notmatch "exit code"
+            ) "location restore failure must remain primary after a successful child exit"
+        }
+        Assert-Contract (
+            (Get-Location).Path -ceq $repository.Path
+        ) "cwd failure probes must return the contract process to its safe repository location"
+    }
+
     Invoke-ContractCase -Name "vcpkg-version-record-shapes" -Action {
         $expected = [pscustomobject]@{
             version = "1.2.3"
@@ -307,54 +740,54 @@ try {
                 "git-tree" = ("a" * 40)
             }
             $record | Add-Member -NotePropertyName $field -NotePropertyValue "1.2.3"
-            Assert-Contract (Test-EasyConVcpkgVersionRecord -Record $record -Expected $expected) `
+            Assert-Contract (Test-PrivateVcpkgVersionRecord -Record $record -Expected $expected) `
                 "vcpkg audit must accept the $field record shape without reading absent fields"
         }
         $incomplete = [pscustomobject]@{ version = "1.2.3" }
-        Assert-Contract (-not (Test-EasyConVcpkgVersionRecord `
+        Assert-Contract (-not (Test-PrivateVcpkgVersionRecord `
             -Record $incomplete -Expected $expected)) `
             "vcpkg audit must reject a record without port-version or git-tree"
     }
 
     Invoke-ContractCase -Name "vcpkg-tool-manifest-record-shapes" -Action {
         $sevenZr = [pscustomobject]@{ name = "7zr"; os = "windows" }
-        Assert-Contract (Test-EasyConVcpkgToolManifestRecord `
+        Assert-Contract (Test-PrivateVcpkgToolManifestRecord `
             -Record $sevenZr -Expected ([pscustomobject]@{ name = "7zr" })) `
             "7zr must be audited without reading an absent architecture"
-        Assert-Contract (-not (Test-EasyConVcpkgToolManifestRecord `
+        Assert-Contract (-not (Test-PrivateVcpkgToolManifestRecord `
             -Record $sevenZr -Expected ([pscustomobject]@{ name = "cmake" }))) `
             "an architecture-less record must not satisfy a normal x64 tool pin"
         $cmake = [pscustomobject]@{ name = "cmake"; os = "windows"; arch = "x64" }
-        Assert-Contract (Test-EasyConVcpkgToolManifestRecord `
+        Assert-Contract (Test-PrivateVcpkgToolManifestRecord `
             -Record $cmake -Expected ([pscustomobject]@{ name = "cmake" })) `
             "ordinary Windows tools must retain an x64 architecture pin"
     }
 
     Invoke-ContractCase -Name "fingerprint-and-manifest-change" -Action {
-        $configuration = Get-EasyConWindowsBuildConfiguration -Path $configurationPath
+        $configuration = Get-PrivateWindowsBuildConfiguration -Path $configurationPath
         $fixture = Join-Path $temporaryRoot "fingerprint repository"
         foreach ($relative in @($configuration.fingerprintInputs.path)) {
             Set-ContractFile -Path (Join-Path $fixture $relative) -Value "fixture:$relative"
         }
-        $first = Get-EasyConEnvironmentFingerprint -RepositoryRoot $fixture `
+        $first = Get-PrivateEnvironmentFingerprint -RepositoryRoot $fixture `
             -Configuration $configuration
-        $again = Get-EasyConEnvironmentFingerprint -RepositoryRoot $fixture `
+        $again = Get-PrivateEnvironmentFingerprint -RepositoryRoot $fixture `
             -Configuration $configuration
         Assert-Contract ($first.Value -ceq $again.Value) "unchanged inputs need one stable fingerprint"
         Add-Content -LiteralPath (Join-Path $fixture "vcpkg.json") -Value "changed" -Encoding utf8NoBOM
-        $changed = Get-EasyConEnvironmentFingerprint -RepositoryRoot $fixture `
+        $changed = Get-PrivateEnvironmentFingerprint -RepositoryRoot $fixture `
             -Configuration $configuration
         Assert-Contract ($first.Value -cne $changed.Value) `
             "a frozen manifest change must require a different prepared environment"
         Add-Content -LiteralPath (Join-Path $fixture "Cargo.lock") -Value "changed" -Encoding utf8NoBOM
-        $lockChanged = Get-EasyConEnvironmentFingerprint -RepositoryRoot $fixture `
+        $lockChanged = Get-PrivateEnvironmentFingerprint -RepositoryRoot $fixture `
             -Configuration $configuration
         Assert-Contract ($changed.Value -cne $lockChanged.Value) `
             "a Cargo lock change must require a different prepared environment"
     }
 
     Invoke-ContractCase -Name "text-fingerprint-canonicalizes-checkout-line-endings" -Action {
-        $configuration = Get-EasyConWindowsBuildConfiguration -Path $configurationPath
+        $configuration = Get-PrivateWindowsBuildConfiguration -Path $configurationPath
         $fixtures = [ordered]@{
             lf = "alpha`nbeta`ngamma`n"
             crlf = "alpha`r`nbeta`r`ngamma`r`n"
@@ -366,7 +799,7 @@ try {
             foreach ($relative in @($configuration.fingerprintInputs.path)) {
                 Set-ContractUtf8Text -Path (Join-Path $root $relative) -Value $fixture.Value
             }
-            $fingerprints[$fixture.Key] = (Get-EasyConEnvironmentFingerprint `
+            $fingerprints[$fixture.Key] = (Get-PrivateEnvironmentFingerprint `
                 -RepositoryRoot $root -Configuration $configuration).Value
         }
         Assert-Contract ($fingerprints.lf -ceq $fingerprints.crlf) `
@@ -381,7 +814,7 @@ try {
         }
         Set-ContractUtf8Text -Path (Join-Path $changedRoot "Cargo.lock") `
             -Value "alpha`nchanged`ngamma`n"
-        $changed = Get-EasyConEnvironmentFingerprint -RepositoryRoot $changedRoot `
+        $changed = Get-PrivateEnvironmentFingerprint -RepositoryRoot $changedRoot `
             -Configuration $configuration
         Assert-Contract ($fingerprints.lf -cne $changed.Value) `
             "a real canonical text change must invalidate the fingerprint"
@@ -393,10 +826,10 @@ try {
         $binaryConfiguration = [pscustomobject]@{
             fingerprintInputs = @([pscustomobject]@{ path = "input.bin"; kind = "binary" })
         }
-        $binaryCrLf = Get-EasyConEnvironmentFingerprint -RepositoryRoot $binaryRoot `
+        $binaryCrLf = Get-PrivateEnvironmentFingerprint -RepositoryRoot $binaryRoot `
             -Configuration $binaryConfiguration
         [System.IO.File]::WriteAllBytes($binaryPath, [byte[]](0x61, 0x0a, 0x62))
-        $binaryLf = Get-EasyConEnvironmentFingerprint -RepositoryRoot $binaryRoot `
+        $binaryLf = Get-PrivateEnvironmentFingerprint -RepositoryRoot $binaryRoot `
             -Configuration $binaryConfiguration
         Assert-Contract ($binaryCrLf.Value -cne $binaryLf.Value) `
             "binary fingerprint inputs must hash raw bytes without newline normalization"
@@ -406,20 +839,20 @@ try {
             fingerprintInputs = @([pscustomobject]@{ path = "input.bin"; kind = "text" })
         }
         Assert-Throws -Pattern "valid UTF-8" -Action {
-            Get-EasyConEnvironmentFingerprint -RepositoryRoot $binaryRoot `
+            Get-PrivateEnvironmentFingerprint -RepositoryRoot $binaryRoot `
                 -Configuration $textConfiguration
         }
     }
 
     Invoke-ContractCase -Name "worktree-environment-isolation" -Action {
         $cache = Join-Path $temporaryRoot "shared cache"
-        $first = Get-EasyConEnvironmentLocation -RepositoryRoot (Join-Path $temporaryRoot "worktree one") `
+        $first = Get-PrivateEnvironmentLocation -RepositoryRoot (Join-Path $temporaryRoot "worktree one") `
             -Fingerprint ("a" * 64) -CacheRoot $cache
-        $firstAgain = Get-EasyConEnvironmentLocation -RepositoryRoot (Join-Path $temporaryRoot "worktree one") `
+        $firstAgain = Get-PrivateEnvironmentLocation -RepositoryRoot (Join-Path $temporaryRoot "worktree one") `
             -Fingerprint ("a" * 64) -CacheRoot $cache
-        $second = Get-EasyConEnvironmentLocation -RepositoryRoot (Join-Path $temporaryRoot "worktree two") `
+        $second = Get-PrivateEnvironmentLocation -RepositoryRoot (Join-Path $temporaryRoot "worktree two") `
             -Fingerprint ("a" * 64) -CacheRoot $cache
-        $changed = Get-EasyConEnvironmentLocation -RepositoryRoot (Join-Path $temporaryRoot "worktree one") `
+        $changed = Get-PrivateEnvironmentLocation -RepositoryRoot (Join-Path $temporaryRoot "worktree one") `
             -Fingerprint ("b" * 64) -CacheRoot $cache
         Assert-Contract ($first.EnvironmentRoot -ceq $firstAgain.EnvironmentRoot) `
             "one worktree and fingerprint must resolve stably"
@@ -435,10 +868,10 @@ try {
             Invoke-EasyConWindowsVerify -RepositoryRoot $repository `
                 -ConfigurationPath $configurationPath -CacheRoot $cache
         }
-        $configuration = Get-EasyConWindowsBuildConfiguration -Path $configurationPath
-        $fingerprint = Get-EasyConEnvironmentFingerprint -RepositoryRoot $repository `
+        $configuration = Get-PrivateWindowsBuildConfiguration -Path $configurationPath
+        $fingerprint = Get-PrivateEnvironmentFingerprint -RepositoryRoot $repository `
             -Configuration $configuration
-        $location = Get-EasyConEnvironmentLocation -RepositoryRoot $repository `
+        $location = Get-PrivateEnvironmentLocation -RepositoryRoot $repository `
             -Fingerprint $fingerprint.Value -CacheRoot $cache
         Set-ContractFile -Path $location.StampPath -Value "{not-json"
         Assert-Throws -Pattern "stamp is damaged.*Rerun Setup" -Action {
@@ -461,10 +894,10 @@ try {
 
     Invoke-ContractCase -Name "damaged-controlled-tool-rejected" -Action {
         $cache = Join-Path $temporaryRoot "artifact cache"
-        $configuration = Get-EasyConWindowsBuildConfiguration -Path $configurationPath
-        $fingerprint = Get-EasyConEnvironmentFingerprint -RepositoryRoot $repository `
+        $configuration = Get-PrivateWindowsBuildConfiguration -Path $configurationPath
+        $fingerprint = Get-PrivateEnvironmentFingerprint -RepositoryRoot $repository `
             -Configuration $configuration
-        $location = Get-EasyConEnvironmentLocation -RepositoryRoot $repository `
+        $location = Get-PrivateEnvironmentLocation -RepositoryRoot $repository `
             -Fingerprint $fingerprint.Value -CacheRoot $cache
         $tool = Join-Path $location.EnvironmentRoot "tools/cmake.exe"
         Set-ContractFile -Path $tool -Value "damaged"
@@ -517,7 +950,7 @@ try {
         $destination = Join-Path $temporaryRoot "tools/7zr-1.0/7zr.exe"
         Set-ContractFile -Path $source -Value "pinned bootstrap executable"
         $sha512 = (Get-FileHash -LiteralPath $source -Algorithm SHA512).Hash.ToLowerInvariant()
-        $installed = Install-EasyConPinnedExecutable -Source $source `
+        $installed = Install-PrivatePinnedExecutable -Source $source `
             -Destination $destination -Sha512 $sha512 -TrustedRoot $temporaryRoot `
             -Description "contract bootstrap tool"
         Remove-Item -LiteralPath $source -Force
@@ -760,15 +1193,15 @@ try {
     }
 
     Invoke-ContractCase -Name "msvc-developer-shell-reinitializes-after-sanitization" -Action {
-        $configuration = Get-EasyConWindowsBuildConfiguration -Path $configurationPath
-        Initialize-EasyConMsvcEnvironment `
+        $configuration = Get-PrivateWindowsBuildConfiguration -Path $configurationPath
+        Initialize-PrivateMsvcEnvironment `
             -MsvcToolsVersion ([string]$configuration.hostTools.msvcToolsVersion) `
             -WindowsSdkVersion ([string]$configuration.hostTools.windowsSdkVersion) | Out-Null
         $systemRoot = [Environment]::GetEnvironmentVariable("SystemRoot", "Process")
         Set-PrivateVerifiedProcessEnvironment `
             -PathDirectories @($PSHOME, $systemRoot, (Join-Path $systemRoot "System32")) `
             -Variables ([ordered]@{ CARGO_INCREMENTAL = "0" })
-        $reinitialized = Initialize-EasyConMsvcEnvironment `
+        $reinitialized = Initialize-PrivateMsvcEnvironment `
             -MsvcToolsVersion ([string]$configuration.hostTools.msvcToolsVersion) `
             -WindowsSdkVersion ([string]$configuration.hostTools.windowsSdkVersion)
         Assert-Contract ($env:VSCMD_ARG_HOST_ARCH -ceq "x64") `
@@ -1017,14 +1450,14 @@ try {
         $blocked = Join-Path $trusted "redirect"
         $leaf = Join-Path $blocked "output.bin"
         Assert-Throws -Pattern "reparse point" -Action {
-            Assert-EasyConPhysicalPath -Path $leaf -TrustedRoot $trusted `
+            Assert-PrivatePhysicalPath -Path $leaf -TrustedRoot $trusted `
                 -ReparsePointClassifier {
                     param($Candidate)
                     $Candidate.Equals($blocked, [System.StringComparison]::OrdinalIgnoreCase)
                 }
         }
         Assert-Throws -Pattern "escaped its trusted root" -Action {
-            Assert-EasyConPhysicalPath -Path (Join-Path $temporaryRoot "outside.bin") `
+            Assert-PrivatePhysicalPath -Path (Join-Path $temporaryRoot "outside.bin") `
                 -TrustedRoot $trusted -ReparsePointClassifier { $false }
         }
     }
@@ -1058,4 +1491,4 @@ finally {
     }
 }
 
-Write-Output "Windows workspace contracts passed: 19 cases"
+Write-Output "Windows workspace contracts passed: 21 cases"
