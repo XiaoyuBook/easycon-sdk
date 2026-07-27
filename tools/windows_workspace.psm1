@@ -2914,11 +2914,40 @@ function Assert-EasyConRustToolchain {
             throw "frozen Rust component is not installed: $component"
         }
     }
-    $cargo = Get-EasyConCommandPath -Name "cargo.exe"
+    $rustupHomeValue = [Environment]::GetEnvironmentVariable("RUSTUP_HOME", "Process")
+    if ([string]::IsNullOrWhiteSpace($rustupHomeValue)) {
+        throw "RUSTUP_HOME must identify the controlled Rust toolchain root"
+    }
+    $rustupHome = Assert-EasyConPhysicalPath -Path $rustupHomeValue
+    $expectedToolchain = Join-Path $rustupHome (
+        "toolchains/$($Pin.Channel)-$($Pin.Target)"
+    )
+    $expectedCargo = Resolve-EasyConFullPath -Path (Join-Path $expectedToolchain "bin/cargo.exe")
+    Assert-EasyConPhysicalPath -Path $expectedCargo -TrustedRoot $rustupHome | Out-Null
+    $cargoOutput = @(Invoke-EasyConNativeCapture -Program $rustup -Arguments @(
+        "which", "--toolchain", [string]$Pin.Channel, "cargo"
+    ) -Description "frozen Cargo path check")
+    if (
+        $cargoOutput.Count -ne 1 -or
+        [string]$cargoOutput[0] -cne ([string]$cargoOutput[0]).Trim() -or
+        -not [System.IO.Path]::IsPathFullyQualified([string]$cargoOutput[0])
+    ) {
+        throw "rustup must report exactly one absolute Cargo path for the frozen toolchain"
+    }
+    $reportedCargo = Resolve-EasyConFullPath -Path ([string]$cargoOutput[0])
+    if (-not $reportedCargo.Equals(
+        $expectedCargo, [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw "rustup Cargo path escaped or does not match the frozen toolchain: $reportedCargo"
+    }
+    $cargo = Get-EasyConPhysicalFile -Path $reportedCargo -TrustedRoot $rustupHome
+    $cargoVersion = Get-EasyConCargoVersion -CargoPath $cargo `
+        -ExpectedVersion ([string]$Pin.Channel) -ExpectedTarget ([string]$Pin.Target)
     $env:RUSTUP_TOOLCHAIN = [string]$Pin.Channel
     return [pscustomobject]@{
         RustupPath = $rustup
         CargoPath = $cargo
+        CargoVersion = $cargoVersion
         Version = [string]$Pin.Channel
         Target = [string]$Pin.Target
     }
@@ -3112,19 +3141,71 @@ function Install-EasyConVcpkgDependencies {
         "--downloads-root=$downloads",
         "--overlay-triplets=$triplets"
     )
-    for ($attempt = 1; $attempt -le 3; $attempt++) {
-        try {
-            Invoke-EasyConNativeCapture -Program $Vcpkg.Executable -Arguments $arguments `
-                -Description "install verified vcpkg dependencies" `
-                -WorkingDirectory $repository -StreamOutput | Out-Null
-            break
-        }
-        catch {
-            if ($attempt -eq 3) {
-                throw
+    $primaryFailure = $null
+    try {
+        for ($attempt = 1; $attempt -le 3; $attempt++) {
+            try {
+                Invoke-EasyConNativeCapture -Program $Vcpkg.Executable -Arguments $arguments `
+                    -Description "install verified vcpkg dependencies" `
+                    -WorkingDirectory $repository -StreamOutput | Out-Null
+                break
             }
-            if ($RetryDelayMilliseconds -gt 0) {
-                Start-Sleep -Milliseconds $RetryDelayMilliseconds
+            catch {
+                if ($attempt -eq 3) {
+                    throw
+                }
+                if ($RetryDelayMilliseconds -gt 0) {
+                    Start-Sleep -Milliseconds $RetryDelayMilliseconds
+                }
+            }
+        }
+    }
+    catch {
+        $primaryFailure = $_
+        throw
+    }
+    finally {
+        $cleanupFailures = [System.Collections.Generic.List[object]]::new()
+        foreach ($transientTree in @($buildtrees, $packages)) {
+            try {
+                Remove-EasyConTransientBuildTree -Path $transientTree -TrustedRoot $cache
+            }
+            catch {
+                $cleanupFailures.Add([pscustomobject]@{
+                    Failure = $_
+                    Path = $transientTree
+                    Residual = Test-Path -LiteralPath $transientTree
+                })
+            }
+        }
+        if ($cleanupFailures.Count -gt 0) {
+            if ($null -ne $primaryFailure) {
+                for ($index = 0; $index -lt $cleanupFailures.Count; $index++) {
+                    $cleanup = $cleanupFailures[$index]
+                    $primaryFailure.Exception.Data["EasyConVcpkgTransientCleanupFailure$index"] = `
+                        $cleanup.Failure.Exception.ToString()
+                    if ($cleanup.Residual) {
+                        $primaryFailure.Exception.Data["EasyConResidualVcpkgTransientTree$index"] = `
+                            $cleanup.Path
+                    }
+                }
+            }
+            else {
+                $first = $cleanupFailures[0]
+                $diagnostic = [System.IO.IOException]::new(
+                    "vcpkg install succeeded but transient cleanup failed for $($first.Path): $($first.Failure.Exception.Message)",
+                    $first.Failure.Exception
+                )
+                for ($index = 0; $index -lt $cleanupFailures.Count; $index++) {
+                    $cleanup = $cleanupFailures[$index]
+                    $diagnostic.Data["EasyConVcpkgTransientCleanupFailure$index"] = `
+                        $cleanup.Failure.Exception.ToString()
+                    if ($cleanup.Residual) {
+                        $diagnostic.Data["EasyConResidualVcpkgTransientTree$index"] = `
+                            $cleanup.Path
+                    }
+                }
+                throw $diagnostic
             }
         }
     }
@@ -3271,15 +3352,32 @@ function Get-EasyConCargoVersion {
         [string]$CargoPath,
 
         [Parameter(Mandatory)]
-        [string]$ExpectedVersion
+        [string]$ExpectedVersion,
+
+        [string]$ExpectedTarget
     )
 
     $output = @(Invoke-EasyConNativeCapture -Program $CargoPath -Arguments @("--version", "--verbose") `
         -Description "frozen Cargo version check")
-    if ($output[0] -notmatch '^cargo ([0-9]+\.[0-9]+\.[0-9]+) ' -or $Matches[1] -cne $ExpectedVersion) {
+    if (
+        $output.Count -eq 0 -or
+        $output[0] -notmatch '^cargo ([0-9]+\.[0-9]+\.[0-9]+) ' -or
+        $Matches[1] -cne $ExpectedVersion
+    ) {
         throw "Cargo does not match the frozen Rust version $ExpectedVersion"
     }
-    return $Matches[1]
+    $version = $Matches[1]
+    $release = @($output | Where-Object { $_ -cmatch '^release: ' })
+    if ($release.Count -ne 1 -or ($release[0] -split ': ', 2)[1] -cne $ExpectedVersion) {
+        throw "Cargo release does not match the frozen Rust version $ExpectedVersion"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedTarget)) {
+        $host = @($output | Where-Object { $_ -cmatch '^host: ' })
+        if ($host.Count -ne 1 -or ($host[0] -split ': ', 2)[1] -cne $ExpectedTarget) {
+            throw "Cargo host does not match the frozen Rust target $ExpectedTarget"
+        }
+    }
+    return $version
 }
 
 function Install-EasyConCargoSources {
@@ -3606,17 +3704,13 @@ function Install-EasyConWindowsEnvironment {
 
     Install-EasyConVcpkgDependencies -Vcpkg $vcpkg -RepositoryRoot $repository `
         -DownloadsRoot $setupVcpkgDownloads -DownloadsTrustedRoot $cacheStorage `
-        -CacheRoot $cache `
-        -WorkspaceLayout $vcpkgLayout
-    foreach ($transientTree in @($vcpkgLayout.Buildtrees, $vcpkgLayout.Packages)) {
-        Remove-EasyConTransientBuildTree -Path $transientTree -TrustedRoot $cache
-    }
+        -CacheRoot $cache -WorkspaceLayout $vcpkgLayout
     $null = Set-EasyConCargoNativeLinkSearch -InstalledRoot $vcpkgLayout.Installed `
         -CacheRoot $cache
 
     $nativeTree = Get-EasyConTreeFingerprint -Path $vcpkgLayout.Installed -TrustedRoot $cache
 
-    $cargoVersion = Get-EasyConCargoVersion -CargoPath $rust.CargoPath -ExpectedVersion $rust.Version
+    $cargoVersion = $rust.CargoVersion
     $started.Stop()
     $summary = [ordered]@{
         status = "installed"
@@ -4004,8 +4098,7 @@ function Invoke-EasyConWindowsVerifyCore {
     ) {
         throw "Rust tool paths changed since Setup. Rerun Setup."
     }
-    $cargoVersion = Get-EasyConCargoVersion -CargoPath $tools.cargo `
-        -ExpectedVersion ([string]$rustPin.Channel)
+    $cargoVersion = $rust.CargoVersion
     $buildTools = Get-EasyConBuildToolVersions `
         -CMakeMinimumVersion ([version]$stamp.versions.cmake) `
         -NinjaMinimumVersion ([version]$stamp.versions.ninja)
@@ -4111,16 +4204,22 @@ function Invoke-EasyConEnvironmentLifecycle {
                 -TimeoutMilliseconds $LeaseTimeoutMilliseconds
         }
         if ($Mode -ceq "Setup") {
+            $setupVerificationLease = Enter-EasyConSharedCacheLease `
+                -CacheRoot ([string]$Location.CacheRoot) -Access Shared `
+                -TimeoutMilliseconds $LeaseTimeoutMilliseconds
+            $verificationFailure = $null
             try {
-                $setupVerificationLease = Enter-EasyConSharedCacheLease `
-                    -CacheRoot ([string]$Location.CacheRoot) -Access Shared `
-                    -TimeoutMilliseconds $LeaseTimeoutMilliseconds
                 try {
                     $verified = & $VerifyAction
                 }
-                finally {
-                    $setupVerificationLease.Dispose()
+                catch {
+                    $verificationFailure = $_
                 }
+            }
+            finally {
+                $setupVerificationLease.Dispose()
+            }
+            if ($null -eq $verificationFailure) {
                 Write-EasyConStructuredRecord -Kind "setup" -Value ([ordered]@{
                     status = "already-ready"
                     identity = [string]$Location.IdentityKey
@@ -4128,10 +4227,8 @@ function Invoke-EasyConEnvironmentLifecycle {
                 })
                 return $verified
             }
-            catch {
-                if (Test-Path -LiteralPath $Location.EnvironmentRoot) {
-                    Write-Host "Existing prepared environment failed verification and will be rebuilt by Setup: $($_.Exception.Message)"
-                }
+            if (Test-Path -LiteralPath $Location.EnvironmentRoot) {
+                Write-Host "Existing prepared environment failed verification and will be rebuilt by Setup: $($verificationFailure.Exception.Message)"
             }
 
             New-EasyConSafeDirectory -Path $Location.CacheRoot `

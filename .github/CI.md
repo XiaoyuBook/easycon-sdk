@@ -65,7 +65,9 @@ Setup 使用 `vswhere.exe` 加载并核对 VS 2022 x64、MSVC `14.44.35207` 与 
 Rust toolchain、受控 CMake/Ninja、vcpkg scripts/tool/native dependencies、7-Zip 和 OCR 模型。所有下载先按清单
 hash 验证；完成后写入 `environment-stamp.json`，记录 fingerprint、workspace key、工具显式路径与 SHA-256、精确
 版本、Cargo vendor/native tree hash 和资产路径。Cargo crates 由 `Cargo.lock` 与全部 workspace manifests 驱动
-`cargo vendor --locked` 安装到该环境；下载缓存只用于加速生成 vendor tree。重复 Setup 先验证现有 stamp；环境完整时
+`cargo vendor --locked` 安装到该环境；Cargo 只由 rustup 的固定 toolchain `which` 结果解析，且在 vendor 前必须匹配
+受控 Rust home 下的精确 toolchain 路径、release 与 host，ambient PATH 中的 `cargo.exe` 不构成候选。下载缓存只用于
+加速生成 vendor tree。重复 Setup 先验证现有 stamp；环境完整时
 返回 `already-ready`，损坏时只重建该 fingerprint/worktree 的受控环境。vcpkg scripts checkout 只从同卷完整
 staging 目录做原子 rename；Windows sharing violation 使用有限 publish/cleanup 重试。若外部句柄阻止删除，原始
 publish failure 始终是主错误，诊断同时记录 cleanup failure 并把残留 destination 标记为不可用；释放句柄后，下一次
@@ -82,8 +84,9 @@ temporary，完整验证后才原子发布。不同 hash 使用不同锁，同�
 目标副本，损坏时从 blob 修复，因此不为同一 internal tool 发起第二次公网下载。
 vcpkg scripts 按 commit 保存，每次复核 HEAD、cleanliness、tools manifest 与 registry pins，再以无 hardlink 的本地 clone
 物化到当前环境；source downloads 按 scripts commit 持久复用并继续由 vcpkg 自身 hash 合同核验，install 最多做三次有界
-尝试并复用同一 downloads/buildtrees/binary cache。安装成功后删除 transient buildtrees/packages，包括 port source 中的
-合法 reparse/symlink；删除只移除链接本身且不跟随其目标，这些 transient 目录不进入 prepared environment 或 stamp。
+尝试并复用同一 downloads/buildtrees/binary cache。最终成功或失败都删除 transient buildtrees/packages，包括 port source
+中的合法 reparse/symlink；删除只移除链接本身且不跟随其目标，这些 transient 目录不进入 prepared environment 或 stamp。
+若外部句柄阻止 transient cleanup，install 首错保持为主错误并附带 cleanup/residual tree 状态，句柄释放后的 Setup 可恢复。
 OCR 先由原有 Python
 provisioner 精确校验冻结 manifest，再从 SHA-256 blob 物化。`RUSTUP_HOME` 持久复用已安装 components，但由于 Rust
 分发内容没有仓库内 hash pin，每次实际 Setup 仍执行 rustup install/check；install 最多做三次有界尝试并复用 rustup
@@ -106,6 +109,8 @@ repository contracts 与 diff 门禁。缺失、损坏、worktree 不匹配或 f
 复验 stamp 全程持有独占 lease；Verify 持共享 lease；Workspace 的同一个共享 lease 覆盖 Verify 和全部 gates，因而
 Setup 不能与同一环境的读取或构建竞争。共享资产层另有跨 identity reader/writer lease：Setup provision 期间独占，
 Verify/Workspace 从验证到最后一个 gate 共享读取，防止另一 identity 修改 Rust/vcpkg 共享状态。异常路径总是释放 lease。
+Setup 检查 ready 环境前取得共享资产 reader lease；该 lease busy/timeout 时保留 stamp 与环境，原样返回 acquisition failure，
+不进入 Verify failure 的删除/重建路径，也不运行 Setup provision。
 Verify 在启动 gate 前清除 ambient Rust wrapper/compiler、
 Cargo target/linker/registry flags、cc-rs target compiler、`CL`/`_CL_`、MSVC Developer Shell 残留、CMake/package roots、
 vcpkg override 与代理变量，再用 stamp 中核验过的工具绝对路径、pinned Developer Shell include/lib 路径和受控变量重建

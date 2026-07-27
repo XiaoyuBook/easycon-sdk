@@ -69,7 +69,9 @@ pwsh -NoProfile -File tools/run_windows_workspace.ps1 -Mode Workspace
 `Setup` 是可重跑的一次性在线准备步骤，安装并核验固定 Rust toolchain、受控 CMake/Ninja、vcpkg
 scripts/tool/registry/native install tree、7-Zip 与测试 OCR 模型，然后写入包含 fingerprint、显式路径、版本、文件
 hash、Cargo vendor tree hash 和 native tree hash 的 stamp。Setup 使用 `cargo vendor --locked` 把 lockfile 与全部
-workspace manifests 对应的 crate sources 安装进环境。`Verify` 与 `Workspace` 不安装或下载；两者只接受当前
+workspace manifests 对应的 crate sources 安装进环境。Cargo 不从 ambient PATH 解析；rustup 必须先为固定 channel 返回
+受控 Rust home 精确 toolchain 目录中的 `cargo.exe`，Setup 在首次 Cargo 执行前核对该路径、release 与 host。
+`Verify` 与 `Workspace` 不安装或下载；两者只接受当前
 fingerprint 对应且未损坏的 stamp，缺失或失配时要求重新运行 Setup。`Workspace` 在 Verify 后运行完整仓库门禁。
 
 环境目录之外有跨 fingerprint/worktree 的共享资产层。直接固定资产以 SHA-256/SHA-512 内容寻址，命中时每次重验
@@ -83,13 +85,16 @@ stamp、ready 状态和 prepared tree 不进入共享缓存。受控 7-Zip fetch
 最终 `7z.exe` 还需匹配固定 SHA-256 和精确 x64 版本，宿主 PATH 的 `7z.exe`/`7zr.exe` 不构成候选。
 已验证的 CMake/Ninja archive 还会物化到按 scripts commit 隔离的 vcpkg downloads root；每次 Setup 重验目标副本，损坏时
 从内容寻址 blob 修复，vcpkg 不再为同一 internal tool 二次联网。vcpkg install 的短暂失败最多做三次有界尝试，复用
-同一 downloads、buildtrees 与 binary cache；成功后安全删除 transient buildtrees/packages，不把 port source 中合法的
-reparse/symlink 带入最终 prepared tree，且删除不跟随链接目标。
+同一 downloads、buildtrees 与 binary cache；最终成功或失败都安全删除 transient buildtrees/packages，不把 port source
+中合法的 reparse/symlink 带入最终 prepared tree，且删除不跟随链接目标。清理失败时保留 install 首错并附加
+cleanup/residual tree 诊断；外部句柄释放后的 Setup 可自行恢复，通用 prepared-tree reparse 防护不放宽。
 
 同一 fingerprint/worktree identity 使用环境目录外的跨进程 reader/writer lease：Setup 独占 stamp 检查、旧树删除、
 安装、stamp 发布与最终 Verify；普通 Verify 共享读取；Workspace 的共享 lease 从 Verify 连续覆盖到最后一个 gate。
 共享资产层另有跨 identity reader/writer lease，Setup provision 独占，Verify/Workspace 全程共享，避免 Rust/vcpkg
-共享状态与读取中的环境竞争。所有异常路径释放 lease。vcpkg checkout 先在同卷不可见 staging 中完成并验证，再用原子目录 rename 发布；访问冲突
+共享状态与读取中的环境竞争。Setup 的 ready 预检先获取共享资产 reader lease；writer busy/timeout 原样失败并保留
+stamp/环境，不被当成 Verify failure 触发删除或 provision。所有异常路径释放 lease。vcpkg checkout 先在同卷不可见
+staging 中完成并验证，再用原子目录 rename 发布；访问冲突
 只做有限 publish/cleanup 重试。cleanup 成功时删除 partial destination；若外部句柄令删除暂时不可能，则返回以原始
 publish failure 为主、附带 cleanup failure 与残留状态的诊断，且残留绝不视为有效 checkout。句柄释放后，下一次
 Setup 在独占 lease 下删除旧环境树并安全恢复。

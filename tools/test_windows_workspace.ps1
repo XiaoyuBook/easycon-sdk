@@ -1363,6 +1363,188 @@ try {
             "a persistently failing vcpkg install must stop after three attempts"
     }
 
+    Invoke-ContractCase -Name "vcpkg-install-failure-junction-rerun-recovery" -Action {
+        $environment = Join-Path $temporaryRoot "vcpkg failed install recovery environment"
+        $downloads = Join-Path $temporaryRoot "vcpkg failed install recovery downloads"
+        $external = Join-Path $temporaryRoot "vcpkg failed install external target"
+        $layoutRoot = Join-Path $environment "layout"
+        $layout = [pscustomobject]@{
+            Buildtrees = Join-Path $layoutRoot "buildtrees"
+            Packages = Join-Path $layoutRoot "packages"
+            Installed = Join-Path $layoutRoot "installed"
+            ManifestRoot = Join-Path $layoutRoot "manifest"
+        }
+        foreach ($directory in @(
+            $environment,
+            $downloads,
+            $external,
+            $layout.Buildtrees,
+            $layout.Packages,
+            $layout.Installed,
+            $layout.ManifestRoot
+        )) {
+            New-Item -ItemType Directory -Force -Path $directory | Out-Null
+        }
+        $externalMarker = Join-Path $external "keep-external.txt"
+        $installedMarker = Join-Path $layout.Installed "keep-installed.txt"
+        Set-ContractFile -Path $externalMarker -Value "external"
+        Set-ContractFile -Path $installedMarker -Value "installed"
+        $vcpkg = [pscustomobject]@{
+            Executable = Join-Path $environment "contract-vcpkg.exe"
+            Root = Join-Path $environment "vcpkg-root"
+        }
+        New-Item -ItemType Directory -Force -Path $vcpkg.Root | Out-Null
+        $state = [pscustomobject]@{
+            Installs = 0
+            FailInstall = $true
+            RealJunctionsCreated = $false
+        }
+        $capture = {
+            param($Program, $Arguments, $Description, $WorkingDirectory, [switch]$StreamOutput)
+            $null = $Program, $Arguments, $WorkingDirectory, $StreamOutput
+            Assert-Contract ($Description -ceq "install verified vcpkg dependencies") `
+                "the recovery fixture must execute the vcpkg install seam"
+            $state.Installs++
+            if ($state.FailInstall) {
+                foreach ($root in @($layout.Buildtrees, $layout.Packages)) {
+                    $junction = Join-Path $root "hosted-port-source"
+                    if (-not (Test-Path -LiteralPath $junction)) {
+                        New-Item -ItemType Junction -Path $junction -Target $external | Out-Null
+                    }
+                    $item = Get-Item -Force -LiteralPath $junction
+                    Assert-Contract (
+                        ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+                    ) "the failed-install regression fixture must contain a real NTFS junction"
+                }
+                $state.RealJunctionsCreated = $true
+                throw "synthetic failed vcpkg install with hosted junction"
+            }
+            return @()
+        }.GetNewClosure()
+        $parameters = @{
+            Vcpkg = $vcpkg
+            RepositoryRoot = $repository.Path
+            DownloadsRoot = $downloads
+            DownloadsTrustedRoot = $temporaryRoot
+            CacheRoot = $environment
+            WorkspaceLayout = $layout
+            RetryDelayMilliseconds = 0
+        }
+
+        Assert-Throws -Pattern "synthetic failed vcpkg install with hosted junction" -Action {
+            Invoke-PrivateCommandWithNativeCapture `
+                -CommandName "Install-EasyConVcpkgDependencies" -Parameters $parameters `
+                -NativeCapture $capture
+        }
+        Assert-Contract ($state.Installs -eq 3 -and $state.RealJunctionsCreated) `
+            "the failed install must exhaust three attempts with real junction residue"
+        Assert-Contract (Test-Path -LiteralPath $externalMarker -PathType Leaf) `
+            "failed-install cleanup must never follow a junction into its external target"
+        Assert-Contract (Test-Path -LiteralPath $installedMarker -PathType Leaf) `
+            "failed-install transient cleanup must not delete the installed tree"
+
+        $rerunCleanupFailure = $null
+        try {
+            Invoke-PrivateCommand -CommandName "Remove-EasyConSafeTree" -Parameters @{
+                Path = $environment
+                TrustedRoot = $temporaryRoot
+            }
+        }
+        catch {
+            $rerunCleanupFailure = $_
+        }
+        $rerunCleanupDiagnostic = if ($null -eq $rerunCleanupFailure) {
+            "none"
+        }
+        else {
+            $rerunCleanupFailure.Exception.Message
+        }
+        Assert-Contract ($null -eq $rerunCleanupFailure) (
+            "a later Setup must safely remove the failed environment without manual link " +
+            "cleanup; failure=$rerunCleanupDiagnostic"
+        )
+        Assert-Contract (Test-Path -LiteralPath $externalMarker -PathType Leaf) `
+            "later Setup recovery must leave the junction target intact"
+
+        foreach ($directory in @(
+            $environment,
+            $layout.Buildtrees,
+            $layout.Packages,
+            $layout.Installed,
+            $layout.ManifestRoot,
+            $vcpkg.Root
+        )) {
+            New-Item -ItemType Directory -Force -Path $directory | Out-Null
+        }
+        $replacementInstalledMarker = Join-Path $layout.Installed "replacement-installed.txt"
+        Set-ContractFile -Path $replacementInstalledMarker -Value "replacement"
+        $state.FailInstall = $false
+        Invoke-PrivateCommandWithNativeCapture `
+            -CommandName "Install-EasyConVcpkgDependencies" -Parameters $parameters `
+            -NativeCapture $capture | Out-Null
+        Assert-Contract ($state.Installs -eq 4) `
+            "the next Setup must reach and complete its vcpkg install"
+        Assert-Contract (
+            -not (Test-Path -LiteralPath $layout.Buildtrees) -and
+            -not (Test-Path -LiteralPath $layout.Packages)
+        ) "successful rerun must remove both transient vcpkg trees"
+        Assert-Contract (Test-Path -LiteralPath $replacementInstalledMarker -PathType Leaf) `
+            "successful rerun cleanup must preserve the installed tree"
+        Assert-Contract (Test-Path -LiteralPath $externalMarker -PathType Leaf) `
+            "successful rerun must preserve the former junction target"
+
+        foreach ($directory in @($layout.Buildtrees, $layout.Packages)) {
+            New-Item -ItemType Directory -Force -Path $directory | Out-Null
+        }
+        $lockedBuildtree = Join-Path $layout.Buildtrees "locked-output.bin"
+        $lockedHandle = [System.IO.FileStream]::new(
+            $lockedBuildtree,
+            [System.IO.FileMode]::Create,
+            [System.IO.FileAccess]::ReadWrite,
+            [System.IO.FileShare]::None
+        )
+        $state.FailInstall = $true
+        $lockedFailure = $null
+        try {
+            try {
+                Invoke-PrivateCommandWithNativeCapture `
+                    -CommandName "Install-EasyConVcpkgDependencies" -Parameters $parameters `
+                    -NativeCapture $capture | Out-Null
+            }
+            catch {
+                $lockedFailure = $_
+            }
+            Assert-Contract ($null -ne $lockedFailure) `
+                "a failed install with locked transient output must remain a failure"
+            Assert-Contract (
+                $lockedFailure.Exception.Message -match
+                    "synthetic failed vcpkg install with hosted junction"
+            ) "transient cleanup failure must not replace the vcpkg install primary error"
+            Assert-Contract (
+                $lockedFailure.Exception.Data.Contains(
+                    "EasyConVcpkgTransientCleanupFailure0"
+                ) -and
+                $lockedFailure.Exception.Data.Contains(
+                    "EasyConResidualVcpkgTransientTree0"
+                ) -and
+                [string]$lockedFailure.Exception.Data[
+                    "EasyConResidualVcpkgTransientTree0"
+                ] -ceq $layout.Buildtrees
+            ) "locked transient cleanup must attach failure and residual-tree diagnostics"
+            Assert-Contract (Test-Path -LiteralPath $replacementInstalledMarker -PathType Leaf) `
+                "cleanup failure must not delete the installed tree"
+            Assert-Contract (Test-Path -LiteralPath $externalMarker -PathType Leaf) `
+                "cleanup failure must not follow a junction target"
+        }
+        finally {
+            $lockedHandle.Dispose()
+        }
+        Remove-PrivateTransientBuildTree -Path $layout.Buildtrees -TrustedRoot $environment
+        Remove-PrivateTransientBuildTree -Path $layout.Packages -TrustedRoot $environment
+        Assert-Contract (Test-Path -LiteralPath $externalMarker -PathType Leaf) `
+            "released cleanup recovery must still preserve the external target"
+    }
+
     Invoke-ContractCase -Name "shared-vcpkg-scripts-revalidate-across-identities" -Action {
         $sharedRoot = Join-Path $temporaryRoot "shared vcpkg source cache"
         $commit = "a" * 40
@@ -1499,18 +1681,219 @@ try {
             "the mocked pinned vcpkg checkout must publish atomically"
     }
 
+    Invoke-ContractCase -Name "pinned-cargo-source-rejects-ambient-path-contamination" -Action {
+        $pin = [pscustomobject]@{
+            Channel = "1.97.1"
+            Target = "x86_64-pc-windows-msvc"
+            Components = @("clippy", "rustfmt")
+        }
+        $rustupHome = Join-Path $temporaryRoot "cargo provenance rustup home"
+        $controlledCargo = Join-Path $rustupHome (
+            "toolchains/1.97.1-x86_64-pc-windows-msvc/bin/cargo.exe"
+        )
+        $ambientDirectory = Join-Path $temporaryRoot "ambient cargo contamination"
+        $ambientCargo = Join-Path $ambientDirectory "cargo.exe"
+        foreach ($path in @($controlledCargo, $ambientCargo)) {
+            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $path) | Out-Null
+            Copy-Item -LiteralPath (Join-Path $PSHOME "pwsh.exe") -Destination $path
+        }
+        $vendorEnvironment = Join-Path $temporaryRoot "cargo provenance environment"
+        $vendorDownloads = Join-Path $temporaryRoot "cargo provenance downloads"
+        New-Item -ItemType Directory -Force -Path $vendorEnvironment, $vendorDownloads | Out-Null
+        $state = [pscustomobject]@{
+            CargoWhichPath = $controlledCargo
+            CargoVersion = "1.97.1"
+            RustRelease = "1.97.1"
+            RustHost = "x86_64-pc-windows-msvc"
+            Targets = @("x86_64-pc-windows-msvc")
+            Components = @(
+                "clippy-x86_64-pc-windows-msvc (installed)",
+                "rustfmt-x86_64-pc-windows-msvc (installed)"
+            )
+            CargoWhichFailure = $false
+            AmbientExecutions = 0
+            VendorProgram = $null
+            Events = [System.Collections.Generic.List[string]]::new()
+        }
+        $capture = {
+            param($Program, $Arguments, $Description, $WorkingDirectory, [switch]$StreamOutput)
+            $null = $WorkingDirectory, $StreamOutput
+            if ($Program.Equals($ambientCargo, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $state.AmbientExecutions++
+            }
+            switch ($Description) {
+                "frozen rustc version check" {
+                    $state.Events.Add("rustc") | Out-Null
+                    return @(
+                        "rustc $($state.RustRelease) (contract)",
+                        "binary: rustc",
+                        "host: $($state.RustHost)",
+                        "release: $($state.RustRelease)"
+                    )
+                }
+                "frozen Rust target check" {
+                    $state.Events.Add("targets") | Out-Null
+                    return @($state.Targets)
+                }
+                "frozen Rust component check" {
+                    $state.Events.Add("components") | Out-Null
+                    return @($state.Components)
+                }
+                "frozen Cargo path check" {
+                    $state.Events.Add("cargo-which") | Out-Null
+                    if ($state.CargoWhichFailure) {
+                        throw "synthetic missing frozen rustup toolchain"
+                    }
+                    return $state.CargoWhichPath
+                }
+                "frozen Cargo version check" {
+                    $state.Events.Add("cargo-version") | Out-Null
+                    return @(
+                        "cargo $($state.CargoVersion) (contract 2026-01-01)",
+                        "release: $($state.CargoVersion)",
+                        "host: x86_64-pc-windows-msvc"
+                    )
+                }
+                "install locked Cargo sources" {
+                    $state.Events.Add("cargo-vendor") | Out-Null
+                    $state.VendorProgram = $Program
+                    $vendorRoot = [string]$Arguments[-1]
+                    New-Item -ItemType Directory -Force -Path $vendorRoot | Out-Null
+                    Set-ContractFile -Path (Join-Path $vendorRoot "contract-crate/Cargo.toml") `
+                        -Value "[package]`nname='contract-crate'`nversion='1.0.0'"
+                    return @()
+                }
+                default {
+                    throw "unexpected Cargo provenance native capture: $Description"
+                }
+            }
+        }.GetNewClosure()
+        $savedPath = [Environment]::GetEnvironmentVariable("PATH", "Process")
+        $savedRustupHome = [Environment]::GetEnvironmentVariable("RUSTUP_HOME", "Process")
+        $savedToolchain = [Environment]::GetEnvironmentVariable("RUSTUP_TOOLCHAIN", "Process")
+        try {
+            $env:PATH = $ambientDirectory + [System.IO.Path]::PathSeparator + $savedPath
+            $env:RUSTUP_HOME = $rustupHome
+            $rust = Invoke-PrivateCommandWithNativeCapture `
+                -CommandName "Assert-EasyConRustToolchain" -Parameters @{ Pin = $pin } `
+                -NativeCapture $capture
+            Invoke-PrivateCommandWithNativeCapture `
+                -CommandName "Install-EasyConCargoSources" -Parameters @{
+                    CargoPath = $rust.CargoPath
+                    RepositoryRoot = $repository.Path
+                    EnvironmentRoot = $vendorEnvironment
+                    DownloadCacheRoot = $vendorDownloads
+                } -NativeCapture $capture | Out-Null
+            Invoke-PrivateCommandWithNativeCapture `
+                -CommandName "Get-EasyConCargoVersion" -Parameters @{
+                    CargoPath = $rust.CargoPath
+                    ExpectedVersion = $pin.Channel
+                } -NativeCapture $capture | Out-Null
+
+            $cargoWhichIndex = $state.Events.IndexOf("cargo-which")
+            $cargoVersionIndex = $state.Events.IndexOf("cargo-version")
+            $cargoVendorIndex = $state.Events.IndexOf("cargo-vendor")
+            Assert-Contract (
+                $rust.CargoPath.Equals(
+                    $controlledCargo, [System.StringComparison]::OrdinalIgnoreCase
+                ) -and
+                $state.AmbientExecutions -eq 0 -and
+                $state.VendorProgram.Equals(
+                    $controlledCargo, [System.StringComparison]::OrdinalIgnoreCase
+                ) -and
+                $cargoWhichIndex -ge 0 -and
+                $cargoVersionIndex -gt $cargoWhichIndex -and
+                $cargoVendorIndex -gt $cargoVersionIndex
+            ) (
+                "Cargo must be resolved and version-checked from the pinned rustup toolchain " +
+                "before vendor; CargoPath=$($rust.CargoPath) AmbientExecutions=" +
+                "$($state.AmbientExecutions) Events=$($state.Events -join ',')"
+            )
+
+            $state.CargoWhichFailure = $true
+            Assert-Throws -Pattern "missing frozen rustup toolchain" -Action {
+                Invoke-PrivateCommandWithNativeCapture `
+                    -CommandName "Assert-EasyConRustToolchain" -Parameters @{ Pin = $pin } `
+                    -NativeCapture $capture
+            }
+            $state.CargoWhichFailure = $false
+
+            $state.CargoWhichPath = $ambientCargo
+            Assert-Throws -Pattern "escaped|frozen toolchain" -Action {
+                Invoke-PrivateCommandWithNativeCapture `
+                    -CommandName "Assert-EasyConRustToolchain" -Parameters @{ Pin = $pin } `
+                    -NativeCapture $capture
+            }
+            $state.CargoWhichPath = $controlledCargo
+
+            $state.CargoVersion = "1.96.0"
+            Assert-Throws -Pattern "Cargo.*frozen Rust version" -Action {
+                Invoke-PrivateCommandWithNativeCapture `
+                    -CommandName "Assert-EasyConRustToolchain" -Parameters @{ Pin = $pin } `
+                    -NativeCapture $capture
+            }
+            $state.CargoVersion = "1.97.1"
+
+            $state.RustRelease = "1.96.0"
+            Assert-Throws -Pattern "rustc.*frozen channel" -Action {
+                Invoke-PrivateCommandWithNativeCapture `
+                    -CommandName "Assert-EasyConRustToolchain" -Parameters @{ Pin = $pin } `
+                    -NativeCapture $capture
+            }
+            $state.RustRelease = "1.97.1"
+
+            $state.RustHost = "x86_64-unknown-linux-gnu"
+            Assert-Throws -Pattern "rustc host.*frozen Windows target" -Action {
+                Invoke-PrivateCommandWithNativeCapture `
+                    -CommandName "Assert-EasyConRustToolchain" -Parameters @{ Pin = $pin } `
+                    -NativeCapture $capture
+            }
+            $state.RustHost = "x86_64-pc-windows-msvc"
+
+            $state.Targets = @()
+            Assert-Throws -Pattern "Rust target is not installed" -Action {
+                Invoke-PrivateCommandWithNativeCapture `
+                    -CommandName "Assert-EasyConRustToolchain" -Parameters @{ Pin = $pin } `
+                    -NativeCapture $capture
+            }
+            $state.Targets = @("x86_64-pc-windows-msvc")
+
+            $state.Components = @("clippy-x86_64-pc-windows-msvc (installed)")
+            Assert-Throws -Pattern "Rust component is not installed: rustfmt" -Action {
+                Invoke-PrivateCommandWithNativeCapture `
+                    -CommandName "Assert-EasyConRustToolchain" -Parameters @{ Pin = $pin } `
+                    -NativeCapture $capture
+            }
+            Assert-Contract ($state.AmbientExecutions -eq 0) `
+                "all rejected Rust/Cargo states must fail before ambient cargo execution"
+        }
+        finally {
+            [Environment]::SetEnvironmentVariable("PATH", $savedPath, "Process")
+            [Environment]::SetEnvironmentVariable("RUSTUP_HOME", $savedRustupHome, "Process")
+            [Environment]::SetEnvironmentVariable("RUSTUP_TOOLCHAIN", $savedToolchain, "Process")
+        }
+    }
+
     Invoke-ContractCase -Name "shared-rust-toolchain-retains-rustup-validation" -Action {
         $pin = [pscustomobject]@{
             Channel = "1.97.1"
             Target = "x86_64-pc-windows-msvc"
             Components = @("clippy", "rustfmt")
         }
+        $rustupHome = Join-Path $temporaryRoot "shared Rust contract home"
+        $cargoPath = Join-Path $rustupHome (
+            "toolchains/1.97.1-x86_64-pc-windows-msvc/bin/cargo.exe"
+        )
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $cargoPath) | Out-Null
+        Copy-Item -LiteralPath (Join-Path $PSHOME "pwsh.exe") -Destination $cargoPath
         $state = [pscustomobject]@{
             Installs = 0
             FailuresRemaining = 2
             RustcChecks = 0
             TargetChecks = 0
             ComponentChecks = 0
+            CargoPathChecks = 0
+            CargoVersionChecks = 0
         }
         $capture = {
             param($Program, $Arguments, $Description, $WorkingDirectory, $StreamOutput)
@@ -1536,6 +1919,18 @@ try {
                         "rustfmt-x86_64-pc-windows-msvc (installed)"
                     )
                 }
+                "frozen Cargo path check" {
+                    $state.CargoPathChecks++
+                    return $cargoPath
+                }
+                "frozen Cargo version check" {
+                    $state.CargoVersionChecks++
+                    return @(
+                        "cargo 1.97.1 (contract 2026-01-01)",
+                        "release: 1.97.1",
+                        "host: x86_64-pc-windows-msvc"
+                    )
+                }
                 "install frozen Rust toolchain" {
                     $state.Installs++
                     if ($state.FailuresRemaining -gt 0) {
@@ -1550,7 +1945,9 @@ try {
             }
         }.GetNewClosure()
         $savedToolchain = [Environment]::GetEnvironmentVariable("RUSTUP_TOOLCHAIN", "Process")
+        $savedRustupHome = [Environment]::GetEnvironmentVariable("RUSTUP_HOME", "Process")
         try {
+            $env:RUSTUP_HOME = $rustupHome
             $parameters = @{ Pin = $pin; RetryDelayMilliseconds = 0 }
             Invoke-PrivateCommandWithNativeCapture `
                 -CommandName "Install-EasyConRustToolchain" -Parameters $parameters `
@@ -1562,7 +1959,9 @@ try {
                 $state.Installs -eq 4 -and
                 $state.RustcChecks -eq 2 -and
                 $state.TargetChecks -eq 2 -and
-                $state.ComponentChecks -eq 2
+                $state.ComponentChecks -eq 2 -and
+                $state.CargoPathChecks -eq 2 -and
+                $state.CargoVersionChecks -eq 2
             ) "Rust retries must resume before each successful Setup revalidates shared state"
 
             $state.FailuresRemaining = 99
@@ -1577,6 +1976,9 @@ try {
         finally {
             [Environment]::SetEnvironmentVariable(
                 "RUSTUP_TOOLCHAIN", $savedToolchain, "Process"
+            )
+            [Environment]::SetEnvironmentVariable(
+                "RUSTUP_HOME", $savedRustupHome, "Process"
             )
         }
     }
@@ -2374,4 +2776,4 @@ finally {
     }
 }
 
-Write-Output "Windows workspace contracts passed: 32 cases"
+Write-Output "Windows workspace contracts passed: 34 cases"

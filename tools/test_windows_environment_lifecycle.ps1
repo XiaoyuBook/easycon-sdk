@@ -103,6 +103,39 @@ function Assert-EnvironmentSnapshot {
     }
 }
 
+function Wait-ContractFileCreated {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [int]$TimeoutMilliseconds = 10000
+    )
+
+    if (Test-Path -LiteralPath $Path -PathType Leaf) {
+        return
+    }
+    $parent = Split-Path -Parent $Path
+    $watcher = [System.IO.FileSystemWatcher]::new($parent, (Split-Path -Leaf $Path))
+    try {
+        $watcher.NotifyFilter = [System.IO.NotifyFilters]::FileName
+        $watcher.EnableRaisingEvents = $true
+        if (Test-Path -LiteralPath $Path -PathType Leaf) {
+            return
+        }
+        $change = $watcher.WaitForChanged(
+            [System.IO.WatcherChangeTypes]::Created,
+            $TimeoutMilliseconds
+        )
+        Assert-Contract (
+            -not $change.TimedOut -and
+            (Test-Path -LiteralPath $Path -PathType Leaf)
+        ) "timed out waiting for synchronized contract file $Path"
+    }
+    finally {
+        $watcher.Dispose()
+    }
+}
+
 $modulePath = Join-Path $PSScriptRoot "windows_workspace.psm1"
 $temporaryRoot = Join-Path ([System.IO.Path]::GetTempPath()) (
     "easycon lifecycle contract {0}" -f [guid]::NewGuid().ToString("N")
@@ -326,6 +359,214 @@ try {
     Assert-Sequence -Actual $events.ToArray() -Expected @("verify") `
         -Description "already-ready Setup must not provision again"
 
+    $readyMarker = Join-Path $environmentRoot "ready-preserved.txt"
+    Set-Content -LiteralPath $readyMarker -Value "preserve" -Encoding utf8NoBOM
+    $readyLeaseState = [pscustomobject]@{ SetupCalls = 0; VerifyCalls = 0 }
+    $writerLease = Enter-PrivateSharedCacheLease -CacheRoot $location.CacheRoot `
+        -Access Exclusive -TimeoutMilliseconds 0
+    try {
+        $expectedBusy = $null
+        try {
+            Enter-PrivateSharedCacheLease -CacheRoot $location.CacheRoot -Access Shared `
+                -TimeoutMilliseconds 0 | Out-Null
+        }
+        catch {
+            $expectedBusy = $_
+        }
+        Assert-Contract ($null -ne $expectedBusy) `
+            "the regression fixture must hold the shared-cache writer lease"
+
+        $actualBusy = $null
+        try {
+            Invoke-PrivateEnvironmentLifecycle -Mode Setup -Location $location `
+                -SetupAction {
+                    $readyLeaseState.SetupCalls++
+                }.GetNewClosure() -VerifyAction {
+                    $readyLeaseState.VerifyCalls++
+                    return "verified"
+                }.GetNewClosure() -WorkspaceAction { param($Summary) } `
+                -LeaseTimeoutMilliseconds 0 | Out-Null
+        }
+        catch {
+            $actualBusy = $_
+        }
+        Assert-Contract ($null -ne $actualBusy) `
+            "ready Setup must report shared-cache lease contention"
+        Assert-Contract ($actualBusy.Exception.Message -ceq $expectedBusy.Exception.Message) `
+            "ready Setup must preserve the original shared-cache busy diagnostic"
+        $stampExists = Test-Path -LiteralPath $location.StampPath -PathType Leaf
+        $markerExists = Test-Path -LiteralPath $readyMarker -PathType Leaf
+        $readyStatePreserved = (
+            $stampExists -and
+            (Get-Content -Raw -LiteralPath $location.StampPath).Trim() -ceq "ready" -and
+            $markerExists -and
+            (Get-Content -Raw -LiteralPath $readyMarker).Trim() -ceq "preserve"
+        )
+        Assert-Contract (
+            $readyLeaseState.VerifyCalls -eq 0 -and
+            $readyLeaseState.SetupCalls -eq 0 -and
+            $readyStatePreserved
+        ) (
+            "shared-cache contention must preserve ready state without verification or " +
+            "provision; VerifyCalls=$($readyLeaseState.VerifyCalls) " +
+            "SetupCalls=$($readyLeaseState.SetupCalls) StampExists=$stampExists " +
+            "MarkerExists=$markerExists"
+        )
+    }
+    finally {
+        $writerLease.Dispose()
+    }
+
+    $waitProbeRoot = Join-Path $temporaryRoot "shared cache wait probe"
+    $waitEnvironment = Join-Path $waitProbeRoot "environment"
+    $waitStamp = Join-Path $waitEnvironment "environment-stamp.json"
+    $waitMarker = Join-Path $waitEnvironment "ready-preserved.txt"
+    $busyObserved = Join-Path $waitProbeRoot "busy-observed.txt"
+    $waitingObserved = Join-Path $waitProbeRoot "waiting-observed.txt"
+    $waitResult = Join-Path $waitProbeRoot "result.txt"
+    New-Item -ItemType Directory -Force -Path $waitEnvironment | Out-Null
+    Set-Content -LiteralPath $waitStamp -Value "ready" -Encoding utf8NoBOM
+    Set-Content -LiteralPath $waitMarker -Value "preserve" -Encoding utf8NoBOM
+    $waitChild = Join-Path $waitProbeRoot "wait-child.ps1"
+    Set-Content -LiteralPath $waitChild -Encoding utf8NoBOM -Value @'
+param(
+    [Parameter(Mandatory)][string]$ModulePath,
+    [Parameter(Mandatory)][string]$CacheRoot,
+    [Parameter(Mandatory)][string]$EnvironmentRoot,
+    [Parameter(Mandatory)][string]$StampPath,
+    [Parameter(Mandatory)][string]$ReadyMarker,
+    [Parameter(Mandatory)][string]$BusyObserved,
+    [Parameter(Mandatory)][string]$WaitingObserved,
+    [Parameter(Mandatory)][string]$ResultPath
+)
+$ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
+Import-Module -Name $ModulePath -Force
+$module = Get-Module windows_workspace
+$location = [pscustomobject]@{
+    CacheRoot = $CacheRoot
+    EnvironmentRoot = $EnvironmentRoot
+    StampPath = $StampPath
+    LockPath = Join-Path $CacheRoot "locks/wait-probe.lock"
+    IdentityKey = "wait-probe"
+    WorkspaceKey = "wait-probe-workspace"
+}
+$state = [pscustomobject]@{ SetupCalls = 0; VerifyCalls = 0 }
+$setup = { $state.SetupCalls++ }.GetNewClosure()
+$verify = {
+    $state.VerifyCalls++
+    if (
+        -not (Test-Path -LiteralPath $StampPath -PathType Leaf) -or
+        (Get-Content -Raw -LiteralPath $StampPath).Trim() -cne "ready"
+    ) {
+        throw "wait probe environment is not ready"
+    }
+    return "verified"
+}.GetNewClosure()
+$invokeLifecycle = {
+    param([int]$Timeout)
+    & $module {
+        param($OwnedLocation, $SetupAction, $VerifyAction, $LeaseTimeout)
+        Invoke-EasyConEnvironmentLifecycle -Mode Setup -Location $OwnedLocation `
+            -SetupAction $SetupAction -VerifyAction $VerifyAction `
+            -WorkspaceAction { param($Summary) } `
+            -LeaseTimeoutMilliseconds $LeaseTimeout
+    } $location $setup $verify $Timeout
+}.GetNewClosure()
+$expectedBusy = $null
+try {
+    & $module {
+        param($Root)
+        Enter-EasyConSharedCacheLease -CacheRoot $Root -Access Shared `
+            -TimeoutMilliseconds 0 -RetryMilliseconds 0
+    } $CacheRoot | ForEach-Object { $_.Dispose() }
+}
+catch {
+    $expectedBusy = $_
+}
+if ($null -eq $expectedBusy) {
+    throw "wait probe did not observe the held writer lease"
+}
+$actualBusy = $null
+try {
+    & $invokeLifecycle 0 | Out-Null
+}
+catch {
+    $actualBusy = $_
+}
+if (
+    $null -eq $actualBusy -or
+    $actualBusy.Exception.Message -cne $expectedBusy.Exception.Message -or
+    $state.SetupCalls -ne 0 -or
+    $state.VerifyCalls -ne 0 -or
+    -not (Test-Path -LiteralPath $ReadyMarker -PathType Leaf)
+) {
+    throw "wait probe timeout mutated ready state or changed the busy diagnostic"
+}
+[System.IO.File]::WriteAllText($BusyObserved, "busy", [System.Text.UTF8Encoding]::new($false))
+[System.IO.File]::WriteAllText($WaitingObserved, "waiting", [System.Text.UTF8Encoding]::new($false))
+& $invokeLifecycle 10000 | Out-Null
+if (
+    $state.SetupCalls -ne 0 -or
+    $state.VerifyCalls -ne 1 -or
+    -not (Test-Path -LiteralPath $ReadyMarker -PathType Leaf)
+) {
+    throw "wait probe did not resume as already-ready after writer release"
+}
+[System.IO.File]::WriteAllText($ResultPath, "passed", [System.Text.UTF8Encoding]::new($false))
+'@
+    $waitWriter = Enter-PrivateSharedCacheLease -CacheRoot $location.CacheRoot `
+        -Access Exclusive -TimeoutMilliseconds 0
+    $waitProcess = $null
+    try {
+        $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+        $startInfo.FileName = Join-Path $PSHOME "pwsh.exe"
+        $startInfo.UseShellExecute = $false
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        foreach ($argument in @(
+            "-NoLogo", "-NoProfile", "-File", $waitChild,
+            "-ModulePath", $modulePath,
+            "-CacheRoot", $location.CacheRoot,
+            "-EnvironmentRoot", $waitEnvironment,
+            "-StampPath", $waitStamp,
+            "-ReadyMarker", $waitMarker,
+            "-BusyObserved", $busyObserved,
+            "-WaitingObserved", $waitingObserved,
+            "-ResultPath", $waitResult
+        )) {
+            $startInfo.ArgumentList.Add([string]$argument)
+        }
+        $waitProcess = [System.Diagnostics.Process]::Start($startInfo)
+        Wait-ContractFileCreated -Path $busyObserved
+        Wait-ContractFileCreated -Path $waitingObserved
+        Assert-Contract (-not $waitProcess.WaitForExit(250)) `
+            "the synchronized contender must still be waiting while the writer lease is held"
+        $waitWriter.Dispose()
+        $waitWriter = $null
+        Assert-Contract ($waitProcess.WaitForExit(10000)) `
+            "the synchronized contender must finish after the writer lease is released"
+        $waitOutput = $waitProcess.StandardOutput.ReadToEnd()
+        $waitError = $waitProcess.StandardError.ReadToEnd()
+        Assert-Contract (
+            $waitProcess.ExitCode -eq 0 -and
+            (Test-Path -LiteralPath $waitResult -PathType Leaf) -and
+            (Get-Content -Raw -LiteralPath $waitResult).Trim() -ceq "passed"
+        ) "shared-cache waiter failed after release; output=$waitOutput error=$waitError"
+    }
+    finally {
+        if ($null -ne $waitWriter) {
+            $waitWriter.Dispose()
+        }
+        if ($null -ne $waitProcess) {
+            if (-not $waitProcess.HasExited) {
+                $waitProcess.Kill($true)
+                $waitProcess.WaitForExit()
+            }
+            $waitProcess.Dispose()
+        }
+    }
+
     Set-Content -LiteralPath $location.StampPath -Value "damaged" -Encoding utf8NoBOM
     Set-Content -LiteralPath (Join-Path $environmentRoot "stale.txt") `
         -Value "stale" -Encoding utf8NoBOM
@@ -525,4 +766,4 @@ finally {
     }
 }
 
-Write-Output "Windows environment lifecycle contracts passed: 17 cases"
+Write-Output "Windows environment lifecycle contracts passed: 19 cases"

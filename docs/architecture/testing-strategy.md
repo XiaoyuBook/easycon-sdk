@@ -435,7 +435,9 @@ SLO 在专用、固定电源策略的测试机测量；O-04 依据首轮数据�
 
 Windows 环境生命周期另有无网络轻量合同：首次 Setup、`already-ready`、损坏重建、Setup 中断后恢复、
 Setup-vs-Setup/Verify/Workspace ownership、Verify 失败时 gate 零启动，以及 Workspace 从 Verify 到全部 gates 持共享
-lease。环境测试必须启动真实子进程证明 ambient compiler/wrapper、target compiler/linker、MSVC include/lib、
+lease。ready 环境与另一 identity 的 shared-cache writer 竞争必须分别覆盖 timeout 与等待后成功：timeout 原样返回 busy、
+Verify/Setup 调用均为零且 stamp/marker 保留；等待测试用真实子进程与同步 marker 释放 writer，不用随机 sleep。
+环境测试必须启动真实子进程证明 ambient compiler/wrapper、target compiler/linker、MSVC include/lib、
 CMake/package-root/vcpkg/proxy 未被继承；vcpkg publish 测试通过注入访问冲突证明有限重试、partial destination
 可清理时的回滚，以及文件被独占句柄锁定时保留 publish 首错、附加 cleanup 状态并在句柄释放后恢复，不使用随机
 sleep。生命周期合同还必须证明普通 Import 后完整 exported function set exact 等于 Setup/Verify/Workspace，所有 helper
@@ -455,14 +457,17 @@ hash fail closed；不同 hash 的发布锁可并行且同一 hash 跨 identity 
 已验证 blob。vcpkg scripts 命中每次复核且不执行 install/fetch seam，损坏 checkout 隔离重建。7-Zip 合同在宿主 PATH
 同时放入兼容和不兼容 `7z.exe` 时仍只接受空 PATH fetch 返回的清单派生路径，并核对最终 executable hash/精确 x64
 版本。Rust 合同明确保留每次 rustup install/check 及 release/host/target/components 复核，证明 transient install 可在第三次
-有界尝试恢复且持续失败恰在三次后关闭，不能把未 hash 固定的 PR cache 降级为仅信任自报版本。Required CI workflow
+有界尝试恢复且持续失败恰在三次后关闭，不能把未 hash 固定的 PR cache 降级为仅信任自报版本。Cargo provenance 合同
+在 PATH 前置可伪报正确版本的无关 `cargo.exe`，要求 rustup `which` 的固定 toolchain 路径、release、host、target/components
+全部在 vendor 前通过，并覆盖缺失 toolchain、路径逃逸与错误版本；ambient fake 的执行计数必须为零。Required CI workflow
 合同对 PR/main cache namespace、restore 顺序、save 条件、缓存路径和 key
 实施 mutation tests，保证 PR 缓存不能写入或被 trusted main 读取，且 environment/stamp 不进入 Actions cache。
 受控 CMake/Ninja 合同还必须在阻断网络时证明 archive 预填到 commit-scoped vcpkg downloads，跨 environment 命中不下载，
 且损坏的目标副本可从重新核验的 blob 修复。vcpkg install 合同精确核对 commit-scoped downloads 参数，证明第三次尝试
-可恢复且持续失败恰在三次后关闭。hosted port source 可包含合法 reparse/symlink，因此合同还要用指向 trusted root 外部
-marker 的真实 junction 证明成功后删除 transient buildtrees/packages 时只删除链接、不跟随目标；普通 prepared path 的
-reparse fail-closed 合同保持不变。
+可恢复且持续失败恰在三次后关闭。hosted port source 可包含合法 reparse/symlink，因此合同要在失败 install 的
+buildtrees/packages 中创建指向 trusted root 外部 marker 的真实 junction，证明失败 cleanup、后续 Setup recovery 与成功
+cleanup 都只删除 transient link/tree、不跟随目标或误删 installed tree；真实独占句柄还要证明 install 首错与
+cleanup/residual 诊断并存。普通 prepared path 的 reparse fail-closed 合同保持不变。
 
 无论变更类型，都必须确认 `EasyCon/` 仍被根 `.gitignore` 忽略、第三方参考源码没有改动，且外层 tracked
 文件没有引入 `EasyCon/` 内容或项目依赖。
