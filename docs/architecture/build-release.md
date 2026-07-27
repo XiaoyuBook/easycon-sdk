@@ -97,6 +97,8 @@ native command/gate 会在 cwd cleanup 前把非零退出登记为主错误；�
 Cargo/vcpkg cache 只提速，cache miss 不改变正确性合同。本职责拆分不是离线构建承诺，开发电脑与首次 CI Setup
 允许联网。PowerShell、Git、Python、rustup、VS Installer/vswhere 与 VS Build Tools 是运行 Setup 所需的宿主启动条件；
 Setup 会把实际解析到的可执行文件路径和 SHA-256 写入 stamp，日常 Verify 不会回退到另一个系统工具。
+宿主 Python minimum 固定为 `3.8.0` 并以 `System.Version` 数值语义比较，因而 hosted runner 的 Python `3.12.x`
+是满足要求的启动宿主；这与 SDK Python binding 的 `3.10+` 产品支持目标是不同合同。
 
 ## 3. 单一原生构建
 

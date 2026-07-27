@@ -2574,7 +2574,7 @@ function Get-EasyConPythonVersion {
     $python = Get-EasyConCommandPath -Name "python.exe"
     $output = @(Invoke-EasyConNativeCapture -Program $python -Arguments @("--version") `
         -Description "Python version check")
-    if ($output[0] -notmatch '^Python ([0-9]+)\.([0-9]+)\.([0-9]+)') {
+    if ($output[0] -notmatch '^Python ([0-9]+)\.([0-9]+)\.([0-9]+)$') {
         throw "Python returned an unrecognized version string"
     }
     $version = [version]::new([int]$Matches[1], [int]$Matches[2], [int]$Matches[3])
@@ -2583,7 +2583,7 @@ function Get-EasyConPythonVersion {
     }
     return [pscustomobject]@{
         Path = $python
-        Version = $version.ToString()
+        Version = $version
     }
 }
 
@@ -2668,7 +2668,10 @@ function Install-EasyConWindowsEnvironment {
         throw "controlled CMake and Ninja must exactly match windows_build_environment.json"
     }
     $python = Get-EasyConPythonVersion
-    if ($python.Version -lt [version]$configuration.hostTools.pythonMinimumVersion) {
+    $pythonMinimumVersion = ConvertTo-EasyConStrictVersion `
+        -Value ([string]$configuration.hostTools.pythonMinimumVersion) `
+        -Description "Python minimum version"
+    if ($python.Version -lt $pythonMinimumVersion) {
         throw "Python $($python.Version) is older than the pinned minimum $($configuration.hostTools.pythonMinimumVersion)"
     }
     $git = Get-EasyConCommandPath -Name "git.exe"
@@ -2810,7 +2813,7 @@ function Install-EasyConWindowsEnvironment {
         cargoVendorFiles = $cargoSources.VendorTree.Files
         cargoVendorSha256 = $cargoSources.VendorTree.Sha256
         pythonPath = $python.Path
-        python = $python.Version
+        python = $python.Version.ToString()
         gitPath = $git
         pwshPath = $pwsh
         msvcTools = $msvc.Tools

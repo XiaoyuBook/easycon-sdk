@@ -446,6 +446,8 @@ alias duplicate 与 `.` component，并要求在 provision 前拒绝；Python gu
 首错、cleanup/residual 诊断、最终 destination 不可见和句柄释放后的恢复。
 cwd cleanup 合同由真实子 `pwsh` 删除 caller 原目录后分别 exit 42/43，证明 native 输出/描述和 gate 名称/退出码保持主错误，
 location restore failure 仅为附加 Data；exit 0 对照则证明没有更早主错误时 restore failure 仍直接失败。
+Setup 宿主版本合同通过注入 Python `--version` 输出覆盖 `3.12.10`、`3.10.x`、`3.8.0`、`3.7.99` 与非法格式，
+证明 minimum 比较使用 `System.Version` 数值语义且不依赖测试机当前 Python 版本。
 
 无论变更类型，都必须确认 `EasyCon/` 仍被根 `.gitignore` 忽略、第三方参考源码没有改动，且外层 tracked
 文件没有引入 `EasyCon/` 内容或项目依赖。

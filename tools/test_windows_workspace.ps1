@@ -575,6 +575,42 @@ try {
         }
     }
 
+    Invoke-ContractCase -Name "python-version-comparison-uses-numeric-semantics" -Action {
+        $minimum = [version]"3.8.0"
+        foreach ($accepted in @("3.12.10", "3.10.14", "3.8.0")) {
+            $versionOutput = "Python $accepted"
+            $capture = {
+                param($Program, $Arguments, $Description, $WorkingDirectory, $StreamOutput)
+                $null = $Program, $Arguments, $Description, $WorkingDirectory, $StreamOutput
+                return $versionOutput
+            }.GetNewClosure()
+            $python = Invoke-PrivateCommandWithNativeCapture `
+                -CommandName "Get-EasyConPythonVersion" -Parameters @{} `
+                -NativeCapture $capture
+            Assert-Contract (-not ($python.Version -lt $minimum)) `
+                "Python $accepted must not compare older than $minimum"
+            Assert-Contract ($python.Version -is [version]) `
+                "Python $accepted must remain System.Version until serialization"
+        }
+
+        foreach ($rejected in @(
+            "Python 3.7.99",
+            "Python not-a-version",
+            "Python 3.12.10 unexpected"
+        )) {
+            $capture = {
+                param($Program, $Arguments, $Description, $WorkingDirectory, $StreamOutput)
+                $null = $Program, $Arguments, $Description, $WorkingDirectory, $StreamOutput
+                return $rejected
+            }.GetNewClosure()
+            Assert-Throws -Pattern "older than|required|unrecognized version" -Action {
+                Invoke-PrivateCommandWithNativeCapture `
+                    -CommandName "Get-EasyConPythonVersion" -Parameters @{} `
+                    -NativeCapture $capture
+            }
+        }
+    }
+
     Invoke-ContractCase -Name "public-module-surface-hides-lifecycle-bypasses" -Action {
         foreach ($name in @(
             "Enter-EasyConEnvironmentLease",
@@ -1491,4 +1527,4 @@ finally {
     }
 }
 
-Write-Output "Windows workspace contracts passed: 21 cases"
+Write-Output "Windows workspace contracts passed: 22 cases"
