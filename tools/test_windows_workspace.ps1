@@ -137,6 +137,21 @@ function Publish-PrivateDirectoryAtomically {
     } $Parameters
 }
 
+function Remove-PrivateTransientBuildTree {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [string]$TrustedRoot
+    )
+
+    & $script:workspaceModule {
+        param($Tree, $Root)
+        Remove-EasyConTransientBuildTree -Path $Tree -TrustedRoot $Root
+    } $Path $TrustedRoot
+}
+
 function Invoke-PrivateCommandWithNativeCapture {
     param(
         [Parameter(Mandatory)]
@@ -2307,6 +2322,28 @@ try {
                 -TrustedRoot $trusted -ReparsePointClassifier { $false }
         }
     }
+
+    Invoke-ContractCase -Name "vcpkg-transient-cleanup-does-not-follow-reparse" -Action {
+        $environment = Join-Path $temporaryRoot "transient cleanup environment"
+        $buildtrees = Join-Path $environment "buildtrees"
+        $external = Join-Path $temporaryRoot "transient cleanup external"
+        New-Item -ItemType Directory -Path $buildtrees, $external | Out-Null
+        Set-ContractFile -Path (Join-Path $buildtrees "ordinary/output.bin") -Value "delete"
+        $externalMarker = Join-Path $external "keep.txt"
+        Set-ContractFile -Path $externalMarker -Value "keep"
+        $junction = Join-Path $buildtrees "source-link"
+        New-Item -ItemType Junction -Path $junction -Target $external | Out-Null
+        $junctionItem = Get-Item -Force -LiteralPath $junction
+        Assert-Contract (
+            ($junctionItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+        ) "the regression fixture must contain a real reparse point"
+
+        Remove-PrivateTransientBuildTree -Path $buildtrees -TrustedRoot $environment
+        Assert-Contract (-not (Test-Path -LiteralPath $buildtrees)) `
+            "transient vcpkg buildtrees must be removed after a successful install"
+        Assert-Contract (Test-Path -LiteralPath $externalMarker -PathType Leaf) `
+            "transient cleanup must remove a junction without following its external target"
+    }
 }
 catch {
     $contractFailure = $_
@@ -2337,4 +2374,4 @@ finally {
     }
 }
 
-Write-Output "Windows workspace contracts passed: 31 cases"
+Write-Output "Windows workspace contracts passed: 32 cases"

@@ -307,6 +307,32 @@ function Get-EasyConFileHash {
     return (Get-FileHash -LiteralPath $resolved -Algorithm $Algorithm).Hash.ToLowerInvariant()
 }
 
+function Remove-EasyConTransientBuildTree {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [string]$TrustedRoot
+    )
+
+    $resolved = Assert-EasyConPhysicalPath -Path $Path -TrustedRoot $TrustedRoot
+    if (-not (Test-Path -LiteralPath $resolved)) {
+        return
+    }
+    $root = Get-Item -Force -LiteralPath $resolved -ErrorAction Stop
+    if (-not $root.PSIsContainer) {
+        throw "transient build tree is not a directory: $resolved"
+    }
+
+    # PowerShell removes child links themselves rather than traversing their targets. The
+    # root and every ancestor remain reparse-free and confined to the trusted environment.
+    Remove-Item -Force -Recurse -LiteralPath $resolved -ErrorAction Stop
+    if (Test-Path -LiteralPath $resolved) {
+        throw "transient build tree remains after cleanup: $resolved"
+    }
+}
+
 function Assert-EasyConContentFile {
     param(
         [Parameter(Mandatory)]
@@ -3582,6 +3608,9 @@ function Install-EasyConWindowsEnvironment {
         -DownloadsRoot $setupVcpkgDownloads -DownloadsTrustedRoot $cacheStorage `
         -CacheRoot $cache `
         -WorkspaceLayout $vcpkgLayout
+    foreach ($transientTree in @($vcpkgLayout.Buildtrees, $vcpkgLayout.Packages)) {
+        Remove-EasyConTransientBuildTree -Path $transientTree -TrustedRoot $cache
+    }
     $null = Set-EasyConCargoNativeLinkSearch -InstalledRoot $vcpkgLayout.Installed `
         -CacheRoot $cache
 

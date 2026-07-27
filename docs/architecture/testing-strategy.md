@@ -460,7 +460,9 @@ hash fail closed；不同 hash 的发布锁可并行且同一 hash 跨 identity 
 实施 mutation tests，保证 PR 缓存不能写入或被 trusted main 读取，且 environment/stamp 不进入 Actions cache。
 受控 CMake/Ninja 合同还必须在阻断网络时证明 archive 预填到 commit-scoped vcpkg downloads，跨 environment 命中不下载，
 且损坏的目标副本可从重新核验的 blob 修复。vcpkg install 合同精确核对 commit-scoped downloads 参数，证明第三次尝试
-可恢复且持续失败恰在三次后关闭。
+可恢复且持续失败恰在三次后关闭。hosted port source 可包含合法 reparse/symlink，因此合同还要用指向 trusted root 外部
+marker 的真实 junction 证明成功后删除 transient buildtrees/packages 时只删除链接、不跟随目标；普通 prepared path 的
+reparse fail-closed 合同保持不变。
 
 无论变更类型，都必须确认 `EasyCon/` 仍被根 `.gitignore` 忽略、第三方参考源码没有改动，且外层 tracked
 文件没有引入 `EasyCon/` 内容或项目依赖。

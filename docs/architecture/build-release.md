@@ -83,7 +83,8 @@ stamp、ready 状态和 prepared tree 不进入共享缓存。受控 7-Zip fetch
 最终 `7z.exe` 还需匹配固定 SHA-256 和精确 x64 版本，宿主 PATH 的 `7z.exe`/`7zr.exe` 不构成候选。
 已验证的 CMake/Ninja archive 还会物化到按 scripts commit 隔离的 vcpkg downloads root；每次 Setup 重验目标副本，损坏时
 从内容寻址 blob 修复，vcpkg 不再为同一 internal tool 二次联网。vcpkg install 的短暂失败最多做三次有界尝试，复用
-同一 downloads、buildtrees 与 binary cache。
+同一 downloads、buildtrees 与 binary cache；成功后安全删除 transient buildtrees/packages，不把 port source 中合法的
+reparse/symlink 带入最终 prepared tree，且删除不跟随链接目标。
 
 同一 fingerprint/worktree identity 使用环境目录外的跨进程 reader/writer lease：Setup 独占 stamp 检查、旧树删除、
 安装、stamp 发布与最终 Verify；普通 Verify 共享读取；Workspace 的共享 lease 从 Verify 连续覆盖到最后一个 gate。

@@ -82,7 +82,9 @@ temporary，完整验证后才原子发布。不同 hash 使用不同锁，同�
 目标副本，损坏时从 blob 修复，因此不为同一 internal tool 发起第二次公网下载。
 vcpkg scripts 按 commit 保存，每次复核 HEAD、cleanliness、tools manifest 与 registry pins，再以无 hardlink 的本地 clone
 物化到当前环境；source downloads 按 scripts commit 持久复用并继续由 vcpkg 自身 hash 合同核验，install 最多做三次有界
-尝试并复用同一 downloads/buildtrees/binary cache。OCR 先由原有 Python
+尝试并复用同一 downloads/buildtrees/binary cache。安装成功后删除 transient buildtrees/packages，包括 port source 中的
+合法 reparse/symlink；删除只移除链接本身且不跟随其目标，这些 transient 目录不进入 prepared environment 或 stamp。
+OCR 先由原有 Python
 provisioner 精确校验冻结 manifest，再从 SHA-256 blob 物化。`RUSTUP_HOME` 持久复用已安装 components，但由于 Rust
 分发内容没有仓库内 hash pin，每次实际 Setup 仍执行 rustup install/check；install 最多做三次有界尝试并复用 rustup
 保留的 partial，成功后再次核对 release、host、target 与 components。
