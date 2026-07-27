@@ -577,6 +577,7 @@ try {
 
     Invoke-ContractCase -Name "python-version-comparison-uses-numeric-semantics" -Action {
         $minimum = [version]"3.8.0"
+        $pythonPath = $null
         foreach ($accepted in @("3.12.10", "3.10.14", "3.8.0")) {
             $versionOutput = "Python $accepted"
             $capture = {
@@ -591,22 +592,70 @@ try {
                 "Python $accepted must not compare older than $minimum"
             Assert-Contract ($python.Version -is [version]) `
                 "Python $accepted must remain System.Version until serialization"
+            $pythonPath = $python.Path
         }
 
-        foreach ($rejected in @(
-            "Python 3.7.99",
-            "Python not-a-version",
-            "Python 3.12.10 unexpected"
-        )) {
+        $rejectedCases = @(
+            [pscustomobject]@{ Name = "below minimum"; Output = @("Python 3.7.99") },
+            [pscustomobject]@{ Name = "invalid format"; Output = @("Python not-a-version") },
+            [pscustomobject]@{
+                Name = "same-line trailing output"
+                Output = @("Python 3.12.10 unexpected")
+            },
+            [pscustomobject]@{
+                Name = "second trailing line"
+                Output = @("Python 3.12.10", "unexpected trailing line")
+            },
+            [pscustomobject]@{ Name = "empty output"; Output = @() }
+        )
+        foreach ($rejectedCase in $rejectedCases) {
+            $versionOutput = @($rejectedCase.Output)
             $capture = {
                 param($Program, $Arguments, $Description, $WorkingDirectory, $StreamOutput)
                 $null = $Program, $Arguments, $Description, $WorkingDirectory, $StreamOutput
-                return $rejected
+                return $versionOutput
+            }.GetNewClosure()
+            try {
+                Assert-Throws -Pattern "older than|required|unrecognized version" -Action {
+                    Invoke-PrivateCommandWithNativeCapture `
+                        -CommandName "Get-EasyConPythonVersion" -Parameters @{} `
+                        -NativeCapture $capture
+                }
+            }
+            catch {
+                throw "Python $($rejectedCase.Name) was accepted or failed unclearly: $($_.Exception.Message)"
+            }
+        }
+
+        $preparedOutput = @("Python 3.12.10")
+        $capture = {
+            param($Program, $Arguments, $Description, $WorkingDirectory, $StreamOutput)
+            $null = $Program, $Arguments, $Description, $WorkingDirectory, $StreamOutput
+            return $preparedOutput
+        }.GetNewClosure()
+        $prepared = Invoke-PrivateCommandWithNativeCapture `
+            -CommandName "Assert-EasyConPreparedPythonVersion" -Parameters @{
+                PythonPath = $pythonPath
+                ExpectedVersion = "3.12.10"
+                MinimumVersion = $minimum
+            } -NativeCapture $capture
+        Assert-Contract ($prepared -is [version] -and $prepared -eq [version]"3.12.10") `
+            "prepared Python Verify path must retain strict System.Version semantics"
+
+        foreach ($rejectedCase in $rejectedCases) {
+            $preparedOutput = @($rejectedCase.Output)
+            $capture = {
+                param($Program, $Arguments, $Description, $WorkingDirectory, $StreamOutput)
+                $null = $Program, $Arguments, $Description, $WorkingDirectory, $StreamOutput
+                return $preparedOutput
             }.GetNewClosure()
             Assert-Throws -Pattern "older than|required|unrecognized version" -Action {
                 Invoke-PrivateCommandWithNativeCapture `
-                    -CommandName "Get-EasyConPythonVersion" -Parameters @{} `
-                    -NativeCapture $capture
+                    -CommandName "Assert-EasyConPreparedPythonVersion" -Parameters @{
+                        PythonPath = $pythonPath
+                        ExpectedVersion = "3.12.10"
+                        MinimumVersion = $minimum
+                    } -NativeCapture $capture
             }
         }
     }

@@ -2570,14 +2570,32 @@ function Install-EasyConCargoSources {
     }
 }
 
+function ConvertFrom-EasyConPythonVersionOutput {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Output,
+
+        [Parameter(Mandatory)]
+        [string]$Description
+    )
+
+    if ($Output.Count -ne 1) {
+        throw "$Description returned an unrecognized version response; expected exactly one line"
+    }
+    $line = [string]$Output[0]
+    if ($line -cnotmatch '^Python ([0-9]+)\.([0-9]+)\.([0-9]+)$') {
+        throw "$Description returned an unrecognized version string"
+    }
+    return [version]::new([int]$Matches[1], [int]$Matches[2], [int]$Matches[3])
+}
+
 function Get-EasyConPythonVersion {
     $python = Get-EasyConCommandPath -Name "python.exe"
     $output = @(Invoke-EasyConNativeCapture -Program $python -Arguments @("--version") `
         -Description "Python version check")
-    if ($output[0] -notmatch '^Python ([0-9]+)\.([0-9]+)\.([0-9]+)$') {
-        throw "Python returned an unrecognized version string"
-    }
-    $version = [version]::new([int]$Matches[1], [int]$Matches[2], [int]$Matches[3])
+    $version = ConvertFrom-EasyConPythonVersionOutput -Output $output `
+        -Description "Python"
     if ($version -lt [version]"3.8.0") {
         throw "Python $version is older than required 3.8.0"
     }
@@ -2947,6 +2965,33 @@ function Invoke-EasyConWindowsSetupCore {
     }
 }
 
+function Assert-EasyConPreparedPythonVersion {
+    param(
+        [Parameter(Mandatory)]
+        [string]$PythonPath,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedVersion,
+
+        [Parameter(Mandatory)]
+        [version]$MinimumVersion
+    )
+
+    $expected = ConvertTo-EasyConStrictVersion -Value $ExpectedVersion `
+        -Description "prepared Python version"
+    $output = @(Invoke-EasyConNativeCapture -Program $PythonPath -Arguments @("--version") `
+        -Description "prepared Python version check")
+    $actual = ConvertFrom-EasyConPythonVersionOutput -Output $output `
+        -Description "prepared Python"
+    if ($actual -lt $MinimumVersion) {
+        throw "Python $actual is older than required $MinimumVersion"
+    }
+    if ($actual -ne $expected) {
+        throw "Python version changed since Setup. Rerun Setup."
+    }
+    return $actual
+}
+
 function Invoke-EasyConWindowsVerifyCore {
     [CmdletBinding()]
     param(
@@ -3137,11 +3182,12 @@ function Invoke-EasyConWindowsVerifyCore {
     ) {
         throw "controlled CMake or Ninja path/version changed since Setup. Rerun Setup."
     }
-    $pythonOutput = @(Invoke-EasyConNativeCapture -Program $tools.python -Arguments @("--version") `
-        -Description "prepared Python version check")
-    if ($pythonOutput[0] -notmatch '^Python ([0-9]+\.[0-9]+\.[0-9]+)' -or $Matches[1] -cne [string]$stamp.versions.python) {
-        throw "Python version changed since Setup. Rerun Setup."
-    }
+    $pythonMinimumVersion = ConvertTo-EasyConStrictVersion `
+        -Value ([string]$configuration.hostTools.pythonMinimumVersion) `
+        -Description "Python minimum version"
+    Assert-EasyConPreparedPythonVersion -PythonPath $tools.python `
+        -ExpectedVersion ([string]$stamp.versions.python) `
+        -MinimumVersion $pythonMinimumVersion | Out-Null
 
     $vcpkg = Assert-EasyConVcpkgCheckout -VcpkgRoot $preparedPaths.vcpkgScriptsRoot `
         -Configuration $configuration -VcpkgExecutable $tools.vcpkg

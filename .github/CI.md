@@ -101,7 +101,8 @@ air-gapped 构建或完整离线 cache。PowerShell、Git、Python、rustup、VS
 Setup 的宿主前置条件；Setup 把实际使用的宿主可执行文件路径和 SHA-256 写入 stamp，日常 Verify 不静默回退到其他
 系统工具，也不修改 user/machine PATH、持久环境变量或 Git 全局配置。
 宿主 Python minimum 由固定清单设为 `3.8.0`，Setup 使用数值版本语义比较，因此 hosted runner 的 Python `3.12.x`
-满足要求；这项启动条件不改变 SDK Python binding 的 `3.10+` 产品目标。
+满足要求；Setup 与 Verify 都只接受恰好一行、完整 `Python X.Y.Z` 的版本输出。这项启动条件不改变 SDK Python
+binding 的 `3.10+` 产品目标。
 
 默认环境根为 `LocalApplicationData/EasyConSdk/be2`，其下按 fingerprint 与 canonical worktree
 路径 hash 分隔。`-CacheRoot` 可选择另一个受控根。Required Windows job 在 checkout 后、cache restore 和 Setup 前，
