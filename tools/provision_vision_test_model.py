@@ -182,8 +182,12 @@ def main():
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--allowed-root", type=Path, default=CACHE_ROOT)
+    parser.add_argument("--verify-manifest-only", action="store_true")
     arguments = parser.parse_args()
     manifest = load_manifest(arguments.manifest)
+    if arguments.verify_manifest_only:
+        print("verified frozen OCR test model manifest")
+        return 0
     provision(manifest, arguments.output, allowed_root=arguments.allowed_root)
     return 0
 

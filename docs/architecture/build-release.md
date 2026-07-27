@@ -72,9 +72,23 @@ hash、Cargo vendor tree hash 和 native tree hash 的 stamp。Setup 使用 `car
 workspace manifests 对应的 crate sources 安装进环境。`Verify` 与 `Workspace` 不安装或下载；两者只接受当前
 fingerprint 对应且未损坏的 stamp，缺失或失配时要求重新运行 Setup。`Workspace` 在 Verify 后运行完整仓库门禁。
 
+环境目录之外有跨 fingerprint/worktree 的共享资产层。直接固定资产以 SHA-256/SHA-512 内容寻址，命中时每次重验
+hash/bytes，损坏项在逐资产锁内隔离，唯一同卷 temporary 通过验证后才原子发布。CMake、Ninja、vcpkg.exe、7-Zip/7zr
+和 OCR 都从这些 blob 物化；OCR 在任何下载前仍调用原有 provisioner 精确验证冻结 manifest。vcpkg scripts 按 commit
+保存并在每次复用时复核 checkout、cleanliness、tool manifest 和 registry pins，再用本地无 hardlink clone 物化；vcpkg
+source downloads 按 scripts commit 复用并继续服从 vcpkg 自身的内容 hash。Rust home 持久复用 components，但没有仓库
+内分发 hash pin，因此每次实际 Setup 仍执行 rustup install/check；install 最多做三次有界尝试并复用 rustup partial，
+成功后再核对 release、host、target 和 components。环境
+stamp、ready 状态和 prepared tree 不进入共享缓存。受控 7-Zip fetch 使用空 PATH 与 downloaded-binaries-only 模式，
+最终 `7z.exe` 还需匹配固定 SHA-256 和精确 x64 版本，宿主 PATH 的 `7z.exe`/`7zr.exe` 不构成候选。
+已验证的 CMake/Ninja archive 还会物化到按 scripts commit 隔离的 vcpkg downloads root；每次 Setup 重验目标副本，损坏时
+从内容寻址 blob 修复，vcpkg 不再为同一 internal tool 二次联网。vcpkg install 的短暂失败最多做三次有界尝试，复用
+同一 downloads、buildtrees 与 binary cache。
+
 同一 fingerprint/worktree identity 使用环境目录外的跨进程 reader/writer lease：Setup 独占 stamp 检查、旧树删除、
 安装、stamp 发布与最终 Verify；普通 Verify 共享读取；Workspace 的共享 lease 从 Verify 连续覆盖到最后一个 gate。
-所有异常路径释放 lease。vcpkg checkout 先在同卷不可见 staging 中完成并验证，再用原子目录 rename 发布；访问冲突
+共享资产层另有跨 identity reader/writer lease，Setup provision 独占，Verify/Workspace 全程共享，避免 Rust/vcpkg
+共享状态与读取中的环境竞争。所有异常路径释放 lease。vcpkg checkout 先在同卷不可见 staging 中完成并验证，再用原子目录 rename 发布；访问冲突
 只做有限 publish/cleanup 重试。cleanup 成功时删除 partial destination；若外部句柄令删除暂时不可能，则返回以原始
 publish failure 为主、附带 cleanup failure 与残留状态的诊断，且残留绝不视为有效 checkout。句柄释放后，下一次
 Setup 在独占 lease 下删除旧环境树并安全恢复。
@@ -93,9 +107,10 @@ lease 完成 Verify 和全部 gates；三个生命周期命令返回时完整恢
 native command/gate 会在 cwd cleanup 前把非零退出登记为主错误；原 cwd 被外部删除而无法恢复时，cleanup failure 只作为
 附加诊断且不覆盖退出码、native 输出/描述或 gate 名称。若子进程成功，cwd restore failure 本身仍使调用失败。
 
-下载包、工具二进制、native install tree 与编译缓存只存在于用户的受控环境根或 CI 临时目录，不进入 Git。
-Cargo/vcpkg cache 只提速，cache miss 不改变正确性合同。本职责拆分不是离线构建承诺，开发电脑与首次 CI Setup
-允许联网。PowerShell、Git、Python、rustup、VS Installer/vswhere 与 VS Build Tools 是运行 Setup 所需的宿主启动条件；
+下载包、工具二进制、native install tree 与编译缓存只存在于用户的受控环境根或 CI 临时目录，不进入 Git。完整且
+hash 匹配的直接资产 cache hit 不重新下载，即使 fingerprint/worktree 改变、旧环境损坏或前次 Setup 失败也可复用。
+Rust 的 rustup 检查及 vcpkg/Cargo 缺失内容仍可联网，所以这不是完全离线合同；所有 cache 只提速，miss 不改变正确性。
+PowerShell、Git、Python、rustup、VS Installer/vswhere 与 VS Build Tools 是运行 Setup 所需的宿主启动条件；
 Setup 会把实际解析到的可执行文件路径和 SHA-256 写入 stamp，日常 Verify 不会回退到另一个系统工具。
 宿主 Python minimum 固定为 `3.8.0` 并以 `System.Version` 数值语义比较，因而 hosted runner 的 Python `3.12.x`
 是满足要求的启动宿主；Setup/Verify 只接受恰好一行、完整 `Python X.Y.Z` 的版本输出。这与 SDK Python binding

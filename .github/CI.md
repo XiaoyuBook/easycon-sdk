@@ -36,7 +36,9 @@ Linux job 是 non-required Vision build candidate。只有四个 Linux native �
   `67958c6a13a35130ff8035bef33097ffe3376a6708577a826cfa41fa592db611`。
 - `scripts/vcpkg-tools.json` 的审计 SHA-256 固定为
   `7757067afc4839dd982eee8cfb68cb500c4255a64c37a7c150ee9244342595e6`，并逐字段核对 CMake `4.3.3`、
-  Ninja `1.13.2`、7-Zip `26.01` 与其 `7zr` bootstrap 的 URL、archive、executable 和 SHA-512。
+  Ninja `1.13.2`、7-Zip `26.01` 与其 `7zr` bootstrap 的 URL、archive、executable 和 SHA-512。7-Zip 最终
+  `7z.exe` 另有固定 SHA-256；Setup 以空 PATH 和 `VCPKG_FORCE_DOWNLOADED_BINARIES=1` 调用 vcpkg fetch，只接受
+  清单派生的唯一绝对 x64 `26.01` 路径，不接受宿主 PATH 中的任意 `7z.exe`/`7zr.exe`。
 - 直接 native pins 为 OpenCV `4.12.0#5`、Tesseract `5.5.2#0` 与 Leptonica `1.87.0#0`；Setup 同时核对
   registry baseline 版本与 versions database git tree。传递依赖由同一固定 baseline 解析。
 - OCR 只调用仓库 provisioner；manifest、来源、大小、SHA-256 和许可证在 Setup 与日常 Verify 中核验。
@@ -72,6 +74,19 @@ Setup 在独占 lease 下删除旧环境树并恢复。脚本不把无法删除�
 原始 download/hash/publish failure 为主并附带 cleanup 与 residual 状态，临时文件永不作为固定 asset 或 stamp 接受。
 句柄释放后，后续下载可以使用新的完整 temporary 恢复，下一次 Setup 也会在独占 lease 下清理旧环境树。
 
+环境根的 `caches/` 是独立于 `e/<fingerprint>/<worktree>` 的共享资产层，不保存 stamp、ready 状态或 prepared
+environment。CMake/Ninja、vcpkg.exe、7-Zip/7zr 与 OCR 原始文件进入 `assets-v1/blobs/<algorithm>/<hash>`；每次命中
+重新核对 hash，带大小 pin 的资产同时核对 bytes。损坏 blob 在逐资产独占锁内原子移入 quarantine，下载写入唯一同卷
+temporary，完整验证后才原子发布。不同 hash 使用不同锁，同一 hash 跨 identity 互斥，错误 hash 永不成为最终 blob。
+已验证的 CMake/Ninja archive 还会原子物化到按 vcpkg scripts commit 隔离的 downloads root；vcpkg 使用前再次核对该
+目标副本，损坏时从 blob 修复，因此不为同一 internal tool 发起第二次公网下载。
+vcpkg scripts 按 commit 保存，每次复核 HEAD、cleanliness、tools manifest 与 registry pins，再以无 hardlink 的本地 clone
+物化到当前环境；source downloads 按 scripts commit 持久复用并继续由 vcpkg 自身 hash 合同核验，install 最多做三次有界
+尝试并复用同一 downloads/buildtrees/binary cache。OCR 先由原有 Python
+provisioner 精确校验冻结 manifest，再从 SHA-256 blob 物化。`RUSTUP_HOME` 持久复用已安装 components，但由于 Rust
+分发内容没有仓库内 hash pin，每次实际 Setup 仍执行 rustup install/check；install 最多做三次有界尝试并复用 rustup
+保留的 partial，成功后再次核对 release、host、target 与 components。
+
 日常只验证或运行完整门禁：
 
 ```powershell
@@ -87,7 +102,9 @@ repository contracts 与 diff 门禁。缺失、损坏、worktree 不匹配或 f
 
 每个 fingerprint/worktree identity 在环境根外有一个 ownership lock。Setup 从检查 stamp、删除旧树、安装到发布并
 复验 stamp 全程持有独占 lease；Verify 持共享 lease；Workspace 的同一个共享 lease 覆盖 Verify 和全部 gates，因而
-Setup 不能与读取或构建竞争。异常路径总是释放 lease。Verify 在启动 gate 前清除 ambient Rust wrapper/compiler、
+Setup 不能与同一环境的读取或构建竞争。共享资产层另有跨 identity reader/writer lease：Setup provision 期间独占，
+Verify/Workspace 从验证到最后一个 gate 共享读取，防止另一 identity 修改 Rust/vcpkg 共享状态。异常路径总是释放 lease。
+Verify 在启动 gate 前清除 ambient Rust wrapper/compiler、
 Cargo target/linker/registry flags、cc-rs target compiler、`CL`/`_CL_`、MSVC Developer Shell 残留、CMake/package roots、
 vcpkg override 与代理变量，再用 stamp 中核验过的工具绝对路径、pinned Developer Shell include/lib 路径和受控变量重建
 当前进程环境；HTTP(S) proxy 只允许在线 Setup 使用。模块完整导出集合只有 Setup、Verify 与 Workspace；parser、下载、
@@ -96,8 +113,10 @@ vcpkg override 与代理变量，再用 stamp 中核验过的工具绝对路径�
 空值和名称大小写），成功和异常路径都不遗留临时受控变量。native command 或 gate 的非零退出在 cwd cleanup 前登记为
 主错误；若原 cwd 已被外部删除，location restore failure 只附加到诊断。子进程成功且 cwd 无法恢复时，恢复失败仍直接失败。
 
-这一区分是生命周期职责，不是离线合同：Setup 可联网，Workspace 不负责准备环境，但不承诺零网络请求、
-air-gapped 构建或完整离线 cache。PowerShell、Git、Python、rustup、VS Installer/vswhere 与 VS Build Tools 是启动
+完整且 hash 匹配的直接资产 cache hit 不调用下载器；fingerprint/worktree 变化、旧环境损坏或前次 Setup 失败都只重建
+prepared environment，并复用这些已验证 blob。vcpkg scripts 命中也不 fetch。Rust 仍执行 rustup 安全检查，vcpkg/Cargo
+在其下载 cache 缺项时仍可联网，因此这一区分不是 air-gapped 或完全离线合同。PowerShell、Git、Python、rustup、
+VS Installer/vswhere 与 VS Build Tools 是启动
 Setup 的宿主前置条件；Setup 把实际使用的宿主可执行文件路径和 SHA-256 写入 stamp，日常 Verify 不静默回退到其他
 系统工具，也不修改 user/machine PATH、持久环境变量或 Git 全局配置。
 宿主 Python minimum 由固定清单设为 `3.8.0`，Setup 使用数值版本语义比较，因此 hosted runner 的 Python `3.12.x`
@@ -111,9 +130,13 @@ binding 的 `3.10+` 产品目标。
 target 路径保持不同 worktree 的 source-bound CMake cache 隔离；脚本拒绝 reparse point、环境根逃逸、过长 object
 path、外部 vcpkg overlay/chainload/install 输入和脏 scripts checkout。
 
-Required CI 先单独执行 `-Mode Setup`，再执行 `-Mode Workspace -RequireCleanTree`。Actions 只 restore Cargo
-downloads 与 vcpkg binary cache；cache hit/miss 只影响耗时，不是环境正确性的输入。pull request 只读 cache，只有完整
-门禁成功后的可信 `main` push 可 save。Setup/Verify 总是以固定清单和 stamp 为准，不缓存环境 stamp、OCR 或工具目录。
+Required CI 先单独执行 `-Mode Setup`，再执行 `-Mode Workspace -RequireCleanTree`。Actions restore 的 Setup 资产仅包含
+`assets-v1`、vcpkg scripts/downloads 与 Rust home；`e/`、stamp、ready 状态和物化后的环境工具目录永不进入 Actions
+cache。key 不包含 workflow/module 实现文件，避免无关 runner 编辑导致所有原始资产失效。pull request 先读同一 PR
+namespace，再回退到 trusted-main；每个 run 使用新 primary key，并在 `always()` 下只写该 PR namespace，使 Setup 后的
+代码门禁失败仍可供同一 PR 后续 run 复用。`main` 只读 trusted-main，且仅在完整成功后写 trusted-main，绝不读取 PR
+namespace。所有 restore 都是不可信的提速输入：Setup 每次按上述 hash/git/rustup 安全模型复验，cache miss 不改变正确性。
+Cargo downloads 与 vcpkg binary cache 保持独立 key，且同样不因 workflow/module 文本编辑全量失效。
 
 `Native Quality (Non-Required)` 没有改用 workspace runner：其 clang-cl、clang-tidy、analyze、sanitizer、fuzz preset
 矩阵不是 Required Windows Workspace 合同。它保留独立初始化，同时由 guard 防止 vcpkg pins 漂移。

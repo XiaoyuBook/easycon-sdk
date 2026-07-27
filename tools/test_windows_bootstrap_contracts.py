@@ -72,8 +72,53 @@ class RequiredCiContracts(unittest.TestCase):
                 "${{ github.workspace }}",
             ),
             "incomplete key": (
-                "windows-workspace-vcpkg-v4-${{ hashFiles(",
-                "windows-workspace-vcpkg-v4-${{ hashFiles('vcpkg.json') }} # ",
+                "windows-workspace-vcpkg-v5-${{ hashFiles(",
+                "windows-workspace-vcpkg-v5-${{ hashFiles('vcpkg.json') }} # ",
+            ),
+        }
+        for label, (original, replacement) in mutations.items():
+            with self.subTest(label=label):
+                mutated = self.workflow.replace(original, replacement, 1)
+                self.assertNotEqual(mutated, self.workflow)
+                self.assert_rejected(mutated, label)
+
+    def test_setup_asset_cache_is_pr_scoped_and_main_isolated(self):
+        required_fragments = (
+            "      - name: Restore verified Setup assets\n",
+            "windows-workspace-setup-assets-v1-${{ github.event_name == 'pull_request'",
+            "format('pr-{0}', github.event.pull_request.number)",
+            "windows-workspace-setup-assets-v1-trusted-main-",
+            "      - name: Save verified Setup assets for this pull request\n",
+            "always() && github.event_name == 'pull_request'",
+            "      - name: Save verified Setup assets from trusted main\n",
+            "github.event_name == 'push' && github.ref == 'refs/heads/main' && success()",
+        )
+        for fragment in required_fragments:
+            self.assertIn(fragment, self.workflow)
+
+        self.assertNotIn("'.github/workflows/required-ci.yml'", self.workflow)
+        self.assertNotIn("'tools/windows_workspace.psm1'", self.workflow)
+
+        mutations = {
+            "PR cache written as trusted main": (
+                "format('pr-{0}', github.event.pull_request.number)",
+                "'trusted-main'",
+            ),
+            "PR cache save broadened": (
+                "always() && github.event_name == 'pull_request'",
+                "always()",
+            ),
+            "trusted main save accepts failures": (
+                "github.event_name == 'push' && github.ref == 'refs/heads/main' && success()",
+                "always() && github.ref == 'refs/heads/main'",
+            ),
+            "prepared environment cached": (
+                "${{ runner.temp }}/easycon-windows-workspace/caches/assets-v1",
+                "${{ runner.temp }}/easycon-windows-workspace/e",
+            ),
+            "runner implementation invalidates assets": (
+                "${{ github.run_id }}-${{ github.run_attempt }}",
+                "${{ hashFiles('.github/workflows/required-ci.yml') }}",
             ),
         }
         for label, (original, replacement) in mutations.items():
@@ -254,6 +299,9 @@ class WindowsBuildEnvironmentContracts(unittest.TestCase):
             "uppercase scripts commit": lambda value: value["vcpkg"].update(scriptsCommit="C" * 40),
             "registry divergence": lambda value: value["vcpkg"].update(registryBaseline="0" * 40),
             "uppercase SHA-512": lambda value: value["vcpkg"]["internalTools"][0].update(sha512="A" * 128),
+            "uppercase 7zip executable SHA-256": lambda value: value["vcpkg"][
+                "internalTools"
+            ][2].update(executableSha256="A" * 64),
             "duplicate tool": lambda value: value["vcpkg"]["internalTools"].__setitem__(2, copy.deepcopy(value["vcpkg"]["internalTools"][0])),
             "negative port version": lambda value: value["vcpkg"]["nativeDependencies"][0].update(portVersion=-1),
             "unknown native dependency": lambda value: value["vcpkg"]["nativeDependencies"][0].update(name="other"),

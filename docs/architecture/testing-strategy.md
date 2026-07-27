@@ -450,5 +450,17 @@ Setup/Verify 宿主版本合同通过各自的 native capture 路径注入 Pytho
 `3.8.0`、`3.7.99`、空输出、多行、同一行尾随与非法格式，证明 minimum 比较使用 `System.Version` 数值语义、
 parser 只接受恰好一行完整输出，且测试不依赖机器当前 Python 版本。
 
+共享资产合同必须覆盖：cache miss 只下载一次；完整命中时阻断 download seam 且零下载；损坏 blob 隔离后恢复；错误
+hash fail closed；不同 hash 的发布锁可并行且同一 hash 跨 identity 互斥；fingerprint/worktree 变化及失败重建仍复用
+已验证 blob。vcpkg scripts 命中每次复核且不执行 install/fetch seam，损坏 checkout 隔离重建。7-Zip 合同在宿主 PATH
+同时放入兼容和不兼容 `7z.exe` 时仍只接受空 PATH fetch 返回的清单派生路径，并核对最终 executable hash/精确 x64
+版本。Rust 合同明确保留每次 rustup install/check 及 release/host/target/components 复核，证明 transient install 可在第三次
+有界尝试恢复且持续失败恰在三次后关闭，不能把未 hash 固定的 PR cache 降级为仅信任自报版本。Required CI workflow
+合同对 PR/main cache namespace、restore 顺序、save 条件、缓存路径和 key
+实施 mutation tests，保证 PR 缓存不能写入或被 trusted main 读取，且 environment/stamp 不进入 Actions cache。
+受控 CMake/Ninja 合同还必须在阻断网络时证明 archive 预填到 commit-scoped vcpkg downloads，跨 environment 命中不下载，
+且损坏的目标副本可从重新核验的 blob 修复。vcpkg install 合同精确核对 commit-scoped downloads 参数，证明第三次尝试
+可恢复且持续失败恰在三次后关闭。
+
 无论变更类型，都必须确认 `EasyCon/` 仍被根 `.gitignore` 忽略、第三方参考源码没有改动，且外层 tracked
 文件没有引入 `EasyCon/` 内容或项目依赖。

@@ -307,6 +307,340 @@ function Get-EasyConFileHash {
     return (Get-FileHash -LiteralPath $resolved -Algorithm $Algorithm).Hash.ToLowerInvariant()
 }
 
+function Assert-EasyConContentFile {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [ValidateSet("SHA256", "SHA512")]
+        [string]$Algorithm,
+
+        [Parameter(Mandatory)]
+        [string]$Hash,
+
+        [long]$Bytes = -1,
+
+        [Parameter(Mandatory)]
+        [string]$TrustedRoot,
+
+        [Parameter(Mandatory)]
+        [string]$Description
+    )
+
+    $resolved = Get-EasyConPhysicalFile -Path $Path -TrustedRoot $TrustedRoot
+    if ($Bytes -ge 0) {
+        $actualBytes = (Get-Item -Force -LiteralPath $resolved).Length
+        if ($actualBytes -ne $Bytes) {
+            throw "$Description has $actualBytes bytes; expected $Bytes"
+        }
+    }
+    $actualHash = Get-EasyConFileHash -Path $resolved -Algorithm $Algorithm
+    if ($actualHash -cne $Hash) {
+        $label = if ($Algorithm -ceq "SHA256") { "SHA-256" } else { "SHA-512" }
+        throw "$Description has $label $actualHash; expected $Hash"
+    }
+    return $resolved
+}
+
+function Enter-EasyConExclusiveFileLease {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [string]$TrustedRoot,
+
+        [Parameter(Mandatory)]
+        [string]$Description,
+
+        [ValidateRange(0, 7200000)]
+        [int]$TimeoutMilliseconds = 1800000,
+
+        [ValidateRange(0, 1000)]
+        [int]$RetryMilliseconds = 100
+    )
+
+    $trusted = Resolve-EasyConFullPath -Path $TrustedRoot
+    New-EasyConSafeDirectory -Path $trusted -TrustedRoot $trusted | Out-Null
+    $lockPath = Assert-EasyConPhysicalPath -Path $Path -TrustedRoot $trusted
+    New-EasyConSafeDirectory -Path (Split-Path -Parent $lockPath) `
+        -TrustedRoot $trusted | Out-Null
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    $lastFailure = $null
+    while ($true) {
+        try {
+            return [System.IO.FileStream]::new(
+                $lockPath,
+                [System.IO.FileMode]::OpenOrCreate,
+                [System.IO.FileAccess]::ReadWrite,
+                [System.IO.FileShare]::None
+            )
+        }
+        catch [System.IO.IOException] {
+            $lastFailure = $_.Exception
+        }
+        if ($timer.ElapsedMilliseconds -ge $TimeoutMilliseconds) {
+            throw "$Description is busy: $($lastFailure.Message)"
+        }
+        $remaining = $TimeoutMilliseconds - [int]$timer.ElapsedMilliseconds
+        $delay = [Math]::Min($RetryMilliseconds, $remaining)
+        if ($delay -gt 0) {
+            Start-Sleep -Milliseconds $delay
+        }
+    }
+}
+
+function Enter-EasyConSharedCacheLease {
+    param(
+        [Parameter(Mandatory)]
+        [string]$CacheRoot,
+
+        [ValidateSet("Shared", "Exclusive")]
+        [string]$Access,
+
+        [ValidateRange(0, 7200000)]
+        [int]$TimeoutMilliseconds = 1800000,
+
+        [ValidateRange(0, 1000)]
+        [int]$RetryMilliseconds = 100
+    )
+
+    $shared = Resolve-EasyConFullPath -Path (Join-Path $CacheRoot "caches")
+    New-EasyConSafeDirectory -Path $shared -TrustedRoot $shared | Out-Null
+    $lockPath = Assert-EasyConPhysicalPath `
+        -Path (Join-Path $shared "locks/setup-assets.lock") -TrustedRoot $shared
+    New-EasyConSafeDirectory -Path (Split-Path -Parent $lockPath) `
+        -TrustedRoot $shared | Out-Null
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    $lastFailure = $null
+    while ($true) {
+        try {
+            if ($Access -ceq "Shared") {
+                if (-not (Test-Path -LiteralPath $lockPath -PathType Leaf)) {
+                    $initializer = [System.IO.FileStream]::new(
+                        $lockPath,
+                        [System.IO.FileMode]::OpenOrCreate,
+                        [System.IO.FileAccess]::ReadWrite,
+                        [System.IO.FileShare]::ReadWrite
+                    )
+                    $initializer.Dispose()
+                }
+                return [System.IO.FileStream]::new(
+                    $lockPath,
+                    [System.IO.FileMode]::Open,
+                    [System.IO.FileAccess]::Read,
+                    [System.IO.FileShare]::Read
+                )
+            }
+            return [System.IO.FileStream]::new(
+                $lockPath,
+                [System.IO.FileMode]::OpenOrCreate,
+                [System.IO.FileAccess]::ReadWrite,
+                [System.IO.FileShare]::None
+            )
+        }
+        catch [System.IO.IOException] {
+            $lastFailure = $_.Exception
+        }
+        if ($timer.ElapsedMilliseconds -ge $TimeoutMilliseconds) {
+            throw "shared Setup asset cache ownership is busy ($Access): $($lastFailure.Message)"
+        }
+        $remaining = $TimeoutMilliseconds - [int]$timer.ElapsedMilliseconds
+        $delay = [Math]::Min($RetryMilliseconds, $remaining)
+        if ($delay -gt 0) {
+            Start-Sleep -Milliseconds $delay
+        }
+    }
+}
+
+function Get-EasyConSharedContentAsset {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$SharedCacheRoot,
+
+        [Parameter(Mandatory)]
+        [string]$Url,
+
+        [Parameter(Mandatory)]
+        [ValidateSet("SHA256", "SHA512")]
+        [string]$Algorithm,
+
+        [Parameter(Mandatory)]
+        [string]$Hash,
+
+        [long]$Bytes = -1,
+
+        [Parameter(Mandatory)]
+        [string]$Description,
+
+        [scriptblock]$DownloadAction
+    )
+
+    $expectedLength = if ($Algorithm -ceq "SHA256") { 64 } else { 128 }
+    if ($Hash -cnotmatch "^[0-9a-f]{$expectedLength}$") {
+        throw "$Description content hash must be $expectedLength lowercase hexadecimal characters"
+    }
+    $uri = [uri]$Url
+    if (-not $uri.IsAbsoluteUri -or $uri.Scheme -cne "https") {
+        throw "$Description URL must be absolute HTTPS"
+    }
+
+    $shared = Resolve-EasyConFullPath -Path $SharedCacheRoot
+    New-EasyConSafeDirectory -Path $shared -TrustedRoot $shared | Out-Null
+    $assets = New-EasyConSafeDirectory -Path (Join-Path $shared "assets-v1") `
+        -TrustedRoot $shared
+    $algorithmName = $Algorithm.ToLowerInvariant()
+    $blobs = New-EasyConSafeDirectory -Path (Join-Path $assets "blobs/$algorithmName") `
+        -TrustedRoot $shared
+    $locks = New-EasyConSafeDirectory -Path (Join-Path $assets "locks") `
+        -TrustedRoot $shared
+    $quarantine = New-EasyConSafeDirectory -Path (Join-Path $assets "quarantine") `
+        -TrustedRoot $shared
+    $assetPath = Assert-EasyConPhysicalPath -Path (Join-Path $blobs $Hash) `
+        -TrustedRoot $shared
+    $lease = Enter-EasyConExclusiveFileLease `
+        -Path (Join-Path $locks "$algorithmName-$Hash.lock") -TrustedRoot $shared `
+        -Description "$Description shared cache ownership"
+    try {
+        if (Test-Path -LiteralPath $assetPath -PathType Leaf) {
+            try {
+                return Assert-EasyConContentFile -Path $assetPath -Algorithm $Algorithm `
+                    -Hash $Hash -Bytes $Bytes -TrustedRoot $shared `
+                    -Description "$Description shared cache entry"
+            }
+            catch {
+                $damage = $_.Exception
+                $quarantined = Join-Path $quarantine (
+                    "$algorithmName-$Hash.corrupt-$PID-$([guid]::NewGuid().ToString('N'))"
+                )
+                try {
+                    Assert-EasyConPhysicalPath -Path $quarantined -TrustedRoot $shared | Out-Null
+                    [System.IO.File]::Move($assetPath, $quarantined)
+                }
+                catch {
+                    $diagnostic = [System.IO.IOException]::new(
+                        "$Description shared cache entry is damaged and could not be isolated: $($damage.Message); $($_.Exception.Message)",
+                        $damage
+                    )
+                    $diagnostic.Data["EasyConSharedAssetIsolationFailure"] = `
+                        $_.Exception.ToString()
+                    throw $diagnostic
+                }
+            }
+        }
+
+        $temporary = "$assetPath.download-$PID-$([guid]::NewGuid().ToString('N'))"
+        Assert-EasyConPhysicalPath -Path $temporary -TrustedRoot $shared | Out-Null
+        $primaryFailure = $null
+        try {
+            if ($null -eq $DownloadAction) {
+                $curl = Get-EasyConCommandPath -Name "curl.exe"
+                Invoke-EasyConNativeCapture -Program $curl -Arguments @(
+                    "--fail", "--location", "--silent", "--show-error",
+                    "--retry", "15", "--retry-delay", "1", "--retry-all-errors",
+                    "--continue-at", "-",
+                    "--speed-limit", "1024", "--speed-time", "60",
+                    "--connect-timeout", "20", "--max-time", "120",
+                    "--proto", "=https", "--proto-redir", "=https",
+                    "--output", $temporary, $Url
+                ) -Description "download $Description" | Out-Null
+            }
+            else {
+                & $DownloadAction $Url $temporary
+            }
+            Assert-EasyConContentFile -Path $temporary -Algorithm $Algorithm `
+                -Hash $Hash -Bytes $Bytes -TrustedRoot $shared `
+                -Description "$Description download" | Out-Null
+            [System.IO.File]::Move($temporary, $assetPath)
+        }
+        catch {
+            $primaryFailure = $_
+            throw
+        }
+        finally {
+            Complete-EasyConTemporaryFileCleanup -Path $temporary -TrustedRoot $shared `
+                -Description "$Description shared download" -PrimaryFailure $primaryFailure
+        }
+        return Assert-EasyConContentFile -Path $assetPath -Algorithm $Algorithm `
+            -Hash $Hash -Bytes $Bytes -TrustedRoot $shared `
+            -Description "$Description shared cache entry"
+    }
+    finally {
+        $lease.Dispose()
+    }
+}
+
+function Copy-EasyConContentFileAtomically {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Source,
+
+        [Parameter(Mandatory)]
+        [string]$Destination,
+
+        [Parameter(Mandatory)]
+        [ValidateSet("SHA256", "SHA512")]
+        [string]$Algorithm,
+
+        [Parameter(Mandatory)]
+        [string]$Hash,
+
+        [long]$Bytes = -1,
+
+        [Parameter(Mandatory)]
+        [string]$SourceTrustedRoot,
+
+        [Parameter(Mandatory)]
+        [string]$DestinationTrustedRoot,
+
+        [Parameter(Mandatory)]
+        [string]$Description
+    )
+
+    $sourcePath = Assert-EasyConContentFile -Path $Source -Algorithm $Algorithm `
+        -Hash $Hash -Bytes $Bytes -TrustedRoot $SourceTrustedRoot `
+        -Description "$Description source"
+    $destinationPath = Assert-EasyConPhysicalPath -Path $Destination `
+        -TrustedRoot $DestinationTrustedRoot
+    New-EasyConSafeDirectory -Path (Split-Path -Parent $destinationPath) `
+        -TrustedRoot $DestinationTrustedRoot | Out-Null
+    if (Test-Path -LiteralPath $destinationPath -PathType Leaf) {
+        try {
+            return Assert-EasyConContentFile -Path $destinationPath -Algorithm $Algorithm `
+                -Hash $Hash -Bytes $Bytes -TrustedRoot $DestinationTrustedRoot `
+                -Description "$Description destination"
+        }
+        catch {
+            Remove-Item -Force -LiteralPath $destinationPath -ErrorAction Stop
+        }
+    }
+
+    $temporary = "$destinationPath.copy-$PID-$([guid]::NewGuid().ToString('N'))"
+    Assert-EasyConPhysicalPath -Path $temporary -TrustedRoot $DestinationTrustedRoot | Out-Null
+    $primaryFailure = $null
+    try {
+        Copy-Item -LiteralPath $sourcePath -Destination $temporary
+        Assert-EasyConContentFile -Path $temporary -Algorithm $Algorithm -Hash $Hash `
+            -Bytes $Bytes -TrustedRoot $DestinationTrustedRoot `
+            -Description "$Description materialized copy" | Out-Null
+        [System.IO.File]::Move($temporary, $destinationPath)
+    }
+    catch {
+        $primaryFailure = $_
+        throw
+    }
+    finally {
+        Complete-EasyConTemporaryFileCleanup -Path $temporary `
+            -TrustedRoot $DestinationTrustedRoot -Description "$Description materialization" `
+            -PrimaryFailure $primaryFailure
+    }
+    return Assert-EasyConContentFile -Path $destinationPath -Algorithm $Algorithm `
+        -Hash $Hash -Bytes $Bytes -TrustedRoot $DestinationTrustedRoot `
+        -Description "$Description destination"
+}
+
 function Get-EasyConFingerprintInputHash {
     [CmdletBinding()]
     param(
@@ -447,10 +781,23 @@ function Get-EasyConPinnedDownload {
         [string]$TrustedRoot,
 
         [Parameter(Mandatory)]
-        [string]$Description
+        [string]$Description,
+
+        [string]$SharedCacheRoot,
+
+        [scriptblock]$DownloadAction
     )
 
     $destinationPath = Assert-EasyConPhysicalPath -Path $Destination -TrustedRoot $TrustedRoot
+    if (-not [string]::IsNullOrWhiteSpace($SharedCacheRoot)) {
+        $sharedAsset = Get-EasyConSharedContentAsset -SharedCacheRoot $SharedCacheRoot `
+            -Url $Url -Algorithm SHA512 -Hash $Sha512 -Description $Description `
+            -DownloadAction $DownloadAction
+        return Copy-EasyConContentFileAtomically -Source $sharedAsset `
+            -Destination $destinationPath -Algorithm SHA512 -Hash $Sha512 `
+            -SourceTrustedRoot $SharedCacheRoot -DestinationTrustedRoot $TrustedRoot `
+            -Description $Description
+    }
     if (Test-Path -LiteralPath $destinationPath -PathType Leaf) {
         $actual = Get-EasyConFileHash -Path $destinationPath -Algorithm SHA512
         if ($actual -ceq $Sha512) {
@@ -967,10 +1314,17 @@ function Get-EasyConWindowsBuildConfiguration {
         }
         $toolNames = @()
         foreach ($element in $vcpkg.internalTools.EnumerateArray()) {
-            $tool = & $getObject $element @(
+            if ($element.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) {
+                throw "vcpkg internal tool must be a JSON object"
+            }
+            $toolName = & $getString $element.GetProperty("name") "vcpkg internal tool name"
+            $toolFields = @(
                 "name", "version", "url", "archive", "executable", "sha512"
-            ) "vcpkg internal tool"
-            $toolName = & $getString $tool.name "vcpkg internal tool name"
+            )
+            if ($toolName -ceq "7zip") {
+                $toolFields += "executableSha256"
+            }
+            $tool = & $getObject $element $toolFields "vcpkg internal tool"
             if ($toolName -notin @("cmake", "ninja", "7zip", "7zr") -or $toolNames -ccontains $toolName) {
                 throw "vcpkg internal tool names must be exactly cmake, ninja, 7zip, and 7zr"
             }
@@ -993,6 +1347,13 @@ function Get-EasyConWindowsBuildConfiguration {
             $sha512 = & $getString $tool.sha512 "$toolName SHA-512"
             if ($sha512 -cnotmatch '^[0-9a-f]{128}$') {
                 throw "$toolName SHA-512 must be lowercase hexadecimal"
+            }
+            if ($toolName -ceq "7zip") {
+                $executableSha256 = & $getString $tool.executableSha256 `
+                    "7zip executable SHA-256"
+                if ($executableSha256 -cnotmatch '^[0-9a-f]{64}$') {
+                    throw "7zip executable SHA-256 must be lowercase hexadecimal"
+                }
             }
         }
         if (($toolNames | Sort-Object) -join ',' -cne '7zip,7zr,cmake,ninja') {
@@ -1540,7 +1901,8 @@ function Clear-EasyConUntrustedBuildEnvironment {
         "VCPKG_ROOT", "VCPKG_BINARY_SOURCES", "VCPKG_DOWNLOADS",
         "VCPKG_DISABLE_METRICS", "VCPKG_FEATURE_FLAGS", "VCPKG_OVERLAY_PORTS",
         "VCPKG_OVERLAY_TRIPLETS", "VCPKG_CHAINLOAD_TOOLCHAIN_FILE",
-        "VCPKG_INSTALL_OPTIONS", "VCPKG_BOOTSTRAP_OPTIONS"
+        "VCPKG_INSTALL_OPTIONS", "VCPKG_BOOTSTRAP_OPTIONS",
+        "VCPKG_FORCE_DOWNLOADED_BINARIES", "VCPKG_FORCE_SYSTEM_BINARIES"
     )
     if (-not $AllowProxy) {
         $exactNames += @(
@@ -1641,7 +2003,9 @@ function Get-EasyConVcpkgAsset {
         [Parameter(Mandatory)]
         [object]$Configuration,
 
-        [string]$AssetPath
+        [string]$AssetPath,
+
+        [string]$SharedCacheRoot
     )
 
     $cache = Assert-EasyConPhysicalPath -Path $CacheRoot
@@ -1650,6 +2014,27 @@ function Get-EasyConVcpkgAsset {
     $asset = $Configuration.vcpkg.windowsAsset
     $cachedAsset = Join-Path $downloads "vcpkg-$($Configuration.vcpkg.toolRelease)-windows.exe"
     Assert-EasyConPhysicalPath -Path $cachedAsset -TrustedRoot $cache | Out-Null
+    if (-not [string]::IsNullOrWhiteSpace($SharedCacheRoot)) {
+        $downloadAction = $null
+        if (-not [string]::IsNullOrWhiteSpace($AssetPath)) {
+            $source = Assert-EasyConPhysicalPath -Path $AssetPath
+            Assert-EasyConPinnedFile -Path $source -Bytes ([long]$asset.bytes) `
+                -Sha256 ([string]$asset.sha256) -Description "provided vcpkg.exe"
+            $downloadAction = {
+                param($Url, $Destination)
+                $null = $Url
+                Copy-Item -LiteralPath $source -Destination $Destination
+            }.GetNewClosure()
+        }
+        $sharedAsset = Get-EasyConSharedContentAsset -SharedCacheRoot $SharedCacheRoot `
+            -Url ([string]$asset.url) -Algorithm SHA256 -Hash ([string]$asset.sha256) `
+            -Bytes ([long]$asset.bytes) -Description "pinned vcpkg.exe" `
+            -DownloadAction $downloadAction
+        return Copy-EasyConContentFileAtomically -Source $sharedAsset `
+            -Destination $cachedAsset -Algorithm SHA256 -Hash ([string]$asset.sha256) `
+            -Bytes ([long]$asset.bytes) -SourceTrustedRoot $SharedCacheRoot `
+            -DestinationTrustedRoot $cache -Description "pinned vcpkg.exe"
+    }
     if (Test-Path -LiteralPath $cachedAsset -PathType Leaf) {
         Assert-EasyConPinnedFile -Path $cachedAsset -Bytes ([long]$asset.bytes) `
             -Sha256 ([string]$asset.sha256) -Description "cached vcpkg.exe"
@@ -1762,6 +2147,7 @@ function Install-EasyConVcpkgCheckout {
             [string]$Configuration.vcpkg.scriptsRepository
         ) -Description "set pinned vcpkg origin" | Out-Null
         Invoke-EasyConNativeCapture -Program $git -Arguments @(
+            "-c", "http.sslBackend=schannel",
             "-c", "core.longpaths=true", "-c", "core.symlinks=false", "-C", $temporary,
             "fetch", "--depth", "1", "origin",
             [string]$Configuration.vcpkg.scriptsCommit
@@ -1771,7 +2157,7 @@ function Install-EasyConVcpkgCheckout {
             "checkout", "--detach", "FETCH_HEAD"
         ) -Description "check out pinned vcpkg scripts" | Out-Null
 
-        Assert-EasyConPhysicalPath -Path $VcpkgExecutable -TrustedRoot $cache | Out-Null
+        Get-EasyConPhysicalFile -Path $VcpkgExecutable | Out-Null
         Assert-EasyConVcpkgCheckout -VcpkgRoot $temporary `
             -Configuration $Configuration -VcpkgExecutable $VcpkgExecutable | Out-Null
         Assert-EasyConPhysicalTree -Path $temporary -TrustedRoot $cache | Out-Null
@@ -1798,6 +2184,167 @@ function Install-EasyConVcpkgCheckout {
                     $primaryFailure.Exception.Data["EasyConVcpkgStagingCleanupFailure"] = `
                         $_.Exception.ToString()
                     $primaryFailure.Exception.Data["EasyConResidualVcpkgStaging"] = $temporary
+                }
+                else {
+                    throw
+                }
+            }
+        }
+    }
+}
+
+function Get-EasyConSharedVcpkgCheckout {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$SharedCacheRoot,
+
+        [Parameter(Mandatory)]
+        [object]$Configuration,
+
+        [Parameter(Mandatory)]
+        [string]$VcpkgExecutable,
+
+        [scriptblock]$ValidateAction,
+
+        [scriptblock]$InstallAction
+    )
+
+    $shared = Resolve-EasyConFullPath -Path $SharedCacheRoot
+    New-EasyConSafeDirectory -Path $shared -TrustedRoot $shared | Out-Null
+    $sources = New-EasyConSafeDirectory -Path (Join-Path $shared "vcpkg-scripts") `
+        -TrustedRoot $shared
+    $quarantine = New-EasyConSafeDirectory `
+        -Path (Join-Path $shared "vcpkg-scripts-quarantine") -TrustedRoot $shared
+    $commit = [string]$Configuration.vcpkg.scriptsCommit
+    $checkout = Assert-EasyConPhysicalPath -Path (Join-Path $sources $commit) `
+        -TrustedRoot $shared
+    $lease = Enter-EasyConExclusiveFileLease `
+        -Path (Join-Path $shared "locks/vcpkg-scripts-$commit.lock") `
+        -TrustedRoot $shared -Description "vcpkg scripts $commit shared cache ownership"
+    if ($null -eq $ValidateAction) {
+        $assertCheckout = ${function:Assert-EasyConVcpkgCheckout}
+        $assertAuditPins = ${function:Assert-EasyConVcpkgAuditPins}
+        $ValidateAction = {
+            param($Root)
+            $verified = & $assertCheckout -VcpkgRoot $Root `
+                -Configuration $Configuration -VcpkgExecutable $VcpkgExecutable
+            & $assertAuditPins -VcpkgRoot $verified.Root `
+                -Configuration $Configuration
+            return $verified.Root
+        }.GetNewClosure()
+    }
+    if ($null -eq $InstallAction) {
+        $installCheckout = ${function:Install-EasyConVcpkgCheckout}
+        $InstallAction = {
+            param($Root)
+            & $installCheckout -VcpkgRoot $Root -CacheRoot $shared `
+                -Configuration $Configuration -VcpkgExecutable $VcpkgExecutable
+        }.GetNewClosure()
+    }
+    try {
+        if (Test-Path -LiteralPath $checkout -PathType Container) {
+            try {
+                return & $ValidateAction $checkout
+            }
+            catch {
+                $damage = $_.Exception
+                $quarantined = Join-Path $quarantine (
+                    "$commit.corrupt-$PID-$([guid]::NewGuid().ToString('N'))"
+                )
+                try {
+                    Assert-EasyConPhysicalPath -Path $quarantined -TrustedRoot $shared | Out-Null
+                    [System.IO.Directory]::Move($checkout, $quarantined)
+                }
+                catch {
+                    $diagnostic = [System.IO.IOException]::new(
+                        "cached vcpkg scripts are damaged and could not be isolated: $($damage.Message); $($_.Exception.Message)",
+                        $damage
+                    )
+                    $diagnostic.Data["EasyConVcpkgSourceIsolationFailure"] = `
+                        $_.Exception.ToString()
+                    throw $diagnostic
+                }
+            }
+        }
+
+        & $InstallAction $checkout
+        return & $ValidateAction $checkout
+    }
+    finally {
+        $lease.Dispose()
+    }
+}
+
+function Install-EasyConVcpkgCheckoutFromShared {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$SourceRoot,
+
+        [Parameter(Mandatory)]
+        [string]$VcpkgRoot,
+
+        [Parameter(Mandatory)]
+        [string]$EnvironmentRoot,
+
+        [Parameter(Mandatory)]
+        [string]$SharedCacheRoot,
+
+        [Parameter(Mandatory)]
+        [object]$Configuration,
+
+        [Parameter(Mandatory)]
+        [string]$VcpkgExecutable
+    )
+
+    $environment = Assert-EasyConPhysicalPath -Path $EnvironmentRoot
+    $source = Assert-EasyConPhysicalTree -Path $SourceRoot -TrustedRoot $SharedCacheRoot
+    Assert-EasyConVcpkgCheckout -VcpkgRoot $source -Configuration $Configuration `
+        -VcpkgExecutable $VcpkgExecutable | Out-Null
+    Assert-EasyConVcpkgAuditPins -VcpkgRoot $source -Configuration $Configuration
+    $destination = Assert-EasyConPhysicalPath -Path $VcpkgRoot -TrustedRoot $environment
+    if (Test-Path -LiteralPath $destination) {
+        throw "refusing to replace an existing vcpkg environment checkout"
+    }
+    New-EasyConSafeDirectory -Path (Split-Path -Parent $destination) `
+        -TrustedRoot $environment | Out-Null
+    $temporary = "$destination.materialize-$PID-$([guid]::NewGuid().ToString('N'))"
+    Assert-EasyConPhysicalPath -Path $temporary -TrustedRoot $environment | Out-Null
+    $completed = $false
+    $primaryFailure = $null
+    try {
+        $git = Get-EasyConCommandPath -Name "git.exe"
+        Invoke-EasyConNativeCapture -Program $git -Arguments @(
+            "-c", "core.longpaths=true", "clone", "--local", "--no-hardlinks", "--no-tags",
+            $source, $temporary
+        ) -Description "materialize cached vcpkg scripts" | Out-Null
+        Invoke-EasyConNativeCapture -Program $git -Arguments @(
+            "-c", "core.longpaths=true", "-C", $temporary, "remote", "set-url", "origin",
+            [string]$Configuration.vcpkg.scriptsRepository
+        ) -Description "restore pinned vcpkg origin" | Out-Null
+        Assert-EasyConVcpkgCheckout -VcpkgRoot $temporary -Configuration $Configuration `
+            -VcpkgExecutable $VcpkgExecutable | Out-Null
+        Assert-EasyConVcpkgAuditPins -VcpkgRoot $temporary -Configuration $Configuration
+        Publish-EasyConDirectoryAtomically -Source $temporary -Destination $destination `
+            -TrustedRoot $environment | Out-Null
+        $completed = $true
+    }
+    catch {
+        $primaryFailure = $_
+        throw
+    }
+    finally {
+        if (-not $completed -and (Test-Path -LiteralPath $temporary)) {
+            try {
+                Remove-EasyConSafeTree -Path $temporary -TrustedRoot $environment
+            }
+            catch {
+                if ($null -ne $primaryFailure) {
+                    $primaryFailure.Exception.Data["EasyConVcpkgMaterializationCleanupFailure"] = `
+                        $_.Exception.ToString()
+                    $primaryFailure.Exception.Data["EasyConResidualVcpkgMaterialization"] = `
+                        $temporary
                 }
                 else {
                     throw
@@ -2103,19 +2650,26 @@ function Install-EasyConControlledBuildTools {
         [string]$EnvironmentRoot,
 
         [Parameter(Mandatory)]
-        [object]$Configuration
+        [object]$Configuration,
+
+        [Parameter(Mandatory)]
+        [string]$SharedCacheRoot
     )
 
     $environment = Assert-EasyConPhysicalPath -Path $EnvironmentRoot
-    $downloads = New-EasyConSafeDirectory -Path (Join-Path $environment "tool-downloads") `
-        -TrustedRoot $environment
+    $shared = Resolve-EasyConFullPath -Path $SharedCacheRoot
+    New-EasyConSafeDirectory -Path $shared -TrustedRoot $shared | Out-Null
+    $downloads = New-EasyConSafeDirectory -Path (Join-Path $shared (Join-Path `
+        "vcpkg-downloads" ([string]$Configuration.vcpkg.scriptsCommit))) `
+        -TrustedRoot $shared
     $toolsRoot = New-EasyConSafeDirectory -Path (Join-Path $environment "tools") `
         -TrustedRoot $environment
     $result = [ordered]@{}
     foreach ($tool in @($Configuration.vcpkg.internalTools | Where-Object { $_.name -in @("cmake", "ninja") })) {
         $archive = Get-EasyConPinnedDownload -Destination (Join-Path $downloads $tool.archive) `
             -Url ([string]$tool.url) -Sha512 ([string]$tool.sha512) `
-            -TrustedRoot $environment -Description "$($tool.name) $($tool.version)"
+            -TrustedRoot $shared -Description "$($tool.name) $($tool.version)" `
+            -SharedCacheRoot $SharedCacheRoot
         $destination = Join-Path $toolsRoot "$($tool.name)-$($tool.version)"
         if (-not (Test-Path -LiteralPath $destination -PathType Container)) {
             New-EasyConSafeDirectory -Path $destination -TrustedRoot $environment | Out-Null
@@ -2239,6 +2793,68 @@ function Assert-EasyConVisionModel {
     }
 }
 
+function Install-EasyConSharedVisionModel {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$ManifestPath,
+
+        [Parameter(Mandatory)]
+        [string]$ModelRoot,
+
+        [Parameter(Mandatory)]
+        [string]$RepositoryRoot,
+
+        [Parameter(Mandatory)]
+        [string]$AllowedModelRoot,
+
+        [Parameter(Mandatory)]
+        [string]$SharedCacheRoot,
+
+        [Parameter(Mandatory)]
+        [string]$PythonPath
+    )
+
+    $repository = Assert-EasyConPhysicalPath -Path $RepositoryRoot
+    $manifestPathResolved = Get-EasyConPhysicalFile -Path $ManifestPath `
+        -TrustedRoot $repository
+    Invoke-EasyConNativeCapture -Program $PythonPath -Arguments @(
+        "tools/provision_vision_test_model.py",
+        "--manifest", "spec/fixtures/vision/ocr-model.json",
+        "--output", $ModelRoot,
+        "--allowed-root", $AllowedModelRoot,
+        "--verify-manifest-only"
+    ) -Description "verify frozen OCR test model manifest" `
+        -WorkingDirectory $repository | Out-Null
+    $manifest = Read-EasyConPhysicalText -Path $manifestPathResolved `
+        -TrustedRoot $repository | ConvertFrom-Json -Depth 16
+    $allowed = Resolve-EasyConFullPath -Path $AllowedModelRoot
+    $model = Resolve-EasyConFullPath -Path $ModelRoot
+    if (-not (Test-EasyConPathWithin -Path $model -Root $allowed)) {
+        throw "OCR test model must remain inside the controlled model storage"
+    }
+    New-EasyConSafeDirectory -Path $allowed -TrustedRoot $allowed | Out-Null
+    New-EasyConSafeDirectory -Path $model -TrustedRoot $allowed | Out-Null
+    foreach ($name in @("model", "license")) {
+        $entry = $manifest.$name
+        $uri = [uri][string]$entry.url
+        if ($uri.Scheme -cne "https" -or $uri.Host -cne "raw.githubusercontent.com") {
+            throw "OCR manifest $name URL is outside the frozen HTTPS host"
+        }
+        $sharedAsset = Get-EasyConSharedContentAsset `
+            -SharedCacheRoot $SharedCacheRoot -Url ([string]$entry.url) `
+            -Algorithm SHA256 -Hash ([string]$entry.sha256) -Bytes ([long]$entry.bytes) `
+            -Description "OCR test $name"
+        Copy-EasyConContentFileAtomically -Source $sharedAsset `
+            -Destination (Join-Path $model ([string]$entry.path)) -Algorithm SHA256 `
+            -Hash ([string]$entry.sha256) -Bytes ([long]$entry.bytes) `
+            -SourceTrustedRoot $SharedCacheRoot -DestinationTrustedRoot $allowed `
+            -Description "OCR test $name" | Out-Null
+    }
+    return Assert-EasyConVisionModel -ManifestPath $manifestPathResolved `
+        -ModelRoot $model -RepositoryRoot $repository -AllowedModelRoot $allowed
+}
+
 function Assert-EasyConRustToolchain {
     [CmdletBinding()]
     param(
@@ -2286,11 +2902,14 @@ function Install-EasyConRustToolchain {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
-        [object]$Pin
+        [object]$Pin,
+
+        [ValidateRange(0, 60000)]
+        [int]$RetryDelayMilliseconds = 1000
     )
 
     $rustup = Get-EasyConCommandPath -Name "rustup.exe"
-    Invoke-EasyConNativeCapture -Program $rustup -Arguments @(
+    $installArguments = @(
         "toolchain",
         "install",
         [string]$Pin.Channel,
@@ -2302,7 +2921,22 @@ function Install-EasyConRustToolchain {
         "rustfmt",
         "--target",
         [string]$Pin.Target
-    ) -Description "install frozen Rust toolchain" | Out-Null
+    )
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+            Invoke-EasyConNativeCapture -Program $rustup -Arguments $installArguments `
+                -Description "install frozen Rust toolchain" | Out-Null
+            break
+        }
+        catch {
+            if ($attempt -eq 3) {
+                throw
+            }
+            if ($RetryDelayMilliseconds -gt 0) {
+                Start-Sleep -Milliseconds $RetryDelayMilliseconds
+            }
+        }
+    }
     return Assert-EasyConRustToolchain -Pin $Pin
 }
 
@@ -2416,13 +3050,25 @@ function Install-EasyConVcpkgDependencies {
         [Parameter(Mandatory)]
         [string]$CacheRoot,
 
+        [string]$DownloadsTrustedRoot,
+
         [Parameter(Mandatory)]
-        [object]$WorkspaceLayout
+        [object]$WorkspaceLayout,
+
+        [ValidateRange(0, 60000)]
+        [int]$RetryDelayMilliseconds = 1000
     )
 
     $repository = Assert-EasyConPhysicalPath -Path $RepositoryRoot
     $cache = Assert-EasyConPhysicalPath -Path $CacheRoot
-    $downloads = Assert-EasyConPhysicalPath -Path $DownloadsRoot -TrustedRoot $cache
+    $downloadsTrustRoot = if ([string]::IsNullOrWhiteSpace($DownloadsTrustedRoot)) {
+        $cache
+    }
+    else {
+        Assert-EasyConPhysicalPath -Path $DownloadsTrustedRoot
+    }
+    $downloads = Assert-EasyConPhysicalPath -Path $DownloadsRoot `
+        -TrustedRoot $downloadsTrustRoot
     $buildtrees = Assert-EasyConPhysicalPath -Path $WorkspaceLayout.Buildtrees -TrustedRoot $cache
     $packages = Assert-EasyConPhysicalPath -Path $WorkspaceLayout.Packages -TrustedRoot $cache
     $installed = Assert-EasyConPhysicalPath -Path $WorkspaceLayout.Installed -TrustedRoot $cache
@@ -2440,9 +3086,136 @@ function Install-EasyConVcpkgDependencies {
         "--downloads-root=$downloads",
         "--overlay-triplets=$triplets"
     )
-    Invoke-EasyConNativeCapture -Program $Vcpkg.Executable -Arguments $arguments `
-        -Description "install verified vcpkg dependencies" `
-        -WorkingDirectory $repository -StreamOutput | Out-Null
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+            Invoke-EasyConNativeCapture -Program $Vcpkg.Executable -Arguments $arguments `
+                -Description "install verified vcpkg dependencies" `
+                -WorkingDirectory $repository -StreamOutput | Out-Null
+            break
+        }
+        catch {
+            if ($attempt -eq 3) {
+                throw
+            }
+            if ($RetryDelayMilliseconds -gt 0) {
+                Start-Sleep -Milliseconds $RetryDelayMilliseconds
+            }
+        }
+    }
+}
+
+function Install-EasyConControlledSevenZip {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object]$Vcpkg,
+
+        [Parameter(Mandatory)]
+        [string]$DownloadsRoot,
+
+        [Parameter(Mandatory)]
+        [string]$CacheRoot,
+
+        [Parameter(Mandatory)]
+        [object]$SevenZipPin,
+
+        [Parameter(Mandatory)]
+        [object]$SevenZrPin,
+
+        [string]$SharedCacheRoot
+    )
+
+    $cache = Assert-EasyConPhysicalPath -Path $CacheRoot
+    $downloads = Assert-EasyConPhysicalPath -Path $DownloadsRoot -TrustedRoot $cache
+    $sevenZipArchive = Get-EasyConPinnedDownload `
+        -Destination (Join-Path $downloads $SevenZipPin.archive) `
+        -Url ([string]$SevenZipPin.url) -Sha512 ([string]$SevenZipPin.sha512) `
+        -TrustedRoot $cache -Description "7-Zip $($SevenZipPin.version)" `
+        -SharedCacheRoot $SharedCacheRoot
+    $sevenZrDownload = Get-EasyConPinnedDownload `
+        -Destination (Join-Path $downloads $SevenZrPin.archive) `
+        -Url ([string]$SevenZrPin.url) -Sha512 ([string]$SevenZrPin.sha512) `
+        -TrustedRoot $cache -Description "7zr $($SevenZrPin.version)" `
+        -SharedCacheRoot $SharedCacheRoot
+    $sevenZr = Install-EasyConPinnedExecutable -Source $sevenZrDownload `
+        -Destination (Join-Path $cache (Join-Path `
+            "tools/7zr-$($SevenZrPin.version)" ([string]$SevenZrPin.executable))) `
+        -Sha512 ([string]$SevenZrPin.sha512) -TrustedRoot $cache `
+        -Description "7zr $($SevenZrPin.version)"
+    $null = $sevenZipArchive
+    $isolatedPath = New-EasyConSafeDirectory `
+        -Path (Join-Path $cache "tools/vcpkg-fetch-path") -TrustedRoot $cache
+    $isolatedEntries = @(Get-ChildItem -Force -LiteralPath $isolatedPath -ErrorAction Stop)
+    if ($isolatedEntries.Count -ne 0) {
+        throw "controlled vcpkg fetch PATH must remain empty"
+    }
+    $expectedSevenZip = Resolve-EasyConFullPath -Path (Join-Path $downloads (
+        "tools/7zip-$($SevenZipPin.version)-windows/$($SevenZipPin.executable)"
+    ))
+    Assert-EasyConPhysicalPath -Path $expectedSevenZip -TrustedRoot $cache | Out-Null
+
+    $originalPath = [Environment]::GetEnvironmentVariable("PATH", "Process")
+    $originalForceDownloaded = [Environment]::GetEnvironmentVariable(
+        "VCPKG_FORCE_DOWNLOADED_BINARIES", "Process"
+    )
+    try {
+        [Environment]::SetEnvironmentVariable("PATH", $isolatedPath, "Process")
+        [Environment]::SetEnvironmentVariable(
+            "VCPKG_FORCE_DOWNLOADED_BINARIES", "1", "Process"
+        )
+        $sevenZipOutput = @(Invoke-EasyConNativeCapture -Program $Vcpkg.Executable -Arguments @(
+            "fetch", "7zip", "--vcpkg-root", $Vcpkg.Root, "--downloads-root=$downloads"
+        ) -Description "prepare audited vcpkg 7-Zip tool")
+    }
+    finally {
+        [Environment]::SetEnvironmentVariable("PATH", $originalPath, "Process")
+        [Environment]::SetEnvironmentVariable(
+            "VCPKG_FORCE_DOWNLOADED_BINARIES", $originalForceDownloaded, "Process"
+        )
+    }
+
+    if ($sevenZipOutput.Count -eq 0) {
+        throw "vcpkg 7-Zip fetch returned no audited tool path"
+    }
+    $pathLines = @($sevenZipOutput | ForEach-Object {
+        $line = [string]$_
+        $trimmed = $line.Trim()
+        if (-not [string]::IsNullOrWhiteSpace($trimmed) -and [System.IO.Path]::IsPathFullyQualified($trimmed)) {
+            $trimmed
+        }
+    })
+    $reportedLine = [string]$sevenZipOutput[-1]
+    if (
+        $reportedLine -cne $reportedLine.Trim() -or
+        $pathLines.Count -ne 1 -or
+        $pathLines[0] -cne $reportedLine
+    ) {
+        throw "vcpkg 7-Zip fetch output must end with exactly one absolute audited tool path"
+    }
+    $reportedSevenZip = Resolve-EasyConFullPath -Path $reportedLine
+    if (-not $reportedSevenZip.Equals(
+        $expectedSevenZip, [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw "vcpkg 7-Zip fetch output did not select the controlled path: $reportedSevenZip"
+    }
+    $sevenZip = Get-EasyConPhysicalFile -Path $expectedSevenZip -TrustedRoot $cache
+    $sevenZipHash = Get-EasyConFileHash -Path $sevenZip -Algorithm SHA256
+    if ($sevenZipHash -cne [string]$SevenZipPin.executableSha256) {
+        throw "controlled 7-Zip executable has SHA-256 $sevenZipHash; expected $($SevenZipPin.executableSha256)"
+    }
+    $versionOutput = @(Invoke-EasyConNativeCapture -Program $sevenZip -Arguments @("i") `
+        -Description "verify controlled 7-Zip version")
+    $expectedVersionPattern = '^7-Zip ' + [regex]::Escape([string]$SevenZipPin.version) +
+        ' \(x64\) : .+$'
+    $versionLines = @($versionOutput | Where-Object { [string]$_ -cmatch $expectedVersionPattern })
+    if ($versionLines.Count -ne 1) {
+        throw "controlled 7-Zip did not report the exact x64 version $($SevenZipPin.version)"
+    }
+    return [pscustomobject]@{
+        SevenZipPath = $sevenZip
+        SevenZipVersion = [string]$SevenZipPin.version
+        SevenZrPath = $sevenZr
+    }
 }
 
 function Set-EasyConCargoNativeLinkSearch {
@@ -2659,6 +3432,13 @@ function Install-EasyConWindowsEnvironment {
 
     $cache = Resolve-EasyConFullPath -Path $EnvironmentRoot
     New-EasyConSafeDirectory -Path $cache -TrustedRoot $cache | Out-Null
+    $cacheStorage = if ([string]::IsNullOrWhiteSpace($SharedCacheRoot)) {
+        $cache
+    }
+    else {
+        Resolve-EasyConFullPath -Path $SharedCacheRoot
+    }
+    New-EasyConSafeDirectory -Path $cacheStorage -TrustedRoot $cacheStorage | Out-Null
     Assert-EasyConVcpkgEnvironmentInputs
     Clear-EasyConUntrustedBuildEnvironment -AllowProxy
 
@@ -2666,7 +3446,7 @@ function Install-EasyConWindowsEnvironment {
         -MsvcToolsVersion ([string]$configuration.hostTools.msvcToolsVersion) `
         -WindowsSdkVersion ([string]$configuration.hostTools.windowsSdkVersion)
     $controlledTools = Install-EasyConControlledBuildTools -EnvironmentRoot $cache `
-        -Configuration $configuration
+        -Configuration $configuration -SharedCacheRoot $cacheStorage
     $controlledPath = @(
         Split-Path -Parent $controlledTools.cmake
         Split-Path -Parent $controlledTools.ninja
@@ -2709,10 +3489,15 @@ function Install-EasyConWindowsEnvironment {
         throw "VCPKG_ROOT must remain inside the controlled build cache"
     }
     $vcpkgExecutable = Get-EasyConVcpkgAsset -CacheRoot $cache `
-        -Configuration $configuration
+        -Configuration $configuration -SharedCacheRoot $cacheStorage
     if (-not (Test-Path -LiteralPath $resolvedVcpkgRoot -PathType Container)) {
-        Install-EasyConVcpkgCheckout -VcpkgRoot $resolvedVcpkgRoot -CacheRoot $cache `
-            -Configuration $configuration -VcpkgExecutable $vcpkgExecutable
+        $sharedVcpkgRoot = Get-EasyConSharedVcpkgCheckout `
+            -SharedCacheRoot $cacheStorage -Configuration $configuration `
+            -VcpkgExecutable $vcpkgExecutable
+        Install-EasyConVcpkgCheckoutFromShared -SourceRoot $sharedVcpkgRoot `
+            -VcpkgRoot $resolvedVcpkgRoot -EnvironmentRoot $cache `
+            -SharedCacheRoot $cacheStorage -Configuration $configuration `
+            -VcpkgExecutable $vcpkgExecutable
     }
     $vcpkg = Assert-EasyConVcpkgCheckout -VcpkgRoot $resolvedVcpkgRoot `
         -Configuration $configuration -VcpkgExecutable $vcpkgExecutable
@@ -2724,26 +3509,16 @@ function Install-EasyConWindowsEnvironment {
     $resolvedModelRoot = Resolve-EasyConFullPath `
         -Path (Join-Path $allowedModelRoot $configuration.visionModelDirectory)
     Assert-EasyConPhysicalPath -Path $resolvedModelRoot -TrustedRoot $allowedModelRoot | Out-Null
-    New-EasyConSafeDirectory -Path $resolvedModelRoot -TrustedRoot $allowedModelRoot | Out-Null
-    Invoke-EasyConNativeCapture -Program $python.Path -Arguments @(
-        "tools/provision_vision_test_model.py",
-        "--manifest", "spec/fixtures/vision/ocr-model.json",
-        "--output", $resolvedModelRoot,
-        "--allowed-root", $allowedModelRoot
-    ) -Description "provision frozen OCR test model" -WorkingDirectory $repository | Out-Null
-    $vision = Assert-EasyConVisionModel -ManifestPath $modelManifest `
+    $vision = Install-EasyConSharedVisionModel -ManifestPath $modelManifest `
         -ModelRoot $resolvedModelRoot -RepositoryRoot $repository `
-        -AllowedModelRoot $allowedModelRoot
+        -AllowedModelRoot $allowedModelRoot -SharedCacheRoot $cacheStorage `
+        -PythonPath $python.Path
 
+    $rustupHome = New-EasyConSafeDirectory -Path (Join-Path $cacheStorage "rustup-home") `
+        -TrustedRoot $cacheStorage
+    $env:RUSTUP_HOME = $rustupHome
     $rust = Install-EasyConRustToolchain -Pin $rustPin
 
-    $cacheStorage = if ([string]::IsNullOrWhiteSpace($SharedCacheRoot)) {
-        $cache
-    }
-    else {
-        Resolve-EasyConFullPath -Path $SharedCacheRoot
-    }
-    New-EasyConSafeDirectory -Path $cacheStorage -TrustedRoot $cacheStorage | Out-Null
     $binaryCache = Join-Path $cacheStorage "vcpkg-binary-cache"
     if ($binaryCache.IndexOfAny([char[]]",;") -ge 0) {
         throw "vcpkg binary cache path cannot contain comma or semicolon"
@@ -2756,10 +3531,13 @@ function Install-EasyConWindowsEnvironment {
         -DownloadCacheRoot (Join-Path $cacheStorage "cargo-download-cache")
     $env:CARGO_HOME = $cargoSources.CargoHome
 
-    $externalDownloads = Join-Path $cache (
+    $externalDownloads = Join-Path $cacheStorage (
         Join-Path "vcpkg-downloads" ([string]$configuration.vcpkg.scriptsCommit)
     )
-    $vcpkgDownloads = New-EasyConSafeDirectory -Path $externalDownloads -TrustedRoot $cache
+    $setupVcpkgDownloads = New-EasyConSafeDirectory -Path $externalDownloads `
+        -TrustedRoot $cacheStorage
+    $vcpkgDownloads = New-EasyConSafeDirectory -Path (Join-Path $cache "vcpkg-downloads") `
+        -TrustedRoot $cache
 
     $vcpkgLayout = New-EasyConVcpkgWorkspaceLayout -Vcpkg $vcpkg `
         -RepositoryRoot $repository -CargoTargetDirectory $cargoTarget `
@@ -2767,9 +3545,10 @@ function Install-EasyConWindowsEnvironment {
 
     $env:VCPKG_ROOT = $vcpkgLayout.Root
     $env:VCPKG_BINARY_SOURCES = "clear;files,$binaryCache,readwrite"
-    $env:VCPKG_DOWNLOADS = $vcpkgDownloads
+    $env:VCPKG_DOWNLOADS = $setupVcpkgDownloads
     $env:VCPKG_DISABLE_METRICS = "1"
     $env:VCPKG_FEATURE_FLAGS = "manifests,registries,versions"
+    $env:VCPKG_FORCE_DOWNLOADED_BINARIES = "1"
     $env:CXX = [string]$msvc.Tools.'cl.exe'
     $env:CARGO_TARGET_DIR = $cargoTarget
     $env:CARGO_INCREMENTAL = "0"
@@ -2777,27 +3556,31 @@ function Install-EasyConWindowsEnvironment {
 
     $sevenZipPin = @($configuration.vcpkg.internalTools | Where-Object { $_.name -ceq "7zip" })[0]
     $sevenZrPin = @($configuration.vcpkg.internalTools | Where-Object { $_.name -ceq "7zr" })[0]
-    $sevenZipArchive = Get-EasyConPinnedDownload `
-        -Destination (Join-Path $vcpkgDownloads $sevenZipPin.archive) `
-        -Url ([string]$sevenZipPin.url) -Sha512 ([string]$sevenZipPin.sha512) `
-        -TrustedRoot $cache -Description "7-Zip $($sevenZipPin.version)"
-    $sevenZrDownload = Get-EasyConPinnedDownload `
-        -Destination (Join-Path $vcpkgDownloads $sevenZrPin.archive) `
-        -Url ([string]$sevenZrPin.url) -Sha512 ([string]$sevenZrPin.sha512) `
-        -TrustedRoot $cache -Description "7zr $($sevenZrPin.version)"
-    $sevenZr = Install-EasyConPinnedExecutable -Source $sevenZrDownload `
-        -Destination (Join-Path $cache (Join-Path `
-            "tools/7zr-$($sevenZrPin.version)" ([string]$sevenZrPin.executable))) `
-        -Sha512 ([string]$sevenZrPin.sha512) -TrustedRoot $cache `
-        -Description "7zr $($sevenZrPin.version)"
-    $null = $sevenZipArchive
-    $sevenZipOutput = @(Invoke-EasyConNativeCapture -Program $vcpkg.Executable -Arguments @(
-        "fetch", "7zip", "--vcpkg-root", $vcpkg.Root, "--downloads-root=$vcpkgDownloads"
-    ) -Description "prepare audited vcpkg 7-Zip tool")
-    $sevenZip = Get-EasyConPhysicalFile -Path $sevenZipOutput[-1].Trim() -TrustedRoot $cache
+    $sevenZipTools = Install-EasyConControlledSevenZip -Vcpkg $vcpkg `
+        -DownloadsRoot $setupVcpkgDownloads -CacheRoot $cacheStorage `
+        -SevenZipPin $sevenZipPin -SevenZrPin $sevenZrPin `
+        -SharedCacheRoot $cacheStorage
+    $sevenZip = Copy-EasyConContentFileAtomically `
+        -Source $sevenZipTools.SevenZipPath `
+        -Destination (Join-Path $cache "tools/7zip-$($sevenZipPin.version)/7z.exe") `
+        -Algorithm SHA256 -Hash ([string]$sevenZipPin.executableSha256) `
+        -SourceTrustedRoot $cacheStorage -DestinationTrustedRoot $cache `
+        -Description "controlled 7-Zip executable"
+    $sevenZr = Copy-EasyConContentFileAtomically `
+        -Source $sevenZipTools.SevenZrPath `
+        -Destination (Join-Path $cache "tools/7zr-$($sevenZrPin.version)/7zr.exe") `
+        -Algorithm SHA512 -Hash ([string]$sevenZrPin.sha512) `
+        -SourceTrustedRoot $cacheStorage -DestinationTrustedRoot $cache `
+        -Description "controlled 7zr executable"
+    $env:PATH = (@(
+        Split-Path -Parent $sevenZip
+        Split-Path -Parent $sevenZr
+        $env:PATH
+    ) -join [System.IO.Path]::PathSeparator)
 
     Install-EasyConVcpkgDependencies -Vcpkg $vcpkg -RepositoryRoot $repository `
-        -DownloadsRoot $vcpkgDownloads -CacheRoot $cache `
+        -DownloadsRoot $setupVcpkgDownloads -DownloadsTrustedRoot $cacheStorage `
+        -CacheRoot $cache `
         -WorkspaceLayout $vcpkgLayout
     $null = Set-EasyConCargoNativeLinkSearch -InstalledRoot $vcpkgLayout.Installed `
         -CacheRoot $cache
@@ -2819,6 +3602,7 @@ function Install-EasyConWindowsEnvironment {
         ninjaPath = $buildTools.NinjaPath
         ninja = $buildTools.NinjaVersion
         sevenZipPath = $sevenZip
+        sevenZipVersion = $sevenZipTools.SevenZipVersion
         sevenZrPath = $sevenZr
         rust = $rust.Version
         rustupPath = $rust.RustupPath
@@ -2878,10 +3662,17 @@ function Invoke-EasyConWindowsSetupCore {
     $fingerprint = $Context.Fingerprint
     $location = $Context.Location
 
-    $installed = Install-EasyConWindowsEnvironment -RepositoryRoot $repository `
-        -ConfigurationPath $ConfigurationPath -EnvironmentRoot $location.EnvironmentRoot `
-        -SharedCacheRoot (Join-Path $location.CacheRoot "caches") `
-        -VsWherePath $VsWherePath
+    $sharedCacheRoot = Resolve-EasyConFullPath -Path (Join-Path $location.CacheRoot "caches")
+    $sharedLease = Enter-EasyConSharedCacheLease -CacheRoot $location.CacheRoot `
+        -Access Exclusive
+    try {
+        $installed = Install-EasyConWindowsEnvironment -RepositoryRoot $repository `
+            -ConfigurationPath $ConfigurationPath -EnvironmentRoot $location.EnvironmentRoot `
+            -SharedCacheRoot $sharedCacheRoot -VsWherePath $VsWherePath
+    }
+    finally {
+        $sharedLease.Dispose()
+    }
     $toolRecords = [System.Collections.Generic.List[object]]::new()
     foreach ($entry in @(
         @("cmake", $installed.cmakePath, $true),
@@ -2929,6 +3720,7 @@ function Invoke-EasyConWindowsSetupCore {
             python = $installed.python
             cmake = $installed.cmake
             ninja = $installed.ninja
+            sevenZip = $installed.sevenZipVersion
             msvcTools = $installed.msvcToolsVersion
             windowsSdk = $installed.windowsSdkVersion
             vcpkgScripts = $installed.vcpkgScripts
@@ -3058,6 +3850,14 @@ function Invoke-EasyConWindowsVerifyCore {
         if ($actualHash -cne [string]$record.sha256) {
             throw "prepared tool $name is damaged: SHA-256 $actualHash does not match the Setup stamp. Rerun Setup."
         }
+        if ($name -ceq "7zip") {
+            $sevenZipPin = @($configuration.vcpkg.internalTools | Where-Object {
+                $_.name -ceq "7zip"
+            })[0]
+            if ($actualHash -cne [string]$sevenZipPin.executableSha256) {
+                throw "prepared 7-Zip does not match the pinned executable SHA-256. Rerun Setup."
+            }
+        }
         $tools[$name] = $path
     }
     $expectedToolNames = @(
@@ -3070,6 +3870,10 @@ function Invoke-EasyConWindowsVerifyCore {
 
     $preparedPaths = @{}
     try {
+        $sharedCacheRoot = Assert-EasyConPhysicalTree `
+            -Path (Join-Path $location.CacheRoot "caches") -TrustedRoot $location.CacheRoot
+        $preparedPaths.rustupHome = Assert-EasyConPhysicalTree `
+            -Path (Join-Path $sharedCacheRoot "rustup-home") -TrustedRoot $sharedCacheRoot
         foreach ($name in @(
             "cargoHome", "cargoVendor", "vcpkgScriptsRoot", "vcpkgExecutionRoot",
             "vcpkgInstalled", "vcpkgDownloads", "ocrModel", "cargoTarget"
@@ -3150,11 +3954,13 @@ function Invoke-EasyConWindowsVerifyCore {
         CARGO_TARGET_DIR = $preparedPaths.cargoTarget
         CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER = $tools.link
         EASYCON_VISION_TEST_TESSDATA = $preparedPaths.ocrModel
+        RUSTUP_HOME = $preparedPaths.rustupHome
         RUSTUP_TOOLCHAIN = [string]$rustPin.Channel
         VCPKG_BINARY_SOURCES = "clear"
         VCPKG_DISABLE_METRICS = "1"
         VCPKG_DOWNLOADS = $preparedPaths.vcpkgDownloads
         VCPKG_FEATURE_FLAGS = "manifests,registries,versions"
+        VCPKG_FORCE_DOWNLOADED_BINARIES = "1"
         VCPKG_ROOT = $preparedPaths.vcpkgExecutionRoot
     }
     foreach ($entry in $controlledMsvcEnvironment.GetEnumerator()) {
@@ -3174,13 +3980,17 @@ function Invoke-EasyConWindowsVerifyCore {
     $buildTools = Get-EasyConBuildToolVersions `
         -CMakeMinimumVersion ([version]$stamp.versions.cmake) `
         -NinjaMinimumVersion ([version]$stamp.versions.ninja)
+    $sevenZipPin = @($configuration.vcpkg.internalTools | Where-Object {
+        $_.name -ceq "7zip"
+    })[0]
     if (
         -not $buildTools.CMakePath.Equals($tools.cmake, [System.StringComparison]::OrdinalIgnoreCase) -or
         -not $buildTools.NinjaPath.Equals($tools.ninja, [System.StringComparison]::OrdinalIgnoreCase) -or
         $buildTools.CMakeVersion -cne [string]$stamp.versions.cmake -or
-        $buildTools.NinjaVersion -cne [string]$stamp.versions.ninja
+        $buildTools.NinjaVersion -cne [string]$stamp.versions.ninja -or
+        [string]$stamp.versions.sevenZip -cne [string]$sevenZipPin.version
     ) {
-        throw "controlled CMake or Ninja path/version changed since Setup. Rerun Setup."
+        throw "controlled build tool version changed since Setup. Rerun Setup."
     }
     $pythonMinimumVersion = ConvertTo-EasyConStrictVersion `
         -Value ([string]$configuration.hostTools.pythonMinimumVersion) `
@@ -3223,6 +4033,7 @@ function Invoke-EasyConWindowsVerifyCore {
         target = [string]$configuration.target
         cmake = $buildTools.CMakeVersion
         ninja = $buildTools.NinjaVersion
+        sevenZip = [string]$sevenZipPin.version
         rust = $rustPin.Channel
         cargo = $cargoVersion
         vcpkgScripts = [string]$configuration.vcpkg.scriptsCommit
@@ -3259,14 +4070,28 @@ function Invoke-EasyConEnvironmentLifecycle {
 
     $environmentSnapshot = Get-EasyConProcessEnvironmentSnapshot
     $lease = $null
+    $sharedCacheLease = $null
     $primaryFailure = $null
     try {
         $access = if ($Mode -ceq "Setup") { "Exclusive" } else { "Shared" }
         $lease = Enter-EasyConEnvironmentLease -Location $Location -Access $access `
             -TimeoutMilliseconds $LeaseTimeoutMilliseconds
+        if ($Mode -cne "Setup") {
+            $sharedCacheLease = Enter-EasyConSharedCacheLease `
+                -CacheRoot ([string]$Location.CacheRoot) -Access Shared `
+                -TimeoutMilliseconds $LeaseTimeoutMilliseconds
+        }
         if ($Mode -ceq "Setup") {
             try {
-                $verified = & $VerifyAction
+                $setupVerificationLease = Enter-EasyConSharedCacheLease `
+                    -CacheRoot ([string]$Location.CacheRoot) -Access Shared `
+                    -TimeoutMilliseconds $LeaseTimeoutMilliseconds
+                try {
+                    $verified = & $VerifyAction
+                }
+                finally {
+                    $setupVerificationLease.Dispose()
+                }
                 Write-EasyConStructuredRecord -Kind "setup" -Value ([ordered]@{
                     status = "already-ready"
                     identity = [string]$Location.IdentityKey
@@ -3295,7 +4120,15 @@ function Invoke-EasyConEnvironmentLifecycle {
             New-EasyConSafeDirectory -Path $Location.EnvironmentRoot `
                 -TrustedRoot $Location.CacheRoot | Out-Null
             & $SetupAction | Out-Null
-            return & $VerifyAction
+            $finalVerificationLease = Enter-EasyConSharedCacheLease `
+                -CacheRoot ([string]$Location.CacheRoot) -Access Shared `
+                -TimeoutMilliseconds $LeaseTimeoutMilliseconds
+            try {
+                return & $VerifyAction
+            }
+            finally {
+                $finalVerificationLease.Dispose()
+            }
         }
 
         $summary = & $VerifyAction
@@ -3310,6 +4143,14 @@ function Invoke-EasyConEnvironmentLifecycle {
     }
     finally {
         $cleanupFailures = [System.Collections.Generic.List[object]]::new()
+        if ($null -ne $sharedCacheLease) {
+            try {
+                $sharedCacheLease.Dispose()
+            }
+            catch {
+                $cleanupFailures.Add($_)
+            }
+        }
         if ($null -ne $lease) {
             try {
                 $lease.Dispose()

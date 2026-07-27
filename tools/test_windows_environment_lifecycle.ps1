@@ -165,6 +165,36 @@ function Enter-PrivateEnvironmentLease {
     } $Location $Access $TimeoutMilliseconds
 }
 
+function Get-PrivateSharedContentAsset {
+    param(
+        [Parameter(Mandatory)]
+        [hashtable]$Parameters
+    )
+
+    & $script:workspaceModule {
+        param($Arguments)
+        Get-EasyConSharedContentAsset @Arguments
+    } $Parameters
+}
+
+function Enter-PrivateSharedCacheLease {
+    param(
+        [Parameter(Mandatory)]
+        [string]$CacheRoot,
+
+        [Parameter(Mandatory)]
+        [string]$Access,
+
+        [int]$TimeoutMilliseconds = 0
+    )
+
+    & $script:workspaceModule {
+        param($Root, $LeaseAccess, $Timeout)
+        Enter-EasyConSharedCacheLease -CacheRoot $Root -Access $LeaseAccess `
+            -TimeoutMilliseconds $Timeout -RetryMilliseconds 0
+    } $CacheRoot $Access $TimeoutMilliseconds
+}
+
 function Invoke-EnvironmentRestorationContract {
     param(
         [Parameter(Mandatory)]
@@ -226,8 +256,29 @@ $state = [pscustomobject]@{
     FailSetup = $false
     RejectStale = $false
 }
+$sharedPayload = [System.Text.Encoding]::UTF8.GetBytes("lifecycle shared asset")
+$sharedHash = [Convert]::ToHexString(
+    [System.Security.Cryptography.SHA256]::HashData($sharedPayload)
+).ToLowerInvariant()
+$sharedState = [pscustomobject]@{ Downloads = 0 }
+$sharedDownload = {
+    param($Url, $Destination)
+    $null = $Url
+    $sharedState.Downloads++
+    [System.IO.File]::WriteAllBytes($Destination, $sharedPayload)
+}.GetNewClosure()
+$sharedAssetParameters = @{
+    SharedCacheRoot = (Join-Path $temporaryRoot "caches")
+    Url = "https://example.invalid/lifecycle.bin"
+    Algorithm = "SHA256"
+    Hash = $sharedHash
+    Bytes = [long]$sharedPayload.Length
+    Description = "lifecycle shared asset"
+    DownloadAction = $sharedDownload
+}
 $setupAction = {
     $events.Add("setup") | Out-Null
+    Get-PrivateSharedContentAsset -Parameters $sharedAssetParameters | Out-Null
     if ($state.RejectStale) {
         Assert-Contract (-not (Test-Path -LiteralPath (Join-Path $environmentRoot "stale.txt"))) `
             "damaged rebuild must remove the old environment tree before Setup"
@@ -265,6 +316,8 @@ try {
         -WorkspaceAction $workspaceAction -LeaseTimeoutMilliseconds 0 | Out-Null
     Assert-Sequence -Actual $events.ToArray() -Expected @("verify", "setup", "verify") `
         -Description "first Setup must verify, prepare, and verify the published result"
+    Assert-Contract ($sharedState.Downloads -eq 1) `
+        "the first lifecycle identity must fetch a missing fixed asset once"
 
     $events.Clear()
     Invoke-PrivateEnvironmentLifecycle -Mode Setup -Location $location `
@@ -297,6 +350,37 @@ try {
         -WorkspaceAction $workspaceAction -LeaseTimeoutMilliseconds 0 | Out-Null
     Assert-Contract (-not (Test-Path -LiteralPath (Join-Path $environmentRoot "partial.txt"))) `
         "a later Setup must recover from interrupted partial state"
+    Assert-Contract ($sharedState.Downloads -eq 1) `
+        "damage and interrupted rebuilds must reuse the verified shared asset"
+
+    foreach ($identityName in @("fingerprint-change", "worktree-change")) {
+        $alternateRoot = Join-Path $temporaryRoot "e/$identityName"
+        $alternateLocation = [pscustomobject]@{
+            CacheRoot = $temporaryRoot
+            EnvironmentRoot = $alternateRoot
+            StampPath = Join-Path $alternateRoot "environment-stamp.json"
+            LockPath = Join-Path $temporaryRoot "locks/$identityName.lock"
+            IdentityKey = $identityName
+            WorkspaceKey = "$identityName-workspace"
+        }
+        $alternateSetup = {
+            Get-PrivateSharedContentAsset -Parameters $sharedAssetParameters | Out-Null
+            New-Item -ItemType Directory -Force -Path $alternateRoot | Out-Null
+            Set-Content -LiteralPath $alternateLocation.StampPath -Value "ready" `
+                -Encoding utf8NoBOM
+        }.GetNewClosure()
+        $alternateVerify = {
+            if (-not (Test-Path -LiteralPath $alternateLocation.StampPath -PathType Leaf)) {
+                throw "alternate identity is not ready"
+            }
+            return "verified"
+        }.GetNewClosure()
+        Invoke-PrivateEnvironmentLifecycle -Mode Setup -Location $alternateLocation `
+            -SetupAction $alternateSetup -VerifyAction $alternateVerify `
+            -WorkspaceAction { param($Summary) } -LeaseTimeoutMilliseconds 0 | Out-Null
+    }
+    Assert-Contract ($sharedState.Downloads -eq 1) `
+        "fingerprint and worktree identity changes must reuse the verified shared asset"
 
     $events.Clear()
     Invoke-PrivateEnvironmentLifecycle -Mode Verify -Location $location `
@@ -311,6 +395,10 @@ try {
         Assert-Contract ($Summary -ceq "verified") "Workspace must receive verified state"
         Assert-Throws -Pattern "busy|ownership" -Action {
             Enter-PrivateEnvironmentLease -Location $location -Access Exclusive `
+                -TimeoutMilliseconds 0
+        }
+        Assert-Throws -Pattern "busy|ownership" -Action {
+            Enter-PrivateSharedCacheLease -CacheRoot $location.CacheRoot -Access Exclusive `
                 -TimeoutMilliseconds 0
         }
         $events.Add("workspace") | Out-Null
@@ -437,4 +525,4 @@ finally {
     }
 }
 
-Write-Output "Windows environment lifecycle contracts passed: 16 cases"
+Write-Output "Windows environment lifecycle contracts passed: 17 cases"

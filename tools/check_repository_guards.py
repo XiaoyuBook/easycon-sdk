@@ -87,7 +87,23 @@ if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP)) {
   throw "RUNNER_TEMP is not available"
 }
 $cacheRoot = Join-Path $env:RUNNER_TEMP "easycon-windows-workspace"
+New-Item -ItemType Directory -Force -Path (Join-Path $cacheRoot "caches") | Out-Null
 Add-Content -LiteralPath $env:GITHUB_ENV -Value "EASYCON_BUILD_CACHE_ROOT=$cacheRoot" -Encoding utf8"""
+SETUP_ASSET_CACHE_PATHS = """${{ runner.temp }}/easycon-windows-workspace/caches/assets-v1
+${{ runner.temp }}/easycon-windows-workspace/caches/vcpkg-scripts
+${{ runner.temp }}/easycon-windows-workspace/caches/vcpkg-downloads
+${{ runner.temp }}/easycon-windows-workspace/caches/rustup-home
+"""
+SETUP_ASSET_CACHE_KEY = (
+    "windows-workspace-setup-assets-v1-${{ github.event_name == 'pull_request' && "
+    "format('pr-{0}', github.event.pull_request.number) || 'trusted-main' }}-"
+    "${{ github.run_id }}-${{ github.run_attempt }}"
+)
+SETUP_ASSET_RESTORE_KEYS = (
+    "windows-workspace-setup-assets-v1-${{ github.event_name == 'pull_request' && "
+    "format('pr-{0}-', github.event.pull_request.number) || 'trusted-main-' }}\n"
+    "windows-workspace-setup-assets-v1-trusted-main-\n"
+)
 JOB_LEVEL_RUNNER_CONTEXT = re.compile(
     r"\$\{\{(?:(?!\}\}).)*\brunner\s*\.", re.IGNORECASE
 )
@@ -680,10 +696,13 @@ def required_ci_failures(workflow):
     workspace_names = [
         "Check out the candidate",
         "Initialize the controlled cache root",
+        "Restore verified Setup assets",
         "Restore Cargo downloads",
         "Restore vcpkg binary cache",
         "Set up the pinned Windows build environment",
         "Run the complete Windows workspace gates",
+        "Save verified Setup assets for this pull request",
+        "Save verified Setup assets from trusted main",
         "Save Cargo downloads from trusted main",
         "Save vcpkg binaries from trusted main",
     ]
@@ -711,23 +730,38 @@ def required_ci_failures(workflow):
                 "Windows workspace cache root must be initialized from RUNNER_TEMP through GITHUB_ENV"
             )
 
+    setup_assets_restore = workspace_steps.get("Restore verified Setup assets", {})
+    if _exact_keys(
+        setup_assets_restore,
+        {"name", "id", "uses", "with"},
+        "Required / Windows Workspace Setup asset restore",
+        failures,
+    ):
+        if (
+            setup_assets_restore["id"] != "setup_assets_cache"
+            or setup_assets_restore["uses"] != CACHE_RESTORE_ACTION
+        ):
+            failures.append("Setup asset restore identity or action pin changed")
+        if setup_assets_restore.get("with") != {
+            "path": SETUP_ASSET_CACHE_PATHS,
+            "key": SETUP_ASSET_CACHE_KEY,
+            "restore-keys": SETUP_ASSET_RESTORE_KEYS,
+        }:
+            failures.append("Setup asset restore inputs or PR/main isolation changed")
+
     restore_contracts = {
         "Restore Cargo downloads": (
             "cargo_cache",
             "${{ runner.temp }}/easycon-windows-workspace/caches/cargo-download-cache",
-            "windows-workspace-cargo-v4-${{ hashFiles('Cargo.lock', 'Cargo.toml', "
-            "'crates/**/Cargo.toml', 'tests/support/Cargo.toml', 'rust-toolchain.toml', "
-            "'tools/windows_build_environment.json', "
-            "'tools/windows_workspace.psm1', 'tools/run_windows_workspace.ps1', "
-            "'.github/workflows/required-ci.yml') }}",
+            "windows-workspace-cargo-v5-${{ hashFiles('Cargo.lock', 'Cargo.toml', "
+            "'crates/**/Cargo.toml', 'tests/support/Cargo.toml', 'rust-toolchain.toml') }}",
         ),
         "Restore vcpkg binary cache": (
             "vcpkg_cache",
             "${{ runner.temp }}/easycon-windows-workspace/caches/vcpkg-binary-cache",
-            "windows-workspace-vcpkg-v4-${{ hashFiles("
-            "'tools/windows_build_environment.json', 'vcpkg.json', "
-            "'vcpkg-configuration.json', 'cmake/triplets/**', 'CMakePresets.json', "
-            "'.github/workflows/required-ci.yml', '.github/workflows/native-quality.yml') }}",
+            "windows-workspace-vcpkg-v5-${{ hashFiles("
+            "'vcpkg.json', 'vcpkg-configuration.json', 'cmake/triplets/**', "
+            "'CMakePresets.json') }}",
         ),
     }
     for name, (step_id, expected_path, expected_key) in restore_contracts.items():
@@ -769,6 +803,32 @@ def required_ci_failures(workflow):
             failures.append("Windows workspace runner base SHA contract changed")
         if runner_step["run"].strip() != WORKSPACE_INVOCATION:
             failures.append("Windows workspace runner invocation changed or is not active")
+
+    setup_asset_saves = {
+        "Save verified Setup assets for this pull request": (
+            "always() && github.event_name == 'pull_request'"
+        ),
+        "Save verified Setup assets from trusted main": (
+            "github.event_name == 'push' && github.ref == 'refs/heads/main' && success()"
+        ),
+    }
+    for name, expected_condition in setup_asset_saves.items():
+        step = workspace_steps.get(name, {})
+        if _exact_keys(
+            step,
+            {"name", "if", "uses", "with"},
+            "Required / Windows Workspace step {!r}".format(name),
+            failures,
+        ):
+            if step["if"] != expected_condition:
+                failures.append("{} cache trust boundary changed".format(name))
+            if step["uses"] != CACHE_SAVE_ACTION:
+                failures.append("{} action pin changed".format(name))
+            if step.get("with") != {
+                "path": SETUP_ASSET_CACHE_PATHS,
+                "key": "${{ steps.setup_assets_cache.outputs.cache-primary-key }}",
+            }:
+                failures.append("{} save inputs changed".format(name))
 
     save_contracts = {
         "Save Cargo downloads from trusted main": (
@@ -987,7 +1047,10 @@ def parse_windows_build_environment(text):
         raise ValueError("vcpkg internalTools must be a JSON array")
     internal_names = []
     for index, tool in enumerate(internal_tools):
-        _require_json_keys(tool, INTERNAL_TOOL_KEYS, "internal tool {}".format(index))
+        tool_keys = INTERNAL_TOOL_KEYS
+        if isinstance(tool, dict) and tool.get("name") == "7zip":
+            tool_keys = tool_keys | {"executableSha256"}
+        _require_json_keys(tool, tool_keys, "internal tool {}".format(index))
         name = _require_string(tool["name"], "internal tool name")
         internal_names.append(name)
         version = _require_string(tool["version"], "{} version".format(name))
@@ -1011,6 +1074,11 @@ def parse_windows_build_environment(text):
             r"[0-9a-f]{128}", _require_string(tool["sha512"], "{} SHA-512".format(name))
         ):
             raise ValueError("{} SHA-512 must be lowercase hexadecimal".format(name))
+        if name == "7zip" and not re.fullmatch(
+            r"[0-9a-f]{64}",
+            _require_string(tool["executableSha256"], "7zip executable SHA-256"),
+        ):
+            raise ValueError("7zip executable SHA-256 must be lowercase hexadecimal")
     if sorted(internal_names) != ["7zip", "7zr", "cmake", "ninja"]:
         raise ValueError("internal tools must be exactly 7zip, 7zr, cmake, and ninja")
     seven_zr = next(tool for tool in internal_tools if tool["name"] == "7zr")

@@ -69,6 +69,7 @@
         "url": "https://github.com/ip7z/7zip/releases/download/26.01/7z2601-x64.exe",
         "archive": "7z2601-x64.7z.exe",
         "executable": "7z.exe",
+        "executableSha256": "2bff20bd679d45166b8c2d039044a4ca16189e6d69ff9c82345b4c1306986ec4",
         "sha512": "e52d5050c8fe4c0a09bd482d36eb1377cf342c4739060d94094c4acb5aab1e53fa3842f64dec7b5df3b3bdc7394a8bc9a9cd7a88808342c1136dd9ce9fe5a0a2"
       },
       {

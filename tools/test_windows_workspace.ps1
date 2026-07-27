@@ -547,6 +547,10 @@ try {
                 '55d3d891e8fc6c8ad7f92e172125319896761e57c5125944613d9bbfa5b9374387e9fc1468ad5bcb31464f43fb1c455ea251343942595f42955dc67090aa12ee',
                 ('A' * 128)
             )
+            "7zip executable hash" = $configurationText.Replace(
+                '2bff20bd679d45166b8c2d039044a4ca16189e6d69ff9c82345b4c1306986ec4',
+                ('A' * 64)
+            )
             "native tree" = $configurationText.Replace(
                 '0e28cd8713d7b810bef28ed0d7859dd761215854',
                 ('A' * 40)
@@ -846,6 +850,756 @@ try {
         Assert-Contract (Test-PrivateVcpkgToolManifestRecord `
             -Record $cmake -Expected ([pscustomobject]@{ name = "cmake" })) `
             "ordinary Windows tools must retain an x64 architecture pin"
+    }
+
+    Invoke-ContractCase -Name "vcpkg-sevenzip-materialization-ignores-host-path" -Action {
+        $caseRoot = Join-Path $temporaryRoot "controlled sevenzip"
+        $downloads = Join-Path $caseRoot "downloads"
+        $hostedDirectory = Join-Path $caseRoot "hosted system tools"
+        $incompatibleDirectory = Join-Path $caseRoot "incompatible system tools"
+        $vcpkgRoot = Join-Path $caseRoot "vcpkg"
+        New-Item -ItemType Directory -Force `
+            -Path $downloads, $hostedDirectory, $incompatibleDirectory, $vcpkgRoot | Out-Null
+        Set-ContractFile -Path (Join-Path $hostedDirectory "7z.exe") `
+            -Value "hosted compatible system sevenzip"
+        Set-ContractFile -Path (Join-Path $incompatibleDirectory "7z.exe") `
+            -Value "hosted incompatible system sevenzip"
+        $vcpkgExecutable = Join-Path $vcpkgRoot "vcpkg.exe"
+        Set-ContractFile -Path $vcpkgExecutable -Value "contract vcpkg"
+
+        $archivePayload = "pinned sevenzip installer"
+        $sevenZrPayload = "pinned sevenzr bootstrap"
+        $controlledPayload = "controlled extracted sevenzip"
+        $sevenZipPin = [pscustomobject]@{
+            name = "7zip"
+            version = "26.01"
+            url = "https://example.invalid/7zip.exe"
+            archive = "7z2601-x64.7z.exe"
+            executable = "7z.exe"
+            sha512 = $null
+            executableSha256 = $null
+        }
+        $sevenZrPin = [pscustomobject]@{
+            name = "7zr"
+            version = "26.01"
+            url = "https://example.invalid/7zr.exe"
+            archive = "contract-7zr.exe"
+            executable = "7zr.exe"
+            sha512 = $null
+        }
+        $sevenZipArchive = Join-Path $downloads $sevenZipPin.archive
+        $sevenZrDownload = Join-Path $downloads $sevenZrPin.archive
+        Set-ContractFile -Path $sevenZipArchive -Value $archivePayload
+        Set-ContractFile -Path $sevenZrDownload -Value $sevenZrPayload
+        $sevenZipPin.sha512 = (Get-FileHash -LiteralPath $sevenZipArchive -Algorithm SHA512).
+            Hash.ToLowerInvariant()
+        $sevenZrPin.sha512 = (Get-FileHash -LiteralPath $sevenZrDownload -Algorithm SHA512).
+            Hash.ToLowerInvariant()
+        $sevenZipPin.executableSha256 = [Convert]::ToHexString(
+            [System.Security.Cryptography.SHA256]::HashData(
+                [System.Text.Encoding]::UTF8.GetBytes($controlledPayload)
+            )
+        ).ToLowerInvariant()
+        $expectedPath = Join-Path $downloads "tools/7zip-26.01-windows/7z.exe"
+        $isolatedPath = Join-Path $caseRoot "tools/vcpkg-fetch-path"
+        $vcpkg = [pscustomobject]@{ Root = $vcpkgRoot; Executable = $vcpkgExecutable }
+        $state = [pscustomobject]@{ Mode = "hosted"; Fetches = 0; VersionChecks = 0 }
+        $capture = {
+            param($Program, $Arguments, $Description, $WorkingDirectory, $StreamOutput)
+            $null = $Program, $Arguments, $WorkingDirectory, $StreamOutput
+            if ($Description -ceq "prepare audited vcpkg 7-Zip tool") {
+                $state.Fetches++
+                Assert-Contract ($env:PATH -ceq $isolatedPath) `
+                    "vcpkg fetch must use only the controlled empty PATH"
+                Assert-Contract ($env:VCPKG_FORCE_DOWNLOADED_BINARIES -ceq "1") `
+                    "vcpkg fetch must reject all host internal-tool discoveries"
+                $pathEntries = @($env:PATH -split [System.IO.Path]::PathSeparator)
+                if (
+                    $state.Mode -ceq "external-output" -or
+                    ($state.Mode -ceq "hosted" -and @($pathEntries | Where-Object {
+                        $_ -cin @($hostedDirectory, $incompatibleDirectory)
+                    }).Count -ne 0)
+                ) {
+                    return "C:\ProgramData\Chocolatey\bin\7z.exe"
+                }
+                if ($state.Mode -notin @("missing", "tampered")) {
+                    Set-ContractFile -Path $expectedPath -Value $controlledPayload
+                }
+                return @(
+                    "A suitable version of 7zip was not found (required v26.1.0).",
+                    "Extracting 7zip...",
+                    $expectedPath
+                )
+            }
+            if ($Description -ceq "verify controlled 7-Zip version") {
+                $state.VersionChecks++
+                if ($state.Mode -ceq "wrong-version") {
+                    return @("", "7-Zip 25.00 (x64) : contract", "")
+                }
+                return @("", "7-Zip 26.01 (x64) : contract", "")
+            }
+            throw "unexpected native capture: $Description"
+        }.GetNewClosure()
+        $parameters = @{
+            Vcpkg = $vcpkg
+            DownloadsRoot = $downloads
+            CacheRoot = $caseRoot
+            SevenZipPin = $sevenZipPin
+            SevenZrPin = $sevenZrPin
+        }
+
+        $originalPath = $env:PATH
+        $originalForceDownloaded = [Environment]::GetEnvironmentVariable(
+            "VCPKG_FORCE_DOWNLOADED_BINARIES", "Process"
+        )
+        try {
+            $env:VCPKG_FORCE_DOWNLOADED_BINARIES = "host-poison"
+            foreach ($hostDirectory in @($hostedDirectory, $incompatibleDirectory)) {
+                $env:PATH = "$hostDirectory$([System.IO.Path]::PathSeparator)$originalPath"
+                $prepared = Invoke-PrivateCommandWithNativeCapture `
+                    -CommandName "Install-EasyConControlledSevenZip" -Parameters $parameters `
+                    -NativeCapture $capture
+                Assert-Contract ($env:PATH.StartsWith(
+                    $hostDirectory, [System.StringComparison]::Ordinal
+                )) "controlled fetch must restore the caller PATH"
+                Assert-Contract ($env:VCPKG_FORCE_DOWNLOADED_BINARIES -ceq "host-poison") `
+                    "controlled fetch must restore the caller vcpkg discovery setting"
+                Assert-Contract ($prepared.SevenZipPath -ceq $expectedPath) `
+                    "compatible or incompatible host 7z must not change the controlled path"
+            }
+        }
+        finally {
+            $env:PATH = $originalPath
+            [Environment]::SetEnvironmentVariable(
+                "VCPKG_FORCE_DOWNLOADED_BINARIES", $originalForceDownloaded, "Process"
+            )
+        }
+        Assert-Contract (
+            (Get-FileHash -LiteralPath $prepared.SevenZipPath -Algorithm SHA256).
+                Hash.ToLowerInvariant() -ceq $sevenZipPin.executableSha256
+        ) "controlled 7-Zip must match its pinned executable hash"
+        Assert-Contract ($state.VersionChecks -eq 2) `
+            "each controlled 7-Zip materialization must receive one exact version check"
+
+        $state.Mode = "no-system"
+        $env:PATH = $PSHOME
+        try {
+            $preparedWithoutSystem = Invoke-PrivateCommandWithNativeCapture `
+                -CommandName "Install-EasyConControlledSevenZip" -Parameters $parameters `
+                -NativeCapture $capture
+        }
+        finally {
+            $env:PATH = $originalPath
+        }
+        Assert-Contract ($preparedWithoutSystem.SevenZipPath -ceq $expectedPath) `
+            "absence of a system 7z must retain the same controlled path"
+
+        $state.Mode = "external-output"
+        Assert-Throws -Pattern "fetch output|controlled.*path|trusted root" -Action {
+            Invoke-PrivateCommandWithNativeCapture `
+                -CommandName "Install-EasyConControlledSevenZip" -Parameters $parameters `
+                -NativeCapture $capture
+        }
+
+        $state.Mode = "missing"
+        Remove-Item -LiteralPath $expectedPath -Force
+        Assert-Throws -Pattern "missing|7-Zip" -Action {
+            Invoke-PrivateCommandWithNativeCapture `
+                -CommandName "Install-EasyConControlledSevenZip" -Parameters $parameters `
+                -NativeCapture $capture
+        }
+
+        $state.Mode = "tampered"
+        Set-ContractFile -Path $expectedPath -Value "tampered extracted sevenzip"
+        Assert-Throws -Pattern "SHA-256|7-Zip" -Action {
+            Invoke-PrivateCommandWithNativeCapture `
+                -CommandName "Install-EasyConControlledSevenZip" -Parameters $parameters `
+                -NativeCapture $capture
+        }
+
+        $state.Mode = "wrong-version"
+        Set-ContractFile -Path $expectedPath -Value $controlledPayload
+        Assert-Throws -Pattern "version|7-Zip" -Action {
+            Invoke-PrivateCommandWithNativeCapture `
+                -CommandName "Install-EasyConControlledSevenZip" -Parameters $parameters `
+                -NativeCapture $capture
+        }
+    }
+
+    Invoke-ContractCase -Name "shared-content-cache-revalidates-and-recovers" -Action {
+        $sharedRoot = Join-Path $temporaryRoot "shared content cache"
+        $payload = "verified shared payload"
+        $payloadBytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
+        $expectedHash = [Convert]::ToHexString(
+            [System.Security.Cryptography.SHA256]::HashData($payloadBytes)
+        ).ToLowerInvariant()
+        $state = [pscustomobject]@{ Downloads = 0 }
+        $download = {
+            param($Url, $Destination)
+            $null = $Url
+            $state.Downloads++
+            [System.IO.File]::WriteAllBytes($Destination, $payloadBytes)
+        }.GetNewClosure()
+        $parameters = @{
+            SharedCacheRoot = $sharedRoot
+            Url = "https://example.invalid/verified.bin"
+            Algorithm = "SHA256"
+            Hash = $expectedHash
+            Bytes = [long]$payloadBytes.Length
+            Description = "contract shared asset"
+            DownloadAction = $download
+        }
+
+        $first = Invoke-PrivateCommand -CommandName "Get-EasyConSharedContentAsset" `
+            -Parameters $parameters
+        Assert-Contract ($state.Downloads -eq 1) "a missing shared asset must download once"
+        Assert-Contract (
+            (Get-FileHash -LiteralPath $first -Algorithm SHA256).Hash.ToLowerInvariant() -ceq
+                $expectedHash
+        ) "the first shared asset publication must match its content hash"
+
+        $blockedNetwork = {
+            param($Url, $Destination)
+            $null = $Url, $Destination
+            throw "network seam must not run on a complete cache hit"
+        }
+        $hitParameters = $parameters.Clone()
+        $hitParameters.DownloadAction = $blockedNetwork
+        $second = Invoke-PrivateCommand -CommandName "Get-EasyConSharedContentAsset" `
+            -Parameters $hitParameters
+        Assert-Contract ($second -ceq $first) `
+            "a verified shared cache hit must retain the content-addressed path"
+        Assert-Contract ($state.Downloads -eq 1) `
+            "a complete shared cache hit must not start a download"
+
+        [System.IO.File]::WriteAllText($first, "damaged cache entry")
+        $repaired = Invoke-PrivateCommand -CommandName "Get-EasyConSharedContentAsset" `
+            -Parameters $parameters
+        Assert-Contract ($state.Downloads -eq 2) `
+            "a damaged shared cache entry must be isolated and fetched once"
+        Assert-Contract (
+            (Get-FileHash -LiteralPath $repaired -Algorithm SHA256).Hash.ToLowerInvariant() -ceq
+                $expectedHash
+        ) "a repaired shared cache entry must be revalidated"
+        $quarantine = Join-Path $sharedRoot "assets-v1/quarantine"
+        Assert-Contract (
+            @(Get-ChildItem -LiteralPath $quarantine -File -ErrorAction Stop).Count -eq 1
+        ) "a damaged shared cache entry must be isolated exactly once"
+
+        $wrongPayload = [System.Text.Encoding]::UTF8.GetBytes("wrong payload")
+        $wrongHash = "0" * 64
+        $wrongParameters = $parameters.Clone()
+        $wrongParameters.Hash = $wrongHash
+        $wrongParameters.Bytes = [long]$wrongPayload.Length
+        $wrongParameters.DownloadAction = {
+            param($Url, $Destination)
+            $null = $Url
+            [System.IO.File]::WriteAllBytes($Destination, $wrongPayload)
+        }.GetNewClosure()
+        Assert-Throws -Pattern "SHA-256|hash|content" -Action {
+            Invoke-PrivateCommand -CommandName "Get-EasyConSharedContentAsset" `
+                -Parameters $wrongParameters
+        }
+        $wrongPath = Join-Path $sharedRoot "assets-v1/blobs/sha256/$wrongHash"
+        Assert-Contract (-not (Test-Path -LiteralPath $wrongPath)) `
+            "a wrong-hash download must never publish a cache entry"
+    }
+
+    Invoke-ContractCase -Name "default-shared-download-retains-module-scope" -Action {
+        $sharedRoot = Join-Path $temporaryRoot "default shared download"
+        $payloadBytes = [System.Text.Encoding]::UTF8.GetBytes("default download payload")
+        $expectedHash = [Convert]::ToHexString(
+            [System.Security.Cryptography.SHA256]::HashData($payloadBytes)
+        ).ToLowerInvariant()
+        $state = [pscustomobject]@{ Downloads = 0 }
+        $capture = {
+            param($Program, $Arguments, $Description, $WorkingDirectory, $StreamOutput)
+            $null = $Program, $WorkingDirectory, $StreamOutput
+            Assert-Contract ($Description -ceq "download contract default asset") `
+                "the default shared download must retain its module description"
+            $continueIndex = [Array]::IndexOf([object[]]$Arguments, "--continue-at")
+            Assert-Contract (
+                $continueIndex -ge 0 -and
+                $continueIndex + 1 -lt $Arguments.Count -and
+                [string]$Arguments[$continueIndex + 1] -ceq "-"
+            ) "the default shared download must resume its unique verified temporary"
+            $speedIndex = [Array]::IndexOf([object[]]$Arguments, "--speed-limit")
+            Assert-Contract (
+                $speedIndex -ge 0 -and
+                $speedIndex + 3 -lt $Arguments.Count -and
+                [string]$Arguments[$speedIndex + 1] -ceq "1024" -and
+                [string]$Arguments[$speedIndex + 2] -ceq "--speed-time" -and
+                [string]$Arguments[$speedIndex + 3] -ceq "60"
+            ) "the default shared download must retry a stalled transfer promptly"
+            $retryIndex = [Array]::IndexOf([object[]]$Arguments, "--retry")
+            $retryDelayIndex = [Array]::IndexOf([object[]]$Arguments, "--retry-delay")
+            $maximumIndex = [Array]::IndexOf([object[]]$Arguments, "--max-time")
+            Assert-Contract (
+                $retryIndex -ge 0 -and
+                [string]$Arguments[$retryIndex + 1] -ceq "15" -and
+                $retryDelayIndex -ge 0 -and
+                [string]$Arguments[$retryDelayIndex + 1] -ceq "1" -and
+                $maximumIndex -ge 0 -and
+                [string]$Arguments[$maximumIndex + 1] -ceq "120"
+            ) "the default shared download must bound each resumable transfer attempt"
+            $outputIndex = [Array]::IndexOf([object[]]$Arguments, "--output")
+            Assert-Contract ($outputIndex -ge 0 -and $outputIndex + 1 -lt $Arguments.Count) `
+                "the default shared download must pass a controlled output path"
+            $state.Downloads++
+            [System.IO.File]::WriteAllBytes(
+                [string]$Arguments[$outputIndex + 1], $payloadBytes
+            )
+            return @()
+        }.GetNewClosure()
+        $asset = Invoke-PrivateCommandWithNativeCapture `
+            -CommandName "Get-EasyConSharedContentAsset" -Parameters @{
+                SharedCacheRoot = $sharedRoot
+                Url = "https://example.invalid/default.bin"
+                Algorithm = "SHA256"
+                Hash = $expectedHash
+                Bytes = [long]$payloadBytes.Length
+                Description = "contract default asset"
+            } -NativeCapture $capture
+        Assert-Contract ($state.Downloads -eq 1) `
+            "the default shared download path must execute exactly once"
+        Assert-Contract (
+            (Get-FileHash -LiteralPath $asset -Algorithm SHA256).Hash.ToLowerInvariant() -ceq
+                $expectedHash
+        ) "the default shared download must publish only verified content"
+    }
+
+    Invoke-ContractCase -Name "controlled-tools-preseed-shared-vcpkg-downloads" -Action {
+        $sharedRoot = Join-Path $temporaryRoot "controlled tool shared cache"
+        $fixtureRoot = Join-Path $temporaryRoot "controlled tool archives"
+        $cmakeSource = Join-Path $fixtureRoot "cmake source"
+        $ninjaSource = Join-Path $fixtureRoot "ninja source"
+        $cmakeExecutable = Join-Path $cmakeSource "cmake-contract/bin/cmake.exe"
+        $ninjaExecutable = Join-Path $ninjaSource "ninja.exe"
+        Set-ContractFile -Path $cmakeExecutable -Value "contract cmake"
+        Set-ContractFile -Path $ninjaExecutable -Value "contract ninja"
+        $cmakeArchive = Join-Path $fixtureRoot "cmake-contract.zip"
+        $ninjaArchive = Join-Path $fixtureRoot "ninja-contract.zip"
+        Compress-Archive -LiteralPath (Join-Path $cmakeSource "cmake-contract") `
+            -DestinationPath $cmakeArchive
+        Compress-Archive -LiteralPath $ninjaExecutable -DestinationPath $ninjaArchive
+        $cmakeHash = (Get-FileHash -LiteralPath $cmakeArchive -Algorithm SHA512).Hash.ToLowerInvariant()
+        $ninjaHash = (Get-FileHash -LiteralPath $ninjaArchive -Algorithm SHA512).Hash.ToLowerInvariant()
+        foreach ($fixture in @(
+            [pscustomobject]@{ Path = $cmakeArchive; Hash = $cmakeHash },
+            [pscustomobject]@{ Path = $ninjaArchive; Hash = $ninjaHash }
+        )) {
+            $blob = Join-Path $sharedRoot (Join-Path "assets-v1/blobs/sha512" $fixture.Hash)
+            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $blob) | Out-Null
+            Copy-Item -LiteralPath $fixture.Path -Destination $blob
+        }
+        $commit = "d" * 40
+        $configuration = [pscustomobject]@{
+            vcpkg = [pscustomobject]@{
+                scriptsCommit = $commit
+                internalTools = @(
+                    [pscustomobject]@{
+                        name = "cmake"
+                        version = "contract"
+                        url = "https://example.invalid/cmake-contract.zip"
+                        archive = "cmake-contract.zip"
+                        executable = "cmake-contract/bin/cmake.exe"
+                        sha512 = $cmakeHash
+                    },
+                    [pscustomobject]@{
+                        name = "ninja"
+                        version = "contract"
+                        url = "https://example.invalid/ninja-contract.zip"
+                        archive = "ninja-contract.zip"
+                        executable = "ninja.exe"
+                        sha512 = $ninjaHash
+                    }
+                )
+            }
+        }
+        $blockedNetwork = {
+            param($Program, $Arguments, $Description, $WorkingDirectory, $StreamOutput)
+            $null = $Program, $Arguments, $WorkingDirectory, $StreamOutput
+            throw "network seam must not run: $Description"
+        }
+        $downloadRoot = Join-Path $sharedRoot (Join-Path "vcpkg-downloads" $commit)
+        $parameters = @{
+            Configuration = $configuration
+            SharedCacheRoot = $sharedRoot
+        }
+
+        foreach ($identity in @("first identity", "second identity")) {
+            $environment = Join-Path $temporaryRoot $identity
+            New-Item -ItemType Directory -Force -Path $environment | Out-Null
+            $parameters.EnvironmentRoot = $environment
+            $tools = Invoke-PrivateCommandWithNativeCapture `
+                -CommandName "Install-EasyConControlledBuildTools" `
+                -Parameters $parameters -NativeCapture $blockedNetwork
+            Assert-Contract (
+                (Test-Path -LiteralPath $tools.cmake -PathType Leaf) -and
+                (Test-Path -LiteralPath $tools.ninja -PathType Leaf)
+            ) "each environment must materialize controlled tools from shared archives"
+        }
+
+        $sharedCmakeArchive = Join-Path $downloadRoot "cmake-contract.zip"
+        $sharedNinjaArchive = Join-Path $downloadRoot "ninja-contract.zip"
+        Assert-Contract (
+            (Get-FileHash -LiteralPath $sharedCmakeArchive -Algorithm SHA512).Hash.ToLowerInvariant() -ceq
+                $cmakeHash -and
+            (Get-FileHash -LiteralPath $sharedNinjaArchive -Algorithm SHA512).Hash.ToLowerInvariant() -ceq
+                $ninjaHash
+        ) "controlled archives must preseed the commit-scoped vcpkg download cache"
+
+        Set-ContractFile -Path $sharedCmakeArchive -Value "damaged"
+        $repairEnvironment = Join-Path $temporaryRoot "repair identity"
+        New-Item -ItemType Directory -Force -Path $repairEnvironment | Out-Null
+        $parameters.EnvironmentRoot = $repairEnvironment
+        Invoke-PrivateCommandWithNativeCapture `
+            -CommandName "Install-EasyConControlledBuildTools" `
+            -Parameters $parameters -NativeCapture $blockedNetwork | Out-Null
+        Assert-Contract (
+            (Get-FileHash -LiteralPath $sharedCmakeArchive -Algorithm SHA512).Hash.ToLowerInvariant() -ceq
+                $cmakeHash
+        ) "a damaged vcpkg tool archive must be repaired from the verified blob without network"
+    }
+
+    Invoke-ContractCase -Name "vcpkg-install-retains-commit-scoped-downloads" -Action {
+        $cacheRoot = Join-Path $temporaryRoot "vcpkg dependency environment"
+        $downloadsTrustRoot = Join-Path $temporaryRoot "vcpkg dependency shared cache"
+        $downloadsRoot = Join-Path $downloadsTrustRoot "vcpkg-downloads/$("e" * 40)"
+        $vcpkgRoot = Join-Path $cacheRoot "vcpkg root"
+        $layoutRoot = Join-Path $cacheRoot "layout"
+        $layout = [pscustomobject]@{
+            Buildtrees = Join-Path $layoutRoot "buildtrees"
+            Packages = Join-Path $layoutRoot "packages"
+            Installed = Join-Path $layoutRoot "installed"
+            ManifestRoot = Join-Path $layoutRoot "manifest"
+        }
+        foreach ($directory in @(
+            $cacheRoot,
+            $downloadsRoot,
+            $vcpkgRoot,
+            $layout.Buildtrees,
+            $layout.Packages,
+            $layout.Installed,
+            $layout.ManifestRoot
+        )) {
+            New-Item -ItemType Directory -Force -Path $directory | Out-Null
+        }
+        $vcpkg = [pscustomobject]@{
+            Executable = Join-Path $cacheRoot "contract-vcpkg.exe"
+            Root = $vcpkgRoot
+        }
+        $state = [pscustomobject]@{ Installs = 0; FailuresRemaining = 2 }
+        $capture = {
+            param($Program, $Arguments, $Description, $WorkingDirectory, [switch]$StreamOutput)
+            $null = $Program
+            Assert-Contract ($Description -ceq "install verified vcpkg dependencies") `
+                "the vcpkg dependency seam must retain its controlled description"
+            Assert-Contract ($StreamOutput) `
+                "the vcpkg dependency install must stream hosted diagnostics"
+            Assert-Contract (
+                (Resolve-Path -LiteralPath $WorkingDirectory).Path -ceq $repository.Path
+            ) "the vcpkg dependency install must run from the repository root"
+            Assert-Contract (
+                [Array]::IndexOf(
+                    [object[]]$Arguments, "--downloads-root=$downloadsRoot"
+                ) -ge 0
+            ) "vcpkg must receive the commit-scoped downloads root"
+            Assert-Contract (
+                [Array]::IndexOf(
+                    [object[]]$Arguments, "--downloads-root=$downloadsTrustRoot"
+                ) -lt 0
+            ) "the broader downloads trusted root must never replace the cache path"
+            $state.Installs++
+            if ($state.FailuresRemaining -gt 0) {
+                $state.FailuresRemaining--
+                throw "synthetic transient vcpkg download failure"
+            }
+            return @()
+        }.GetNewClosure()
+
+        Invoke-PrivateCommandWithNativeCapture `
+            -CommandName "Install-EasyConVcpkgDependencies" -Parameters @{
+                Vcpkg = $vcpkg
+                RepositoryRoot = $repository.Path
+                DownloadsRoot = $downloadsRoot
+                DownloadsTrustedRoot = $downloadsTrustRoot
+                CacheRoot = $cacheRoot
+                WorkspaceLayout = $layout
+                RetryDelayMilliseconds = 0
+            } -NativeCapture $capture | Out-Null
+        Assert-Contract ($state.Installs -eq 3) `
+            "the controlled vcpkg dependency install must recover on its third attempt"
+
+        $state.FailuresRemaining = 99
+        Assert-Throws -Pattern "synthetic transient vcpkg download failure" -Action {
+            Invoke-PrivateCommandWithNativeCapture `
+                -CommandName "Install-EasyConVcpkgDependencies" -Parameters @{
+                    Vcpkg = $vcpkg
+                    RepositoryRoot = $repository.Path
+                    DownloadsRoot = $downloadsRoot
+                    DownloadsTrustedRoot = $downloadsTrustRoot
+                    CacheRoot = $cacheRoot
+                    WorkspaceLayout = $layout
+                    RetryDelayMilliseconds = 0
+                } -NativeCapture $capture
+        }
+        Assert-Contract ($state.Installs -eq 6) `
+            "a persistently failing vcpkg install must stop after three attempts"
+    }
+
+    Invoke-ContractCase -Name "shared-vcpkg-scripts-revalidate-across-identities" -Action {
+        $sharedRoot = Join-Path $temporaryRoot "shared vcpkg source cache"
+        $commit = "a" * 40
+        $configuration = [pscustomobject]@{
+            vcpkg = [pscustomobject]@{ scriptsCommit = $commit }
+        }
+        $state = [pscustomobject]@{ Installs = 0; Validations = 0 }
+        $install = {
+            param($Root)
+            $state.Installs++
+            New-Item -ItemType Directory -Force -Path $Root | Out-Null
+            Set-ContractFile -Path (Join-Path $Root "verified.txt") -Value $commit
+        }.GetNewClosure()
+        $validate = {
+            param($Root)
+            $state.Validations++
+            $marker = Join-Path $Root "verified.txt"
+            if (-not (Test-Path -LiteralPath $marker -PathType Leaf)) {
+                throw "cached vcpkg scripts marker is missing"
+            }
+            if ((Get-Content -Raw -LiteralPath $marker) -cne $commit) {
+                throw "cached vcpkg scripts marker is damaged"
+            }
+            return $Root
+        }.GetNewClosure()
+        $parameters = @{
+            SharedCacheRoot = $sharedRoot
+            Configuration = $configuration
+            VcpkgExecutable = (Join-Path $temporaryRoot "unused-vcpkg.exe")
+            ValidateAction = $validate
+            InstallAction = $install
+        }
+
+        $first = Invoke-PrivateCommand -CommandName "Get-EasyConSharedVcpkgCheckout" `
+            -Parameters $parameters
+        $blocked = $parameters.Clone()
+        $blocked.InstallAction = { param($Root); throw "network/install seam must not run" }
+        $second = Invoke-PrivateCommand -CommandName "Get-EasyConSharedVcpkgCheckout" `
+            -Parameters $blocked
+        Assert-Contract ($first -ceq $second) `
+            "different environment identities must resolve the same pinned source cache"
+        Assert-Contract ($state.Installs -eq 1 -and $state.Validations -eq 2) `
+            "a shared vcpkg source hit must revalidate without reinstalling"
+
+        Set-ContractFile -Path (Join-Path $first "verified.txt") -Value "damaged"
+        $repaired = Invoke-PrivateCommand -CommandName "Get-EasyConSharedVcpkgCheckout" `
+            -Parameters $parameters
+        Assert-Contract ($repaired -ceq $first -and $state.Installs -eq 2) `
+            "damaged cached vcpkg scripts must be isolated and rebuilt at the fixed path"
+        Assert-Contract (
+            @(Get-ChildItem -LiteralPath (Join-Path $sharedRoot "vcpkg-scripts-quarantine") `
+                -Directory -ErrorAction Stop).Count -eq 1
+        ) "damaged cached vcpkg scripts must have one quarantined tree"
+    }
+
+    Invoke-ContractCase -Name "vcpkg-network-fetch-uses-windows-tls" -Action {
+        $cacheRoot = Join-Path $temporaryRoot "vcpkg fetch cache"
+        $checkoutRoot = Join-Path $cacheRoot "checkout"
+        $vcpkgExecutable = Join-Path $cacheRoot "vcpkg.exe"
+        New-Item -ItemType Directory -Force -Path $cacheRoot | Out-Null
+        $executableBytes = [System.Text.Encoding]::ASCII.GetBytes("contract vcpkg executable")
+        [System.IO.File]::WriteAllBytes($vcpkgExecutable, $executableBytes)
+        $executableHash = [Convert]::ToHexString(
+            [System.Security.Cryptography.SHA256]::HashData($executableBytes)
+        ).ToLowerInvariant()
+        $commit = "b" * 40
+        $toolCommit = "c" * 40
+        $toolRelease = "2026-01-01"
+        $configuration = [pscustomobject]@{
+            vcpkg = [pscustomobject]@{
+                scriptsRepository = "https://github.com/microsoft/vcpkg.git"
+                scriptsCommit = $commit
+                toolRelease = $toolRelease
+                toolCommit = $toolCommit
+                windowsAsset = [pscustomobject]@{
+                    bytes = $executableBytes.Length
+                    sha256 = $executableHash
+                }
+            }
+        }
+        $state = [pscustomobject]@{ Fetches = 0 }
+        $capture = {
+            param($Program, $Arguments, $Description, $WorkingDirectory, $StreamOutput)
+            $null = $Program, $WorkingDirectory, $StreamOutput
+            switch ($Description) {
+                "fetch pinned vcpkg scripts" {
+                    $state.Fetches++
+                    $backendIndex = [Array]::IndexOf(
+                        [object[]]$Arguments, "http.sslBackend=schannel"
+                    )
+                    Assert-Contract (
+                        $backendIndex -gt 0 -and
+                        [string]$Arguments[$backendIndex - 1] -ceq "-c"
+                    ) "the pinned vcpkg fetch must use the Windows TLS backend"
+                    return @()
+                }
+                "check out pinned vcpkg scripts" {
+                    $rootIndex = [Array]::IndexOf([object[]]$Arguments, "-C")
+                    $root = [string]$Arguments[$rootIndex + 1]
+                    foreach ($relative in @(
+                        ".vcpkg-root",
+                        "bootstrap-vcpkg.bat",
+                        "bootstrap-vcpkg.sh",
+                        "scripts/buildsystems/vcpkg.cmake"
+                    )) {
+                        $path = Join-Path $root $relative
+                        [System.IO.Directory]::CreateDirectory(
+                            [System.IO.Path]::GetDirectoryName($path)
+                        ) | Out-Null
+                        [System.IO.File]::WriteAllText($path, "contract")
+                    }
+                    return @()
+                }
+                "vcpkg scripts commit check" { return $commit }
+                "vcpkg required tracked file check" { return [string]$Arguments[-1] }
+                "vcpkg scripts cleanliness check" { return @() }
+                "vcpkg tool version check" {
+                    return "vcpkg package management program version $toolRelease-$toolCommit"
+                }
+                default { return @() }
+            }
+        }.GetNewClosure()
+
+        Invoke-PrivateCommandWithNativeCapture `
+            -CommandName "Install-EasyConVcpkgCheckout" -Parameters @{
+                VcpkgRoot = $checkoutRoot
+                CacheRoot = $cacheRoot
+                Configuration = $configuration
+                VcpkgExecutable = $vcpkgExecutable
+            } -NativeCapture $capture | Out-Null
+        Assert-Contract ($state.Fetches -eq 1) `
+            "the pinned vcpkg checkout must perform exactly one controlled fetch"
+        Assert-Contract (Test-Path -LiteralPath $checkoutRoot -PathType Container) `
+            "the mocked pinned vcpkg checkout must publish atomically"
+    }
+
+    Invoke-ContractCase -Name "shared-rust-toolchain-retains-rustup-validation" -Action {
+        $pin = [pscustomobject]@{
+            Channel = "1.97.1"
+            Target = "x86_64-pc-windows-msvc"
+            Components = @("clippy", "rustfmt")
+        }
+        $state = [pscustomobject]@{
+            Installs = 0
+            FailuresRemaining = 2
+            RustcChecks = 0
+            TargetChecks = 0
+            ComponentChecks = 0
+        }
+        $capture = {
+            param($Program, $Arguments, $Description, $WorkingDirectory, $StreamOutput)
+            $null = $Program, $Arguments, $WorkingDirectory, $StreamOutput
+            switch ($Description) {
+                "frozen rustc version check" {
+                    $state.RustcChecks++
+                    return @(
+                        "rustc 1.97.1 (contract)",
+                        "binary: rustc",
+                        "host: x86_64-pc-windows-msvc",
+                        "release: 1.97.1"
+                    )
+                }
+                "frozen Rust target check" {
+                    $state.TargetChecks++
+                    return "x86_64-pc-windows-msvc"
+                }
+                "frozen Rust component check" {
+                    $state.ComponentChecks++
+                    return @(
+                        "clippy-x86_64-pc-windows-msvc (installed)",
+                        "rustfmt-x86_64-pc-windows-msvc (installed)"
+                    )
+                }
+                "install frozen Rust toolchain" {
+                    $state.Installs++
+                    if ($state.FailuresRemaining -gt 0) {
+                        $state.FailuresRemaining--
+                        throw "synthetic transient Rust download failure"
+                    }
+                    return "synthetic Rust install"
+                }
+                default {
+                    throw "unexpected native capture: $Description"
+                }
+            }
+        }.GetNewClosure()
+        $savedToolchain = [Environment]::GetEnvironmentVariable("RUSTUP_TOOLCHAIN", "Process")
+        try {
+            $parameters = @{ Pin = $pin; RetryDelayMilliseconds = 0 }
+            Invoke-PrivateCommandWithNativeCapture `
+                -CommandName "Install-EasyConRustToolchain" -Parameters $parameters `
+                -NativeCapture $capture | Out-Null
+            Invoke-PrivateCommandWithNativeCapture `
+                -CommandName "Install-EasyConRustToolchain" -Parameters $parameters `
+                -NativeCapture $capture | Out-Null
+            Assert-Contract (
+                $state.Installs -eq 4 -and
+                $state.RustcChecks -eq 2 -and
+                $state.TargetChecks -eq 2 -and
+                $state.ComponentChecks -eq 2
+            ) "Rust retries must resume before each successful Setup revalidates shared state"
+
+            $state.FailuresRemaining = 99
+            Assert-Throws -Pattern "synthetic transient Rust download failure" -Action {
+                Invoke-PrivateCommandWithNativeCapture `
+                    -CommandName "Install-EasyConRustToolchain" -Parameters $parameters `
+                    -NativeCapture $capture
+            }
+            Assert-Contract ($state.Installs -eq 7) `
+                "a persistently failing Rust install must stop after three attempts"
+        }
+        finally {
+            [Environment]::SetEnvironmentVariable(
+                "RUSTUP_TOOLCHAIN", $savedToolchain, "Process"
+            )
+        }
+    }
+
+    Invoke-ContractCase -Name "shared-cache-publication-lease-is-cross-identity" -Action {
+        $sharedRoot = Join-Path $temporaryRoot "shared publication lease"
+        $lockA = Join-Path $sharedRoot "assets-v1/locks/sha256-a.lock"
+        $lockB = Join-Path $sharedRoot "assets-v1/locks/sha256-b.lock"
+        $parametersA = @{
+            Path = $lockA
+            TrustedRoot = $sharedRoot
+            Description = "contract asset A"
+            TimeoutMilliseconds = 0
+            RetryMilliseconds = 0
+        }
+        $leaseA = Invoke-PrivateCommand -CommandName "Enter-EasyConExclusiveFileLease" `
+            -Parameters $parametersA
+        try {
+            Assert-Throws -Pattern "busy|ownership" -Action {
+                Invoke-PrivateCommand -CommandName "Enter-EasyConExclusiveFileLease" `
+                    -Parameters $parametersA
+            }
+            $leaseB = Invoke-PrivateCommand -CommandName "Enter-EasyConExclusiveFileLease" `
+                -Parameters @{
+                    Path = $lockB
+                    TrustedRoot = $sharedRoot
+                    Description = "contract asset B"
+                    TimeoutMilliseconds = 0
+                    RetryMilliseconds = 0
+                }
+            $leaseB.Dispose()
+        }
+        finally {
+            $leaseA.Dispose()
+        }
+        $released = Invoke-PrivateCommand -CommandName "Enter-EasyConExclusiveFileLease" `
+            -Parameters $parametersA
+        $released.Dispose()
     }
 
     Invoke-ContractCase -Name "fingerprint-and-manifest-change" -Action {
@@ -1305,6 +2059,7 @@ try {
             "CXX_X86_64_PC_WINDOWS_MSVC", "AR_X86_64_PC_WINDOWS_MSVC", "HOST_CC",
             "TARGET_CXX", "CL", "_CL_", "CMAKE_PREFIX_PATH", "OPENSSL_ROOT_DIR",
             "VCPKG_DEFAULT_TRIPLET", "VSCMD_VER", "__VSCMD_PREINIT_PATH",
+            "VCPKG_FORCE_DOWNLOADED_BINARIES", "VCPKG_FORCE_SYSTEM_BINARIES",
             "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"
         )
         $controlledValues = [ordered]@{
@@ -1318,9 +2073,11 @@ try {
             INCLUDE = Join-Path $temporaryRoot "controlled include"
             LIB = Join-Path $temporaryRoot "controlled lib"
             LIBPATH = Join-Path $temporaryRoot "controlled libpath"
+            RUSTUP_HOME = Join-Path $temporaryRoot "controlled rustup home"
             RUSTUP_TOOLCHAIN = "1.97.1"
             VCPKG_ROOT = Join-Path $temporaryRoot "controlled vcpkg"
             VCPKG_BINARY_SOURCES = "clear"
+            VCPKG_FORCE_DOWNLOADED_BINARIES = "1"
         }
         $saved = @{}
         foreach ($name in @($poisonedNames + @($controlledValues.Keys) + @("PATH")) | Select-Object -Unique) {
@@ -1352,6 +2109,8 @@ try {
     hostCc = $env:HOST_CC
     targetCxxAlias = $env:TARGET_CXX
     vcpkgTriplet = $env:VCPKG_DEFAULT_TRIPLET
+    vcpkgForceDownloaded = $env:VCPKG_FORCE_DOWNLOADED_BINARIES
+    vcpkgForceSystem = $env:VCPKG_FORCE_SYSTEM_BINARIES
     vscmdVersion = $env:VSCMD_VER
     vscmdPreinitPath = $env:__VSCMD_PREINIT_PATH
     httpProxy = $env:HTTP_PROXY
@@ -1372,9 +2131,9 @@ try {
             $child = (& $pwsh -NoLogo -NoProfile -Command $childScript) | ConvertFrom-Json
             foreach ($property in @(
                 "rustc", "rustcBootstrap", "rustcWrapper", "workspaceWrapper", "cl",
-                "underscoreCl", "cmakePrefix", "packageRoot", "rustupHome", "cargoNetOffline",
+                "underscoreCl", "cmakePrefix", "packageRoot", "cargoNetOffline",
                 "cargoRegistry", "targetCc", "targetCxx", "targetAr", "hostCc", "targetCxxAlias",
-                "vcpkgTriplet", "vscmdVersion", "vscmdPreinitPath", "httpProxy", "httpsProxy",
+                "vcpkgTriplet", "vcpkgForceSystem", "vscmdVersion", "vscmdPreinitPath", "httpProxy", "httpsProxy",
                 "allProxy"
             )) {
                 Assert-Contract ([string]::IsNullOrEmpty([string]$child.$property)) `
@@ -1382,7 +2141,7 @@ try {
             }
             foreach ($property in @(
                 "ar", "cc", "cargoHome", "cargoTarget", "targetLinker", "cxx",
-                "include", "lib", "libpath"
+                "include", "lib", "libpath", "rustupHome", "vcpkgForceDownloaded"
             )) {
                 $key = @{
                     ar = "AR"
@@ -1394,6 +2153,8 @@ try {
                     include = "INCLUDE"
                     lib = "LIB"
                     libpath = "LIBPATH"
+                    rustupHome = "RUSTUP_HOME"
+                    vcpkgForceDownloaded = "VCPKG_FORCE_DOWNLOADED_BINARIES"
                 }[$property]
                 Assert-Contract ($child.$property -ceq $controlledValues[$key]) `
                     "verified child must receive controlled $key"
@@ -1576,4 +2337,4 @@ finally {
     }
 }
 
-Write-Output "Windows workspace contracts passed: 22 cases"
+Write-Output "Windows workspace contracts passed: 31 cases"
