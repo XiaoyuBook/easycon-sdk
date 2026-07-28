@@ -61,7 +61,8 @@ path/kind/顺序、无 `.`/`..` component 的规范相对路径和 Windows 大�
 pwsh -NoProfile -File tools/run_windows_workspace.ps1 -Mode Setup
 ```
 
-Setup 使用 `vswhere.exe` 加载并核对 VS 2022 x64、MSVC `14.44.35207` 与 Windows SDK `10.0.26100.0`，安装固定
+Setup 使用 `vswhere.exe` 加载并核对 VS 2022 x64、MSVC `14.44.35207` 与 Windows SDK `10.0.26100.0`；成功退出但
+没有非空匹配时明确报告未找到带 x64 C++ toolchain 的 Visual Studio 2022。Setup 随后安装固定
 Rust toolchain、受控 CMake/Ninja、vcpkg scripts/tool/native dependencies、7-Zip 和 OCR 模型。所有下载先按清单
 hash 验证；完成后写入 `environment-stamp.json`，记录 fingerprint、workspace key、工具显式路径与 SHA-256、精确
 版本、Cargo vendor/native tree hash 和资产路径。Cargo crates 由 `Cargo.lock` 与全部 workspace manifests 驱动
@@ -86,7 +87,9 @@ vcpkg scripts 按 commit 保存，每次复核 HEAD、cleanliness、tools manife
 物化到当前环境；source downloads 按 scripts commit 持久复用并继续由 vcpkg 自身 hash 合同核验，install 最多做三次有界
 尝试并复用同一 downloads/buildtrees/binary cache。最终成功或失败都删除 transient buildtrees/packages，包括 port source
 中的合法 reparse/symlink；删除只移除链接本身且不跟随其目标，这些 transient 目录不进入 prepared environment 或 stamp。
-若外部句柄阻止 transient cleanup，install 首错保持为主错误并附带 cleanup/residual tree 状态，句柄释放后的 Setup 可恢复。
+若外部句柄阻止 transient cleanup，install 首错保持为主错误并附带 cleanup/residual tree 状态。句柄释放后的 Setup
+在通用 prepared-tree 严格删除前，只对固定布局推导出的 `w/setup/vcpkg/buildtrees` 与 `packages` 重试同一 link-safe
+清理；installed tree 不在专用清理范围，其他位置的 reparse point 仍由通用防护拒绝。
 OCR 先由原有 Python
 provisioner 精确校验冻结 manifest，再从 SHA-256 blob 物化。`RUSTUP_HOME` 持久复用已安装 components，但由于 Rust
 分发内容没有仓库内 hash pin，每次实际 Setup 仍执行 rustup install/check；install 最多做三次有界尝试并复用 rustup

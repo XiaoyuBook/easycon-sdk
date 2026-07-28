@@ -333,6 +333,24 @@ function Remove-EasyConTransientBuildTree {
     }
 }
 
+function Get-EasyConKnownVcpkgTransientTrees {
+    param(
+        [Parameter(Mandatory)]
+        [string]$EnvironmentRoot,
+
+        [Parameter(Mandatory)]
+        [string]$TrustedRoot
+    )
+
+    $environment = Assert-EasyConPhysicalPath -Path $EnvironmentRoot `
+        -TrustedRoot $TrustedRoot
+    $workspaceRoot = Join-Path $environment "w/setup/vcpkg"
+    return @(
+        Resolve-EasyConFullPath -Path (Join-Path $workspaceRoot "buildtrees")
+        Resolve-EasyConFullPath -Path (Join-Path $workspaceRoot "packages")
+    )
+}
+
 function Assert-EasyConContentFile {
     param(
         [Parameter(Mandatory)]
@@ -1608,10 +1626,13 @@ function Find-EasyConVisualStudio {
         "-property",
         "installationPath"
     ) -Description "Visual Studio 2022 discovery"
-    $installation = @($output | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })[0].Trim()
-    if ([string]::IsNullOrWhiteSpace($installation)) {
+    $installations = @($output | Where-Object {
+        -not [string]::IsNullOrWhiteSpace($_)
+    })
+    if ($installations.Count -eq 0) {
         throw "Visual Studio 2022 with the x64 C++ toolchain was not found"
     }
+    $installation = $installations[0].Trim()
     $installation = Resolve-EasyConFullPath -Path $installation
     Assert-EasyConPhysicalPath -Path $installation `
         -ReparsePointClassifier $ReparsePointClassifier | Out-Null
@@ -4239,6 +4260,36 @@ function Invoke-EasyConEnvironmentLifecycle {
                     [System.StringComparison]::OrdinalIgnoreCase
                 )) {
                     throw "refusing to rebuild the broad environment cache root"
+                }
+                $recoveryCleanupFailures = [System.Collections.Generic.List[object]]::new()
+                foreach ($transientTree in @(Get-EasyConKnownVcpkgTransientTrees `
+                    -EnvironmentRoot $Location.EnvironmentRoot `
+                    -TrustedRoot $Location.CacheRoot)) {
+                    try {
+                        Remove-EasyConTransientBuildTree -Path $transientTree `
+                            -TrustedRoot $Location.EnvironmentRoot
+                    }
+                    catch {
+                        $recoveryCleanupFailures.Add([pscustomobject]@{
+                            Failure = $_
+                            Path = $transientTree
+                            Residual = Test-Path -LiteralPath $transientTree
+                        })
+                    }
+                }
+                if ($recoveryCleanupFailures.Count -gt 0) {
+                    for ($index = 0; $index -lt $recoveryCleanupFailures.Count; $index++) {
+                        $cleanup = $recoveryCleanupFailures[$index]
+                        $verificationFailure.Exception.Data[
+                            "EasyConVcpkgRecoveryCleanupFailure$index"
+                        ] = $cleanup.Failure.Exception.ToString()
+                        if ($cleanup.Residual) {
+                            $verificationFailure.Exception.Data[
+                                "EasyConResidualVcpkgTransientTree$index"
+                            ] = $cleanup.Path
+                        }
+                    }
+                    throw $verificationFailure
                 }
                 Remove-EasyConSafeTree -Path $Location.EnvironmentRoot `
                     -TrustedRoot $Location.CacheRoot

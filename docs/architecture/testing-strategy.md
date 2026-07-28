@@ -451,6 +451,8 @@ location restore failure 仅为附加 Data；exit 0 对照则证明没有更早�
 Setup/Verify 宿主版本合同通过各自的 native capture 路径注入 Python `--version` 输出，覆盖 `3.12.10`、`3.10.x`、
 `3.8.0`、`3.7.99`、空输出、多行、同一行尾随与非法格式，证明 minimum 比较使用 `System.Version` 数值语义、
 parser 只接受恰好一行完整输出，且测试不依赖机器当前 Python 版本。
+Visual Studio discovery 合同通过 native capture 注入 `vswhere` 的空输出、仅空白、多条、畸形、有效单路径与非零失败；
+空/空白成功输出必须给出 x64 C++ toolchain 未找到诊断，不能泄漏数组索引异常，其他既有边界保持不变。
 
 共享资产合同必须覆盖：cache miss 只下载一次；完整命中时阻断 download seam 且零下载；损坏 blob 隔离后恢复；错误
 hash fail closed；不同 hash 的发布锁可并行且同一 hash 跨 identity 互斥；fingerprint/worktree 变化及失败重建仍复用
@@ -467,7 +469,10 @@ hash fail closed；不同 hash 的发布锁可并行且同一 hash 跨 identity 
 可恢复且持续失败恰在三次后关闭。hosted port source 可包含合法 reparse/symlink，因此合同要在失败 install 的
 buildtrees/packages 中创建指向 trusted root 外部 marker 的真实 junction，证明失败 cleanup、后续 Setup recovery 与成功
 cleanup 都只删除 transient link/tree、不跟随目标或误删 installed tree；真实独占句柄还要证明 install 首错与
-cleanup/residual 诊断并存。普通 prepared path 的 reparse fail-closed 合同保持不变。
+cleanup/residual 诊断并存。恢复合同必须锁住 junction 本身制造两个 known transient root 的失败残留，释放句柄后走
+公开 Setup lifecycle 并证明 SetupAction 恰好执行一次；句柄仍占用时保留 Verify 首错与 cleanup/residual Data，且不启动
+SetupAction。固定布局外的 unknown reparse 必须继续 fail closed，installed tree 和外部目标都不得被专用清理误删；
+这些并发边界使用真实 handle 与同步终态，不依赖随机 sleep。
 
 无论变更类型，都必须确认 `EasyCon/` 仍被根 `.gitignore` 忽略、第三方参考源码没有改动，且外层 tracked
 文件没有引入 `EasyCon/` 内容或项目依赖。

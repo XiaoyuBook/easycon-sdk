@@ -100,7 +100,9 @@ release、host、target 和 components。Cargo 不从 ambient PATH 独立选择�
 已验证的 CMake/Ninja archive 同时预填到按 vcpkg scripts commit 隔离的共享 downloads root；vcpkg 不再为同一内部工具
 二次联网，目标副本损坏时从内容寻址 blob 重新物化。vcpkg install 的短暂失败最多重试三次，并复用同一
 downloads/buildtrees/binary cache；最终成功或失败都安全清理 transient buildtrees/packages。若清理受外部句柄阻止，
-install 首错保持为主错误并附带 cleanup/residual tree 诊断，句柄释放后的 Setup 可自行恢复。
+install 首错保持为主错误并附带 cleanup/residual tree 诊断。句柄释放后的 Setup 会先清理固定布局可推导的
+buildtrees/packages，再执行通用严格环境树删除；只删除这些 transient tree 内的 link 本身，不跟随外部目标，
+installed tree 不属于专用清理范围，其他位置的 reparse point 仍 fail closed。
 
 同一环境 identity 的 Setup 独占重建，Verify/Workspace 共享读取，且 Workspace 从 Verify 到最后一个 gate 持续受保护；
 共享资产另有跨 identity reader/writer lease，避免 Setup 修改 Rust/vcpkg 共享状态时与 Verify 或 gates 竞争。受控 7-Zip
@@ -115,6 +117,8 @@ Windows 大小写 alias。锁定的 download/stamp temporary 无法立即删除�
 句柄释放后的后续下载或 Setup 可恢复。完整、未损坏的直接固定资产 cache hit 不重新启动下载；Rust/vcpkg/Cargo
 仍按各自安全模型检查或补齐缺失内容，因此这一职责拆分不承诺完全离线或零网络请求。完整固定清单与 CI 边界见
 [GitHub CI 运维边界](.github/CI.md) 和 [构建、发布与合规](docs/architecture/build-release.md)。
+`vswhere.exe` 成功退出但没有非空匹配时，Setup 明确报告未找到带 x64 C++ toolchain 的 Visual Studio 2022，
+不会暴露内部数组索引异常。
 
 ## 许可证
 

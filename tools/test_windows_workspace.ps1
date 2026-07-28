@@ -679,6 +679,80 @@ try {
         }
     }
 
+    Invoke-ContractCase -Name "vswhere-empty-output-has-actionable-diagnostic" -Action {
+        $vswhere = Join-Path $temporaryRoot "vswhere contract/vswhere.exe"
+        Set-ContractFile -Path $vswhere -Value "contract"
+        foreach ($case in @(
+            [pscustomobject]@{ Name = "empty"; Output = [string[]]@() },
+            [pscustomobject]@{ Name = "whitespace"; Output = [string[]]@("", "   ", "`t") }
+        )) {
+            $discoveryOutput = [string[]]$case.Output
+            $capture = {
+                param($Program, $Arguments, $Description, $WorkingDirectory, $StreamOutput)
+                $null = $WorkingDirectory, $StreamOutput
+                Assert-Contract ($Program -ceq $vswhere) `
+                    "Visual Studio discovery must execute the selected vswhere path"
+                Assert-Contract ($Description -ceq "Visual Studio 2022 discovery") `
+                    "Visual Studio discovery must retain its native diagnostic description"
+                Assert-Contract (
+                    [Array]::IndexOf([object[]]$Arguments, "installationPath") -ge 0
+                ) "vswhere must request the installationPath property"
+                return $discoveryOutput
+            }.GetNewClosure()
+            try {
+                Assert-Throws `
+                    -Pattern "Visual Studio 2022 with the x64 C\+\+ toolchain was not found" `
+                    -Action {
+                        Invoke-PrivateCommandWithNativeCapture `
+                            -CommandName "Find-EasyConVisualStudio" `
+                            -Parameters @{ VsWherePath = $vswhere } `
+                            -NativeCapture $capture
+                    }
+            }
+            catch {
+                throw "vswhere $($case.Name) output lost its actionable diagnostic: $($_.Exception.Message)"
+            }
+        }
+
+        $visualStudio = Join-Path $temporaryRoot "Visual Studio contract"
+        Set-ContractFile -Path (Join-Path $visualStudio `
+            "Common7/Tools/Microsoft.VisualStudio.DevShell.dll") -Value "contract"
+        $discoveryOutput = [string[]]@("", "   ", $visualStudio, "ignored-second-match")
+        $capture = {
+            param($Program, $Arguments, $Description, $WorkingDirectory, $StreamOutput)
+            $null = $Program, $Arguments, $Description, $WorkingDirectory, $StreamOutput
+            return $discoveryOutput
+        }.GetNewClosure()
+        $selected = Invoke-PrivateCommandWithNativeCapture `
+            -CommandName "Find-EasyConVisualStudio" `
+            -Parameters @{ VsWherePath = $vswhere } -NativeCapture $capture
+        Assert-Contract ($selected -ceq $visualStudio) `
+            "Visual Studio discovery must keep the first valid nonblank match"
+
+        $malformedInstallation = Join-Path $temporaryRoot "malformed Visual Studio output"
+        New-Item -ItemType Directory -Force -Path $malformedInstallation | Out-Null
+        $discoveryOutput = [string[]]@($malformedInstallation)
+        $capture = {
+            param($Program, $Arguments, $Description, $WorkingDirectory, $StreamOutput)
+            $null = $Program, $Arguments, $Description, $WorkingDirectory, $StreamOutput
+            return $discoveryOutput
+        }.GetNewClosure()
+        Assert-Throws -Pattern "Developer Shell module is missing" -Action {
+            Invoke-PrivateCommandWithNativeCapture -CommandName "Find-EasyConVisualStudio" `
+                -Parameters @{ VsWherePath = $vswhere } -NativeCapture $capture
+        }
+
+        $capture = {
+            param($Program, $Arguments, $Description, $WorkingDirectory, $StreamOutput)
+            $null = $Program, $Arguments, $WorkingDirectory, $StreamOutput
+            throw "$Description failed with exit code 23"
+        }
+        Assert-Throws -Pattern "Visual Studio 2022 discovery failed with exit code 23" -Action {
+            Invoke-PrivateCommandWithNativeCapture -CommandName "Find-EasyConVisualStudio" `
+                -Parameters @{ VsWherePath = $vswhere } -NativeCapture $capture
+        }
+    }
+
     Invoke-ContractCase -Name "public-module-surface-hides-lifecycle-bypasses" -Action {
         foreach ($name in @(
             "Enter-EasyConEnvironmentLease",
@@ -2776,4 +2850,4 @@ finally {
     }
 }
 
-Write-Output "Windows workspace contracts passed: 34 cases"
+Write-Output "Windows workspace contracts passed: 35 cases"

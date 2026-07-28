@@ -136,6 +136,67 @@ function Wait-ContractFileCreated {
     }
 }
 
+if ($null -eq ("EasyConLifecycleContractNativeMethods" -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+public static class EasyConLifecycleContractNativeMethods
+{
+    private const uint GenericRead = 0x80000000;
+    private const uint FileShareRead = 0x00000001;
+    private const uint FileShareWrite = 0x00000002;
+    private const uint OpenExisting = 3;
+    private const uint FileFlagBackupSemantics = 0x02000000;
+    private const uint FileFlagOpenReparsePoint = 0x00200000;
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern SafeFileHandle CreateFileW(
+        string fileName,
+        uint desiredAccess,
+        uint shareMode,
+        IntPtr securityAttributes,
+        uint creationDisposition,
+        uint flagsAndAttributes,
+        IntPtr templateFile
+    );
+
+    public static SafeFileHandle OpenDirectoryReparsePointWithoutDeleteSharing(string path)
+    {
+        SafeFileHandle handle = CreateFileW(
+            path,
+            GenericRead,
+            FileShareRead | FileShareWrite,
+            IntPtr.Zero,
+            OpenExisting,
+            FileFlagBackupSemantics | FileFlagOpenReparsePoint,
+            IntPtr.Zero
+        );
+        if (handle.IsInvalid)
+        {
+            int error = Marshal.GetLastWin32Error();
+            handle.Dispose();
+            throw new Win32Exception(error, "failed to lock junction without delete sharing");
+        }
+        return handle;
+    }
+}
+'@
+}
+
+function Open-ContractLockedJunction {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    return [EasyConLifecycleContractNativeMethods]::OpenDirectoryReparsePointWithoutDeleteSharing(
+        $Path
+    )
+}
+
 $modulePath = Join-Path $PSScriptRoot "windows_workspace.psm1"
 $temporaryRoot = Join-Path ([System.IO.Path]::GetTempPath()) (
     "easycon lifecycle contract {0}" -f [guid]::NewGuid().ToString("N")
@@ -226,6 +287,21 @@ function Enter-PrivateSharedCacheLease {
         Enter-EasyConSharedCacheLease -CacheRoot $Root -Access $LeaseAccess `
             -TimeoutMilliseconds $Timeout -RetryMilliseconds 0
     } $CacheRoot $Access $TimeoutMilliseconds
+}
+
+function Remove-PrivateTransientBuildTree {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [string]$TrustedRoot
+    )
+
+    & $script:workspaceModule {
+        param($Tree, $Root)
+        Remove-EasyConTransientBuildTree -Path $Tree -TrustedRoot $Root
+    } $Path $TrustedRoot
 }
 
 function Invoke-EnvironmentRestorationContract {
@@ -594,6 +670,206 @@ if (
     Assert-Contract ($sharedState.Downloads -eq 1) `
         "damage and interrupted rebuilds must reuse the verified shared asset"
 
+    $junctionRecoveryEnvironment = Join-Path $temporaryRoot "e/junction-recovery"
+    $junctionRecoveryLocation = [pscustomobject]@{
+        CacheRoot = $temporaryRoot
+        EnvironmentRoot = $junctionRecoveryEnvironment
+        StampPath = Join-Path $junctionRecoveryEnvironment "environment-stamp.json"
+        LockPath = Join-Path $temporaryRoot "locks/junction-recovery.lock"
+        IdentityKey = "junction-recovery"
+        WorkspaceKey = "junction-recovery-workspace"
+    }
+    $vcpkgTransientRoot = Join-Path $junctionRecoveryEnvironment "w/setup/vcpkg"
+    $knownTransientTrees = @(
+        Join-Path $vcpkgTransientRoot "buildtrees"
+        Join-Path $vcpkgTransientRoot "packages"
+    )
+    $installedTree = Join-Path $vcpkgTransientRoot "installed"
+    $externalTargets = @(
+        Join-Path $temporaryRoot "junction-recovery-external-buildtrees"
+        Join-Path $temporaryRoot "junction-recovery-external-packages"
+    )
+    $externalMarkers = @(
+        Join-Path $externalTargets[0] "keep-buildtrees.txt"
+        Join-Path $externalTargets[1] "keep-packages.txt"
+    )
+    foreach ($index in 0..1) {
+        New-Item -ItemType Directory -Force -Path $externalTargets[$index] | Out-Null
+        Set-Content -LiteralPath $externalMarkers[$index] -Value "external" `
+            -Encoding utf8NoBOM
+    }
+
+    $createLockedTransientResidue = {
+        New-Item -ItemType Directory -Force -Path $knownTransientTrees | Out-Null
+        New-Item -ItemType Directory -Force -Path $installedTree | Out-Null
+        $installedMarker = Join-Path $installedTree "keep-installed.txt"
+        Set-Content -LiteralPath $installedMarker -Value "installed" -Encoding utf8NoBOM
+        $handles = [System.Collections.Generic.List[Microsoft.Win32.SafeHandles.SafeFileHandle]]::new()
+        $junctions = [System.Collections.Generic.List[string]]::new()
+        foreach ($index in 0..1) {
+            $junction = Join-Path $knownTransientTrees[$index] "hosted-port-source"
+            New-Item -ItemType Junction -Path $junction -Target $externalTargets[$index] | Out-Null
+            $junctionItem = Get-Item -Force -LiteralPath $junction
+            Assert-Contract (
+                ($junctionItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+            ) "the lifecycle recovery fixture must contain a real NTFS junction"
+            $junctions.Add($junction) | Out-Null
+            $handle = Open-ContractLockedJunction -Path $junction
+            Assert-Contract (-not $handle.IsInvalid -and -not $handle.IsClosed) `
+                "the lifecycle fixture must retain an open junction handle"
+            $handles.Add($handle) | Out-Null
+        }
+        return [pscustomobject]@{
+            Handles = $handles.ToArray()
+            Junctions = $junctions.ToArray()
+            InstalledMarker = $installedMarker
+        }
+    }.GetNewClosure()
+
+    $lockedResidue = & $createLockedTransientResidue
+    $initialCleanupFailures = [System.Collections.Generic.List[object]]::new()
+    try {
+        foreach ($tree in $knownTransientTrees) {
+            try {
+                Remove-PrivateTransientBuildTree -Path $tree `
+                    -TrustedRoot $junctionRecoveryEnvironment
+            }
+            catch {
+                $initialCleanupFailures.Add($_)
+            }
+        }
+        Assert-Contract ($initialCleanupFailures.Count -eq 2) (
+            "locked junctions must leave both known vcpkg transient roots for recovery; " +
+            "failures=$($initialCleanupFailures.Count) roots=" +
+            (($knownTransientTrees | ForEach-Object {
+                "$_=$(Test-Path -LiteralPath $_)"
+            }) -join ",")
+        )
+        foreach ($junction in $lockedResidue.Junctions) {
+            Assert-Contract (Test-Path -LiteralPath $junction) `
+                "failed transient cleanup must retain the locked junction itself"
+        }
+        Assert-Contract (Test-Path -LiteralPath $lockedResidue.InstalledMarker -PathType Leaf) `
+            "failed transient cleanup must not delete the installed tree"
+        foreach ($marker in $externalMarkers) {
+            Assert-Contract (Test-Path -LiteralPath $marker -PathType Leaf) `
+                "failed transient cleanup must not follow a junction target"
+        }
+    }
+    finally {
+        foreach ($handle in $lockedResidue.Handles) {
+            $handle.Dispose()
+        }
+    }
+
+    $junctionRecoveryState = [pscustomobject]@{ SetupCalls = 0; VerifyCalls = 0 }
+    $junctionRecoverySetup = {
+        $junctionRecoveryState.SetupCalls++
+        foreach ($tree in $knownTransientTrees) {
+            Assert-Contract (-not (Test-Path -LiteralPath $tree)) `
+                "Setup must remove known vcpkg transient residue before provisioning"
+        }
+        foreach ($marker in $externalMarkers) {
+            Assert-Contract (Test-Path -LiteralPath $marker -PathType Leaf) `
+                "Setup recovery must preserve external junction targets"
+        }
+        Set-Content -LiteralPath $junctionRecoveryLocation.StampPath -Value "ready" `
+            -Encoding utf8NoBOM
+    }.GetNewClosure()
+    $junctionRecoveryVerify = {
+        $junctionRecoveryState.VerifyCalls++
+        if (
+            -not (Test-Path -LiteralPath $junctionRecoveryLocation.StampPath -PathType Leaf) -or
+            (Get-Content -Raw -LiteralPath $junctionRecoveryLocation.StampPath).Trim() -cne "ready"
+        ) {
+            throw "synthetic locked junction environment mismatch"
+        }
+        return "verified"
+    }.GetNewClosure()
+
+    Invoke-PrivateEnvironmentLifecycle -Mode Setup -Location $junctionRecoveryLocation `
+        -SetupAction $junctionRecoverySetup -VerifyAction $junctionRecoveryVerify `
+        -WorkspaceAction { param($Summary) } -LeaseTimeoutMilliseconds 0 | Out-Null
+    Assert-Contract (
+        $junctionRecoveryState.SetupCalls -eq 1 -and
+        $junctionRecoveryState.VerifyCalls -eq 2
+    ) "a later public Setup lifecycle must recover the released junction residue exactly once"
+
+    $unknownReparse = Join-Path $junctionRecoveryEnvironment "unknown/reparse-output"
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $unknownReparse) | Out-Null
+    New-Item -ItemType Junction -Path $unknownReparse -Target $externalTargets[0] | Out-Null
+    Set-Content -LiteralPath $junctionRecoveryLocation.StampPath -Value "damaged" `
+        -Encoding utf8NoBOM
+    Assert-Throws -Pattern "physical tree contains a reparse point" -Action {
+        Invoke-PrivateEnvironmentLifecycle -Mode Setup -Location $junctionRecoveryLocation `
+            -SetupAction $junctionRecoverySetup -VerifyAction $junctionRecoveryVerify `
+            -WorkspaceAction { param($Summary) } -LeaseTimeoutMilliseconds 0
+    }
+    Assert-Contract ($junctionRecoveryState.SetupCalls -eq 1) `
+        "an unknown prepared-tree reparse point must fail closed before SetupAction"
+    Assert-Contract (Test-Path -LiteralPath $externalMarkers[0] -PathType Leaf) `
+        "unknown reparse rejection must preserve its external target"
+    Remove-Item -Force -LiteralPath $unknownReparse
+    Remove-Item -Force -LiteralPath (Split-Path -Parent $unknownReparse)
+
+    $lockedResidue = & $createLockedTransientResidue
+    Set-Content -LiteralPath $junctionRecoveryLocation.StampPath -Value "damaged" `
+        -Encoding utf8NoBOM
+    $lockedSetupFailure = $null
+    try {
+        try {
+            Invoke-PrivateEnvironmentLifecycle -Mode Setup -Location $junctionRecoveryLocation `
+                -SetupAction $junctionRecoverySetup -VerifyAction $junctionRecoveryVerify `
+                -WorkspaceAction { param($Summary) } -LeaseTimeoutMilliseconds 0 | Out-Null
+        }
+        catch {
+            $lockedSetupFailure = $_
+        }
+        Assert-Contract ($null -ne $lockedSetupFailure) `
+            "Setup recovery must fail while known transient junctions remain locked"
+        Assert-Contract (
+            $lockedSetupFailure.Exception.Message -match
+                "synthetic locked junction environment mismatch"
+        ) "locked recovery cleanup must retain the verification failure as the primary error"
+        Assert-Contract (
+            $lockedSetupFailure.Exception.Data.Contains(
+                "EasyConVcpkgRecoveryCleanupFailure0"
+            ) -and
+            $lockedSetupFailure.Exception.Data.Contains(
+                "EasyConVcpkgRecoveryCleanupFailure1"
+            ) -and
+            $lockedSetupFailure.Exception.Data.Contains(
+                "EasyConResidualVcpkgTransientTree0"
+            ) -and
+            $lockedSetupFailure.Exception.Data.Contains(
+                "EasyConResidualVcpkgTransientTree1"
+            )
+        ) "locked recovery must attach cleanup and residual diagnostics for both known roots"
+        Assert-Contract ($junctionRecoveryState.SetupCalls -eq 1) `
+            "locked known transient cleanup must fail before SetupAction"
+        Assert-Contract (Test-Path -LiteralPath $lockedResidue.InstalledMarker -PathType Leaf) `
+            "known transient recovery cleanup must not delete the installed tree"
+        foreach ($marker in $externalMarkers) {
+            Assert-Contract (Test-Path -LiteralPath $marker -PathType Leaf) `
+                "locked recovery cleanup must not follow external junction targets"
+        }
+    }
+    finally {
+        foreach ($handle in $lockedResidue.Handles) {
+            $handle.Dispose()
+        }
+    }
+
+    Invoke-PrivateEnvironmentLifecycle -Mode Setup -Location $junctionRecoveryLocation `
+        -SetupAction $junctionRecoverySetup -VerifyAction $junctionRecoveryVerify `
+        -WorkspaceAction { param($Summary) } -LeaseTimeoutMilliseconds 0 | Out-Null
+    Assert-Contract ($junctionRecoveryState.SetupCalls -eq 2) `
+        "Setup must recover deterministically after locked junction handles are released"
+    foreach ($marker in $externalMarkers) {
+        Assert-Contract (Test-Path -LiteralPath $marker -PathType Leaf) `
+            "completed Setup recovery must preserve each external junction target"
+    }
+
     foreach ($identityName in @("fingerprint-change", "worktree-change")) {
         $alternateRoot = Join-Path $temporaryRoot "e/$identityName"
         $alternateLocation = [pscustomobject]@{
@@ -766,4 +1042,4 @@ finally {
     }
 }
 
-Write-Output "Windows environment lifecycle contracts passed: 19 cases"
+Write-Output "Windows environment lifecycle contracts passed: 20 cases"
