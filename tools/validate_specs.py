@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path, PurePosixPath
 
 
@@ -2164,6 +2165,40 @@ def validate_vision_model_provisioner_regressions():
         not attempted_downloads,
         "OCR provisioner must reject output outside ignored .tools/vision-models before writing",
     )
+
+    with tempfile.TemporaryDirectory(prefix="easycon-ocr-contract-") as temporary:
+        controlled_root = Path(temporary) / "controlled"
+        model.download = lambda entry, destination: attempted_downloads.append(destination)
+        try:
+            attempted_downloads.clear()
+            try:
+                model.provision(
+                    manifest,
+                    controlled_root / "model",
+                    allowed_root=controlled_root,
+                )
+            except model.ProvisionError:
+                pass
+            require(
+                attempted_downloads,
+                "OCR provisioner must accept an explicit controlled root before downloading",
+            )
+
+            attempted_downloads.clear()
+            try:
+                model.provision(
+                    manifest,
+                    Path(temporary) / "outside",
+                    allowed_root=controlled_root,
+                )
+            except model.ProvisionError:
+                pass
+            require(
+                not attempted_downloads,
+                "OCR provisioner must reject output escaping an explicit controlled root",
+            )
+        finally:
+            model.download = original_download
 
     require(
         hasattr(model, "FrozenRedirectHandler"),

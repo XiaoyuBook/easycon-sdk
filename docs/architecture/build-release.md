@@ -40,16 +40,90 @@ backend 或合并大段平台专属生产代码。
 
 | 层 | 基线 |
 | --- | --- |
-| Rust | stable toolchain，精确版本在实现开始时写入 `rust-toolchain.toml`；发布分支不跟随 channel 漂移 |
-| C++ | Visual Studio Build Tools 2022 17.10+、MSVC v143、C++20、Windows SDK 10.0.22621+ |
-| Build | CMake 3.30+、Ninja 1.11+、Cargo；统一由 CMake preset/xtask 编排，不维护四套 native build |
-| Native deps | manifest-mode vcpkg 或等价可审计 lock，固定 OpenCV 4.x、Tesseract 5.x、Leptonica 及传递依赖 |
+| Rust | `rust-toolchain.toml` 精确固定 `1.97.1` 与 `x86_64-pc-windows-msvc`、rustfmt、clippy；发布分支不跟随 channel 漂移 |
+| C++ | Visual Studio Build Tools 2022、MSVC `14.44.35207`、C++20、Windows SDK `10.0.26100.0` |
+| Build | 受控 CMake `4.3.3`、Ninja `1.13.2`、Cargo；统一由 CMake preset/xtask 编排，不维护四套 native build |
+| Native deps | vcpkg scripts/registry `cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3`、tool `2026-07-13`；OpenCV `4.12.0#5`、Tesseract `5.5.2#0`、Leptonica `1.87.0#0` 及传递依赖由同一 registry baseline 解析 |
 | .NET | .NET 8 SDK 最新 servicing；`dotnet pack` |
 | Python | Python 3.10-3.14 test matrix、build 1.x、twine；wheel repair/inspection 工具 |
 | Node | Node 22/24、npm、TypeScript、node-gyp/CMake.js 中选定一个 addon 构建入口 |
 | Quality | rustfmt/clippy、clang-format/clang-tidy、cargo-deny、SBOM 和 license scanner |
 
-**[推导]** 架构文档不猜测 2026-07-17 当天的 Rust patch 号。实施分支在第一次可重复构建时锁定精确 stable 版本，并把升级作为显式依赖 PR；这比文档中的浮动版本更可执行。
+`tools/windows_build_environment.json` 是当前 Windows 开发构建环境的结构化固定清单，记录 vcpkg
+scripts/tool/registry、CMake、Ninja、7-Zip、直接 native ports 的版本、来源和 hash 证据；Rust、triplet、preset 与
+OCR 分别由 fingerprint 中列出的 tracked 文件共同约束。清单显式区分 text 与 binary 输入；text 先严格按 UTF-8
+解码并把 CRLF/独立 CR 规范化为 LF，binary 则 hash 原始 bytes。PowerShell parser 在任何 provision 前强制固定输入
+exact path/kind/order、规范相对 path 和 Windows 大小写不敏感 identity；Python guard 独立执行同一严格合同，防止两者
+漂移。升级任一固定输入都必须经过显式变更并重新运行 Setup。
+
+### Windows 开发环境生命周期
+
+Windows 构建流程分为两个职责：
+
+```powershell
+pwsh -NoProfile -File tools/run_windows_workspace.ps1 -Mode Setup
+pwsh -NoProfile -File tools/run_windows_workspace.ps1 -Mode Verify
+pwsh -NoProfile -File tools/run_windows_workspace.ps1 -Mode Workspace
+```
+
+`Setup` 是可重跑的一次性在线准备步骤，安装并核验固定 Rust toolchain、受控 CMake/Ninja、vcpkg
+scripts/tool/registry/native install tree、7-Zip 与测试 OCR 模型，然后写入包含 fingerprint、显式路径、版本、文件
+hash、Cargo vendor tree hash 和 native tree hash 的 stamp。Setup 使用 `cargo vendor --locked` 把 lockfile 与全部
+workspace manifests 对应的 crate sources 安装进环境。Cargo 不从 ambient PATH 解析；rustup 必须先为固定 channel 返回
+受控 Rust home 精确 toolchain 目录中的 `cargo.exe`，Setup 在首次 Cargo 执行前核对该路径、release 与 host。
+`Verify` 与 `Workspace` 不安装或下载；两者只接受当前
+fingerprint 对应且未损坏的 stamp，缺失或失配时要求重新运行 Setup。`Workspace` 在 Verify 后运行完整仓库门禁。
+
+环境目录之外有跨 fingerprint/worktree 的共享资产层。直接固定资产以 SHA-256/SHA-512 内容寻址，命中时每次重验
+hash/bytes，损坏项在逐资产锁内隔离，唯一同卷 temporary 通过验证后才原子发布。CMake、Ninja、vcpkg.exe、7-Zip/7zr
+和 OCR 都从这些 blob 物化；OCR 在任何下载前仍调用原有 provisioner 精确验证冻结 manifest。vcpkg scripts 按 commit
+保存并在每次复用时复核 checkout、cleanliness、tool manifest 和 registry pins，再用本地无 hardlink clone 物化；vcpkg
+source downloads 按 scripts commit 复用并继续服从 vcpkg 自身的内容 hash。Rust home 持久复用 components，但没有仓库
+内分发 hash pin，因此每次实际 Setup 仍执行 rustup install/check；install 最多做三次有界尝试并复用 rustup partial，
+成功后再核对 release、host、target 和 components。环境
+stamp、ready 状态和 prepared tree 不进入共享缓存。受控 7-Zip fetch 使用空 PATH 与 downloaded-binaries-only 模式，
+最终 `7z.exe` 还需匹配固定 SHA-256 和精确 x64 版本，宿主 PATH 的 `7z.exe`/`7zr.exe` 不构成候选。
+已验证的 CMake/Ninja archive 还会物化到按 scripts commit 隔离的 vcpkg downloads root；每次 Setup 重验目标副本，损坏时
+从内容寻址 blob 修复，vcpkg 不再为同一 internal tool 二次联网。vcpkg install 的短暂失败最多做三次有界尝试，复用
+同一 downloads、buildtrees 与 binary cache；最终成功或失败都安全删除 transient buildtrees/packages，不把 port source
+中合法的 reparse/symlink 带入最终 prepared tree，且删除不跟随链接目标。清理失败时保留 install 首错并附加
+cleanup/residual tree 诊断。外部句柄释放后的 Setup 在通用 prepared-tree 严格删除前，仅对固定布局可推导的
+`w/setup/vcpkg/buildtrees` 与 `packages` 重试 link-safe 清理；installed tree 不在该专用范围，其他位置的 reparse point
+仍 fail closed，通用防护不放宽。若已知 transient link 仍被占用，Verify 首错保持为主错误并附加 cleanup/residual 诊断。
+
+同一 fingerprint/worktree identity 使用环境目录外的跨进程 reader/writer lease：Setup 独占 stamp 检查、旧树删除、
+安装、stamp 发布与最终 Verify；普通 Verify 共享读取；Workspace 的共享 lease 从 Verify 连续覆盖到最后一个 gate。
+共享资产层另有跨 identity reader/writer lease，Setup provision 独占，Verify/Workspace 全程共享，避免 Rust/vcpkg
+共享状态与读取中的环境竞争。Setup 的 ready 预检先获取共享资产 reader lease；writer busy/timeout 原样失败并保留
+stamp/环境，不被当成 Verify failure 触发删除或 provision。所有异常路径释放 lease。vcpkg checkout 先在同卷不可见
+staging 中完成并验证，再用原子目录 rename 发布；访问冲突
+只做有限 publish/cleanup 重试。cleanup 成功时删除 partial destination；若外部句柄令删除暂时不可能，则返回以原始
+publish failure 为主、附带 cleanup failure 与残留状态的诊断，且残留绝不视为有效 checkout。句柄释放后，下一次
+Setup 在独占 lease 下删除旧环境树并安全恢复。
+
+工具、vcpkg.exe 和环境 stamp 的 download/write temporary 也使用 trusted-root 内的有限 cleanup。文件仍被外部句柄
+持有时不承诺当前调用物理删除；诊断保留原始 download/hash/publish failure，并附加 cleanup failure 与 residual 状态。
+残留 temporary 不能通过固定 hash 或成为最终 stamp；句柄释放后新的完整下载可发布，下一次 Setup 也可删除旧环境树。
+
+Verify 在执行任何 gate 前清除 ambient `RUSTC*`/wrapper/rustflags、Cargo target linker/profile/registry overrides、
+cc-rs target compiler、`CL`/`_CL_`、MSVC Developer Shell 残留、CMake/package roots、vcpkg overrides 和 proxy，并用
+stamp 核验后的工具目录构造 PATH，显式恢复 pinned Developer Shell 生成的 include/lib 路径并设置 MSVC linker、Cargo
+home/target、vcpkg tree 与 OCR 路径。代理只属于在线 Setup，不进入 Verify/Workspace 子进程。模块只导出 Setup、Verify
+与 Workspace；parser、下载、安装、环境修改和无锁 gate core 等 helper 全部私有。公开 Workspace 必须持同一个 shared
+lease 完成 Verify 和全部 gates；三个生命周期命令返回时完整恢复调用进程
+进入命令前的环境，异常不会把临时净化或受控变量留在调用 shell。
+native command/gate 会在 cwd cleanup 前把非零退出登记为主错误；原 cwd 被外部删除而无法恢复时，cleanup failure 只作为
+附加诊断且不覆盖退出码、native 输出/描述或 gate 名称。若子进程成功，cwd restore failure 本身仍使调用失败。
+
+下载包、工具二进制、native install tree 与编译缓存只存在于用户的受控环境根或 CI 临时目录，不进入 Git。完整且
+hash 匹配的直接资产 cache hit 不重新下载，即使 fingerprint/worktree 改变、旧环境损坏或前次 Setup 失败也可复用。
+Rust 的 rustup 检查及 vcpkg/Cargo 缺失内容仍可联网，所以这不是完全离线合同；所有 cache 只提速，miss 不改变正确性。
+PowerShell、Git、Python、rustup、VS Installer/vswhere 与 VS Build Tools 是运行 Setup 所需的宿主启动条件；
+Setup 会把实际解析到的可执行文件路径和 SHA-256 写入 stamp，日常 Verify 不会回退到另一个系统工具。`vswhere.exe`
+成功退出但没有非空安装路径时，Setup 给出明确的 Visual Studio 2022 x64 C++ toolchain 未找到诊断。
+宿主 Python minimum 固定为 `3.8.0` 并以 `System.Version` 数值语义比较，因而 hosted runner 的 Python `3.12.x`
+是满足要求的启动宿主；Setup/Verify 只接受恰好一行、完整 `Python X.Y.Z` 的版本输出。这与 SDK Python binding
+的 `3.10+` 产品支持目标是不同合同。
 
 ## 3. 单一原生构建
 

@@ -28,6 +28,10 @@ spec/
 
 fixture 必须自包含、可审阅且注明来源。`EasyCon/` 只用于本地形成候选差分结果，不能成为 CI input。
 
+Phase 4 S0 已在 `main` 基线 `87544d9` 登记 11 条自包含 ECS provenance records 和 33 个 SDK-local artifacts，
+并由静态 validator 校验 schema、分类、来源与 hash。它们是后续 C1/E1 的输入证据，不是 parser/evaluator 的
+可执行 conformance 通过结论；R0 也仍未独立 review/refreeze。
+
 ## 3. 确定性测试后端
 
 ### VirtualClock
@@ -428,6 +432,47 @@ SLO 在专用、固定电源策略的测试机测量；O-04 依据首轮数据�
 - Markdown 相对链接检查；
 - repository guard；
 - `git diff --check`。
+
+Windows 环境生命周期另有无网络轻量合同：首次 Setup、`already-ready`、损坏重建、Setup 中断后恢复、
+Setup-vs-Setup/Verify/Workspace ownership、Verify 失败时 gate 零启动，以及 Workspace 从 Verify 到全部 gates 持共享
+lease。ready 环境与另一 identity 的 shared-cache writer 竞争必须分别覆盖 timeout 与等待后成功：timeout 原样返回 busy、
+Verify/Setup 调用均为零且 stamp/marker 保留；等待测试用真实子进程与同步 marker 释放 writer，不用随机 sleep。
+环境测试必须启动真实子进程证明 ambient compiler/wrapper、target compiler/linker、MSVC include/lib、
+CMake/package-root/vcpkg/proxy 未被继承；vcpkg publish 测试通过注入访问冲突证明有限重试、partial destination
+可清理时的回滚，以及文件被独占句柄锁定时保留 publish 首错、附加 cleanup 状态并在句柄释放后恢复，不使用随机
+sleep。生命周期合同还必须证明普通 Import 后完整 exported function set exact 等于 Setup/Verify/Workspace，所有 helper
+只能通过模块作用域测试，并逐项覆盖三个 wrapper 参数转发以及 Setup/Verify/Workspace 成功与失败后完整恢复调用进程
+环境；Workspace gate 内仍只能看到受控环境。配置合同分别向 PowerShell parser 注入倒序 inputs、Windows 大小写
+alias duplicate 与 `.` component，并要求在 provision 前拒绝；Python guard 对同一 schema/path/kind/order/identity 规则
+给出独立回归。文件 cleanup 合同用真实 `FileShare.None` 覆盖通用 pinned download、vcpkg asset 和 stamp temporary，证明
+首错、cleanup/residual 诊断、最终 destination 不可见和句柄释放后的恢复。
+cwd cleanup 合同由真实子 `pwsh` 删除 caller 原目录后分别 exit 42/43，证明 native 输出/描述和 gate 名称/退出码保持主错误，
+location restore failure 仅为附加 Data；exit 0 对照则证明没有更早主错误时 restore failure 仍直接失败。
+Setup/Verify 宿主版本合同通过各自的 native capture 路径注入 Python `--version` 输出，覆盖 `3.12.10`、`3.10.x`、
+`3.8.0`、`3.7.99`、空输出、多行、同一行尾随与非法格式，证明 minimum 比较使用 `System.Version` 数值语义、
+parser 只接受恰好一行完整输出，且测试不依赖机器当前 Python 版本。
+Visual Studio discovery 合同通过 native capture 注入 `vswhere` 的空输出、仅空白、多条、畸形、有效单路径与非零失败；
+空/空白成功输出必须给出 x64 C++ toolchain 未找到诊断，不能泄漏数组索引异常，其他既有边界保持不变。
+
+共享资产合同必须覆盖：cache miss 只下载一次；完整命中时阻断 download seam 且零下载；损坏 blob 隔离后恢复；错误
+hash fail closed；不同 hash 的发布锁可并行且同一 hash 跨 identity 互斥；fingerprint/worktree 变化及失败重建仍复用
+已验证 blob。vcpkg scripts 命中每次复核且不执行 install/fetch seam，损坏 checkout 隔离重建。7-Zip 合同在宿主 PATH
+同时放入兼容和不兼容 `7z.exe` 时仍只接受空 PATH fetch 返回的清单派生路径，并核对最终 executable hash/精确 x64
+版本。Rust 合同明确保留每次 rustup install/check 及 release/host/target/components 复核，证明 transient install 可在第三次
+有界尝试恢复且持续失败恰在三次后关闭，不能把未 hash 固定的 PR cache 降级为仅信任自报版本。Cargo provenance 合同
+在 PATH 前置可伪报正确版本的无关 `cargo.exe`，要求 rustup `which` 的固定 toolchain 路径、release、host、target/components
+全部在 vendor 前通过，并覆盖缺失 toolchain、路径逃逸与错误版本；ambient fake 的执行计数必须为零。Required CI workflow
+合同对 PR/main cache namespace、restore 顺序、save 条件、缓存路径和 key
+实施 mutation tests，保证 PR 缓存不能写入或被 trusted main 读取，且 environment/stamp 不进入 Actions cache。
+受控 CMake/Ninja 合同还必须在阻断网络时证明 archive 预填到 commit-scoped vcpkg downloads，跨 environment 命中不下载，
+且损坏的目标副本可从重新核验的 blob 修复。vcpkg install 合同精确核对 commit-scoped downloads 参数，证明第三次尝试
+可恢复且持续失败恰在三次后关闭。hosted port source 可包含合法 reparse/symlink，因此合同要在失败 install 的
+buildtrees/packages 中创建指向 trusted root 外部 marker 的真实 junction，证明失败 cleanup、后续 Setup recovery 与成功
+cleanup 都只删除 transient link/tree、不跟随目标或误删 installed tree；真实独占句柄还要证明 install 首错与
+cleanup/residual 诊断并存。恢复合同必须锁住 junction 本身制造两个 known transient root 的失败残留，释放句柄后走
+公开 Setup lifecycle 并证明 SetupAction 恰好执行一次；句柄仍占用时保留 Verify 首错与 cleanup/residual Data，且不启动
+SetupAction。固定布局外的 unknown reparse 必须继续 fail closed，installed tree 和外部目标都不得被专用清理误删；
+这些并发边界使用真实 handle 与同步终态，不依赖随机 sleep。
 
 无论变更类型，都必须确认 `EasyCon/` 仍被根 `.gitignore` 忽略、第三方参考源码没有改动，且外层 tracked
 文件没有引入 `EasyCon/` 内容或项目依赖。

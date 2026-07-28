@@ -178,6 +178,10 @@ serial/四语言/package 支持，macOS 保持 Build/Hardware Unverified、Not S
 
 ### Phase 4：ECS 与跨域 Automation
 
+当前状态：冻结 DAG 中的 W0 与 S0 已在 `main` 基线 `87544d9` 完成。W0 仅登记零依赖的 `easycon-ecs`
+workspace 骨架；S0 仅登记 11 条 provenance records、33 个 SDK-local artifacts 和静态 validator。R0 尚未完成
+独立 review/refreeze，C1 与后续 compiler/runtime 节点未启动；不得把 W0/S0 描述为 Phase 4 implementation freeze。
+
 交付：
 
 - Rust ECS lexer/parser/binder/lowerer/evaluator。
