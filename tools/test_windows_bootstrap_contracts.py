@@ -243,7 +243,7 @@ class WindowsBuildEnvironmentContracts(unittest.TestCase):
 
     def test_duplicate_json_keys_are_rejected(self):
         duplicate_root = self.configuration_text.replace(
-            '"version": 3', '"version": 3,\n  "version": 3', 1
+            '"version": 4', '"version": 4,\n  "version": 4', 1
         )
         self.assert_rejected(duplicate_root, "duplicate root key")
         duplicate_tool = self.configuration_text.replace(

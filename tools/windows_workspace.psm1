@@ -344,7 +344,7 @@ function Get-EasyConKnownVcpkgTransientTrees {
 
     $environment = Assert-EasyConPhysicalPath -Path $EnvironmentRoot `
         -TrustedRoot $TrustedRoot
-    $workspaceRoot = Join-Path $environment "w/setup/vcpkg"
+    $workspaceRoot = Join-Path $environment "setup/vcpkg"
     return @(
         Resolve-EasyConFullPath -Path (Join-Path $workspaceRoot "buildtrees")
         Resolve-EasyConFullPath -Path (Join-Path $workspaceRoot "packages")
@@ -1079,6 +1079,54 @@ function Get-EasyConTreeFingerprint {
     }
 }
 
+function Assert-EasyConPreparedTreeDoesNotReferenceRepository {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [string]$TrustedRoot,
+
+        [Parameter(Mandatory)]
+        [string]$RepositoryRoot,
+
+        [Parameter(Mandatory)]
+        [string]$Description
+    )
+
+    $tree = Assert-EasyConPhysicalTree -Path $Path -TrustedRoot $TrustedRoot
+    $repository = Resolve-EasyConFullPath -Path $RepositoryRoot
+    $references = @(
+        $repository,
+        $repository.Replace("\", "/")
+    ) | Select-Object -Unique
+    $textExtensions = @(
+        ".bat", ".cfg", ".cmake", ".cmd", ".ini", ".json", ".pc", ".props",
+        ".ps1", ".py", ".sh", ".toml", ".txt", ".xml"
+    )
+    $encodings = @(
+        [System.Text.UTF8Encoding]::new($false, $false),
+        [System.Text.UnicodeEncoding]::new($false, $false, $false),
+        [System.Text.UnicodeEncoding]::new($true, $false, $false)
+    )
+    foreach ($file in @(Get-ChildItem -LiteralPath $tree -Recurse -Force -File)) {
+        if ($textExtensions -notcontains $file.Extension.ToLowerInvariant()) {
+            continue
+        }
+        Assert-EasyConPhysicalPath -Path $file.FullName -TrustedRoot $tree | Out-Null
+        $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
+        foreach ($encoding in $encodings) {
+            $text = $encoding.GetString($bytes)
+            foreach ($reference in $references) {
+                if ($text.IndexOf($reference, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                    throw "$Description contains a source worktree absolute path: $($file.FullName)"
+                }
+            }
+        }
+    }
+}
+
 function ConvertTo-EasyConStrictVersion {
     param(
         [Parameter(Mandatory)]
@@ -1174,9 +1222,9 @@ function Get-EasyConWindowsBuildConfiguration {
         if (
             $root.version.ValueKind -ne [System.Text.Json.JsonValueKind]::Number -or
             -not $root.version.TryGetInt32([ref]$version) -or
-            $version -ne 3
+            $version -ne 4
         ) {
-            throw "Windows build environment version must be the JSON integer 3"
+            throw "Windows build environment version must be the JSON integer 4"
         }
         $target = & $getString $root.target "Windows build target"
         if ($target -cne "x86_64-pc-windows-msvc") {
@@ -1945,6 +1993,7 @@ function Clear-EasyConUntrustedBuildEnvironment {
         "CARGO_BUILD_TARGET", "CARGO_ENCODED_RUSTFLAGS", "CARGO_HOME", "CARGO_INCREMENTAL",
         "CARGO_TARGET_DIR", "RUSTDOCFLAGS", "RUSTUP_DIST_SERVER", "RUSTUP_HOME",
         "RUSTUP_TOOLCHAIN", "RUSTUP_UPDATE_ROOT",
+        "TEMP", "TMP",
         "VCPKG_ROOT", "VCPKG_BINARY_SOURCES", "VCPKG_DOWNLOADS",
         "VCPKG_DISABLE_METRICS", "VCPKG_FEATURE_FLAGS", "VCPKG_OVERLAY_PORTS",
         "VCPKG_OVERLAY_TRIPLETS", "VCPKG_CHAINLOAD_TOOLCHAIN_FILE",
@@ -2464,6 +2513,9 @@ function Get-EasyConEnvironmentLocation {
         [Parameter(Mandatory)]
         [string]$Fingerprint,
 
+        [Parameter(Mandatory)]
+        [object]$Configuration,
+
         [string]$CacheRoot
     )
 
@@ -2485,20 +2537,36 @@ function Get-EasyConEnvironmentLocation {
         throw "environment storage inside the repository must remain under ignored .tools storage"
     }
     $workspacePath = Get-EasyConWorkspaceTargetDirectory -RepositoryRoot $repository `
-        -CacheRoot (Join-Path $cache "workspace-keys")
+        -CacheRoot $cache
     $workspaceKey = Split-Path -Leaf $workspacePath
-    $identityBytes = [System.Text.Encoding]::UTF8.GetBytes("$Fingerprint`0$workspaceKey")
+    $environmentSchema = [int]$Configuration.version
+    $hostTargetIdentity = @(
+        [string]$Configuration.target,
+        [string]$Configuration.hostTools.visualStudioMajorVersion,
+        [string]$Configuration.hostTools.msvcToolsVersion,
+        [string]$Configuration.hostTools.windowsSdkVersion
+    ) -join "`0"
+    $identityBytes = [System.Text.Encoding]::UTF8.GetBytes(
+        "$environmentSchema`0$hostTargetIdentity`0$Fingerprint"
+    )
     $identityDigest = [System.Security.Cryptography.SHA256]::HashData($identityBytes)
     $identityKey = [System.Convert]::ToHexString($identityDigest).Substring(0, 24).ToLowerInvariant()
-    $environment = Join-Path $cache (Join-Path "e" $identityKey)
-    $lockPath = Join-Path $cache (Join-Path "locks" "$identityKey.lock")
+    $environmentKey = "v$environmentSchema-$identityKey"
+    $environment = Join-Path $cache (Join-Path "e" $environmentKey)
+    $lockPath = Join-Path $cache (Join-Path "locks" "environment-$environmentKey.lock")
+    $workspaceLockPath = Join-Path $cache (Join-Path "locks" "workspace-$workspaceKey.lock")
     return [pscustomobject]@{
         CacheRoot = $cache
         EnvironmentRoot = Resolve-EasyConFullPath -Path $environment
         StampPath = Resolve-EasyConFullPath -Path (Join-Path $environment "environment-stamp.json")
         LockPath = Resolve-EasyConFullPath -Path $lockPath
-        IdentityKey = $identityKey
+        IdentityKey = $environmentKey
+        EnvironmentSchema = $environmentSchema
+        HostTargetIdentity = $hostTargetIdentity
         WorkspaceKey = $workspaceKey
+        WorkspaceRoot = Resolve-EasyConFullPath -Path $workspacePath
+        WorkspaceLockPath = Resolve-EasyConFullPath -Path $workspaceLockPath
+        CargoTargetDirectory = Resolve-EasyConFullPath -Path (Join-Path $workspacePath "target")
     }
 }
 
@@ -2564,6 +2632,43 @@ function Enter-EasyConEnvironmentLease {
             Start-Sleep -Milliseconds $delay
         }
     }
+}
+
+function Enter-EasyConWorkspaceLease {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object]$Location,
+
+        [ValidateRange(0, 7200000)]
+        [int]$TimeoutMilliseconds = 1800000,
+
+        [ValidateRange(0, 1000)]
+        [int]$RetryMilliseconds = 100
+    )
+
+    $workspaceLock = $Location.PSObject.Properties["WorkspaceLockPath"]
+    $workspaceRoot = $Location.PSObject.Properties["WorkspaceRoot"]
+    $workspaceKey = $Location.PSObject.Properties["WorkspaceKey"]
+    if (
+        $null -eq $workspaceLock -or $null -eq $workspaceRoot -or $null -eq $workspaceKey -or
+        [string]::IsNullOrWhiteSpace([string]$workspaceLock.Value) -or
+        [string]::IsNullOrWhiteSpace([string]$workspaceRoot.Value) -or
+        [string]::IsNullOrWhiteSpace([string]$workspaceKey.Value)
+    ) {
+        throw "Windows workspace location is missing its isolated writable output identity"
+    }
+    $cache = Resolve-EasyConFullPath -Path ([string]$Location.CacheRoot)
+    $resolvedWorkspace = Assert-EasyConPhysicalPath -Path ([string]$workspaceRoot.Value) `
+        -TrustedRoot $cache
+    $leaseLocation = [pscustomobject]@{
+        CacheRoot = $cache
+        LockPath = Resolve-EasyConFullPath -Path ([string]$workspaceLock.Value)
+        IdentityKey = "workspace-$([string]$workspaceKey.Value)"
+        EnvironmentRoot = $resolvedWorkspace
+    }
+    return Enter-EasyConEnvironmentLease -Location $leaseLocation -Access Exclusive `
+        -TimeoutMilliseconds $TimeoutMilliseconds -RetryMilliseconds $RetryMilliseconds
 }
 
 function Test-EasyConVcpkgToolManifestRecord {
@@ -3029,6 +3134,56 @@ function ConvertTo-EasyConCMakePathLiteral {
     return $resolved.Replace("\", "/")
 }
 
+function New-EasyConVcpkgProvisionLayout {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object]$Vcpkg,
+
+        [Parameter(Mandatory)]
+        [string]$RepositoryRoot,
+
+        [Parameter(Mandatory)]
+        [string]$EnvironmentRoot
+    )
+
+    $repository = Assert-EasyConPhysicalPath -Path $RepositoryRoot
+    $environment = Assert-EasyConPhysicalPath -Path $EnvironmentRoot
+    $workspaceRoot = Join-Path $environment "setup/vcpkg"
+    $manifestRoot = New-EasyConSafeDirectory -Path (Join-Path $workspaceRoot "manifest") `
+        -TrustedRoot $environment
+    $buildtrees = New-EasyConSafeDirectory -Path (Join-Path $workspaceRoot "buildtrees") `
+        -TrustedRoot $environment
+    $packages = New-EasyConSafeDirectory -Path (Join-Path $workspaceRoot "packages") `
+        -TrustedRoot $environment
+    $installed = New-EasyConSafeDirectory `
+        -Path (Join-Path $workspaceRoot "installed") -TrustedRoot $environment
+
+    $manifestEntries = @(Get-ChildItem -Force -LiteralPath $manifestRoot -ErrorAction Stop |
+        Where-Object { $_.Name -cne "vcpkg.json" })
+    if ($manifestEntries.Count -ne 0) {
+        throw "generated vcpkg manifest directory contains unexpected input: $($manifestEntries[0].FullName)"
+    }
+
+    $sourceManifest = Join-Path $repository "vcpkg.json"
+    $executionManifest = Join-Path $manifestRoot "vcpkg.json"
+    Assert-EasyConPhysicalPath -Path $sourceManifest -TrustedRoot $repository | Out-Null
+    Assert-EasyConPhysicalPath -Path $executionManifest -TrustedRoot $environment | Out-Null
+    $manifestHash = Get-EasyConFileSha256 -Path $sourceManifest
+    Copy-Item -Force -LiteralPath $sourceManifest -Destination $executionManifest
+    Assert-EasyConPhysicalPath -Path $executionManifest -TrustedRoot $environment | Out-Null
+    if ((Get-EasyConFileSha256 -Path $executionManifest) -cne $manifestHash) {
+        throw "generated vcpkg manifest does not match the tracked manifest"
+    }
+
+    return [pscustomobject]@{
+        ManifestRoot = $manifestRoot
+        Buildtrees = $buildtrees
+        Packages = $packages
+        Installed = $installed
+    }
+}
+
 function New-EasyConVcpkgWorkspaceLayout {
     [CmdletBinding()]
     param(
@@ -3039,54 +3194,59 @@ function New-EasyConVcpkgWorkspaceLayout {
         [string]$RepositoryRoot,
 
         [Parameter(Mandatory)]
-        [string]$CargoTargetDirectory,
+        [string]$WorkspaceRoot,
 
         [Parameter(Mandatory)]
-        [string]$CacheRoot
+        [string]$CacheRoot,
+
+        [Parameter(Mandatory)]
+        [string]$EnvironmentRoot,
+
+        [Parameter(Mandatory)]
+        [string]$InstalledRoot
     )
 
     $repository = Assert-EasyConPhysicalPath -Path $RepositoryRoot
     $cache = Assert-EasyConPhysicalPath -Path $CacheRoot
-    $target = Assert-EasyConPhysicalPath -Path $CargoTargetDirectory -TrustedRoot $cache
-    $workspaceRoot = Join-Path $target (Join-Path "setup" "vcpkg")
+    $workspace = New-EasyConSafeDirectory -Path $WorkspaceRoot -TrustedRoot $cache
+    $environment = Assert-EasyConPhysicalPath -Path $EnvironmentRoot -TrustedRoot $EnvironmentRoot
+    $installed = Assert-EasyConPhysicalTree -Path $InstalledRoot -TrustedRoot $environment
+    $workspaceRoot = Join-Path $workspace "vcpkg"
     $manifestRoot = New-EasyConSafeDirectory -Path (Join-Path $workspaceRoot "manifest") `
         -TrustedRoot $cache
-    $buildtrees = New-EasyConSafeDirectory -Path (Join-Path $workspaceRoot "buildtrees") `
+    $executionRoot = New-EasyConSafeDirectory -Path (Join-Path $workspaceRoot "root") `
         -TrustedRoot $cache
-    $packages = New-EasyConSafeDirectory -Path (Join-Path $workspaceRoot "packages") `
-        -TrustedRoot $cache
-    $installed = New-EasyConSafeDirectory `
-        -Path (Join-Path $workspaceRoot "installed") -TrustedRoot $cache
-    $toolchainRoot = Join-Path $workspaceRoot "toolchain"
     $buildsystems = New-EasyConSafeDirectory `
-        -Path (Join-Path $toolchainRoot "scripts/buildsystems") -TrustedRoot $cache
+        -Path (Join-Path $executionRoot "scripts/buildsystems") -TrustedRoot $cache
+    $downloads = New-EasyConSafeDirectory -Path (Join-Path $workspaceRoot "downloads") `
+        -TrustedRoot $cache
 
     $manifestEntries = @(Get-ChildItem -Force -LiteralPath $manifestRoot -ErrorAction Stop |
         Where-Object { $_.Name -cne "vcpkg.json" })
     if ($manifestEntries.Count -ne 0) {
-        throw "generated vcpkg manifest directory contains unexpected input: $($manifestEntries[0].FullName)"
+        throw "generated workspace vcpkg manifest directory contains unexpected input: $($manifestEntries[0].FullName)"
     }
     $toolchainEntries = @(Get-ChildItem -Force -LiteralPath $buildsystems -ErrorAction Stop |
         Where-Object { $_.Name -cne "vcpkg.cmake" })
     if ($toolchainEntries.Count -ne 0) {
-        throw "generated vcpkg toolchain directory contains unexpected input: $($toolchainEntries[0].FullName)"
+        throw "generated workspace vcpkg toolchain directory contains unexpected input: $($toolchainEntries[0].FullName)"
     }
 
     $sourceManifest = Join-Path $repository "vcpkg.json"
     $executionManifest = Join-Path $manifestRoot "vcpkg.json"
     Assert-EasyConPhysicalPath -Path $sourceManifest -TrustedRoot $repository | Out-Null
-    Assert-EasyConPhysicalPath -Path $executionManifest -TrustedRoot $cache | Out-Null
+    Assert-EasyConPhysicalPath -Path $executionManifest -TrustedRoot $workspace | Out-Null
     $manifestHash = Get-EasyConFileSha256 -Path $sourceManifest
     Copy-Item -Force -LiteralPath $sourceManifest -Destination $executionManifest
-    Assert-EasyConPhysicalPath -Path $executionManifest -TrustedRoot $cache | Out-Null
+    Assert-EasyConPhysicalPath -Path $executionManifest -TrustedRoot $workspace | Out-Null
     if ((Get-EasyConFileSha256 -Path $executionManifest) -cne $manifestHash) {
-        throw "generated vcpkg manifest does not match the tracked manifest"
+        throw "generated workspace vcpkg manifest does not match the tracked manifest"
     }
 
     $actualToolchain = Assert-EasyConPhysicalPath -Path $Vcpkg.Toolchain `
         -TrustedRoot $Vcpkg.Root
     $wrapper = Join-Path $buildsystems "vcpkg.cmake"
-    Assert-EasyConPhysicalPath -Path $wrapper -TrustedRoot $cache | Out-Null
+    Assert-EasyConPhysicalPath -Path $wrapper -TrustedRoot $workspace | Out-Null
     $wrapperText = @(
         "# Generated by tools/windows_workspace.psm1; do not edit.",
         "set(VCPKG_MANIFEST_DIR `"$(ConvertTo-EasyConCMakePathLiteral -Path $manifestRoot)`" CACHE PATH `"EasyCon verified local manifest`" FORCE)",
@@ -3096,18 +3256,16 @@ function New-EasyConVcpkgWorkspaceLayout {
         ""
     ) -join "`n"
     [System.IO.File]::WriteAllText($wrapper, $wrapperText, [System.Text.UTF8Encoding]::new($false))
-    Assert-EasyConPhysicalPath -Path $wrapper -TrustedRoot $cache | Out-Null
+    Assert-EasyConPhysicalPath -Path $wrapper -TrustedRoot $workspace | Out-Null
     if ([System.IO.File]::ReadAllText($wrapper, [System.Text.Encoding]::UTF8) -cne $wrapperText) {
-        throw "generated vcpkg toolchain wrapper changed during creation"
+        throw "generated workspace vcpkg toolchain wrapper changed during creation"
     }
 
     return [pscustomobject]@{
-        Root = Assert-EasyConPhysicalPath -Path $toolchainRoot -TrustedRoot $cache
+        Root = Assert-EasyConPhysicalPath -Path $executionRoot -TrustedRoot $workspace
         Toolchain = $wrapper
         ManifestRoot = $manifestRoot
-        Buildtrees = $buildtrees
-        Packages = $packages
-        Installed = $installed
+        Downloads = $downloads
     }
 }
 
@@ -3456,10 +3614,36 @@ function Install-EasyConCargoSources {
     }
 
     $vendor = Assert-EasyConPhysicalTree -Path $vendorRoot -TrustedRoot $environment
-    $cargoHome = New-EasyConSafeDirectory -Path (Join-Path $environment "cargo-home") `
-        -TrustedRoot $environment
+    return [pscustomobject]@{
+        VendorRoot = $vendor
+        VendorTree = Get-EasyConTreeFingerprint -Path $vendor -TrustedRoot $environment
+    }
+}
+
+function New-EasyConCargoWorkspaceLayout {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$WorkspaceRoot,
+
+        [Parameter(Mandatory)]
+        [string]$CacheRoot,
+
+        [Parameter(Mandatory)]
+        [string]$VendorRoot,
+
+        [Parameter(Mandatory)]
+        [string]$EnvironmentRoot
+    )
+
+    $cache = Assert-EasyConPhysicalPath -Path $CacheRoot
+    $workspace = New-EasyConSafeDirectory -Path $WorkspaceRoot -TrustedRoot $cache
+    $environment = Assert-EasyConPhysicalPath -Path $EnvironmentRoot -TrustedRoot $EnvironmentRoot
+    $vendor = Assert-EasyConPhysicalTree -Path $VendorRoot -TrustedRoot $environment
+    $cargoHome = New-EasyConSafeDirectory -Path (Join-Path $workspace "cargo-home") `
+        -TrustedRoot $cache
     $configurationPath = Join-Path $cargoHome "config.toml"
-    Assert-EasyConPhysicalPath -Path $configurationPath -TrustedRoot $environment | Out-Null
+    Assert-EasyConPhysicalPath -Path $configurationPath -TrustedRoot $workspace | Out-Null
     $vendorLiteral = $vendor.Replace("\", "/")
     if ($vendorLiteral.IndexOfAny([char[]]@('"', "`r", "`n")) -ge 0) {
         throw "Cargo vendor path cannot be represented safely in config.toml"
@@ -3478,13 +3662,14 @@ function Install-EasyConCargoSources {
         $configurationText,
         [System.Text.UTF8Encoding]::new($false)
     )
-    $configuration = Get-EasyConPhysicalFile -Path $configurationPath -TrustedRoot $environment
+    $configuration = Get-EasyConPhysicalFile -Path $configurationPath -TrustedRoot $workspace
+    if ([System.IO.File]::ReadAllText($configuration, [System.Text.Encoding]::UTF8) -cne $configurationText) {
+        throw "generated Cargo source configuration changed during creation"
+    }
     return [pscustomobject]@{
         CargoHome = $cargoHome
         Configuration = $configuration
         ConfigurationSha256 = Get-EasyConFileHash -Path $configuration -Algorithm SHA256
-        VendorRoot = $vendor
-        VendorTree = Get-EasyConTreeFingerprint -Path $vendor -TrustedRoot $environment
     }
 }
 
@@ -3586,6 +3771,10 @@ function Install-EasyConWindowsEnvironment {
     New-EasyConSafeDirectory -Path $cacheStorage -TrustedRoot $cacheStorage | Out-Null
     Assert-EasyConVcpkgEnvironmentInputs
     Clear-EasyConUntrustedBuildEnvironment -AllowProxy
+    $setupTemporary = New-EasyConSafeDirectory -Path (Join-Path $cache "setup/tmp") `
+        -TrustedRoot $cache
+    $env:TEMP = $setupTemporary
+    $env:TMP = $setupTemporary
 
     $msvc = Initialize-EasyConMsvcEnvironment -VsWherePath $VsWherePath `
         -MsvcToolsVersion ([string]$configuration.hostTools.msvcToolsVersion) `
@@ -3619,14 +3808,6 @@ function Install-EasyConWindowsEnvironment {
     }
     $git = Get-EasyConCommandPath -Name "git.exe"
     $pwsh = Get-EasyConCommandPath -Name "pwsh.exe"
-
-    $cargoTarget = Resolve-EasyConFullPath -Path (Join-Path $cache "w")
-    if (-not (Test-EasyConPathWithin -Path $cargoTarget -Root $cache)) {
-        throw "derived Cargo target directory escaped the controlled cache root"
-    }
-    Assert-EasyConPhysicalPath -Path $cargoTarget -TrustedRoot $cache | Out-Null
-    Assert-EasyConCargoPathBudget -CargoTargetDirectory $cargoTarget
-    Assert-EasyConCMakeCacheIsolation -CargoTargetDirectory $cargoTarget -RepositoryRoot $repository
 
     $resolvedVcpkgRoot = Resolve-EasyConFullPath `
         -Path (Join-Path $cache (Join-Path "vcpkg" $configuration.vcpkg.scriptsCommit))
@@ -3669,33 +3850,27 @@ function Install-EasyConWindowsEnvironment {
         throw "vcpkg binary cache path cannot contain comma or semicolon"
     }
     New-EasyConSafeDirectory -Path $binaryCache -TrustedRoot $cacheStorage | Out-Null
-    New-EasyConSafeDirectory -Path $cargoTarget -TrustedRoot $cache | Out-Null
 
     $cargoSources = Install-EasyConCargoSources -CargoPath $rust.CargoPath `
         -RepositoryRoot $repository -EnvironmentRoot $cache `
         -DownloadCacheRoot (Join-Path $cacheStorage "cargo-download-cache")
-    $env:CARGO_HOME = $cargoSources.CargoHome
 
     $externalDownloads = Join-Path $cacheStorage (
         Join-Path "vcpkg-downloads" ([string]$configuration.vcpkg.scriptsCommit)
     )
     $setupVcpkgDownloads = New-EasyConSafeDirectory -Path $externalDownloads `
         -TrustedRoot $cacheStorage
-    $vcpkgDownloads = New-EasyConSafeDirectory -Path (Join-Path $cache "vcpkg-downloads") `
-        -TrustedRoot $cache
 
-    $vcpkgLayout = New-EasyConVcpkgWorkspaceLayout -Vcpkg $vcpkg `
-        -RepositoryRoot $repository -CargoTargetDirectory $cargoTarget `
-        -CacheRoot $cache
+    $vcpkgLayout = New-EasyConVcpkgProvisionLayout -Vcpkg $vcpkg `
+        -RepositoryRoot $repository -EnvironmentRoot $cache
 
-    $env:VCPKG_ROOT = $vcpkgLayout.Root
+    $env:VCPKG_ROOT = $vcpkg.Root
     $env:VCPKG_BINARY_SOURCES = "clear;files,$binaryCache,readwrite"
     $env:VCPKG_DOWNLOADS = $setupVcpkgDownloads
     $env:VCPKG_DISABLE_METRICS = "1"
     $env:VCPKG_FEATURE_FLAGS = "manifests,registries,versions"
     $env:VCPKG_FORCE_DOWNLOADED_BINARIES = "1"
     $env:CXX = [string]$msvc.Tools.'cl.exe'
-    $env:CARGO_TARGET_DIR = $cargoTarget
     $env:CARGO_INCREMENTAL = "0"
     $env:EASYCON_VISION_TEST_TESSDATA = $vision.Root
 
@@ -3726,10 +3901,13 @@ function Install-EasyConWindowsEnvironment {
     Install-EasyConVcpkgDependencies -Vcpkg $vcpkg -RepositoryRoot $repository `
         -DownloadsRoot $setupVcpkgDownloads -DownloadsTrustedRoot $cacheStorage `
         -CacheRoot $cache -WorkspaceLayout $vcpkgLayout
-    $null = Set-EasyConCargoNativeLinkSearch -InstalledRoot $vcpkgLayout.Installed `
-        -CacheRoot $cache
 
     $nativeTree = Get-EasyConTreeFingerprint -Path $vcpkgLayout.Installed -TrustedRoot $cache
+    Assert-EasyConPreparedTreeDoesNotReferenceRepository -Path $cargoSources.VendorRoot `
+        -TrustedRoot $cache -RepositoryRoot $repository -Description "prepared Cargo vendor tree"
+    Assert-EasyConPreparedTreeDoesNotReferenceRepository -Path $vcpkgLayout.Installed `
+        -TrustedRoot $cache -RepositoryRoot $repository -Description "prepared vcpkg installed tree"
+    Remove-EasyConSafeTree -Path $setupTemporary -TrustedRoot $cache
 
     $cargoVersion = $rust.CargoVersion
     $started.Stop()
@@ -3752,9 +3930,6 @@ function Install-EasyConWindowsEnvironment {
         rustupPath = $rust.RustupPath
         cargoPath = $rust.CargoPath
         cargo = $cargoVersion
-        cargoHome = $cargoSources.CargoHome
-        cargoConfig = $cargoSources.Configuration
-        cargoConfigSha256 = $cargoSources.ConfigurationSha256
         cargoVendor = $cargoSources.VendorRoot
         cargoVendorFiles = $cargoSources.VendorTree.Files
         cargoVendorSha256 = $cargoSources.VendorTree.Sha256
@@ -3767,12 +3942,9 @@ function Install-EasyConWindowsEnvironment {
         vcpkgTool = [string]$configuration.vcpkg.toolRelease
         vcpkgRoot = $vcpkg.Root
         vcpkgExecutable = $vcpkg.Executable
-        vcpkgExecutionRoot = $vcpkgLayout.Root
         vcpkgInstalled = $vcpkgLayout.Installed
-        vcpkgDownloads = $vcpkgDownloads
         vcpkgBinaryCache = $binaryCache
         ocrModel = $vision.Root
-        cargoTarget = $cargoTarget
         nativeTreeFiles = $nativeTree.Files
         nativeTreeSha256 = $nativeTree.Sha256
     }
@@ -3841,6 +4013,9 @@ function Invoke-EasyConWindowsSetupCore {
         )) {
             throw "controlled tool $($entry[0]) escaped the prepared environment root"
         }
+        if (Test-EasyConPathWithin -Path $path -Root $location.WorkspaceRoot) {
+            throw "prepared tool $($entry[0]) is bound to a writable workspace path"
+        }
         $toolRecords.Add([ordered]@{
             name = [string]$entry[0]
             path = $path
@@ -3850,10 +4025,11 @@ function Invoke-EasyConWindowsSetupCore {
     }
 
     $stamp = [ordered]@{
-        schemaVersion = 1
+        schemaVersion = 2
+        environmentSchema = $location.EnvironmentSchema
+        hostTargetIdentity = $location.HostTargetIdentity
         fingerprint = $fingerprint.Value
         fingerprintInputs = $fingerprint.Inputs
-        workspaceKey = $location.WorkspaceKey
         createdUtc = [datetime]::UtcNow.ToString("o", [Globalization.CultureInfo]::InvariantCulture)
         environmentRoot = $location.EnvironmentRoot
         target = [string]$configuration.target
@@ -3871,22 +4047,16 @@ function Invoke-EasyConWindowsSetupCore {
             vcpkgTool = $installed.vcpkgTool
         }
         paths = [ordered]@{
-            cargoHome = $installed.cargoHome
-            cargoConfig = $installed.cargoConfig
             cargoVendor = $installed.cargoVendor
             vcpkgScriptsRoot = $installed.vcpkgRoot
-            vcpkgExecutionRoot = $installed.vcpkgExecutionRoot
             vcpkgInstalled = $installed.vcpkgInstalled
-            vcpkgDownloads = $installed.vcpkgDownloads
             ocrModel = $installed.ocrModel
-            cargoTarget = $installed.cargoTarget
         }
         nativeTree = [ordered]@{
             files = $installed.nativeTreeFiles
             sha256 = $installed.nativeTreeSha256
         }
         cargoSources = [ordered]@{
-            configSha256 = $installed.cargoConfigSha256
             files = $installed.cargoVendorFiles
             sha256 = $installed.cargoVendorSha256
         }
@@ -3968,14 +4138,24 @@ function Invoke-EasyConWindowsVerifyCore {
     catch {
         throw "Windows build environment stamp is damaged. Rerun Setup: $($_.Exception.Message)"
     }
+    $expectedStampKeys = @(
+        "schemaVersion", "environmentSchema", "hostTargetIdentity", "fingerprint",
+        "fingerprintInputs", "createdUtc", "environmentRoot", "target", "tools",
+        "versions", "paths", "nativeTree", "cargoSources"
+    )
+    $actualStampKeys = @($stamp.PSObject.Properties.Name | Sort-Object)
+    if (($actualStampKeys -join "`0") -cne (($expectedStampKeys | Sort-Object) -join "`0")) {
+        throw "Windows build environment stamp has an unsupported schema. Rerun Setup."
+    }
     if (
-        [int]$stamp.schemaVersion -ne 1 -or
+        [int]$stamp.schemaVersion -ne 2 -or
+        [int]$stamp.environmentSchema -ne [int]$location.EnvironmentSchema -or
+        [string]$stamp.hostTargetIdentity -cne [string]$location.HostTargetIdentity -or
         [string]$stamp.fingerprint -cne $fingerprint.Value -or
-        [string]$stamp.workspaceKey -cne $location.WorkspaceKey -or
         [string]$stamp.environmentRoot -cne $location.EnvironmentRoot -or
         [string]$stamp.target -cne [string]$configuration.target
     ) {
-        throw "Windows build environment stamp does not match the current fingerprint or workspace. Rerun Setup."
+        throw "Windows build environment stamp does not match the current shared identity. Rerun Setup."
     }
 
     $tools = @{}
@@ -3989,6 +4169,9 @@ function Invoke-EasyConWindowsVerifyCore {
             Test-EasyConPathWithin -Path $path -Root $location.EnvironmentRoot
         )) {
             throw "prepared tool $name escaped the controlled environment root. Rerun Setup."
+        }
+        if (Test-EasyConPathWithin -Path $path -Root $location.WorkspaceRoot) {
+            throw "prepared tool $name is bound to a writable workspace path. Rerun Setup."
         }
         $actualHash = Get-EasyConFileHash -Path $path -Algorithm SHA256
         if ($actualHash -cne [string]$record.sha256) {
@@ -4019,21 +4202,14 @@ function Invoke-EasyConWindowsVerifyCore {
         $preparedPaths.rustupHome = Assert-EasyConPhysicalTree `
             -Path (Join-Path $sharedCacheRoot "rustup-home") -TrustedRoot $sharedCacheRoot
         foreach ($name in @(
-            "cargoHome", "cargoVendor", "vcpkgScriptsRoot", "vcpkgExecutionRoot",
-            "vcpkgInstalled", "vcpkgDownloads", "ocrModel", "cargoTarget"
+            "cargoVendor", "vcpkgScriptsRoot", "vcpkgInstalled", "ocrModel"
         )) {
             $preparedPaths[$name] = Assert-EasyConPhysicalTree `
                 -Path ([string]$stamp.paths.$name) -TrustedRoot $location.EnvironmentRoot
         }
-        $preparedPaths.cargoConfig = Get-EasyConPhysicalFile `
-            -Path ([string]$stamp.paths.cargoConfig) -TrustedRoot $location.EnvironmentRoot
     }
     catch {
         throw "Windows build environment contains a missing or unsafe prepared path. Rerun Setup: $($_.Exception.Message)"
-    }
-    $cargoConfigHash = Get-EasyConFileHash -Path $preparedPaths.cargoConfig -Algorithm SHA256
-    if ($cargoConfigHash -cne [string]$stamp.cargoSources.configSha256) {
-        throw "prepared Cargo source configuration is damaged. Rerun Setup."
     }
     $cargoVendorTree = Get-EasyConTreeFingerprint -Path $preparedPaths.cargoVendor `
         -TrustedRoot $location.EnvironmentRoot
@@ -4089,23 +4265,28 @@ function Invoke-EasyConWindowsVerifyCore {
     }
     $pathDirectories += @($systemRoot, (Join-Path $systemRoot "System32"))
     $rustPin = Get-EasyConRustToolchainPin -RepositoryRoot $repository
+    $workspaceCargoHome = Join-Path $location.WorkspaceRoot "cargo-home"
+    $workspaceDownloads = Join-Path $location.WorkspaceRoot "vcpkg/downloads"
+    $workspaceTemporary = Join-Path $location.WorkspaceRoot "tmp"
     $verifiedVariables = [ordered]@{
         AR = $tools.lib
         CC = $tools.cl
         CXX = $tools.cl
-        CARGO_HOME = $preparedPaths.cargoHome
+        CARGO_HOME = $workspaceCargoHome
         CARGO_INCREMENTAL = "0"
-        CARGO_TARGET_DIR = $preparedPaths.cargoTarget
+        CARGO_TARGET_DIR = $location.CargoTargetDirectory
         CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER = $tools.link
         EASYCON_VISION_TEST_TESSDATA = $preparedPaths.ocrModel
         RUSTUP_HOME = $preparedPaths.rustupHome
         RUSTUP_TOOLCHAIN = [string]$rustPin.Channel
+        TEMP = $workspaceTemporary
+        TMP = $workspaceTemporary
         VCPKG_BINARY_SOURCES = "clear"
         VCPKG_DISABLE_METRICS = "1"
-        VCPKG_DOWNLOADS = $preparedPaths.vcpkgDownloads
+        VCPKG_DOWNLOADS = $workspaceDownloads
         VCPKG_FEATURE_FLAGS = "manifests,registries,versions"
         VCPKG_FORCE_DOWNLOADED_BINARIES = "1"
-        VCPKG_ROOT = $preparedPaths.vcpkgExecutionRoot
+        VCPKG_ROOT = $preparedPaths.vcpkgScriptsRoot
     }
     foreach ($entry in $controlledMsvcEnvironment.GetEnumerator()) {
         $verifiedVariables[$entry.Key] = $entry.Value
@@ -4158,10 +4339,37 @@ function Invoke-EasyConWindowsVerifyCore {
     ) {
         throw "prepared native dependency tree is missing or damaged. Rerun Setup."
     }
+    Assert-EasyConPreparedTreeDoesNotReferenceRepository -Path $preparedPaths.cargoVendor `
+        -TrustedRoot $location.EnvironmentRoot -RepositoryRoot $repository `
+        -Description "prepared Cargo vendor tree"
+    Assert-EasyConPreparedTreeDoesNotReferenceRepository -Path $preparedPaths.vcpkgInstalled `
+        -TrustedRoot $location.EnvironmentRoot -RepositoryRoot $repository `
+        -Description "prepared vcpkg installed tree"
 
-    Assert-EasyConCMakeCacheIsolation -CargoTargetDirectory $preparedPaths.cargoTarget `
+    $workspaceCargo = New-EasyConCargoWorkspaceLayout `
+        -WorkspaceRoot $location.WorkspaceRoot -CacheRoot $location.CacheRoot `
+        -VendorRoot $preparedPaths.cargoVendor -EnvironmentRoot $location.EnvironmentRoot
+    $workspaceTarget = New-EasyConSafeDirectory -Path $location.CargoTargetDirectory `
+        -TrustedRoot $location.WorkspaceRoot
+    Assert-EasyConCargoPathBudget -CargoTargetDirectory $workspaceTarget
+    $workspaceTemporary = New-EasyConSafeDirectory -Path (Join-Path $location.WorkspaceRoot "tmp") `
+        -TrustedRoot $location.WorkspaceRoot
+    $workspaceVcpkg = New-EasyConVcpkgWorkspaceLayout -Vcpkg $vcpkg `
+        -RepositoryRoot $repository -WorkspaceRoot $location.WorkspaceRoot `
+        -CacheRoot $location.CacheRoot -EnvironmentRoot $location.EnvironmentRoot `
+        -InstalledRoot $preparedPaths.vcpkgInstalled
+    Assert-EasyConCMakeCacheIsolation -CargoTargetDirectory $workspaceTarget `
         -RepositoryRoot $repository
-    $env:EASYCON_VISION_TEST_TESSDATA = $vision.Root
+
+    $verifiedVariables.CARGO_HOME = $workspaceCargo.CargoHome
+    $verifiedVariables.CARGO_TARGET_DIR = $workspaceTarget
+    $verifiedVariables.EASYCON_VISION_TEST_TESSDATA = $vision.Root
+    $verifiedVariables.TEMP = $workspaceTemporary
+    $verifiedVariables.TMP = $workspaceTemporary
+    $verifiedVariables.VCPKG_DOWNLOADS = $workspaceVcpkg.Downloads
+    $verifiedVariables.VCPKG_ROOT = $workspaceVcpkg.Root
+    Set-EasyConVerifiedProcessEnvironment -PathDirectories $pathDirectories `
+        -Variables $verifiedVariables
     $null = Set-EasyConCargoNativeLinkSearch `
         -InstalledRoot $preparedPaths.vcpkgInstalled `
         -CacheRoot $location.EnvironmentRoot
@@ -4183,7 +4391,8 @@ function Invoke-EasyConWindowsVerifyCore {
         vcpkgTool = [string]$configuration.vcpkg.toolRelease
         nativeTreeSha256 = $nativeTree.Sha256
         ocrModel = $vision.Root
-        cargoTarget = $preparedPaths.cargoTarget
+        workspaceRoot = $location.WorkspaceRoot
+        cargoTarget = $workspaceTarget
     }
     Write-EasyConStructuredRecord -Kind "verify" -Value $summary
     return [pscustomobject]$summary
@@ -4213,6 +4422,7 @@ function Invoke-EasyConEnvironmentLifecycle {
 
     $environmentSnapshot = Get-EasyConProcessEnvironmentSnapshot
     $lease = $null
+    $workspaceLease = $null
     $sharedCacheLease = $null
     $primaryFailure = $null
     try {
@@ -4220,6 +4430,8 @@ function Invoke-EasyConEnvironmentLifecycle {
         $lease = Enter-EasyConEnvironmentLease -Location $Location -Access $access `
             -TimeoutMilliseconds $LeaseTimeoutMilliseconds
         if ($Mode -cne "Setup") {
+            $workspaceLease = Enter-EasyConWorkspaceLease -Location $Location `
+                -TimeoutMilliseconds $LeaseTimeoutMilliseconds
             $sharedCacheLease = Enter-EasyConSharedCacheLease `
                 -CacheRoot ([string]$Location.CacheRoot) -Access Shared `
                 -TimeoutMilliseconds $LeaseTimeoutMilliseconds
@@ -4328,6 +4540,14 @@ function Invoke-EasyConEnvironmentLifecycle {
                 $cleanupFailures.Add($_)
             }
         }
+        if ($null -ne $workspaceLease) {
+            try {
+                $workspaceLease.Dispose()
+            }
+            catch {
+                $cleanupFailures.Add($_)
+            }
+        }
         if ($null -ne $lease) {
             try {
                 $lease.Dispose()
@@ -4377,7 +4597,7 @@ function Get-EasyConWindowsEnvironmentContext {
     $fingerprint = Get-EasyConEnvironmentFingerprint -RepositoryRoot $repository `
         -Configuration $configuration
     $location = Get-EasyConEnvironmentLocation -RepositoryRoot $repository `
-        -Fingerprint $fingerprint.Value -CacheRoot $CacheRoot
+        -Fingerprint $fingerprint.Value -Configuration $configuration -CacheRoot $CacheRoot
     return [pscustomobject]@{
         Repository = $repository
         Configuration = $configuration

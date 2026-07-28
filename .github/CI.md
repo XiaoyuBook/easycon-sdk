@@ -64,12 +64,14 @@ pwsh -NoProfile -File tools/run_windows_workspace.ps1 -Mode Setup
 Setup 使用 `vswhere.exe` 加载并核对 VS 2022 x64、MSVC `14.44.35207` 与 Windows SDK `10.0.26100.0`；成功退出但
 没有非空匹配时明确报告未找到带 x64 C++ toolchain 的 Visual Studio 2022。Setup 随后安装固定
 Rust toolchain、受控 CMake/Ninja、vcpkg scripts/tool/native dependencies、7-Zip 和 OCR 模型。所有下载先按清单
-hash 验证；完成后写入 `environment-stamp.json`，记录 fingerprint、workspace key、工具显式路径与 SHA-256、精确
-版本、Cargo vendor/native tree hash 和资产路径。Cargo crates 由 `Cargo.lock` 与全部 workspace manifests 驱动
+hash 验证；完成后写入 `environment-stamp.json`，记录环境 schema、host/target identity、fingerprint、工具显式路径与
+SHA-256、精确版本、Cargo vendor/native tree hash 和资产路径，不记录 workspace key 或可写输出路径。Cargo crates 由
+`Cargo.lock` 与全部 workspace manifests 驱动
 `cargo vendor --locked` 安装到该环境；Cargo 只由 rustup 的固定 toolchain `which` 结果解析，且在 vendor 前必须匹配
 受控 Rust home 下的精确 toolchain 路径、release 与 host，ambient PATH 中的 `cargo.exe` 不构成候选。下载缓存只用于
 加速生成 vendor tree。重复 Setup 先验证现有 stamp；环境完整时
-返回 `already-ready`，损坏时只重建该 fingerprint/worktree 的受控环境。vcpkg scripts checkout 只从同卷完整
+返回 `already-ready`，损坏时只重建该 fingerprint/schema/host-target identity 的受控环境。新建或切换 Git worktree
+本身不触发 Setup，必须先 Verify。vcpkg scripts checkout 只从同卷完整
 staging 目录做原子 rename；Windows sharing violation 使用有限 publish/cleanup 重试。若外部句柄阻止删除，原始
 publish failure 始终是主错误，诊断同时记录 cleanup failure 并把残留 destination 标记为不可用；释放句柄后，下一次
 Setup 在独占 lease 下删除旧环境树并恢复。脚本不把无法删除的 partial destination 伪装成有效 checkout。
@@ -77,7 +79,7 @@ Setup 在独占 lease 下删除旧环境树并恢复。脚本不把无法删除�
 原始 download/hash/publish failure 为主并附带 cleanup 与 residual 状态，临时文件永不作为固定 asset 或 stamp 接受。
 句柄释放后，后续下载可以使用新的完整 temporary 恢复，下一次 Setup 也会在独占 lease 下清理旧环境树。
 
-环境根的 `caches/` 是独立于 `e/<fingerprint>/<worktree>` 的共享资产层，不保存 stamp、ready 状态或 prepared
+环境根的 `caches/` 是独立于 `e/v<schema>-<environment-key>` 的共享资产层，不保存 stamp、ready 状态或 prepared
 environment。CMake/Ninja、vcpkg.exe、7-Zip/7zr 与 OCR 原始文件进入 `assets-v1/blobs/<algorithm>/<hash>`；每次命中
 重新核对 hash，带大小 pin 的资产同时核对 bytes。损坏 blob 在逐资产独占锁内原子移入 quarantine，下载写入唯一同卷
 temporary，完整验证后才原子发布。不同 hash 使用不同锁，同一 hash 跨 identity 互斥，错误 hash 永不成为最终 blob。
@@ -88,7 +90,7 @@ vcpkg scripts 按 commit 保存，每次复核 HEAD、cleanliness、tools manife
 尝试并复用同一 downloads/buildtrees/binary cache。最终成功或失败都删除 transient buildtrees/packages，包括 port source
 中的合法 reparse/symlink；删除只移除链接本身且不跟随其目标，这些 transient 目录不进入 prepared environment 或 stamp。
 若外部句柄阻止 transient cleanup，install 首错保持为主错误并附带 cleanup/residual tree 状态。句柄释放后的 Setup
-在通用 prepared-tree 严格删除前，只对固定布局推导出的 `w/setup/vcpkg/buildtrees` 与 `packages` 重试同一 link-safe
+在通用 prepared-tree 严格删除前，只对固定布局推导出的 `setup/vcpkg/buildtrees` 与 `packages` 重试同一 link-safe
 清理；installed tree 不在专用清理范围，其他位置的 reparse point 仍由通用防护拒绝。
 OCR 先由原有 Python
 provisioner 精确校验冻结 manifest，再从 SHA-256 blob 物化。`RUSTUP_HOME` 持久复用已安装 components，但由于 Rust
@@ -103,14 +105,19 @@ pwsh -NoProfile -File tools/run_windows_workspace.ps1 -Mode Workspace
 ```
 
 Verify 与 Workspace 都不 provision、install 或 download。Verify 重新计算 fingerprint，验证 stamp、所有显式工具
-路径/hash、MSVC/SDK、Rust、vcpkg checkout/tool/audit pins、OCR 与完整 native install tree，并只为当前进程设置受控
-PATH、Cargo source replacement 和构建变量。Workspace 必须先通过同一 Verify，再执行 Cargo、Loom、规范、链接、
-repository contracts 与 diff 门禁。缺失、损坏、worktree 不匹配或 fingerprint 失配都在第一个 build gate 前失败，
-并明确要求重新运行 Setup。
+路径/hash、MSVC/SDK、Rust、vcpkg checkout/tool/audit pins、OCR 与完整 native install tree，并只为当前 worktree 创建
+Cargo source replacement、vcpkg wrapper、target 与临时目录。Workspace 必须先通过同一 Verify，再执行 Cargo、Loom、规范、
+链接、repository contracts 与 diff 门禁。缺失、损坏、环境 schema/host-target/fingerprint 失配都在第一个 build gate 前失败，
+并明确要求重新运行 Setup；worktree 切换本身只改变隔离的可写输出。
 
-每个 fingerprint/worktree identity 在环境根外有一个 ownership lock。Setup 从检查 stamp、删除旧树、安装到发布并
-复验 stamp 全程持有独占 lease；Verify 持共享 lease；Workspace 的同一个共享 lease 覆盖 Verify 和全部 gates，因而
-Setup 不能与同一环境的读取或构建竞争。共享资产层另有跨 identity reader/writer lease：Setup provision 期间独占，
+prepared tree、stamp、Cargo vendor/config、vcpkg installed tree 和工具记录都必须审计绝对路径与写入边界：stamp 不得含
+workspace key 或 writable path，vendor/installed text artifact 不得引用 source worktree，工具记录不得指向 `w/<workspace-key>`。
+任何旧 schema、损坏或 identity 不匹配的 stamp 都 fail closed；Workspace 只读 `e/`，其全部可写状态必须留在 `w/`。
+
+每个 fingerprint/schema/host-target identity 在环境根外有一个 ownership lock。Setup 从检查 stamp、删除旧树、安装到
+发布并复验 stamp 全程持有独占 lease；Verify 持共享 lease；Workspace 的同一个共享 lease 覆盖 Verify 和全部 gates，
+因而 Setup 不能与同一环境的读取或构建竞争。每个 canonical worktree 另有只覆盖 `w/<workspace-key>` 的独占 writable-
+output lease，所以不同 worktree 可并行 Workspace 而不写入 shared prepared tree。共享资产层另有跨 identity reader/writer lease：Setup provision 期间独占，
 Verify/Workspace 从验证到最后一个 gate 共享读取，防止另一 identity 修改 Rust/vcpkg 共享状态。异常路径总是释放 lease。
 Setup 检查 ready 环境前取得共享资产 reader lease；该 lease busy/timeout 时保留 stamp 与环境，原样返回 acquisition failure，
 不进入 Verify failure 的删除/重建路径，也不运行 Setup provision。
@@ -123,7 +130,7 @@ vcpkg override 与代理变量，再用 stamp 中核验过的工具绝对路径�
 空值和名称大小写），成功和异常路径都不遗留临时受控变量。native command 或 gate 的非零退出在 cwd cleanup 前登记为
 主错误；若原 cwd 已被外部删除，location restore failure 只附加到诊断。子进程成功且 cwd 无法恢复时，恢复失败仍直接失败。
 
-完整且 hash 匹配的直接资产 cache hit 不调用下载器；fingerprint/worktree 变化、旧环境损坏或前次 Setup 失败都只重建
+完整且 hash 匹配的直接资产 cache hit 不调用下载器；fingerprint 变化、worktree 切换、旧环境损坏或前次 Setup 失败都只重建
 prepared environment，并复用这些已验证 blob。vcpkg scripts 命中也不 fetch。Rust 仍执行 rustup 安全检查，vcpkg/Cargo
 在其下载 cache 缺项时仍可联网，因此这一区分不是 air-gapped 或完全离线合同。PowerShell、Git、Python、rustup、
 VS Installer/vswhere 与 VS Build Tools 是启动
@@ -133,8 +140,8 @@ Setup 的宿主前置条件；Setup 把实际使用的宿主可执行文件路�
 满足要求；Setup 与 Verify 都只接受恰好一行、完整 `Python X.Y.Z` 的版本输出。这项启动条件不改变 SDK Python
 binding 的 `3.10+` 产品目标。
 
-默认环境根为 `LocalApplicationData/EasyConSdk/be2`，其下按 fingerprint 与 canonical worktree
-路径 hash 分隔。`-CacheRoot` 可选择另一个受控根。Required Windows job 在 checkout 后、cache restore 和 Setup 前，
+默认环境根为 `LocalApplicationData/EasyConSdk/be2`，其下 `e/v<schema>-<environment-key>` 只按 fingerprint、环境 schema
+和 host/target identity 分隔，`w/<workspace-key>` 只隔离 canonical worktree 的可写/source-bound 输出。`-CacheRoot` 可选择另一个受控根。Required Windows job 在 checkout 后、cache restore 和 Setup 前，
 用 step 可用的 `RUNNER_TEMP` 计算受控根并通过 `GITHUB_ENV` 设置 `EASYCON_BUILD_CACHE_ROOT`；job-level env 不引用该处
 不可用的 `runner` expression context。restore/save 路径与 Setup/Workspace 都使用同一个 runner temp 根。短 Cargo
 target 路径保持不同 worktree 的 source-bound CMake cache 隔离；脚本拒绝 reparse point、环境根逃逸、过长 object

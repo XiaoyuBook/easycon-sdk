@@ -211,11 +211,13 @@ function Get-PrivateEnvironmentLocation {
     param(
         [Parameter(Mandatory)][string]$RepositoryRoot,
         [Parameter(Mandatory)][string]$Fingerprint,
+        [Parameter(Mandatory)][object]$Configuration,
         [Parameter(Mandatory)][string]$CacheRoot
     )
     Invoke-PrivateCommand -CommandName "Get-EasyConEnvironmentLocation" -Parameters @{
         RepositoryRoot = $RepositoryRoot
         Fingerprint = $Fingerprint
+        Configuration = $Configuration
         CacheRoot = $CacheRoot
     }
 }
@@ -519,7 +521,7 @@ try {
     Invoke-ContractCase -Name "strict-environment-configuration" -Action {
         $configurationText = Get-Content -Raw -LiteralPath $configurationPath
         $configuration = Get-PrivateWindowsBuildConfiguration -Path $configurationPath
-        Assert-Contract ($configuration.version -eq 3) "environment config schema must be v3"
+        Assert-Contract ($configuration.version -eq 4) "environment config schema must be v4"
         Assert-Contract ($configuration.vcpkg.internalTools.Count -eq 4) `
             "CMake, Ninja, 7-Zip, and its 7zr bootstrap must be audited"
         Assert-Contract ($configuration.vcpkg.nativeDependencies.Count -eq 3) `
@@ -535,9 +537,9 @@ try {
 
         $mutations = [ordered]@{
             "duplicate key" = $configurationText.Replace(
-                '"version": 3', '"version": 3, "version": 3'
+                '"version": 4', '"version": 4, "version": 4'
             )
-            "old schema" = $configurationText.Replace('"version": 3', '"version": 2')
+            "old schema" = $configurationText.Replace('"version": 4', '"version": 3')
             "unfrozen target" = $configurationText.Replace(
                 '"x86_64-pc-windows-msvc"', '"x86_64-unknown-linux-gnu"'
             )
@@ -2174,22 +2176,146 @@ try {
         }
     }
 
-    Invoke-ContractCase -Name "worktree-environment-isolation" -Action {
+    Invoke-ContractCase -Name "worktree-shared-prepared-environment" -Action {
         $cache = Join-Path $temporaryRoot "shared cache"
+        $configuration = Get-PrivateWindowsBuildConfiguration -Path $configurationPath
         $first = Get-PrivateEnvironmentLocation -RepositoryRoot (Join-Path $temporaryRoot "worktree one") `
-            -Fingerprint ("a" * 64) -CacheRoot $cache
+            -Fingerprint ("a" * 64) -Configuration $configuration -CacheRoot $cache
         $firstAgain = Get-PrivateEnvironmentLocation -RepositoryRoot (Join-Path $temporaryRoot "worktree one") `
-            -Fingerprint ("a" * 64) -CacheRoot $cache
+            -Fingerprint ("a" * 64) -Configuration $configuration -CacheRoot $cache
         $second = Get-PrivateEnvironmentLocation -RepositoryRoot (Join-Path $temporaryRoot "worktree two") `
-            -Fingerprint ("a" * 64) -CacheRoot $cache
+            -Fingerprint ("a" * 64) -Configuration $configuration -CacheRoot $cache
         $changed = Get-PrivateEnvironmentLocation -RepositoryRoot (Join-Path $temporaryRoot "worktree one") `
-            -Fingerprint ("b" * 64) -CacheRoot $cache
+            -Fingerprint ("b" * 64) -Configuration $configuration -CacheRoot $cache
         Assert-Contract ($first.EnvironmentRoot -ceq $firstAgain.EnvironmentRoot) `
             "one worktree and fingerprint must resolve stably"
-        Assert-Contract ($first.EnvironmentRoot -cne $second.EnvironmentRoot) `
-            "different worktrees must not share mutable build outputs"
+        Assert-Contract ($first.EnvironmentRoot -ceq $second.EnvironmentRoot) `
+            "different worktrees with one fingerprint must share one prepared environment"
+        Assert-Contract ($first.LockPath -ceq $second.LockPath) `
+            "different worktrees with one fingerprint must share one environment lease"
+        Assert-Contract ($first.WorkspaceRoot -cne $second.WorkspaceRoot) `
+            "different worktrees must retain separate writable workspace roots"
+        Assert-Contract ($first.CargoTargetDirectory -cne $second.CargoTargetDirectory) `
+            "different worktrees must retain separate Cargo target directories"
         Assert-Contract ($first.EnvironmentRoot -cne $changed.EnvironmentRoot) `
             "a fingerprint change must select a new environment root"
+    }
+
+    Invoke-ContractCase -Name "real-git-worktrees-share-prepared-identity" -Action {
+        $git = (Get-Command git.exe -ErrorAction Stop).Source
+        $configuration = Get-PrivateWindowsBuildConfiguration -Path $configurationPath
+        $cache = Join-Path $temporaryRoot "real git worktree shared cache"
+        $secondWorktree = Join-Path $temporaryRoot (
+            "real git worktree {0}" -f [guid]::NewGuid().ToString("N")
+        )
+        $head = @(& $git -C $repository.Path rev-parse HEAD)
+        Assert-Contract ($LASTEXITCODE -eq 0 -and $head.Count -eq 1) `
+            "the real worktree contract must resolve one current Git SHA"
+        $worktreeCreated = $false
+        try {
+            & $git -C $repository.Path worktree add --detach $secondWorktree $head[0] | Out-Null
+            Assert-Contract ($LASTEXITCODE -eq 0) "the real worktree contract must create its second checkout"
+            $worktreeCreated = $true
+            foreach ($relative in @($configuration.fingerprintInputs.path)) {
+                $source = Join-Path $repository.Path $relative
+                $destination = Join-Path $secondWorktree $relative
+                New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
+                Copy-Item -LiteralPath $source -Destination $destination -Force
+            }
+            $secondHead = @(& $git -C $secondWorktree rev-parse HEAD)
+            Assert-Contract (
+                $LASTEXITCODE -eq 0 -and $secondHead.Count -eq 1 -and $secondHead[0] -ceq $head[0]
+            ) "the real worktree contract must retain the fixed Git SHA"
+            $firstFingerprint = Get-PrivateEnvironmentFingerprint -RepositoryRoot $repository.Path `
+                -Configuration $configuration
+            $secondFingerprint = Get-PrivateEnvironmentFingerprint -RepositoryRoot $secondWorktree `
+                -Configuration $configuration
+            Assert-Contract ($firstFingerprint.Value -ceq $secondFingerprint.Value) `
+                "matching real worktrees must calculate one fixed environment fingerprint"
+            $firstLocation = Get-PrivateEnvironmentLocation -RepositoryRoot $repository.Path `
+                -Fingerprint $firstFingerprint.Value -Configuration $configuration -CacheRoot $cache
+            $secondLocation = Get-PrivateEnvironmentLocation -RepositoryRoot $secondWorktree `
+                -Fingerprint $secondFingerprint.Value -Configuration $configuration -CacheRoot $cache
+            Assert-Contract ($firstLocation.EnvironmentRoot -ceq $secondLocation.EnvironmentRoot) `
+                "matching real worktrees must share one prepared EnvironmentRoot"
+            Assert-Contract ($firstLocation.LockPath -ceq $secondLocation.LockPath) `
+                "matching real worktrees must share one environment lease"
+            Assert-Contract ($firstLocation.CargoTargetDirectory -cne $secondLocation.CargoTargetDirectory) `
+                "matching real worktrees must isolate Cargo target output"
+        }
+        finally {
+            if ($worktreeCreated) {
+                & $git -C $repository.Path worktree remove --force $secondWorktree | Out-Null
+                if ($LASTEXITCODE -ne 0) {
+                    throw "the real worktree contract failed to remove its temporary checkout"
+                }
+            }
+        }
+    }
+
+    Invoke-ContractCase -Name "prepared-and-workspace-path-boundary" -Action {
+        $cache = Join-Path $temporaryRoot "prepared workspace boundary cache"
+        $repositoryRoot = Join-Path $temporaryRoot "prepared workspace boundary source"
+        $configuration = Get-PrivateWindowsBuildConfiguration -Path $configurationPath
+        Set-ContractFile -Path (Join-Path $repositoryRoot "vcpkg.json") -Value "{}"
+        $location = Get-PrivateEnvironmentLocation -RepositoryRoot $repositoryRoot `
+            -Fingerprint ("c" * 64) -Configuration $configuration -CacheRoot $cache
+        $vendor = Join-Path $location.EnvironmentRoot "cargo-vendor"
+        $installed = Join-Path $location.EnvironmentRoot "setup/vcpkg/installed"
+        $vcpkgRoot = Join-Path $location.EnvironmentRoot "vcpkg/scripts"
+        $toolchain = Join-Path $vcpkgRoot "scripts/buildsystems/vcpkg.cmake"
+        Set-ContractFile -Path (Join-Path $vendor "contract-crate/Cargo.toml") `
+            -Value "[package]`nname='contract-crate'`nversion='1.0.0'"
+        Set-ContractFile -Path (Join-Path $installed "x64-windows-static-md/lib/contract.lib") `
+            -Value "native"
+        Set-ContractFile -Path $toolchain -Value "# shared vcpkg toolchain"
+
+        $cargoLayout = Invoke-PrivateCommand -CommandName "New-EasyConCargoWorkspaceLayout" `
+            -Parameters @{
+                WorkspaceRoot = $location.WorkspaceRoot
+                CacheRoot = $location.CacheRoot
+                VendorRoot = $vendor
+                EnvironmentRoot = $location.EnvironmentRoot
+            }
+        $vcpkgLayout = Invoke-PrivateCommand -CommandName "New-EasyConVcpkgWorkspaceLayout" `
+            -Parameters @{
+                Vcpkg = [pscustomobject]@{ Root = $vcpkgRoot; Toolchain = $toolchain }
+                RepositoryRoot = $repositoryRoot
+                WorkspaceRoot = $location.WorkspaceRoot
+                CacheRoot = $location.CacheRoot
+                EnvironmentRoot = $location.EnvironmentRoot
+                InstalledRoot = $installed
+            }
+        $cargoConfig = Get-Content -Raw -LiteralPath $cargoLayout.Configuration
+        $vcpkgWrapper = Get-Content -Raw -LiteralPath $vcpkgLayout.Toolchain
+        Assert-Contract ($cargoLayout.CargoHome.StartsWith(
+            $location.WorkspaceRoot, [System.StringComparison]::OrdinalIgnoreCase
+        )) "Cargo home must be per-worktree writable state"
+        Assert-Contract ($vcpkgLayout.Root.StartsWith(
+            $location.WorkspaceRoot, [System.StringComparison]::OrdinalIgnoreCase
+        )) "vcpkg wrapper must be per-worktree writable state"
+        Assert-Contract ($cargoConfig.Contains($vendor.Replace("\", "/"))) `
+            "workspace Cargo config must reference the shared vendor tree"
+        Assert-Contract (-not $cargoConfig.Contains($repositoryRoot)) `
+            "workspace Cargo config must not bind to the source worktree"
+        Assert-Contract ($vcpkgWrapper.Contains($installed.Replace("\", "/"))) `
+            "workspace vcpkg wrapper must reference the shared installed tree"
+        Assert-Contract ($vcpkgWrapper.Contains($toolchain.Replace("\", "/"))) `
+            "workspace vcpkg wrapper must include the shared scripts checkout"
+        Assert-Contract (-not $vcpkgWrapper.Contains($repositoryRoot)) `
+            "workspace vcpkg wrapper must not bind to the source worktree"
+
+        $leak = Join-Path $installed "contract-leak.cmake"
+        Set-ContractFile -Path $leak -Value "set(CONTRACT_SOURCE `"$repositoryRoot`")"
+        Assert-Throws -Pattern "source worktree absolute path" -Action {
+            Invoke-PrivateCommand -CommandName "Assert-EasyConPreparedTreeDoesNotReferenceRepository" `
+                -Parameters @{
+                    Path = $installed
+                    TrustedRoot = $location.EnvironmentRoot
+                    RepositoryRoot = $repositoryRoot
+                    Description = "contract prepared installed tree"
+                }
+        }
     }
 
     Invoke-ContractCase -Name "missing-damaged-and-mismatched-stamp" -Action {
@@ -2202,7 +2328,7 @@ try {
         $fingerprint = Get-PrivateEnvironmentFingerprint -RepositoryRoot $repository `
             -Configuration $configuration
         $location = Get-PrivateEnvironmentLocation -RepositoryRoot $repository `
-            -Fingerprint $fingerprint.Value -CacheRoot $cache
+            -Fingerprint $fingerprint.Value -Configuration $configuration -CacheRoot $cache
         Set-ContractFile -Path $location.StampPath -Value "{not-json"
         Assert-Throws -Pattern "stamp is damaged.*Rerun Setup" -Action {
             Invoke-EasyConWindowsVerify -RepositoryRoot $repository `
@@ -2216,7 +2342,7 @@ try {
             target = $configuration.target
         }
         Set-ContractFile -Path $location.StampPath -Value ($mismatch | ConvertTo-Json -Depth 4)
-        Assert-Throws -Pattern "does not match.*Rerun Setup" -Action {
+        Assert-Throws -Pattern "unsupported schema|does not match.*Rerun Setup" -Action {
             Invoke-EasyConWindowsVerify -RepositoryRoot $repository `
                 -ConfigurationPath $configurationPath -CacheRoot $cache
         }
@@ -2228,13 +2354,16 @@ try {
         $fingerprint = Get-PrivateEnvironmentFingerprint -RepositoryRoot $repository `
             -Configuration $configuration
         $location = Get-PrivateEnvironmentLocation -RepositoryRoot $repository `
-            -Fingerprint $fingerprint.Value -CacheRoot $cache
+            -Fingerprint $fingerprint.Value -Configuration $configuration -CacheRoot $cache
         $tool = Join-Path $location.EnvironmentRoot "tools/cmake.exe"
         Set-ContractFile -Path $tool -Value "damaged"
         $stamp = [ordered]@{
-            schemaVersion = 1
+            schemaVersion = 2
+            environmentSchema = $location.EnvironmentSchema
+            hostTargetIdentity = $location.HostTargetIdentity
             fingerprint = $fingerprint.Value
-            workspaceKey = $location.WorkspaceKey
+            fingerprintInputs = @()
+            createdUtc = "2026-01-01T00:00:00.0000000Z"
             environmentRoot = $location.EnvironmentRoot
             target = $configuration.target
             tools = @([ordered]@{
@@ -2243,6 +2372,10 @@ try {
                 sha256 = ("0" * 64)
                 controlled = $true
             })
+            versions = [ordered]@{}
+            paths = [ordered]@{}
+            nativeTree = [ordered]@{}
+            cargoSources = [ordered]@{}
         }
         Set-ContractFile -Path $location.StampPath -Value ($stamp | ConvertTo-Json -Depth 8)
         Assert-Throws -Pattern "prepared tool cmake is damaged.*Rerun Setup" -Action {
@@ -2850,4 +2983,4 @@ finally {
     }
 }
 
-Write-Output "Windows workspace contracts passed: 35 cases"
+Write-Output "Windows workspace contracts passed: 37 cases"
