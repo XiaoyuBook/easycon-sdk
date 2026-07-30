@@ -149,7 +149,7 @@ typedef struct easycon_utf8_view_t {
 
 异步失败存入 operation：先等待终态，再用 `operation_error_clone` 获取 error。`Succeeded` 无 error；`Failed` 必须有；`Cancelled` 可有 cancellation reason error；result 与 error 不能同时存在。
 
-诊断不是 exception：ECS compile operation 可成功产生 Program + diagnostic list；若有 error diagnostics，Program 标记 not-runnable，直接 run 返回 `COMPILE_FAILED`。这保留一次获取全部诊断的能力。
+诊断不是 exception：ECS compile operation 的 compile result 始终包含完整 diagnostic list，并且只有在不存在 error diagnostic 时才包含 optional Program；warning 可与该真实 Program 共存。只要存在任何 error diagnostic，就不创建或发布 partial/not-runnable Program。run 只接受 compile result 中实际存在的 Program，不存在“对失败 Program 运行后返回 `COMPILE_FAILED`”的路径。
 
 ## 7. Operation handle
 
@@ -229,9 +229,9 @@ Operation terminal event 便于 binding 完成 Task/Promise，但 operation quer
 
 ### Automation
 
-- compile source bundle/directory operation → Program + diagnostics；
+- compile source bundle/directory operation → compile result（optional Program + 完整 diagnostics）；
 - Program metadata/required labels/hash；
-- run Program operation；
+- run Program operation，只接受 compile result 实际发布的 Program；
 - operation cancel 作为 stop；
 - run state/log/state events。
 

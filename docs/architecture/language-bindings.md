@@ -10,6 +10,7 @@
 - Error 由 stable domain/code 映射，保留 message、native code、operation/resource ID 和 cause。
 - Event 包含同一 sequence/kind/payload；语言层不得制造或吞掉核心状态事件。
 - Program、Frame、Image、Label 是不可变对象。
+- 编译结果始终包含完整 diagnostics；仅当不存在 error diagnostic 时才包含 optional Program，warning 可与真实 Program 共存。存在 error 时不创建或发布 partial/not-runnable Program，run/start 只接受真实 Program。
 - 同一 Runtime 同时最多一个 Automation run；run 期间直接 Controller 写入得到 busy error。
 - TypeScript 只支持 Node.js，不提供浏览器构建或降级实现。
 
@@ -58,9 +59,11 @@ sequence.press(0ms, easycon::Button::A)
         .release(80ms, easycon::Button::A);
 controller.execute(sequence).get();
 
-auto program = runtime.automation().compile(bundle).get();
-auto run = runtime.automation().run(program);
-run.wait();
+auto compilation = runtime.automation().compile(bundle).get();
+if (auto program = compilation.program()) {
+    auto run = runtime.automation().run(*program);
+    run.wait();
+}
 ```
 
 ### 生命周期
@@ -96,11 +99,14 @@ var devices = await runtime.Controllers.DiscoverAsync(cancellationToken);
 await using var controller = runtime.Controllers.Create();
 await controller.ConnectAsync(devices[0], cancellationToken);
 
-var program = await runtime.Automation.CompileAsync(bundle, cancellationToken);
-await using var run = await runtime.Automation.StartAsync(program, runOptions, cancellationToken);
-await foreach (var evt in runtime.Events(cancellationToken))
+var compilation = await runtime.Automation.CompileAsync(bundle, cancellationToken);
+if (compilation.Program is { } program)
 {
-    // typed event records
+    await using var run = await runtime.Automation.StartAsync(program, runOptions, cancellationToken);
+    await foreach (var evt in runtime.Events(cancellationToken))
+    {
+        // typed event records
+    }
 }
 ```
 
@@ -116,7 +122,7 @@ await foreach (var evt in runtime.Events(cancellationToken))
 ### 错误、Frame 与事件
 
 - `EasyConException` 按 domain 派生 `ControllerException`、`AutomationException`、`VisionException` 等；`Code` 始终可用。
-- compile errors 是 `CompilationResult.Diagnostics`，不是逐条 exception；对 not-runnable Program 调用 Run 才抛 `CompilationException`。
+- compile errors 位于完整的 `CompilationResult.Diagnostics` 中，不是逐条 exception；只要存在 error diagnostic，`CompilationResult.Program` 就为空，且没有可传给 Run 的失败 Program。warning 可与非空的真实 Program 共存。
 - Frame 默认 `CopyPixels()`/`EncodeAsync()`；不返回跨 await 存活的裸 span。
 - Events 使用 `IAsyncEnumerable<EasyConEvent>`，每次枚举创建独立 subscription；取消枚举只关闭该订阅。
 
@@ -138,11 +144,12 @@ async with easycon.Runtime(options) as runtime:
         await controller.connect(devices[0])
         await controller.press(Button.A, duration=0.08)
 
-    program = await runtime.automation.compile(bundle)
-    run = runtime.automation.start(program)
-    async for event in runtime.events():
-        ...
-    await run
+    compilation = await runtime.automation.compile(bundle)
+    if compilation.program is not None:
+        run = runtime.automation.start(compilation.program)
+        async for event in runtime.events():
+            ...
+        await run
 ```
 
 ### context manager 与 asyncio
@@ -157,7 +164,7 @@ async with easycon.Runtime(options) as runtime:
 ### 错误与数据
 
 - `EasyConError` 按 domain 派生；stable code 是 enum，未知值保留为整数。
-- 编译诊断为 immutable dataclass list。
+- `CompilationResult` 的完整编译诊断为 immutable dataclass list，`program` 按共同编译合同为 optional。
 - Frame 默认 `bytes`/Pillow-compatible encoded bytes；v1 不要求 NumPy。可选 NumPy adapter 属于独立 extra 且只能读取复制数据。
 - event async iterator 退出时关闭 subscription，队列 gap 映射成普通 `EventGap`。
 
@@ -178,12 +185,14 @@ const devices = await runtime.controllers.discover({ signal });
 await using controller = runtime.controllers.create();
 await controller.connect(devices[0], { signal });
 
-const program = await runtime.automation.compile(bundle, { signal });
-const run = runtime.automation.start(program, { signal });
-for await (const event of runtime.events({ signal })) {
-  // discriminated union
+const compilation = await runtime.automation.compile(bundle, { signal });
+if (compilation.program) {
+  const run = runtime.automation.start(compilation.program, { signal });
+  for await (const event of runtime.events({ signal })) {
+    // discriminated union
+  }
+  await run.result;
 }
-await run.result;
 ```
 
 ### Promise、AbortSignal 与 dispose
