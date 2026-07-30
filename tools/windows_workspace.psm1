@@ -1079,6 +1079,139 @@ function Get-EasyConTreeFingerprint {
     }
 }
 
+function Assert-EasyConPreparedTextArtifactDoesNotReferenceRoots {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [object[]]$ForbiddenRoots,
+
+        [Parameter(Mandatory)]
+        [string]$Description
+    )
+
+    $maximumReferenceLength = 0
+    foreach ($root in $ForbiddenRoots) {
+        foreach ($reference in @($root.References)) {
+            $maximumReferenceLength = [Math]::Max($maximumReferenceLength, $reference.Length)
+        }
+    }
+
+    $stream = $null
+    $reader = $null
+    $hasByteOrderMark = $false
+    $isText = $true
+    $damagedText = $null
+    $matchedRoot = $null
+    try {
+        $stream = [System.IO.File]::Open(
+            $Path,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::Read
+        )
+        $prefix = [byte[]]::new(3)
+        $prefixLength = 0
+        while ($prefixLength -lt $prefix.Length) {
+            $prefixRead = $stream.Read(
+                $prefix,
+                $prefixLength,
+                $prefix.Length - $prefixLength
+            )
+            if ($prefixRead -eq 0) {
+                break
+            }
+            $prefixLength += $prefixRead
+        }
+        $encoding = [System.Text.UTF8Encoding]::new($false, $true)
+        $preambleLength = 0
+        if (
+            $prefixLength -ge 3 -and
+            $prefix[0] -eq 0xef -and $prefix[1] -eq 0xbb -and $prefix[2] -eq 0xbf
+        ) {
+            $hasByteOrderMark = $true
+            $preambleLength = 3
+        }
+        elseif ($prefixLength -ge 2 -and $prefix[0] -eq 0xff -and $prefix[1] -eq 0xfe) {
+            $hasByteOrderMark = $true
+            $preambleLength = 2
+            $encoding = [System.Text.UnicodeEncoding]::new($false, $false, $true)
+        }
+        elseif ($prefixLength -ge 2 -and $prefix[0] -eq 0xfe -and $prefix[1] -eq 0xff) {
+            $hasByteOrderMark = $true
+            $preambleLength = 2
+            $encoding = [System.Text.UnicodeEncoding]::new($true, $false, $true)
+        }
+        $stream.Position = $preambleLength
+        $reader = [System.IO.StreamReader]::new($stream, $encoding, $false, 16384, $true)
+
+        $buffer = [char[]]::new(16384)
+        $tail = ""
+        while (($read = $reader.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $chunk = [string]::new($buffer, 0, $read)
+            if ($chunk.IndexOf([char]0) -ge 0) {
+                if ($hasByteOrderMark) {
+                    $damagedText = "contains a NUL character"
+                }
+                else {
+                    $isText = $false
+                }
+                break
+            }
+
+            if ($null -eq $matchedRoot) {
+                $search = $tail + $chunk
+                foreach ($root in $ForbiddenRoots) {
+                    foreach ($reference in @($root.References)) {
+                        if ($search.IndexOf(
+                            $reference,
+                            [System.StringComparison]::OrdinalIgnoreCase
+                        ) -ge 0) {
+                            $matchedRoot = $root
+                            break
+                        }
+                    }
+                    if ($null -ne $matchedRoot) {
+                        break
+                    }
+                }
+                if ($maximumReferenceLength -gt 1) {
+                    $tailLength = [Math]::Min($maximumReferenceLength - 1, $search.Length)
+                    $tail = $search.Substring($search.Length - $tailLength)
+                }
+            }
+        }
+    }
+    catch {
+        $baseException = $_.Exception.GetBaseException()
+        if ($baseException -isnot [System.Text.DecoderFallbackException]) {
+            throw
+        }
+        if ($hasByteOrderMark) {
+            $damagedText = $baseException.Message
+        }
+        else {
+            $isText = $false
+        }
+    }
+    finally {
+        if ($null -ne $reader) {
+            $reader.Dispose()
+        }
+        if ($null -ne $stream) {
+            $stream.Dispose()
+        }
+    }
+
+    if ($null -ne $damagedText) {
+        throw "$Description contains damaged BOM text artifact ${Path}: $damagedText"
+    }
+    if ($isText -and $null -ne $matchedRoot) {
+        throw "$Description contains a $($matchedRoot.Label) absolute path: $Path"
+    }
+}
+
 function Assert-EasyConPreparedTreeDoesNotReferenceRepository {
     [CmdletBinding()]
     param(
@@ -1121,22 +1254,10 @@ function Assert-EasyConPreparedTreeDoesNotReferenceRepository {
             }
         }
     }.GetNewClosure()
-    $textExtensions = @(
-        ".bat", ".cfg", ".cmake", ".cmd", ".ini", ".json", ".pc", ".props",
-        ".ps1", ".py", ".sh", ".toml", ".txt", ".xml"
-    )
-    $encodings = @(
-        [System.Text.UTF8Encoding]::new($false, $false),
-        [System.Text.UnicodeEncoding]::new($false, $false, $false),
-        [System.Text.UnicodeEncoding]::new($true, $false, $false)
-    )
     foreach ($file in @(Get-ChildItem -LiteralPath $tree -Recurse -Force -File)) {
-        if ($textExtensions -notcontains $file.Extension.ToLowerInvariant()) {
-            continue
-        }
         Assert-EasyConPhysicalPath -Path $file.FullName -TrustedRoot $tree | Out-Null
-        $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
         if ($file.Extension.Equals(".json", [System.StringComparison]::OrdinalIgnoreCase)) {
+            $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
             try {
                 $json = [System.Text.UTF8Encoding]::new($false, $true).GetString($bytes)
                 if ($json.Length -gt 0 -and $json[0] -eq [char]0xfeff) {
@@ -1178,10 +1299,8 @@ function Assert-EasyConPreparedTreeDoesNotReferenceRepository {
             }
             continue
         }
-        foreach ($encoding in $encodings) {
-            $text = $encoding.GetString($bytes)
-            & $assertText $text $file.FullName
-        }
+        Assert-EasyConPreparedTextArtifactDoesNotReferenceRoots -Path $file.FullName `
+            -ForbiddenRoots $forbiddenRoots.ToArray() -Description $Description
     }
 }
 

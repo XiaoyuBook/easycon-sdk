@@ -2587,6 +2587,94 @@ try {
         }
         Remove-Item -LiteralPath $leak -Force
 
+        $cleanText = Join-Path $installed "contract-clean.cmake.in"
+        Set-ContractFile -Path $cleanText -Value "set(CONTRACT_MODE portable)"
+        $cleanUtf8Bom = Join-Path $installed "contract-clean-utf8-bom"
+        [System.IO.File]::WriteAllText(
+            $cleanUtf8Bom,
+            "portable UTF-8 contract text",
+            [System.Text.UTF8Encoding]::new($true, $true)
+        )
+        $cleanUtf16Le = Join-Path $installed "contract-clean-utf16le.targets"
+        [System.IO.File]::WriteAllText(
+            $cleanUtf16Le,
+            "portable UTF-16LE contract text",
+            [System.Text.UnicodeEncoding]::new($false, $true, $true)
+        )
+        $cleanUtf16Be = Join-Path $installed "contract-clean-utf16be.template"
+        [System.IO.File]::WriteAllText(
+            $cleanUtf16Be,
+            "portable UTF-16BE contract text",
+            [System.Text.UnicodeEncoding]::new($true, $true, $true)
+        )
+        $binaryControl = Join-Path $installed "contract-binary.targets"
+        [System.IO.File]::WriteAllBytes(
+            $binaryControl,
+            [byte[]](0x00, 0xff, 0x80, 0x43, 0x4f, 0x4e, 0x54, 0x52, 0x41, 0x43, 0x54)
+        )
+        Invoke-PrivateCommand `
+            -CommandName "Assert-EasyConPreparedTreeDoesNotReferenceRepository" `
+            -Parameters @{
+                Path = $installed
+                TrustedRoot = $location.EnvironmentRoot
+                RepositoryRoot = $repositoryRoot
+                WritableRoot = $location.WritableRoot
+                Description = "contract clean content-classified prepared tree"
+            }
+
+        $otherWritableTextPath = Join-Path $location.WritableRoot `
+            "another-worktree/tmp/generated.txt"
+        foreach ($textLeak in @(
+            [pscustomobject]@{
+                Path = Join-Path $installed "contract-leak.cmake.in"
+                Value = "set(CONTRACT_SOURCE `"$repositoryRoot`")"
+                Encoding = [System.Text.UTF8Encoding]::new($false, $true)
+                Pattern = "source worktree absolute path"
+            },
+            [pscustomobject]@{
+                Path = Join-Path $installed "contract-leak.targets"
+                Value = "<Path>$otherWritableTextPath</Path>"
+                Encoding = [System.Text.UnicodeEncoding]::new($false, $true, $true)
+                Pattern = "writable absolute path"
+            },
+            [pscustomobject]@{
+                Path = Join-Path $installed "contract-leak-extensionless"
+                Value = "source=$repositoryRoot"
+                Encoding = [System.Text.UTF8Encoding]::new($false, $true)
+                Pattern = "source worktree absolute path"
+            },
+            [pscustomobject]@{
+                Path = Join-Path $installed "contract-leak-utf8-bom.template"
+                Value = ("x" * 16380) + $repositoryRoot
+                Encoding = [System.Text.UTF8Encoding]::new($true, $true)
+                Pattern = "source worktree absolute path"
+            },
+            [pscustomobject]@{
+                Path = Join-Path $installed "contract-leak-utf16be.template"
+                Value = "writable=$otherWritableTextPath"
+                Encoding = [System.Text.UnicodeEncoding]::new($true, $true, $true)
+                Pattern = "writable absolute path"
+            }
+        )) {
+            [System.IO.File]::WriteAllText(
+                $textLeak.Path,
+                $textLeak.Value,
+                $textLeak.Encoding
+            )
+            Assert-Throws -Pattern $textLeak.Pattern -Action {
+                Invoke-PrivateCommand `
+                    -CommandName "Assert-EasyConPreparedTreeDoesNotReferenceRepository" `
+                    -Parameters @{
+                        Path = $installed
+                        TrustedRoot = $location.EnvironmentRoot
+                        RepositoryRoot = $repositoryRoot
+                        WritableRoot = $location.WritableRoot
+                        Description = "contract content-classified prepared tree"
+                    }
+            }
+            Remove-Item -LiteralPath $textLeak.Path -Force
+        }
+
         $escapedSourceLeak = Join-Path $installed "contract-escaped-source.json"
         Set-ContractFile -Path $escapedSourceLeak -Value (
             [ordered]@{ generated = [ordered]@{ path = $repositoryRoot } } |
