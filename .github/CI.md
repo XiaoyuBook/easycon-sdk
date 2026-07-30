@@ -111,8 +111,11 @@ Cargo source replacement、vcpkg wrapper、target 与临时目录。Workspace �
 并明确要求重新运行 Setup；worktree 切换本身只改变隔离的可写输出。
 
 prepared tree、stamp、Cargo vendor/config、vcpkg installed tree 和工具记录都必须审计绝对路径与写入边界：stamp 不得含
-workspace key 或 writable path，vendor/installed text artifact 不得引用 source worktree，工具记录不得指向 `w/<workspace-key>`。
-任何旧 schema、损坏或 identity 不匹配的 stamp 都 fail closed；Workspace 只读 `e/`，其全部可写状态必须留在 `w/`。
+workspace key 或 writable path，vendor/installed structured JSON 必须先解码 escaped string，所有 text artifact 不得引用
+source worktree 或整个 `CacheRoot/w`，工具记录也不得位于 source repository 或任意 `w/<workspace-key>`。stamp v2 对 root
+及全部 nested object 严格拒绝 duplicate key、错误 JSON type、字符串/小数/exponent 数值、缺失和未知字段。任何旧 schema、
+损坏或 identity 不匹配的 stamp 都 fail closed；Verify/Workspace 对 `e/` 只读，prepared vcpkg Git 检查禁止 optional lock 和
+index refresh，全部可写状态必须留在当前 `w/`。
 
 每个 fingerprint/schema/host-target identity 在环境根外有一个 ownership lock。Setup 从检查 stamp、删除旧树、安装到
 发布并复验 stamp 全程持有独占 lease；Verify 持共享 lease；Workspace 的同一个共享 lease 覆盖 Verify 和全部 gates，
@@ -120,14 +123,17 @@ workspace key 或 writable path，vendor/installed text artifact 不得引用 so
 output lease，所以不同 worktree 可并行 Workspace 而不写入 shared prepared tree。共享资产层另有跨 identity reader/writer lease：Setup provision 期间独占，
 Verify/Workspace 从验证到最后一个 gate 共享读取，防止另一 identity 修改 Rust/vcpkg 共享状态。异常路径总是释放 lease。
 Setup 检查 ready 环境前取得共享资产 reader lease；该 lease busy/timeout 时保留 stamp 与环境，原样返回 acquisition failure，
-不进入 Verify failure 的删除/重建路径，也不运行 Setup provision。
+不进入 Verify failure 的删除/重建路径，也不运行 Setup provision。Setup 的 ready/final Verify 与普通 Verify/Workspace 一样，
+必须先取得该 canonical worktree 的 writable-output lease；统一锁序为 environment、workspace、shared-cache。
 Verify 在启动 gate 前清除 ambient Rust wrapper/compiler、
 Cargo target/linker/registry flags、cc-rs target compiler、`CL`/`_CL_`、MSVC Developer Shell 残留、CMake/package roots、
 vcpkg override 与代理变量，再用 stamp 中核验过的工具绝对路径、pinned Developer Shell include/lib 路径和受控变量重建
 当前进程环境；HTTP(S) proxy 只允许在线 Setup 使用。模块完整导出集合只有 Setup、Verify 与 Workspace；parser、下载、
 安装、环境修改和无锁 gate core 等 helper 全部保持私有。所有公开 gate 执行都必须先 Verify，
 并持有同一个 shared lease 到最后一个 gate。Setup/Verify/Workspace 返回时完整恢复调用进程原有环境（包括原先缺失、
-空值和名称大小写），成功和异常路径都不遗留临时受控变量。native command 或 gate 的非零退出在 cwd cleanup 前登记为
+空值和名称大小写），成功和异常路径都不遗留临时受控变量。`TEMP`/`TMP`/`TMPDIR`、`PYTHONPYCACHEPREFIX` 和 bytecode
+policy 全部指向当前 `w/<workspace-key>`，Python gate 不在 source tree 生成 ignored pyc；`RequireCleanTree` 还比较 gate
+前后的 ignored Python bytecode snapshot。native command 或 gate 的非零退出在 cwd cleanup 前登记为
 主错误；若原 cwd 已被外部删除，location restore failure 只附加到诊断。子进程成功且 cwd 无法恢复时，恢复失败仍直接失败。
 
 完整且 hash 匹配的直接资产 cache hit 不调用下载器；fingerprint 变化、worktree 切换、旧环境损坏或前次 Setup 失败都只重建

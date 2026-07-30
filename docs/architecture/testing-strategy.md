@@ -437,6 +437,9 @@ Windows 环境生命周期另有无网络轻量合同：两个不同物理 workt
 必须解析同一个 prepared `EnvironmentRoot` 和 environment lease，首个 Setup 后第二个 Setup 必须 `already-ready` 且零 provision/
 download；Cargo target、CMake cache、Cargo home/config、vcpkg wrapper/downloads 和测试临时目录必须不同。prepared tree、stamp、
 Cargo vendor/config、vcpkg installed tree 和工具记录必须审计 worktree absolute path 与潜在写入边界，泄漏 fixture 必须 fail closed。
+两个 fixture 都必须是同一 fixed SHA 的独立 clean checkout，禁止复制 fingerprint inputs；合同必须真实走首次 Setup 与第二次
+already-ready Setup，证明单一 `e/`、不同 `w/` 及 provision/download 计数不增加。prepared JSON 的 escaped source/任意
+`CacheRoot/w` path、source/writable tool record、stamp 每层 duplicate/unknown/type/integer mutation 都要独立 fail closed。
 合同还覆盖首次 Setup、
 损坏重建、Setup 中断后恢复、跨 worktree 的 Setup-vs-Verify/Workspace ownership、Verify 失败时 gate 零启动，以及两个不同
 worktree 的 Workspace 并发时从 Verify 到全部 gates 持共享 environment lease、各自持 writable-output lease。ready 环境与另一
@@ -456,6 +459,9 @@ location restore failure 仅为附加 Data；exit 0 对照则证明没有更早�
 Setup/Verify 宿主版本合同通过各自的 native capture 路径注入 Python `--version` 输出，覆盖 `3.12.10`、`3.10.x`、
 `3.8.0`、`3.7.99`、空输出、多行、同一行尾随与非法格式，证明 minimum 比较使用 `System.Version` 数值语义、
 parser 只接受恰好一行完整输出，且测试不依赖机器当前 Python 版本。
+prepared vcpkg checkout 的真实 Git fixture 必须在改变 tracked file stat 后记录 `.git/index` hash/mtime，Verify 后保持二者
+不变且不产生 `index.lock`。Python 合同核对 `TEMP`/`TMP`/`TMPDIR`、pycache/bytecode 全部落到当前 `w/`，并让
+`RequireCleanTree` 对 gate 新增的 ignored pyc 仍然失败。
 Visual Studio discovery 合同通过 native capture 注入 `vswhere` 的空输出、仅空白、多条、畸形、有效单路径与非零失败；
 空/空白成功输出必须给出 x64 C++ toolchain 未找到诊断，不能泄漏数组索引异常，其他既有边界保持不变。
 

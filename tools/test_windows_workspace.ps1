@@ -101,13 +101,16 @@ function Invoke-PrivateWorkspaceGates {
         [Parameter(Mandatory)]
         [string]$RepositoryRoot,
 
-        [scriptblock]$GateInvoker
+        [scriptblock]$GateInvoker,
+
+        [switch]$RequireCleanTree
     )
 
     & $script:workspaceModule {
-        param($Root, $Invoker)
-        Invoke-EasyConWindowsWorkspaceGates -RepositoryRoot $Root -GateInvoker $Invoker
-    } $RepositoryRoot $GateInvoker
+        param($Root, $Invoker, $RequireClean)
+        Invoke-EasyConWindowsWorkspaceGates -RepositoryRoot $Root -GateInvoker $Invoker `
+            -RequireCleanTree:$RequireClean
+    } $RepositoryRoot $GateInvoker $RequireCleanTree.IsPresent
 }
 
 function Set-PrivateVerifiedProcessEnvironment {
@@ -219,6 +222,50 @@ function Get-PrivateEnvironmentLocation {
         Fingerprint = $Fingerprint
         Configuration = $Configuration
         CacheRoot = $CacheRoot
+    }
+}
+
+function New-ContractEnvironmentStamp {
+    param(
+        [Parameter(Mandatory)][object]$Location,
+        [Parameter(Mandatory)][object]$Fingerprint,
+        [Parameter(Mandatory)][object]$Configuration,
+        [Parameter(Mandatory)][object[]]$Tools
+    )
+
+    $cmake = @($Configuration.vcpkg.internalTools | Where-Object { $_.name -ceq "cmake" })[0]
+    $ninja = @($Configuration.vcpkg.internalTools | Where-Object { $_.name -ceq "ninja" })[0]
+    $sevenZip = @($Configuration.vcpkg.internalTools | Where-Object { $_.name -ceq "7zip" })[0]
+    return [ordered]@{
+        schemaVersion = 2
+        environmentSchema = [int]$Location.EnvironmentSchema
+        hostTargetIdentity = [string]$Location.HostTargetIdentity
+        fingerprint = [string]$Fingerprint.Value
+        fingerprintInputs = @($Fingerprint.Inputs)
+        createdUtc = "2026-01-01T00:00:00.0000000Z"
+        environmentRoot = [string]$Location.EnvironmentRoot
+        target = [string]$Configuration.target
+        tools = $Tools
+        versions = [ordered]@{
+            rust = "1.97.1"
+            cargo = "1.97.1"
+            python = "3.12.0"
+            cmake = [string]$cmake.version
+            ninja = [string]$ninja.version
+            sevenZip = [string]$sevenZip.version
+            msvcTools = [string]$Configuration.hostTools.msvcToolsVersion
+            windowsSdk = [string]$Configuration.hostTools.windowsSdkVersion
+            vcpkgScripts = [string]$Configuration.vcpkg.scriptsCommit
+            vcpkgTool = [string]$Configuration.vcpkg.toolRelease
+        }
+        paths = [ordered]@{
+            cargoVendor = Join-Path $Location.EnvironmentRoot "cargo-vendor"
+            vcpkgScriptsRoot = Join-Path $Location.EnvironmentRoot "vcpkg/scripts"
+            vcpkgInstalled = Join-Path $Location.EnvironmentRoot "setup/vcpkg/installed"
+            ocrModel = Join-Path $Location.EnvironmentRoot "vision-models/contract"
+        }
+        nativeTree = [ordered]@{ files = 1; sha256 = ("0" * 64) }
+        cargoSources = [ordered]@{ files = 1; sha256 = ("0" * 64) }
     }
 }
 
@@ -1757,6 +1804,66 @@ try {
             "the mocked pinned vcpkg checkout must publish atomically"
     }
 
+    Invoke-ContractCase -Name "prepared-vcpkg-validation-keeps-index-read-only" -Action {
+        $git = (Get-Command git.exe -ErrorAction Stop).Source
+        $checkoutRoot = Join-Path $temporaryRoot "read-only prepared vcpkg checkout"
+        foreach ($relative in @(
+            ".vcpkg-root",
+            "bootstrap-vcpkg.bat",
+            "bootstrap-vcpkg.sh",
+            "scripts/buildsystems/vcpkg.cmake"
+        )) {
+            Set-ContractFile -Path (Join-Path $checkoutRoot $relative) -Value "contract"
+        }
+        & $git init --quiet $checkoutRoot
+        Assert-Contract ($LASTEXITCODE -eq 0) "the read-only vcpkg fixture must initialize Git"
+        & $git -C $checkoutRoot add -- .
+        Assert-Contract ($LASTEXITCODE -eq 0) "the read-only vcpkg fixture must stage required files"
+        & $git -c user.name=EasyConContract -c user.email=contract@example.invalid `
+            -C $checkoutRoot commit --quiet -m "contract fixture"
+        Assert-Contract ($LASTEXITCODE -eq 0) "the read-only vcpkg fixture must commit required files"
+        $commit = @(& $git -C $checkoutRoot rev-parse HEAD)[0]
+
+        $toolRelease = "2026-01-01"
+        $toolCommit = "1" * 40
+        $vcpkgExecutable = Join-Path $temporaryRoot "read-only-vcpkg.cmd"
+        Set-ContractFile -Path $vcpkgExecutable -Value (
+            "@echo off`r`necho vcpkg package management program version " +
+            "$toolRelease-$toolCommit`r`n"
+        )
+        $asset = Get-Item -LiteralPath $vcpkgExecutable
+        $assetHash = (Get-FileHash -LiteralPath $vcpkgExecutable -Algorithm SHA256).Hash.ToLowerInvariant()
+        $configuration = [pscustomobject]@{
+            vcpkg = [pscustomobject]@{
+                scriptsCommit = $commit
+                toolRelease = $toolRelease
+                toolCommit = $toolCommit
+                windowsAsset = [pscustomobject]@{
+                    bytes = [long]$asset.Length
+                    sha256 = $assetHash
+                }
+            }
+        }
+
+        $trackedFile = Get-Item -LiteralPath (Join-Path $checkoutRoot "bootstrap-vcpkg.bat")
+        $trackedFile.LastWriteTimeUtc = $trackedFile.LastWriteTimeUtc.AddMinutes(-10)
+        $indexPath = Join-Path $checkoutRoot ".git/index"
+        $beforeHash = (Get-FileHash -LiteralPath $indexPath -Algorithm SHA256).Hash
+        $beforeWrite = (Get-Item -LiteralPath $indexPath).LastWriteTimeUtc.Ticks
+        Invoke-PrivateCommand -CommandName "Assert-EasyConVcpkgCheckout" -Parameters @{
+            VcpkgRoot = $checkoutRoot
+            Configuration = $configuration
+            VcpkgExecutable = $vcpkgExecutable
+        } | Out-Null
+        $afterHash = (Get-FileHash -LiteralPath $indexPath -Algorithm SHA256).Hash
+        $afterWrite = (Get-Item -LiteralPath $indexPath).LastWriteTimeUtc.Ticks
+        Assert-Contract (
+            $afterHash -ceq $beforeHash -and
+            $afterWrite -eq $beforeWrite -and
+            -not (Test-Path -LiteralPath (Join-Path $checkoutRoot ".git/index.lock"))
+        ) "Verify must not refresh the prepared vcpkg index or create an optional lock"
+    }
+
     Invoke-ContractCase -Name "pinned-cargo-source-rejects-ambient-path-contamination" -Action {
         $pin = [pscustomobject]@{
             Channel = "1.97.1"
@@ -2199,55 +2306,217 @@ try {
             "different worktrees must retain separate Cargo target directories"
         Assert-Contract ($first.EnvironmentRoot -cne $changed.EnvironmentRoot) `
             "a fingerprint change must select a new environment root"
+
+        $pythonVariables = @(
+            "TEMP", "TMP", "TMPDIR", "PYTHONPYCACHEPREFIX", "PYTHONDONTWRITEBYTECODE"
+        )
+        $savedPythonVariables = @{}
+        foreach ($name in $pythonVariables) {
+            $savedPythonVariables[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
+        }
+        try {
+            $runtime = Invoke-PrivateCommand `
+                -CommandName "Set-EasyConWorkspaceRuntimeEnvironment" -Parameters @{
+                    WorkspaceRoot = $first.WorkspaceRoot
+                    WritableRoot = $first.WritableRoot
+                }
+            Assert-Contract (
+                $runtime.Temporary.StartsWith(
+                    $first.WorkspaceRoot,
+                    [System.StringComparison]::OrdinalIgnoreCase
+                ) -and
+                $runtime.PythonCache.StartsWith(
+                    $first.WorkspaceRoot,
+                    [System.StringComparison]::OrdinalIgnoreCase
+                )
+            ) "Python temporary and bytecode roots must remain under this worktree w/"
+            Assert-Contract (
+                $env:TEMP -ceq $runtime.Temporary -and
+                $env:TMP -ceq $runtime.Temporary -and
+                $env:TMPDIR -ceq $runtime.Temporary -and
+                $env:PYTHONPYCACHEPREFIX -ceq $runtime.PythonCache -and
+                $env:PYTHONDONTWRITEBYTECODE -ceq "1"
+            ) "Python runtime variables must prevent source-tree bytecode and temp writes"
+        }
+        finally {
+            foreach ($name in $pythonVariables) {
+                [Environment]::SetEnvironmentVariable(
+                    $name,
+                    $savedPythonVariables[$name],
+                    "Process"
+                )
+            }
+        }
     }
 
     Invoke-ContractCase -Name "real-git-worktrees-share-prepared-identity" -Action {
         $git = (Get-Command git.exe -ErrorAction Stop).Source
-        $configuration = Get-PrivateWindowsBuildConfiguration -Path $configurationPath
         $cache = Join-Path $temporaryRoot "real git worktree shared cache"
-        $secondWorktree = Join-Path $temporaryRoot (
-            "real git worktree {0}" -f [guid]::NewGuid().ToString("N")
-        )
-        $head = @(& $git -C $repository.Path rev-parse HEAD)
-        Assert-Contract ($LASTEXITCODE -eq 0 -and $head.Count -eq 1) `
-            "the real worktree contract must resolve one current Git SHA"
-        $worktreeCreated = $false
+        $checkoutRoot = Join-Path $temporaryRoot "fixed SHA worktrees"
+        $firstWorktree = Join-Path $checkoutRoot "one"
+        $secondWorktree = Join-Path $checkoutRoot "two"
+        $head = @(& $git -C $repository.Path rev-parse --verify HEAD)
+        Assert-Contract (
+            $LASTEXITCODE -eq 0 -and
+            $head.Count -eq 1 -and
+            $head[0] -cmatch '^[0-9a-f]{40}$'
+        ) "the real worktree contract must resolve one fixed Git SHA"
+        $fixedSha = $head[0]
+        $createdWorktrees = [System.Collections.Generic.List[string]]::new()
         try {
-            & $git -C $repository.Path worktree add --detach $secondWorktree $head[0] | Out-Null
-            Assert-Contract ($LASTEXITCODE -eq 0) "the real worktree contract must create its second checkout"
-            $worktreeCreated = $true
-            foreach ($relative in @($configuration.fingerprintInputs.path)) {
-                $source = Join-Path $repository.Path $relative
-                $destination = Join-Path $secondWorktree $relative
-                New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
-                Copy-Item -LiteralPath $source -Destination $destination -Force
+            New-Item -ItemType Directory -Force -Path $checkoutRoot | Out-Null
+            foreach ($worktree in @($firstWorktree, $secondWorktree)) {
+                & $git -C $repository.Path worktree add --detach $worktree $fixedSha | Out-Null
+                Assert-Contract ($LASTEXITCODE -eq 0) `
+                    "the real worktree contract must create both fixed-SHA checkouts"
+                $createdWorktrees.Add($worktree) | Out-Null
+
+                $checkoutHead = @(& $git -C $worktree rev-parse --verify HEAD)
+                $checkoutStatus = @(& $git -C $worktree status --porcelain=v1 --untracked-files=all)
+                Assert-Contract (
+                    $LASTEXITCODE -eq 0 -and
+                    $checkoutHead.Count -eq 1 -and
+                    $checkoutHead[0] -ceq $fixedSha -and
+                    $checkoutStatus.Count -eq 0
+                ) "each real worktree fixture must be one unmodified fixed-SHA checkout"
             }
-            $secondHead = @(& $git -C $secondWorktree rev-parse HEAD)
-            Assert-Contract (
-                $LASTEXITCODE -eq 0 -and $secondHead.Count -eq 1 -and $secondHead[0] -ceq $head[0]
-            ) "the real worktree contract must retain the fixed Git SHA"
-            $firstFingerprint = Get-PrivateEnvironmentFingerprint -RepositoryRoot $repository.Path `
-                -Configuration $configuration
+
+            $firstConfiguration = Get-PrivateWindowsBuildConfiguration `
+                -Path (Join-Path $firstWorktree "tools/windows_build_environment.json")
+            $secondConfiguration = Get-PrivateWindowsBuildConfiguration `
+                -Path (Join-Path $secondWorktree "tools/windows_build_environment.json")
+            $firstFingerprint = Get-PrivateEnvironmentFingerprint -RepositoryRoot $firstWorktree `
+                -Configuration $firstConfiguration
             $secondFingerprint = Get-PrivateEnvironmentFingerprint -RepositoryRoot $secondWorktree `
-                -Configuration $configuration
+                -Configuration $secondConfiguration
             Assert-Contract ($firstFingerprint.Value -ceq $secondFingerprint.Value) `
-                "matching real worktrees must calculate one fixed environment fingerprint"
-            $firstLocation = Get-PrivateEnvironmentLocation -RepositoryRoot $repository.Path `
-                -Fingerprint $firstFingerprint.Value -Configuration $configuration -CacheRoot $cache
+                "clean fixed-SHA worktrees must calculate one fingerprint without copied inputs"
+            $firstLocation = Get-PrivateEnvironmentLocation -RepositoryRoot $firstWorktree `
+                -Fingerprint $firstFingerprint.Value -Configuration $firstConfiguration -CacheRoot $cache
             $secondLocation = Get-PrivateEnvironmentLocation -RepositoryRoot $secondWorktree `
-                -Fingerprint $secondFingerprint.Value -Configuration $configuration -CacheRoot $cache
+                -Fingerprint $secondFingerprint.Value -Configuration $secondConfiguration -CacheRoot $cache
             Assert-Contract ($firstLocation.EnvironmentRoot -ceq $secondLocation.EnvironmentRoot) `
                 "matching real worktrees must share one prepared EnvironmentRoot"
             Assert-Contract ($firstLocation.LockPath -ceq $secondLocation.LockPath) `
                 "matching real worktrees must share one environment lease"
-            Assert-Contract ($firstLocation.CargoTargetDirectory -cne $secondLocation.CargoTargetDirectory) `
-                "matching real worktrees must isolate Cargo target output"
+
+            $firstWritable = [ordered]@{
+                CargoTarget = $firstLocation.CargoTargetDirectory
+                CMakeCache = Join-Path $firstLocation.CargoTargetDirectory "cmake"
+                CargoHome = Join-Path $firstLocation.WorkspaceRoot "cargo-home"
+                CargoConfig = Join-Path $firstLocation.WorkspaceRoot "cargo-home/config.toml"
+                VcpkgWrapper = Join-Path $firstLocation.WorkspaceRoot "vcpkg"
+                VcpkgDownloads = Join-Path $firstLocation.WorkspaceRoot "vcpkg/downloads"
+                Temporary = Join-Path $firstLocation.WorkspaceRoot "tmp"
+                PythonCache = Join-Path $firstLocation.WorkspaceRoot "python-cache"
+            }
+            $secondWritable = [ordered]@{
+                CargoTarget = $secondLocation.CargoTargetDirectory
+                CMakeCache = Join-Path $secondLocation.CargoTargetDirectory "cmake"
+                CargoHome = Join-Path $secondLocation.WorkspaceRoot "cargo-home"
+                CargoConfig = Join-Path $secondLocation.WorkspaceRoot "cargo-home/config.toml"
+                VcpkgWrapper = Join-Path $secondLocation.WorkspaceRoot "vcpkg"
+                VcpkgDownloads = Join-Path $secondLocation.WorkspaceRoot "vcpkg/downloads"
+                Temporary = Join-Path $secondLocation.WorkspaceRoot "tmp"
+                PythonCache = Join-Path $secondLocation.WorkspaceRoot "python-cache"
+            }
+            foreach ($name in @($firstWritable.Keys)) {
+                Assert-Contract ($firstWritable[$name] -cne $secondWritable[$name]) `
+                    "matching real worktrees must isolate writable $name output"
+            }
+
+            $state = [pscustomobject]@{ Provisions = 0; Downloads = 0 }
+            $readyMarker = Join-Path $firstLocation.EnvironmentRoot "contract-ready.txt"
+            $setup = {
+                $state.Provisions++
+                $state.Downloads++
+                Set-ContractFile -Path $readyMarker -Value $fixedSha
+            }.GetNewClosure()
+            $newVerify = {
+                param($ownedLocation)
+                if (
+                    -not (Test-Path -LiteralPath $readyMarker -PathType Leaf) -or
+                    (Get-Content -Raw -LiteralPath $readyMarker) -cne $fixedSha
+                ) {
+                    throw "fixed-SHA prepared environment is not ready"
+                }
+                $unexpectedLease = $null
+                $leaseFailure = $null
+                try {
+                    $unexpectedLease = Invoke-PrivateCommand `
+                        -CommandName "Enter-EasyConWorkspaceLease" -Parameters @{
+                            Location = $ownedLocation
+                            TimeoutMilliseconds = 0
+                            RetryMilliseconds = 0
+                        }
+                }
+                catch {
+                    $leaseFailure = $_
+                }
+                finally {
+                    if ($null -ne $unexpectedLease) {
+                        $unexpectedLease.Dispose()
+                    }
+                }
+                Assert-Contract (
+                    $null -ne $leaseFailure -and
+                    $leaseFailure.Exception.Message -match 'busy|ownership'
+                ) "Setup VerifyCore must own this worktree's writable lease before touching w/"
+                New-Item -ItemType Directory -Force -Path $ownedLocation.WorkspaceRoot | Out-Null
+                Set-ContractFile -Path (Join-Path $ownedLocation.WorkspaceRoot "verify.txt") `
+                    -Value $fixedSha
+                return [pscustomobject]@{
+                    status = "ready"
+                    environmentRoot = $ownedLocation.EnvironmentRoot
+                }
+            }.GetNewClosure()
+            $firstVerify = { & $newVerify $firstLocation }.GetNewClosure()
+            $secondVerify = { & $newVerify $secondLocation }.GetNewClosure()
+            $lifecycleParameters = @{
+                Mode = "Setup"
+                SetupAction = $setup
+                WorkspaceAction = { param($Summary) $null = $Summary }
+                LeaseTimeoutMilliseconds = 0
+            }
+            $firstLifecycle = $lifecycleParameters.Clone()
+            $firstLifecycle.Location = $firstLocation
+            $firstLifecycle.VerifyAction = $firstVerify
+            Invoke-PrivateCommand -CommandName "Invoke-EasyConEnvironmentLifecycle" `
+                -Parameters $firstLifecycle | Out-Null
+            Assert-Contract ($state.Provisions -eq 1 -and $state.Downloads -eq 1) `
+                "the first real worktree Setup must provision and download exactly once"
+
+            $secondLifecycle = $lifecycleParameters.Clone()
+            $secondLifecycle.Location = $secondLocation
+            $secondLifecycle.VerifyAction = $secondVerify
+            Invoke-PrivateCommand -CommandName "Invoke-EasyConEnvironmentLifecycle" `
+                -Parameters $secondLifecycle | Out-Null
+            Assert-Contract ($state.Provisions -eq 1 -and $state.Downloads -eq 1) `
+                "the second real worktree Setup must be already-ready with zero repeat work"
+            $environmentDirectories = @(Get-ChildItem -LiteralPath (Join-Path $cache "e") `
+                -Directory -Force)
+            Assert-Contract (
+                $environmentDirectories.Count -eq 1 -and
+                $environmentDirectories[0].FullName -ceq $firstLocation.EnvironmentRoot
+            ) "two real worktrees must leave exactly one shared prepared environment"
+            foreach ($worktree in @($firstWorktree, $secondWorktree)) {
+                $finalHead = @(& $git -C $worktree rev-parse --verify HEAD)
+                $finalStatus = @(& $git -C $worktree status --porcelain=v1 --untracked-files=all)
+                Assert-Contract (
+                    $LASTEXITCODE -eq 0 -and
+                    $finalHead.Count -eq 1 -and
+                    $finalHead[0] -ceq $fixedSha -and
+                    $finalStatus.Count -eq 0
+                ) "both Setup lifecycles must leave each fixed-SHA checkout clean"
+            }
         }
         finally {
-            if ($worktreeCreated) {
-                & $git -C $repository.Path worktree remove --force $secondWorktree | Out-Null
+            $cleanupWorktrees = @($createdWorktrees.ToArray())
+            [array]::Reverse($cleanupWorktrees)
+            foreach ($worktree in $cleanupWorktrees) {
+                & $git -C $repository.Path worktree remove $worktree | Out-Null
                 if ($LASTEXITCODE -ne 0) {
-                    throw "the real worktree contract failed to remove its temporary checkout"
+                    throw "the real worktree contract failed to remove a temporary clean checkout"
                 }
             }
         }
@@ -2316,6 +2585,40 @@ try {
                     Description = "contract prepared installed tree"
                 }
         }
+        Remove-Item -LiteralPath $leak -Force
+
+        $escapedSourceLeak = Join-Path $installed "contract-escaped-source.json"
+        Set-ContractFile -Path $escapedSourceLeak -Value (
+            [ordered]@{ generated = [ordered]@{ path = $repositoryRoot } } |
+                ConvertTo-Json -Depth 4
+        )
+        Assert-Throws -Pattern "source worktree absolute path" -Action {
+            Invoke-PrivateCommand -CommandName "Assert-EasyConPreparedTreeDoesNotReferenceRepository" `
+                -Parameters @{
+                    Path = $installed
+                    TrustedRoot = $location.EnvironmentRoot
+                    RepositoryRoot = $repositoryRoot
+                    Description = "contract escaped prepared source tree"
+                }
+        }
+        Remove-Item -LiteralPath $escapedSourceLeak -Force
+
+        $allWritableRoot = Join-Path $cache "w"
+        $otherWorktreeWrite = Join-Path $allWritableRoot "another-worktree/tmp/tool.exe"
+        $escapedWritableLeak = Join-Path $installed "contract-escaped-writable.json"
+        Set-ContractFile -Path $escapedWritableLeak -Value (
+            [ordered]@{ generated = [ordered]@{ path = $otherWorktreeWrite } } |
+                ConvertTo-Json -Depth 4
+        )
+        Assert-Throws -Pattern "source worktree absolute path|writable absolute path" -Action {
+            Invoke-PrivateCommand -CommandName "Assert-EasyConPreparedTreeDoesNotReferenceRepository" `
+                -Parameters @{
+                    Path = $installed
+                    TrustedRoot = $location.EnvironmentRoot
+                    RepositoryRoot = $allWritableRoot
+                    Description = "contract escaped prepared writable tree"
+                }
+        }
     }
 
     Invoke-ContractCase -Name "missing-damaged-and-mismatched-stamp" -Action {
@@ -2342,9 +2645,147 @@ try {
             target = $configuration.target
         }
         Set-ContractFile -Path $location.StampPath -Value ($mismatch | ConvertTo-Json -Depth 4)
-        Assert-Throws -Pattern "unsupported schema|does not match.*Rerun Setup" -Action {
+        Assert-Throws -Pattern "stamp is damaged|unsupported schema|does not match.*Rerun Setup" -Action {
             Invoke-EasyConWindowsVerify -RepositoryRoot $repository `
                 -ConfigurationPath $configurationPath -CacheRoot $cache
+        }
+    }
+
+    Invoke-ContractCase -Name "stamp-v2-json-schema-is-strict" -Action {
+        $cache = Join-Path $temporaryRoot "strict stamp cache"
+        $configuration = Get-PrivateWindowsBuildConfiguration -Path $configurationPath
+        $fingerprint = Get-PrivateEnvironmentFingerprint -RepositoryRoot $repository `
+            -Configuration $configuration
+        $location = Get-PrivateEnvironmentLocation -RepositoryRoot $repository `
+            -Fingerprint $fingerprint.Value -Configuration $configuration -CacheRoot $cache
+        $tool = Join-Path $location.EnvironmentRoot "tools/cmake.exe"
+        Set-ContractFile -Path $tool -Value "strict stamp fixture"
+        $toolHash = (Get-FileHash -LiteralPath $tool -Algorithm SHA256).Hash.ToLowerInvariant()
+        $baseStamp = New-ContractEnvironmentStamp -Location $location `
+            -Fingerprint $fingerprint -Configuration $configuration -Tools @(
+                [ordered]@{
+                    name = "cmake"
+                    path = $tool
+                    sha256 = $toolHash
+                    controlled = $true
+                }
+            )
+        $baseText = $baseStamp | ConvertTo-Json -Depth 32
+
+        $stringSchema = $baseText | ConvertFrom-Json -Depth 32 -DateKind String
+        $stringSchema.schemaVersion = "2"
+        $fractionalFiles = $baseText | ConvertFrom-Json -Depth 32 -DateKind String
+        $fractionalFiles.nativeTree.files = 1.5
+        $stringBoolean = $baseText | ConvertFrom-Json -Depth 32 -DateKind String
+        $stringBoolean.tools[0].controlled = "true"
+        $unknownVersion = $baseText | ConvertFrom-Json -Depth 32 -DateKind String
+        $unknownVersion.versions | Add-Member -NotePropertyName unknown -NotePropertyValue "damaged"
+        $missingPath = $baseText | ConvertFrom-Json -Depth 32 -DateKind String
+        $missingPath.paths.PSObject.Properties.Remove("ocrModel")
+        $wrongTools = $baseText | ConvertFrom-Json -Depth 32 -DateKind String
+        $wrongTools.tools = [ordered]@{}
+        $mutations = @(
+            [pscustomobject]@{
+                Label = "duplicate root key"
+                Pattern = "duplicate key 'schemaVersion'"
+                Text = $baseText.Replace(
+                    '"schemaVersion": 2',
+                    '"schemaVersion": 2, "schemaVersion": 2'
+                )
+            },
+            [pscustomobject]@{
+                Label = "duplicate nested tool key"
+                Pattern = "duplicate key 'name'"
+                Text = $baseText.Replace('"name": "cmake"', '"name": "cmake", "name": "cmake"')
+            },
+            [pscustomobject]@{
+                Label = "string schema number"
+                Pattern = "schemaVersion must be .*JSON integer"
+                Text = $stringSchema | ConvertTo-Json -Depth 32
+            },
+            [pscustomobject]@{
+                Label = "fractional tree file count"
+                Pattern = "nativeTree files must be a positive JSON integer"
+                Text = $fractionalFiles | ConvertTo-Json -Depth 32
+            },
+            [pscustomobject]@{
+                Label = "string Boolean"
+                Pattern = "tool controlled must be a JSON Boolean"
+                Text = $stringBoolean | ConvertTo-Json -Depth 32
+            },
+            [pscustomobject]@{
+                Label = "unknown versions field"
+                Pattern = "versions keys must be exactly"
+                Text = $unknownVersion | ConvertTo-Json -Depth 32
+            },
+            [pscustomobject]@{
+                Label = "missing prepared path field"
+                Pattern = "paths keys must be exactly"
+                Text = $missingPath | ConvertTo-Json -Depth 32
+            },
+            [pscustomobject]@{
+                Label = "wrong tools JSON type"
+                Pattern = "tools must be a JSON array"
+                Text = $wrongTools | ConvertTo-Json -Depth 32
+            }
+        )
+        foreach ($mutation in $mutations) {
+            Set-ContractFile -Path $location.StampPath -Value $mutation.Text
+            Assert-Throws -Pattern $mutation.Pattern -Action {
+                Invoke-EasyConWindowsVerify -RepositoryRoot $repository `
+                    -ConfigurationPath $configurationPath -CacheRoot $cache
+            }
+        }
+    }
+
+    Invoke-ContractCase -Name "stamp-tools-reject-source-and-all-writable-worktrees" -Action {
+        $cache = Join-Path $temporaryRoot "stamp tool boundary cache"
+        $configuration = Get-PrivateWindowsBuildConfiguration -Path $configurationPath
+        $fingerprint = Get-PrivateEnvironmentFingerprint -RepositoryRoot $repository `
+            -Configuration $configuration
+        $location = Get-PrivateEnvironmentLocation -RepositoryRoot $repository `
+            -Fingerprint $fingerprint.Value -Configuration $configuration -CacheRoot $cache
+        $preparedTool = Join-Path $location.EnvironmentRoot "tools/contract.exe"
+        Set-ContractFile -Path $preparedTool -Value "prepared contract tool"
+        $preparedHash = (Get-FileHash -LiteralPath $preparedTool -Algorithm SHA256).Hash.ToLowerInvariant()
+        $controlledNames = @("cmake", "ninja", "7zip", "7zr", "vcpkg")
+        $expectedNames = @(
+            "python", "7zip", "7zr", "cargo", "cl", "cmake", "git", "lib", "link",
+            "mt", "ninja", "pwsh", "rc", "rustup", "vcpkg"
+        )
+        $otherWritableTool = Join-Path $cache "w/another-worktree/tools/python.exe"
+        Set-ContractFile -Path $otherWritableTool -Value "writable contract tool"
+        foreach ($forbidden in @(
+            [pscustomobject]@{
+                Label = "source repository"
+                Path = Join-Path $repository.Path "tools/windows_workspace.psm1"
+                Pattern = "source repository"
+            },
+            [pscustomobject]@{
+                Label = "another worktree writable root"
+                Path = $otherWritableTool
+                Pattern = "writable workspace path"
+            }
+        )) {
+            $forbiddenHash = (Get-FileHash -LiteralPath $forbidden.Path -Algorithm SHA256).Hash.ToLowerInvariant()
+            $records = [System.Collections.Generic.List[object]]::new()
+            foreach ($name in $expectedNames) {
+                $path = if ($name -ceq "python") { $forbidden.Path } else { $preparedTool }
+                $hash = if ($name -ceq "python") { $forbiddenHash } else { $preparedHash }
+                $records.Add([ordered]@{
+                    name = $name
+                    path = $path
+                    sha256 = $hash
+                    controlled = $controlledNames -ccontains $name
+                }) | Out-Null
+            }
+            $stamp = New-ContractEnvironmentStamp -Location $location `
+                -Fingerprint $fingerprint -Configuration $configuration -Tools $records.ToArray()
+            Set-ContractFile -Path $location.StampPath -Value ($stamp | ConvertTo-Json -Depth 32)
+            Assert-Throws -Pattern $forbidden.Pattern -Action {
+                Invoke-EasyConWindowsVerify -RepositoryRoot $repository `
+                    -ConfigurationPath $configurationPath -CacheRoot $cache
+            }
         }
     }
 
@@ -2357,27 +2798,16 @@ try {
             -Fingerprint $fingerprint.Value -Configuration $configuration -CacheRoot $cache
         $tool = Join-Path $location.EnvironmentRoot "tools/cmake.exe"
         Set-ContractFile -Path $tool -Value "damaged"
-        $stamp = [ordered]@{
-            schemaVersion = 2
-            environmentSchema = $location.EnvironmentSchema
-            hostTargetIdentity = $location.HostTargetIdentity
-            fingerprint = $fingerprint.Value
-            fingerprintInputs = @()
-            createdUtc = "2026-01-01T00:00:00.0000000Z"
-            environmentRoot = $location.EnvironmentRoot
-            target = $configuration.target
-            tools = @([ordered]@{
+        $stamp = New-ContractEnvironmentStamp -Location $location `
+            -Fingerprint $fingerprint -Configuration $configuration -Tools @(
+                [ordered]@{
                 name = "cmake"
                 path = $tool
                 sha256 = ("0" * 64)
                 controlled = $true
-            })
-            versions = [ordered]@{}
-            paths = [ordered]@{}
-            nativeTree = [ordered]@{}
-            cargoSources = [ordered]@{}
-        }
-        Set-ContractFile -Path $location.StampPath -Value ($stamp | ConvertTo-Json -Depth 8)
+                }
+            )
+        Set-ContractFile -Path $location.StampPath -Value ($stamp | ConvertTo-Json -Depth 32)
         Assert-Throws -Pattern "prepared tool cmake is damaged.*Rerun Setup" -Action {
             Invoke-EasyConWindowsVerify -RepositoryRoot $repository `
                 -ConfigurationPath $configurationPath -CacheRoot $cache
@@ -2406,6 +2836,37 @@ try {
         Assert-Contract (-not @($gates | Where-Object {
             $_.Name -match "install|download|provision|vcpkg"
         })) "Workspace gates must not provision, install, or download"
+    }
+
+    Invoke-ContractCase -Name "require-clean-tree-detects-ignored-python-bytecode" -Action {
+        $git = (Get-Command git.exe -ErrorAction Stop).Source
+        $cleanRepository = Join-Path $temporaryRoot "ignored bytecode clean tree"
+        Set-ContractFile -Path (Join-Path $cleanRepository ".gitignore") `
+            -Value "__pycache__/`n*.pyc`n"
+        Set-ContractFile -Path (Join-Path $cleanRepository "tools/contract.py") `
+            -Value "print('contract')`n"
+        & $git init --quiet $cleanRepository
+        & $git -C $cleanRepository add -- .
+        & $git -c user.name=EasyConContract -c user.email=contract@example.invalid `
+            -C $cleanRepository commit --quiet -m "contract fixture"
+        Assert-Contract ($LASTEXITCODE -eq 0) `
+            "the ignored bytecode fixture must start as a clean Git checkout"
+        $bytecode = Join-Path $cleanRepository "tools/__pycache__/contract.cpython-312.pyc"
+        $gateState = [pscustomobject]@{ Writes = 0 }
+        $gateInvoker = {
+            param($Name, $Program, $Arguments, $Root)
+            $null = $Name, $Program, $Arguments, $Root
+            if ($gateState.Writes -eq 0) {
+                Set-ContractFile -Path $bytecode -Value "ignored generated bytecode"
+                $gateState.Writes++
+            }
+        }.GetNewClosure()
+        Assert-Throws -Pattern "ignored Python bytecode|source tree" -Action {
+            Invoke-PrivateWorkspaceGates -RepositoryRoot $cleanRepository `
+                -GateInvoker $gateInvoker -RequireCleanTree
+        }
+        Assert-Contract ($gateState.Writes -eq 1) `
+            "the clean-tree fixture must create exactly one ignored bytecode artifact"
     }
 
     Invoke-ContractCase -Name "pinned-bootstrap-tool-remains-after-download-consumption" -Action {
@@ -2684,7 +3145,8 @@ try {
             "TARGET_CXX", "CL", "_CL_", "CMAKE_PREFIX_PATH", "OPENSSL_ROOT_DIR",
             "VCPKG_DEFAULT_TRIPLET", "VSCMD_VER", "__VSCMD_PREINIT_PATH",
             "VCPKG_FORCE_DOWNLOADED_BINARIES", "VCPKG_FORCE_SYSTEM_BINARIES",
-            "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"
+            "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "TMPDIR",
+            "PYTHONPYCACHEPREFIX", "PYTHONDONTWRITEBYTECODE"
         )
         $controlledValues = [ordered]@{
             AR = "controlled-lib.exe"
@@ -2740,6 +3202,9 @@ try {
     httpProxy = $env:HTTP_PROXY
     httpsProxy = $env:HTTPS_PROXY
     allProxy = $env:ALL_PROXY
+    tmpdir = $env:TMPDIR
+    pythonPycachePrefix = $env:PYTHONPYCACHEPREFIX
+    pythonDontWriteBytecode = $env:PYTHONDONTWRITEBYTECODE
     ar = $env:AR
     cc = $env:CC
     cargoHome = $env:CARGO_HOME
@@ -2758,7 +3223,7 @@ try {
                 "underscoreCl", "cmakePrefix", "packageRoot", "cargoNetOffline",
                 "cargoRegistry", "targetCc", "targetCxx", "targetAr", "hostCc", "targetCxxAlias",
                 "vcpkgTriplet", "vcpkgForceSystem", "vscmdVersion", "vscmdPreinitPath", "httpProxy", "httpsProxy",
-                "allProxy"
+                "allProxy", "tmpdir", "pythonPycachePrefix", "pythonDontWriteBytecode"
             )) {
                 Assert-Contract ([string]::IsNullOrEmpty([string]$child.$property)) `
                     "verified child process must not inherit $property"
@@ -2983,4 +3448,4 @@ finally {
     }
 }
 
-Write-Output "Windows workspace contracts passed: 37 cases"
+Write-Output "Windows workspace contracts passed: 41 cases"

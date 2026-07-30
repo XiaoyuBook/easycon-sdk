@@ -464,6 +464,23 @@ try {
     Assert-Sequence -Actual $events.ToArray() -Expected @("verify") `
         -Description "already-ready Setup must not provision again"
 
+    $events.Clear()
+    $verifyWithWorkspaceOwnership = {
+        Assert-Throws -Pattern "busy|ownership" -Action {
+            Enter-PrivateWorkspaceLease -Location $location -TimeoutMilliseconds 0
+        }
+        $events.Add("verify") | Out-Null
+        if ((Get-Content -Raw -LiteralPath $location.StampPath).Trim() -cne "ready") {
+            throw "synthetic environment mismatch"
+        }
+        return "verified"
+    }.GetNewClosure()
+    Invoke-PrivateEnvironmentLifecycle -Mode Setup -Location $location `
+        -SetupAction $setupAction -VerifyAction $verifyWithWorkspaceOwnership `
+        -WorkspaceAction $workspaceAction -LeaseTimeoutMilliseconds 0 | Out-Null
+    Assert-Sequence -Actual $events.ToArray() -Expected @("verify") `
+        -Description "already-ready Setup VerifyCore must hold the workspace writable lease"
+
     $readyMarker = Join-Path $environmentRoot "ready-preserved.txt"
     Set-Content -LiteralPath $readyMarker -Value "preserve" -Encoding utf8NoBOM
     $readyLeaseState = [pscustomobject]@{ SetupCalls = 0; VerifyCalls = 0 }
@@ -1257,4 +1274,4 @@ finally {
     }
 }
 
-Write-Output "Windows environment lifecycle contracts passed: 23 cases"
+Write-Output "Windows environment lifecycle contracts passed: 24 cases"
