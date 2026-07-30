@@ -68,6 +68,8 @@
 - [ADR-0014：Phase 3 NativePool admission 修复后重新冻结](decisions/0014-phase-3-native-pool-admission-refreeze.md)
 - [ADR-0016：重新冻结 Phase 3 候选的下游阶段重新打开边界](decisions/0016-phase-3-downstream-reopen-boundary.md)
 - [ADR-0017：冻结 Phase 4 ECS 与 Automation 目标（Accepted / Frozen Target）](decisions/0017-phase-4-ecs-automation-target.md)
+- [ADR-0018：窄重开 Phase 2A Controller lease 结算合同（Accepted）](decisions/0018-phase-2a-controller-lease-reopen.md)
+- [ADR-0019：提议冻结 Phase 4 C1 lexer 合同（Proposed / Not Effective）](decisions/0019-phase-4-c1-lexer-contract.md)
 
 ## v1 固定范围
 
@@ -117,10 +119,12 @@ ECS/Automation 的 ownership、产品语义、ProgramHash/PCG golden、`EcsLimit
 
 治理链从 G0a/design base `38ef0dc` 依次经过初始 proposal `6468da5`、第一轮修订 `9983d42` 与第二轮修订
 `fa265dff`；最终独立 full review 任务 `019f9348-1fb0-7130-86b6-57d69a0db31c` 结论为 `APPROVE`，
-P0/P1/P2=`0/0/0`。当前 `main` 基线 `87544d9` 已完成并合入 W0 与 S0：W0 只建立零依赖、可编译的
+P0/P1/P2=`0/0/0`。`main` 已在实现基线 `87544d9` 完成并合入 W0 与 S0：W0 只建立零依赖、可编译的
 `easycon-ecs` workspace 骨架，S0 只建立 11 条自包含 provenance records、33 个 SDK-local artifacts 及静态
-validator。R0 尚未完成独立 review/refreeze，C1 及其后节点也未启动；D0 继续作为独立 Phase 5 Controller
-支线另行授权。这些进展不代表 Phase 4 实现、硬件、支持或发布完成。
+validator。[ADR-0018](decisions/0018-phase-2a-controller-lease-reopen.md) 已接受独立 Phase 5 Controller D0
+窄重开合同，但 D1/D2 尚未启动；[ADR-0019](decisions/0019-phase-4-c1-lexer-contract.md) 只是
+`Proposed / Not Effective` 的 C1 lexer 合同候选，仍须 fixed-SHA 独立 review 与后续单独 acceptance/freeze。
+R0 尚未完成独立 review/refreeze，C1 及其后节点仍未启动。这些进展不代表 Phase 4 实现、硬件、支持或发布完成。
 
 ## 首发基线
 
