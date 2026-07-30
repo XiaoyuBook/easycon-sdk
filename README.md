@@ -43,10 +43,10 @@ validator。[ADR-0018](docs/decisions/0018-phase-2a-controller-lease-reopen.md) 
 窄重开合同，但 D1/D2 尚未形成已接受实现；[ADR-0019](docs/decisions/0019-phase-4-c1-lexer-contract.md) 已接受并冻结
 C1 lexer 合同，固定接受候选为 `e4b12b5`，独立 full review 任务
 `019fb40a-ef77-7f12-8075-885be6a0e917` 结论为 `APPROVE`、P0/P1/P2=`0/0/0`。C1 实现现已获授权但尚未形成
-implementation candidate。[ADR-0020](docs/decisions/0020-controller-settlement-runtime-prerequisites.md) 现仅为
-`Proposed / Not Effective`：它记录 Runtime-only R0-v2 对 D1 的 necessary-but-insufficient 前置设计，D1 保持暂停并保留现有 RED；
-尚未接受、未授权 Runtime/Controller/serial 实现，也未改变 C1 授权。这些进展不表示 Phase 4 实现、硬件、支持或发布
-已经完成。
+implementation candidate。[ADR-0020](docs/decisions/0020-controller-settlement-runtime-prerequisites.md) 现已
+`Accepted / Effective`，固定接受候选为 `a617e084`；它冻结 Runtime-only R0-v2 对 D1 的前置合同，并只解锁 R0-v2
+作为下一独立实现节点。R0-v2 implementation candidate、Phase 1 refreeze、D1 Controller/serial 集成与 D2 均尚未完成；
+D1 保持暂停并保留现有四条 RED，C1 的独立授权不变。这些进展不表示 Phase 4 实现、硬件、支持或发布已经完成。
 
 此前的实验性共享运行基线已经移除，不再作为本项目的产品架构或兼容性约束。后续 public C ABI 和各语言绑定
 将在当前 Rust 共享核心之上按 Phase 5/6 的独立门禁实现。

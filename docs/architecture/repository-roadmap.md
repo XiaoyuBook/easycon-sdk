@@ -179,17 +179,16 @@ serial/四语言/package 支持，macOS 保持 Build/Hardware Unverified、Not S
 ### Phase 4：ECS 与跨域 Automation
 
 当前状态：冻结 DAG 中的 W0 与 S0 已在 `main` 基线 `87544d9` 完成。W0 仅登记零依赖的 `easycon-ecs`
-workspace 骨架；S0 仅登记 11 条 provenance records、33 个 SDK-local artifacts 和静态 validator。R0 尚未完成
-独立 review/refreeze；C1 合同已经冻结但 implementation candidate 尚未形成；不得把 W0/S0 描述为 Phase 4
-implementation freeze。
+workspace 骨架；S0 仅登记 11 条 provenance records、33 个 SDK-local artifacts 和静态 validator。Runtime-only R0-v2
+尚未形成 implementation candidate，也未完成独立 review/refreeze；C1 合同已经冻结但 implementation candidate 尚未形成；
+不得把 W0/S0 描述为 Phase 4 implementation freeze。
 
-[ADR-0020](../decisions/0020-controller-settlement-runtime-prerequisites.md) 现为 `Proposed / Not Effective`，不改变
-任何已接受冻结面或实现授权。它把归档 R0 候选裁定为 Runtime-only R0-v2 的 necessary-but-insufficient 证据，并提议把
-后续治理顺序改为
-“ADR-0020 fixed-SHA 独立设计 review 与单独 acceptance -> Runtime-only R0-v2 完整 Phase 1 门禁、独立 review 与单独
-refreeze -> 带现有四条 RED 恢复 D1，由 D1 才修改 ControllerTransport/system serial/fake 并运行全部受影响 Phase 2A/
-Runtime 门禁 -> D2 独立 review/refreeze”。四条 RED 在 R0-v2 后仍不是通过证据；在该 proposal 被接受且 Phase 1
-重新冻结前，Controller D1 保持暂停。不得宣称 R0、D1 或 D2 已通过；C1 的既有独立授权不受该 proposal 影响。
+[ADR-0020](../decisions/0020-controller-settlement-runtime-prerequisites.md) 现已 `Accepted / Effective`，固定接受候选为
+`a617e084`。它把归档 R0 候选裁定为 Runtime-only R0-v2 的 necessary-but-insufficient 证据，冻结新的治理顺序，并只解锁
+Runtime-only R0-v2 作为下一独立实现节点：R0-v2 完成完整 Phase 1 门禁、独立 review 与单独 refreeze 后，才带现有四条
+RED 恢复 D1；只有 D1 才修改 ControllerTransport/system serial/fake 并运行全部受影响 Phase 2A/Runtime 门禁，随后 D2
+独立 review/refreeze。R0-v2 implementation candidate 尚未形成，四条 RED 在 R0-v2 后仍不是通过证据；Phase 1 重新冻结前，
+Controller D1 保持暂停。不得宣称 R0-v2、D1 或 D2 已通过；C1 的既有独立授权不受本 acceptance 影响。
 
 交付：
 

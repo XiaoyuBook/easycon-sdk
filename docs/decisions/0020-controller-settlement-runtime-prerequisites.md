@@ -1,19 +1,23 @@
-# 0020：提议冻结 Controller 结算的 Runtime 前置合同
+# 0020：冻结 Controller 结算的 Runtime 前置合同
 
-- 状态：Proposed / Not Effective
+- 状态：Accepted / Effective
 - 提议日期：2026-07-30
+- 接受与生效日期：2026-07-30
 - proposal 基线：`main@2fe7eb2ef50f9ec49fe4e186b36605b6502aebb1`
 - proposal 基线 tree：`1281e677ae4e26bfc7a85b19dd6a392d9736eff0`
 - 初始 proposal：`c09c323476a5f0ed972aec6b7f2ee2acbeb139c0`，tree
   `c5b63720f0b4f7db86c92d2439d9489d9cf23425`，parent
   `2fe7eb2ef50f9ec49fe4e186b36605b6502aebb1`
-- 初始 fixed-SHA review：`REQUEST CHANGES`，P0/P1/P2=`0/4/0`；本修订逐项针对四项 P1，但仍是
-  `Proposed / Not Effective`，必须重新接受 fixed-SHA 独立 review
+- 初始 fixed-SHA review：`REQUEST CHANGES`，P0/P1/P2=`0/4/0`；后续修订逐项处理四项 P1
 - 第一轮修订：`362df95b5fdc03c9e2f285de4b456a61f8b6a09f`，tree
   `b1af657a2ed03c94a8ea580a0ed8062239d03aee`，parent
   `c09c323476a5f0ed972aec6b7f2ee2acbeb139c0`
-- 第一轮修订 fixed-SHA review：`REQUEST CHANGES`，P0/P1/P2=`0/1/0`；本次最小修订只处理 ownership-loss
-  waiter settlement 例外与 ADR-0018 的冲突，状态仍为 `Proposed / Not Effective`
+- 第一轮修订 fixed-SHA review：`REQUEST CHANGES`，P0/P1/P2=`0/1/0`；固定接受候选只处理该轮发现的
+  ownership-loss waiter settlement 例外与 ADR-0018 冲突
+- 固定接受候选 / 第二轮修订：`a617e0841b76051192a4d6f6069877b340d5ec33`，tree
+  `4a149e4096aa2de33f232dc4d40608d25ff89bfd`，parent
+  `362df95b5fdc03c9e2f285de4b456a61f8b6a09f`
+- 最终 fixed-SHA 独立 review：`APPROVE`
 - 上位冻结决定：[ADR-0004](0004-operations-events-shutdown.md)、
   [ADR-0006](0006-runtime-stabilization.md)、[ADR-0007](0007-phase-1-freeze.md)、
   [ADR-0009](0009-phase-2a-freeze.md)、[ADR-0017](0017-phase-4-ecs-automation-target.md) 与
@@ -23,16 +27,22 @@
   `d7f0178aa08e476abef9f2f45ec96588a43d9874`
 - 编号说明：已扫描当前 refs、snapshot refs 与 worktrees；ADR-0020 在本 proposal 前未占用
 
-## 状态、生效条件与授权边界
+## 状态、接受决定与授权边界
 
-本文只是 docs-only 设计候选，当前不生效，也不授权修改 production Rust、serial backend、behavior、schema、fixture、
-conformance、测试或 public ABI。它不接受归档 R0 候选，不冻结任何实现，不声明 D1 的现有 RED 已通过，也不取代任何
-既有 Accepted/Frozen ADR。只有本文自身形成固定提交、由独立 reviewer 对该 fixed SHA 完成 full review，并由另一个
-docs-only acceptance/refreeze 决定明确接受后，下文的规范性合同才生效。
+固定接受候选 `a617e0841b76051192a4d6f6069877b340d5ec33` 已完成 fixed-SHA 独立 review 并获得 `APPROVE`。
+本 ADR 现接受并生效，下文规范性合同从本次 docs-only acceptance/refreeze 起成为后续实现与审查的冻结依据。本次
+acceptance 只改变状态、治理链与索引，不修改固定候选已经审查通过的 deadline、terminal/effect arbitration、I/O
+interruption、partial-write/stream settlement、owner-loss 例外或 close 顺序合同。
+
+本 acceptance 仅解锁 Runtime-only R0-v2 按冻结 DAG 形成独立 RED/models、implementation candidate、完整 Phase 1
+门禁、fixed-SHA review 与单独 refreeze；它不接受归档 R0 候选，也不冻结或声明任何实现完成。除下文明确要求的 R0-v2
+Runtime-only source、RED/models、测试与 conformance 外，本 acceptance 不授权提前修改 production Controller、
+`ControllerTransport`、system serial、Controller fake 及其 behavior/schema/fixture/conformance/test，也不改变 public ABI。
+本 acceptance 自身的 SHA/tree 不在 tracked 文档中预言，只由提交后的 Git 对象与外部验收记录固定。
 
 当前 D1 必须暂停在已有 RED 证据，不得把 bounded teardown fallback、单个测试进程退出或未提交 worktree 当作通过。
-proposal 期间，ADR-0018 的历史原文和 Accepted 状态保持不变；本文不通过修改该原文来倒写历史。若本文以后被接受，
-它只取代 ADR-0018 中“D1 与 R0 相互独立”“D1 只拥有 production Controller 且不触及 serial transport 内部边界”两项
+ADR-0018 的历史原文和 Accepted 状态保持不变；本文不通过修改该原文来倒写历史。从本文生效起，它只取代 ADR-0018
+中“D1 与 R0 相互独立”“D1 只拥有 production Controller 且不触及 serial transport 内部边界”两项
 实施假设，并且只在“Controller lane ownership 已丢失、没有可验证 transferable transport/settlement owner、completion 与
 stream settlement 均不可证明”三个条件同时成立的极窄分支，取代 ADR-0018 对 action/release waiter 无条件 settlement
 以及 close join 前 release record 必须终结的要求。该三条件分支之外，ADR-0018 的 waiter/record 完成要求、lease API、
@@ -71,9 +81,9 @@ D1 只读 worktree 中下列 teardown-safe 回归必须原样保留为 RED。它
 这些测试共同覆盖完整 report acceptance 后 close 不得改写 action、release seal 的 action interrupt、close 对 pending
 acquire/release 的接管，以及 SystemClock deadline 的独立进展；它们当前都不是通过证据。
 
-## 决定候选概览
+## 已接受决定概览
 
-若本文被单独接受，最小治理变更由三个架构上不可缺少、实施时严格分阶段的部分组成：
+本文接受的最小治理变更由三个架构上不可缺少、实施时严格分阶段的部分组成：
 
 1. R0-v2 只在 Runtime 增加真实、一次性、非 Operation 的 deadline registration。
 2. R0-v2 只在 Runtime 增加“settlement 决议后 claim、再 cleanup/commit”的通用两阶段 terminal/effect-claim primitive，
@@ -333,7 +343,7 @@ cleanup ownership 已从 panicked lane 完整转移的 Drop-settlement contract�
   保留 panic/owner identity/Controller identity 的可诊断 first error，并保留尚未合法 settlement 的 Operation、cleanup
   record 与 registry identity；对应 action/release waiter 不得被伪造为 `Cancelled`、`Failed`、`Closed` 或 completion，
   registry 也不得伪装为 zero。若 owner/evidence 可证明而只有 cleanup failure，则必须改走上节第一条并完成这些 waiter。
-- 非终态与 registry 保留持续到合法 owner settlement；本 proposal 不授权构造该 owner。未来若要接管 Controller lane，
+- 非终态与 registry 保留持续到合法 owner settlement；本 ADR 不授权构造该 owner。未来若要接管 Controller lane，
   必须另行完整冻结 owner identity、panic detection、transport ownership transfer、completion consumption、cleanup/error
   projection 与 exactly-once commit，并重新审查受影响冻结面。
 
@@ -396,13 +406,11 @@ protocol、硬件资格状态与 O-01/O-02/O-04；Phase 3、Vision、package 和
 
 ## 新依赖 DAG 与验收
 
-若本文被接受，后续唯一允许的顺序为：
+ADR-0020 fixed-SHA proposal、独立 design review 与本次单独 docs-only acceptance/refreeze 已完成。从本 acceptance 生效后，
+后续唯一允许的顺序为：
 
 ```text
-ADR-0020 fixed-SHA proposal
-  -> independent design review
-  -> separate docs-only acceptance/freeze
-  -> R0-v2 Runtime-only RED/models
+R0-v2 Runtime-only RED/models
   -> generic deadline registration + two-phase terminal/effect-claim implementation
   -> Phase 1 full gates
   -> fixed-SHA independent implementation review
@@ -450,19 +458,18 @@ D1 还必须用 exact fault injection 固定下列 acceptance matrix，不能只
 D1 必须运行所有受影响 Phase 2A 与 Runtime 门禁；D2 再固定完整 D1 candidate SHA，完成独立 review 与单独 Controller
 refreeze。R0-v2 refreeze、单条 D1 测试通过或 D1 自报完整门禁都不能代替 D2。
 
-## 本 proposal 的 docs-only 门禁
+## 本 acceptance 的 docs-only 门禁
 
-本 proposal 提交前只运行：
+本 acceptance 提交前只运行：
 
 ```text
 python -B tools/check_markdown_links.py
 python -B tools/check_repository_guards.py
 git diff --check
-git diff --check 2fe7eb2ef50f9ec49fe4e186b36605b6502aebb1
 git diff --cached --check
 ```
 
-这些命令只证明 proposal 文档引用、仓库边界和 diff hygiene，不证明 Runtime/Controller/serial implementation、Rust/Loom、
+这些命令只证明 acceptance 文档引用、仓库边界和 diff hygiene，不证明 Runtime/Controller/serial implementation、Rust/Loom、
 Workspace、hardware、R0-v2、D1 或 D2 已经通过。
 
 ## 关联
