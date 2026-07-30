@@ -4,6 +4,11 @@
 - 提议日期：2026-07-30
 - proposal 基线：`main@2fe7eb2ef50f9ec49fe4e186b36605b6502aebb1`
 - proposal 基线 tree：`1281e677ae4e26bfc7a85b19dd6a392d9736eff0`
+- 初始 proposal：`c09c323476a5f0ed972aec6b7f2ee2acbeb139c0`，tree
+  `c5b63720f0b4f7db86c92d2439d9489d9cf23425`，parent
+  `2fe7eb2ef50f9ec49fe4e186b36605b6502aebb1`
+- 初始 fixed-SHA review：`REQUEST CHANGES`，P0/P1/P2=`0/4/0`；本修订逐项针对四项 P1，但仍是
+  `Proposed / Not Effective`，必须重新接受 fixed-SHA 独立 review
 - 上位冻结决定：[ADR-0004](0004-operations-events-shutdown.md)、
   [ADR-0006](0006-runtime-stabilization.md)、[ADR-0007](0007-phase-1-freeze.md)、
   [ADR-0009](0009-phase-2a-freeze.md)、[ADR-0017](0017-phase-4-ecs-automation-target.md) 与
@@ -64,8 +69,9 @@ acquire/release 的接管，以及 SystemClock deadline 的独立进展；它们
 若本文被单独接受，最小治理变更由三个架构上不可缺少、实施时严格分阶段的部分组成：
 
 1. R0-v2 只在 Runtime 增加真实、一次性、非 Operation 的 deadline registration。
-2. R0-v2 只在 Runtime 增加“先 claim、后 cleanup/commit”的通用两阶段 terminal/effect-claim primitive，并使用
-   Runtime fake/model 验证 effect candidate 与 cancellation 竞争同一个 arbiter。
+2. R0-v2 只在 Runtime 增加“settlement 决议后 claim、再 cleanup/commit”的通用两阶段 terminal/effect-claim primitive，
+   并使用 Runtime fake/model 验证 outstanding work 的 cancellation intent 与真实 completion 由同一个 settlement arbiter
+   决定，intent 本身不能抢先取得 terminal winner。
 3. Phase 1 独立 refreeze 后，D1 才在 `ControllerTransport` 的完整 logical report acceptance 内部边界接入该 generic
    effect-claim hook，并给 generation seal 与 Controller close 分配范围不同的 I/O interruption authority。
 
@@ -111,30 +117,40 @@ clock 的 `now_ns()`；已经满足 deadline predicate 时必须先提交 `Deadl
   registration。一次 advance 中相同 `target_ns` 的 entry 按 registration id 确定性 fire。
 - 注册时已经到期的 target 必须同步标为 `Fired` 或安排等价的立即 wake，不能先入 lane 再等待下一次 clock change。
 
-Runtime close 必须先 seal 新 registration；仍被 resource/Operation close 使用的 deadline worker 在这些 owner 结算前保持
-可运行。依赖 registration 全部 resolve/disarm 后，Runtime 才 drain 剩余 entry 为 `RuntimeClosed`、唤醒 waiter 并 join
-该既有 infrastructure worker。不得让 Controller lane 反向 join Runtime deadline worker。
+Runtime close 必须先 seal 新 registration，但不能因此提前 drain 或停止 deadline worker。该 internal worker 必须在
+resource close、普通 supervised/external owner task join 与 Operation owner settlement/fallback 的全过程继续服务已有
+registration。只有所有可能持有 registration 的 external owner task 已经 join，且其 Operation 已由合法 owner settle 或
+进入下文保守 `CloseFailed` 分支后，Runtime 才把剩余 entry drain 为 `RuntimeClosed`、唤醒 waiter、停止并 join deadline
+internal worker，最后执行 registry 检查。精确阶段顺序与无 join-cycle 约束见“task、thread 与 close ownership”。
 
 ## 两阶段 terminal 与唯一仲裁
 
 ### 两阶段 primitive
 
-R0-v2 必须让每个真实 Operation 持有一个唯一、domain-neutral 的 terminal arbiter。terminal/effect candidate 先通过
-原子 claim 取得不可转让的结算权，owner 随后完成既有 bookkeeping、stream settlement 与 fallible cleanup，最后才
-commit 可观察终态。claim 与 commit 的边界如下：
+R0-v2 必须让每个真实 Operation 持有一个唯一、domain-neutral 的 terminal arbiter。generic primitive 明确区分
+`intent`、`claim` 与 `commit`：intent 只记录请求，不能决定 terminal；真实 owner 取得 settlement evidence 后才原子 claim
+唯一 winner；owner 完成既有 bookkeeping、settlement 与 fallible cleanup 后，才 commit 可观察终态。边界如下：
 
-- claim 决定先到的 terminal/effect winner；一旦成功，任何较晚的 cancel、deadline、close、failure 或 success candidate
-  都只能观察 winner，不能改写它或发布第二个 terminal。
+- first cancellation reason 仍由现有 Operation authority 一次写入并保持 immutable。`Requested`、`Deadline` 或
+  `ParentClose` intent 可以请求 owner 停止工作，但只记录 reason、signal/wake，不等于 terminal/effect claim；后来的 reason
+  不能覆盖第一个 reason。
+- 对没有 outstanding effect 的 generic work，owner 可以在证明 effect 不可能发生后按现有优先级 claim cancellation、
+  deadline、close 或 failure。对存在 outstanding effect 的 work，任何线程都不得仅凭 intent 抢先 claim；必须等待该 domain
+  的唯一 settlement owner 产出 mutually exclusive 的 accepted-effect 或 not-delivered/failure evidence。
+- settlement owner 在消费证据的同一临界区 claim winner。一旦 claim 成功，任何较晚的 cancel、deadline、close、failure
+  或 success candidate 都只能观察 winner，不能改写它或发布第二个 terminal。
 - claim 本身不发布 terminal event、不从 Operation registry unlink、不唤醒 terminal waiter，也不伪造新的 Operation。
 - commit 继续严格使用 ADR-0006/0007 已冻结的顺序：完成 owner cleanup 后提交唯一终态与 immutable error/value，发布
   唯一 terminal event，执行唯一 registry unlink，最后通知 waiter。具体 event schema、OperationValue 与 registry identity
   不变。
-- cancellation winner 可以按既有状态机进入 `Cancelling`，完成 settlement 后提交 `Cancelled`；effect-accepted winner
-  在 cleanup 成功时提交 `Succeeded`。effect acceptance 后发生的 cleanup failure 仍按 ADR-0006 的 first-error/cleanup
-  规则结算，但较晚 cancellation 永远不能把它改写为 `Cancelled` 或抹去已接受 effect 的错误上下文。
-- permit 只能由登记的 Operation owner commit，或在 owner panic/close handoff 时通过显式、一次性的 supervised takeover
-  转交。Runtime close 只能 request cancellation、等待 owner settlement 或执行该 takeover；不得绕过 permit 直接清零
-  registry。
+- cancellation evidence 胜出后才可按既有状态机进入 `Cancelling`，完成 settlement 后提交 `Cancelled` 或既有 deadline/
+  close 投影；outstanding I/O 尚未 settlement 时仅有 cancellation intent，Operation 保持原非终态，不能预先进入一条排除
+  `Succeeded` 的路径。effect-accepted winner 在 cleanup 成功时提交 `Succeeded`。effect acceptance 后发生的 cleanup
+  failure 仍按 ADR-0006 的 first-error/cleanup 规则结算，但较晚 cancellation 永远不能把它改写为 `Cancelled` 或抹去
+  已接受 effect 的错误上下文。
+- permit handoff 不是默认 panic fallback。只有 supervisor 在工作开始前已经持有下文定义的 transferable settlement owner，
+  并在原 owner 已 join 后能够证明 cleanup/effect evidence 所有权完整转移时，才允许显式、一次性 handoff；否则 Runtime
+  close 只能等待 owner settlement 或返回 `CloseFailed`，不得绕过 permit 直接清零 registry。
 
 Operation 对外可见的六态状态机、OperationId、wait/cancel/query API、cancellation first-reason authority、ErrorDomain、
 OperationValue 与 event schema 都不增加枚举值。本文只窄重开状态机内部“谁可以取得 terminal 结算权、取得后何时发布”
@@ -142,8 +158,9 @@ OperationValue 与 event schema 都不增加枚举值。本文只窄重开状态
 
 ### effect acceptance 与 cancellation
 
-对 Controller logical report，唯一真实线性化点是 transport adapter 已累计接受完整 report 的最后一个 byte、在同一 write
-settlement 临界区内调用 acceptance hook 并成功 claim 对应 arbiter 的瞬间。下列位置都不是 effect 线性化点：
+对 Controller logical report，唯一真实线性化点是 backend settlement gate 唯一消费真实 completion，确认累计接受完整
+report 的最后一个 byte，并在同一临界区调用 acceptance hook 成功 claim 对应 arbiter 的瞬间。原始 cancellation request
+与 `CancelIoEx` 返回都不是 settlement。下列位置也不是 effect 线性化点：
 
 - write future/阻塞调用返回到 Controller lane；
 - lane 再次读取 Operation 或 cancellation token；
@@ -151,23 +168,43 @@ settlement 临界区内调用 acceptance hook 并成功 claim 对应 arbiter 的
 - terminal event 发布、registry unlink 或 waiter wake；
 - UART/USB 对端、固件或 Switch 的物理执行。
 
-`ControllerTransport::write` 及 serial/fake adapter 必须接收每次 logical report 专属的 settlement/acceptance handle。adapter
-只能在累计长度等于该 report 精确长度时调用 hook，且必须在向 lane 返回成功之前调用。action report 的 hook 竞争真实
-Operation terminal arbiter；release/close neutral 的 hook 竞争对应的唯一 cleanup record。重复、迟到、wrong-generation
-或在 stream settlement 后到达的 hook 必须无效果。
+`ControllerTransport::write` 及 serial/fake adapter 必须接收每次 logical report 专属的 settlement/acceptance handle，并在
+dispatch 前建立唯一 backend settlement gate。该 gate 的内部状态机固定为：
 
-“cancellation 先到”是 cancellation candidate 先成功 claim 同一个 arbiter，不是仅设置 token bit、排入 lane command 或
-调用 waker；“acceptance 先到”是上述 hook 先成功 claim。仲裁结果唯一：
+```text
+NotDispatched -> Outstanding
+NotDispatched -> Settled(NotDeliveredStreamSettled)
+Outstanding -> Settled(FullAccepted)
+Outstanding -> SettlingNonFull -> Settled(NotDeliveredStreamSettled | PartialOrFailedStreamSettled)
+```
 
-| 首个成功 claim | 必须结果 |
+只有 lane-owned backend completion consumer 能消费真实 completion 并取得 `SettlingNonFull` 的排他 owner。full completion 在
+`Outstanding -> Settled(FullAccepted)` 的同一临界区 claim effect；non-full completion 先由该 owner 完成 interrupt/close 与
+stream settlement，再在 `SettlingNonFull -> Settled(...)` 的同一临界区 claim cancellation/failure。`SettlingNonFull` 不是
+terminal，不发布 event 或唤醒 waiter。action report 的 `FullAccepted` hook claim 真实 Operation arbiter；release/close
+neutral 的 hook claim 对应唯一 cleanup record。重复、迟到、wrong-generation 或已经 settled 的 completion/hook 必须无效果。
+
+当 gate 为 `Outstanding` 时，caller cancellation、Operation deadline、generation seal、Controller close 或 Runtime close
+只能在现有 cancellation authority 登记 first reason，并请求相应 generation/controller-scoped I/O interrupt；它们不得先
+claim cancellation/close winner，也不得仅因 token bit、lane command 或 waker 把 Operation 改到排除 success 的状态。
+若 gate 仍为 `NotDispatched`，owner 可以在证明没有 I/O effect 后直接 settle 为 not-delivered 并 claim 相应 terminal；若 gate
+已经 `Settled(FullAccepted)`，迟到 intent 只能观察 accepted winner。
+
+唯一 backend settlement gate 消费真实 completion 后，必须按可观察结果进入上述唯一分支；只有 full acceptance 或已经
+证明 stream settled 的 non-full outcome 才能在对应最终 transition 的同一临界区 claim：
+
+| settlement evidence | 唯一 winner 与结果 |
 | --- | --- |
-| 完整 report acceptance | accepted effect 保留；正常 cleanup 后 action 为 `Succeeded`，较晚 generation seal、cancel 或 close 不得进入 `Cancelling` 或改成 `Cancelled` |
-| cancellation/close | 禁止 late success；立即请求对应 I/O interruption，证明 write 已返回且 stream settled 后才提交 `Cancelled`/既有 close outcome |
-| failure/deadline | 保留既有 first-error/first-reason；禁止后来 acceptance 或 cancellation 覆盖 |
+| 累计 transferred bytes 精确达到完整 report 长度 | `FullAccepted` 必须胜出；正常 cleanup 后 action 为 `Succeeded`，已经登记或较晚到达的 cancel/deadline/close intent 都不能改写为 `Cancelled`，已登记 first reason 保持 immutable diagnostic 但不成为 terminal winner |
+| 已确认 I/O aborted/not dispatched，完整 report 未接受，且存在 first cancellation reason | 先证明 stream settled，再按该 immutable first reason claim cancellation/deadline/close 的既有投影；禁止 late success |
+| partial bytes 或 I/O failure，完整 report 未接受 | 按下节 settle/关闭 stream 后，以既有 first-reason/first-error 优先级 claim cancellation 或 failure；禁止伪造 acceptance |
+| completion/byte count 仍不确定 | 没有合法 winner；必须继续 settlement 或进入 `CloseFailed`，不能提交 terminal、唤醒 terminal waiter 或清零 registry |
 
-transport 在 cancellation claim 后仍可能观察到底层迟到 completion；该 completion 只能用于证明 stream settlement，不能
-重新 claim accepted effect。若底层无法证明取消前后 byte 边界，必须按下节关闭不确定 stream，不能从“write 最终返回了
-完整长度”反推 late success。
+Windows overlapped adapter 必须把 `CancelIoEx` 只视为 interrupt request。`ERROR_NOT_FOUND` 不能投影为 cancelled，也不能推断
+未发生 effect；adapter 必须继续以 `GetOverlappedResult` 或等价的唯一 completion consumer 取得最终 transferred byte count。
+若结果是完整 report，`FullAccepted` 必须胜过此前登记但晚于真实 completion 的 cancel intent；若结果是 aborted、partial 或
+failure，才按上表 settle。即使 cancellation thread 在 completion 尚未被用户态 gate 消费时先登记 intent，也不能覆盖已经
+由 backend 完成的最后一个 byte。
 
 ## I/O interruption、partial write 与 stream settlement
 
@@ -176,57 +213,70 @@ transport 在 cancellation claim 后仍可能观察到底层迟到 completion；
 Controller 为每个 lane-owned in-flight write 建立一个只用于 interrupt 的 handle。handle 可以从 caller/close 线程发出
 取消信号，但不能提交 report、修改 desired state/lease、关闭 registry 或成为第二个 writer；transport I/O 的 submit、
 completion 解释、stream settlement 与最终 close 仍只由 Controller lane owner 执行。serial backend 必须保证 interrupt
-能使阻塞 write 在既有 bounded transport timeout 内返回；fake 必须实现同一 contract，而不是依赖测试释放 barrier 才退出。
+能使阻塞 write 在既有 bounded transport timeout 内产生可消费的 completion；interrupt 返回、`CancelIoEx` 成功或 token
+变为 cancelled 都不能自行决定 terminal。fake 必须实现同一 settlement contract，而不是依赖测试释放 barrier 才退出。
 
 interruption scope 必须分层：
 
-- **generation action scope**：lease generation 在 seal 时原子拒绝新 action，并直接对该 generation 中尚未 acceptance
-  claim 的 action 发出 `ParentClose` cancellation claim 与 I/O interrupt。它不能取消当前或随后开始的 release neutral。
+- **generation action scope**：lease generation 在 seal 时原子拒绝新 action。对该 generation 中 `NotDispatched` 的 action，
+  owner 可证明无 effect 后 settle cancellation；对 `Outstanding` action，seal 只登记 immutable `ParentClose` first reason 并
+  请求 generation-scoped I/O interrupt，必须等待 backend settlement gate 决定 full acceptance 或 cancellation。它不能取消
+  当前或随后开始的 release neutral。
 - **release scope**：显式/Drop release neutral 使用独立于 generation/run token 的 I/O token，因此 run cancellation、future
   drop 与 generation seal 不能中断它。
-- **Controller close scope**：resource close 拥有上级 interrupt authority，可以中断尚未 acceptance 的 action，也可以
-  中断并接管已经开始的 release neutral。它不把 release token 错误地改成 generation token。
+- **Controller close scope**：resource close 拥有上级 interrupt authority，可以请求中断 outstanding action，也可以请求
+  中断并接管已经开始的 release neutral。action 在现有 Operation authority 登记 immutable first reason；release 在同一
+  cleanup record 登记一次 close intent，不建立第二份 cancellation-reason authority。两者都由 backend settlement gate
+  裁定，不能由 close 线程抢先 claim；release token 也不能被错误地改成 generation token。
 - **close-owned neutral scope**：Controller close 自己新建的 neutral attempt 使用新的、未取消的 close token，只受
   Controller close、既有 bounded transport timeout 与不可恢复 transport failure 约束；不得复用刚刚取消的 action、run
   或 release token。
 
 ### partial write
 
-partial prefix 永远不是 logical report effect acceptance。adapter 可以在同一次 write 内继续已知的 partial completion，
-但若 cancellation、timeout 或 failure 使 logical report 在完整 acceptance claim 前终止，则必须先完成以下 settlement，
-之后才能结算 Operation/release waiter 或发下一份 report：
+partial prefix 永远不是 logical report effect acceptance。adapter 可以在同一次 write 内继续已知的 partial completion；若
+唯一 settlement gate 最终确认累计 bytes 已达到完整 report，则仍必须选择 `FullAccepted`。只有 gate 确认 write 以
+not-delivered、partial、aborted 或 failure 结束时，才先完成以下 settlement，之后才能结算 Operation/release waiter 或发
+下一份 report：
 
 1. 停止/撤销 outstanding I/O，并等待其 completion 已被唯一消费；
 2. 若存在非零 prefix、迟到 byte 数不确定、framing 不确定或 backend 不能证明可复用，幂等关闭 transport 并等待 close
    完成，把 Controller 永久 seal；
 3. 只有 backend 明确证明零 effect、无 outstanding completion 且 stream framing 可复用时，lane 才可继续同一 generation
    的 paced neutral；
-4. 记录只能结算为既有 cancellation/failure 或 `NeutralNotDeliveredStreamSettled`，不得伪造 success/acceptance，也不得在
-   旧 stream 未 settled 时重试 neutral。
+4. 若存在 cancellation intent，保留其 immutable first reason；记录只能结算为既有 cancellation/failure 或
+   `NeutralNotDeliveredStreamSettled`，不得伪造 success/acceptance，也不得在旧 stream 未 settled 时重试 neutral。
 
 stream settled 表示不会再有该 write 的 byte、completion 或 acceptance hook 作用于当前或后续 generation；仅 future 被
 drop、token 被设置或 lane command 被移除都不构成 settled。
 
 ## release 与 Controller close 接管
 
-generation seal 必须在 `neutralize_and_release(self)` 返回 future 前发生，并从 caller 线程直接触发未接受 action 的上述
-interrupt；它不能依赖 lane 先取到 seal command。lane 等所有已 admission action 取得唯一 terminal 且其 stream settled
+generation seal 必须在 `neutralize_and_release(self)` 返回 future 前发生，并从 caller 线程为未结算 action 登记 immutable
+first reason；只有其 gate 为 `Outstanding` 时才直接请求上述 generation-scoped interrupt。seal 不能抢先 claim，也不能依赖
+lane 先取到 seal command；lane 必须消费真实 completion。所有已 admission action 取得唯一 terminal 且其 stream settled
 后，才按既有 Runtime clock/pacing 开始该 generation 的唯一 release neutral。
 
-Controller close 对 release cleanup record 的接管必须保持单 record、单 completion、单 neutral attempt：
+Controller close 对 release cleanup record 的接管必须按该 record 的 dispatch 状态保持单 record、单 completion、单次
+neutral dispatch：
 
-- neutral acceptance 已先 claim 时，close 复用该 record 的 `NeutralAccepted`，不得改成未交付或取消；
-- close 在 neutral acceptance 前先 claim 时，close 发出 release I/O interrupt，等待 stream settled，并在同一 record 完成
-  `NeutralNotDeliveredStreamSettled`；不得再发送第二个 neutral 来掩盖第一次未接受；
-- 不可恢复的 interrupt/close/ownership failure 继续使用 ADR-0018 已有 `Err(cleanup_failure)`，永久 seal Controller，
-  不得清零或伪造 `Closed`；
-- 若显式 release 已经完全终结、generation 已清除，之后才开始独立的 resource close，则该 close 不再是对旧 record 的
-  takeover；它按既有 Controller close 合同发送自己的一次 paced neutral，并使用新的 close-owned token。
+| close 观察到的 release 状态 | close ownership 与唯一结果 |
+| --- | --- |
+| `NeutralUndispatched` | close 继承同一 cleanup record，使用新的 close-owned token 执行这一个 paced neutral；完整 acceptance 为 `NeutralAccepted`，确认 not-delivered 且 stream settled 才为 `NeutralNotDeliveredStreamSettled` |
+| `NeutralInFlight` | close 只在同一 record 登记 close intent 并请求 interrupt；backend settlement gate 若观察到完整 acceptance，则同一 record 为 `NeutralAccepted`；只有 non-full close-interrupt/transport-cancel evidence 胜出时才 settle 为 `NeutralNotDeliveredStreamSettled`，且不得重试第二个 neutral |
+| `ReleaseSettled` | close 不得重开或改写旧 record；若 resource close 此后才独立开始，则按既有合同另行执行一次 final paced neutral，并使用新的 close-owned token |
 
-Controller close 的精确 lane 顺序为：seal acquire/action admission；按 ADR-0018 优先级结算 pending acquire；对未接受
-action claim cancellation 并 interrupt；接管 active release record；等待所有相关 write/stream settlement；提交 action 与
-release 的唯一 terminal/completion；清除匹配 generation 并唤醒 waiter；必要时执行 close-owned neutral；最终幂等关闭
-transport 并 join lane。任何 waiter completion、Operation terminal 或 registry unlink 都不能先于其所属 stream settlement。
+因此“close 在 acceptance 前到达”本身不足以宣告 `NeutralNotDeliveredStreamSettled`：neutral 尚未 dispatch 时 close 必须执行
+同一 record 的唯一 neutral；neutral 已 outstanding 时必须先消费真实 completion。不可恢复的 interrupt/close/ownership
+failure 继续使用 ADR-0018 已有 `Err(cleanup_failure)`，永久 seal Controller；若无法证明 stream settled 或合法 owner，
+不得清零 registry、伪造 `Closed` 或唤醒 completion waiter。
+
+Controller close 的精确 lane 顺序为：seal acquire/action admission；按 ADR-0018 优先级结算 pending acquire；对未接受且
+`NotDispatched` 的 action 直接 settle cancellation，对 `Outstanding` action 只登记 first reason 并 interrupt；按上述三态
+接管 active release record；由唯一 backend gate 消费所有相关 completion 并完成 stream settlement；再提交 action 与 release
+的唯一 terminal/completion、清除匹配 generation 并唤醒 waiter；必要时执行 `ReleaseSettled` 后独立的 final neutral；最终
+幂等关闭 transport 并 join lane。任何 waiter completion、Operation terminal 或 registry unlink 都不能先于其所属 stream
+settlement；lane panic 时还必须服从下节的保守分支。
 
 ## task、thread 与 close ownership
 
@@ -235,43 +285,82 @@ transport 并 join lane。任何 waiter completion、Operation terminal 或 regi
 | owner | 唯一职责 | 明确禁止 |
 | --- | --- | --- |
 | Runtime deadline worker | deadline queue、SystemClock real wait、VirtualClock change scan、signal fire 与 shutdown drain | Controller callback、lease mutation、假 Operation/event/registry |
-| Runtime Operation owner | terminal arbiter、first reason/error、cleanup 后 commit、event 与 registry 顺序 | 在 transport acceptance 外猜测 effect |
-| Controller lane | 唯一 report writer、desired report、lease generation、release record、I/O completion 与 transport close | 自建 deadline thread、让 caller 成为第二 writer |
-| thread-safe interrupt handle | 使指定 in-flight I/O 返回 | 写 report、提交 terminal、修改 generation 或复用为 cancellation reason authority |
+| Runtime Operation owner | terminal arbiter、first reason/error、合法 settlement 后 claim/cleanup/commit、event 与 registry 顺序 | 把 cancellation intent 当作 winner，或在 domain evidence 外猜测 effect |
+| Controller lane-owned backend settlement gate | 唯一 report writer、desired report、lease generation、release record、真实 I/O completion 消费与 transport close | 自建 deadline thread、让 caller/interrupt handle 成为第二 writer 或 settlement owner |
+| thread-safe interrupt handle | 对指定 in-flight I/O 发出 interrupt request | 消费 completion、解释 byte count、写 report、close/接管 transport、提交 terminal 或修改 generation |
 | caller/executor | poll handle、观察 wake、请求 cancel/release/close | 通过持续 poll 或测试 barrier 承担正确性进展 |
 
-Runtime close 保留 ADR-0006/0007 的根 owner：先 seal 新工作并发出 root cancellation；在 deadline infrastructure 仍可服务
-既有 registration 时关闭并 join resources/Controller；等待 Operation owner cleanup、terminal commit 与 registry unlink；
-再 drain/disarm 剩余 deadline registration 并 join deadline worker；最后完成既有 supervised task/thread 与 Runtime close
-检查。实现可以把这些步骤映射到现有内部 phase 名称，但不得形成 Runtime 等 Controller、Controller 反向等 Runtime
-worker 的 join cycle。
+### 可转移 owner 与 lane panic
+
+generic permit 只在以下条件全部成立时允许 supervisor handoff：工作开始前，Operation 已登记唯一 owner identity，且
+supervisor 已经持有显式的 transferable cleanup/settlement owner；原 owner task 已经 join，能够证明不存在仍可 commit 的
+live owner；全部 cleanup state 与 effect/settlement evidence 位于该 transferable owner 控制的共享 record，而不是原线程栈、
+TLS 或已遗失的 domain object；handoff 本身通过同一 arbiter 恰好一次转移 owner identity。满足这些条件后，新 owner 才能
+按既有 first-error 规则 cleanup 并 commit；仅检测到 panic、持有 interrupt handle 或拥有 Operation permit 都不满足条件。
+
+当前 Controller lane 独占 `ControllerTransport`、backend completion consumption、desired report、lease generation 与 release
+record；当前代码没有预先登记的 transferable transport settlement owner，也没有能够证明 byte/completion、framing 与
+cleanup ownership 已从 panicked lane 完整转移的 Drop-settlement contract。因此 D1 不得声称或实现 lane panic takeover：
+
+- lane panic 后，interrupt handle 可以请求 OS I/O 返回，但不能消费 completion、调用/解释 acceptance hook、接管或关闭
+  lane-owned transport，也不能提交 action/release terminal；transport Drop 或 OS handle close 本身不证明 logical stream
+  settled。
+- Runtime/Controller close 必须投影 ADR-0006 的 `CloseFailed`，保留 panic/owner identity/Controller identity 的可诊断
+  first error，并保留尚未合法 settlement 的 Operation、cleanup record 与 registry identity；不得伪造 `Cancelled`、
+  `Failed`、`Closed`、waiter completion 或 registry zero。
+- 非终态与 registry 保留持续到合法 owner settlement；本 proposal 不授权构造该 owner。未来若要接管 Controller lane，
+  必须另行完整冻结 owner identity、panic detection、transport ownership transfer、completion consumption、cleanup/error
+  projection 与 exactly-once commit，并重新审查受影响冻结面。
+
+### Runtime close 顺序
+
+Runtime close 保留 ADR-0006/0007 的根 owner 和既有
+`external task join -> Operation fallback -> internal worker join` 语义，精确顺序为：
+
+1. seal 新工作与新 deadline registration，发出 root cancellation 并启动 resource/Controller close；deadline internal worker
+   继续服务已有 registration。
+2. 在该 worker 仍运行时完成 resource close/interrupt，并 join 全部普通 supervised/external owner task，包括 Controller
+   lane；不得先 drain registration 来迫使 owner 退出。
+3. external task join 后，执行既有 Operation owner settlement/fallback。只有持有上述 transferable owner 的 supervisor 才能
+   handoff 并 commit；Controller lane 等不可转移 owner 的 panic 进入 `CloseFailed` 并保留 registry。
+4. 所有可能持有 registration 的 external owner 已 join，且合法 owner settlement/fallback 已完成后，drain/disarm 剩余
+   registration 为 `RuntimeClosed`，停止并 join deadline internal worker。
+5. internal worker join 后才执行最终 operation/resource/task/deadline registry 检查；任何保守分支留下的非终态或 registry
+   identity 必须使 close 返回 `CloseFailed`，不能被清零。
+
+Runtime close coordinator 是唯一 join owner；deadline internal worker 从不等待或 join Controller/external owner，Controller
+lane 与 external owner 也不得等待 worker shutdown，只能注册、观察或 disarm signal。close coordinator 在 join resource/
+task 时不得持有 deadline queue 或 Operation arbiter lock。由此 deadline 进展与外部 owner settlement 保持可用，同时不存在
+Runtime 等 Controller、Controller 反向等待 Runtime internal worker 的 join cycle。
 
 ## 方案比较
 
 | 方案 | 能闭合的缺口 | 不能接受的代价或剩余缺口 | 结论 |
 | --- | --- | --- | --- |
-| A. 先扩展 Runtime deadline/two-phase terminal primitive，Phase 1 refreeze 后再由 D1 窄接 transport acceptance hook | 一个 Runtime clock authority；非 Operation deadline；effect/cancel 单 arbiter；沿用 Operation event/registry/close owner | 需要依次窄重开 Phase 1 内部 terminal/deadline 与 Phase 2A transport adapter/fake，不能合并实施或 refreeze | **选择**；这是同时满足四条 RED 的最小分阶段组合 |
+| A. 先扩展 Runtime deadline/two-phase terminal primitive，Phase 1 refreeze 后再由 D1 窄接 backend settlement/acceptance hook | 一个 Runtime clock authority；非 Operation deadline；intent 与 completion 由单 settlement arbiter 决议；沿用 Operation event/registry/close owner | 需要依次窄重开 Phase 1 内部 terminal/deadline 与 Phase 2A transport adapter/fake，不能合并实施或 refreeze | **选择**；这是同时满足四条 RED 的最小分阶段组合 |
 | B. 新增 Controller supervised timer/arbiter | 可单独唤醒 acquire，也可保存 Controller 私有 winner | 复制 Runtime clock/terminal authority，增加 thread/task 和双向 close 顺序；仍不能决定真实 Operation accepted effect | 拒绝 |
-| C. 把 Controller Operation 移出 Runtime 根 cancellation，或让 transport 直接提交 terminal | 可绕开 close 覆盖的局部症状 | 破坏 ADR-0004/0006/0007 的 Runtime 根 ownership；transport 获得 event/registry authority；仍没有 SystemClock acquire deadline | 拒绝单独采用；只接受无 terminal authority 的窄 acceptance/interrupt hook |
+| C. 把 Controller Operation 移出 Runtime 根 cancellation，或让 transport 直接提交 terminal | 可绕开 close 覆盖的局部症状 | 破坏 ADR-0004/0006/0007 的 Runtime 根 ownership；transport 获得 event/registry authority；仍没有 SystemClock acquire deadline | 拒绝单独采用；只接受无 event/registry authority 的窄 backend settlement/acceptance/interrupt hook |
 | D. 为每个 acquire 创建隐藏 Operation | 可复用当前 Operation deadline scan | 伪造 OperationId、terminal event、registry count 与 telemetry，改变外部观察且把非 Operation request冒充 Operation | 拒绝 |
 
 选择 A 不是偏好性抽象：当前代码已经由 Runtime 唯一拥有 Clock、Operation terminal/event/registry 与 root close，Controller
 已经由单 lane 唯一拥有 transport I/O 和 lease mutation。R0-v2 把 generic deadline/terminal 留在 Runtime，D1 随后只把
-真实 acceptance 与 interrupt 接入 ControllerTransport；这一顺序保留两条冻结 ownership，也避免用 Phase 1 refreeze
+真实 settlement/acceptance 与 interrupt 接入 ControllerTransport；这一顺序保留两条冻结 ownership，也避免用 Phase 1 refreeze
 错误覆盖尚未审查的 Phase 2A production transport 变更。
 
 ## 窄重开与保持不变的冻结面
 
 本文只有在后续 acceptance 生效时才窄重开：
 
-- ADR-0006：Operation terminal/cancellation 的内部 claim/commit 仲裁、owner takeover 与 close 等待合同；
+- ADR-0006：Operation terminal/cancellation 的 intent/settlement/claim/commit 仲裁、仅在预持有 transferable owner 时的
+  conditional handoff、不可转移 owner 的 `CloseFailed` 与 close 等待合同；
 - ADR-0007：Runtime deadline scheduler、两阶段 terminal primitive、相应 Loom/spec/conformance 与 close drain，并要求新的
   Phase 1 implementation candidate 通过完整门禁后单独 refreeze；
-- ADR-0009：仅授权未来 D1 修改 `ControllerTransport::write` acceptance/interrupt/stream settlement hook、system serial
-  adapter、fake 与 partial-I/O conformance；R0-v2 不得修改这些 production 表面，单 writer、协议、pacing、ACK 与
-  Hardware Unverified 状态不变；
+- ADR-0009：仅授权未来 D1 修改 `ControllerTransport::write` backend settlement/acceptance/interrupt hook、system serial
+  adapter、fake 与 partial-I/O/overlapped-completion conformance；R0-v2 不得修改这些 production 表面，单 writer、协议、
+  pacing、ACK 与 Hardware Unverified 状态不变；
 - ADR-0017：只以 Runtime-only R0-v2 取代旧 R0 窄范围，并把其 Phase 1 refreeze 设为 D1 的真实前置；
-- ADR-0018：只取代 D1/R0 独立性和“不触及 serial transport 内部边界”的实施假设；其余 D0 合同继续有效。
+- ADR-0018：只取代 D1/R0 独立性和“不触及 serial transport 内部边界”的实施假设，并把 success-after-acceptance 落到
+  completion settlement gate；其五态 acquire 优先级、immutable first cancellation reason 与其余 D0 合同继续有效。
 
 保持不变：ADR-0004 的根 Runtime/Operation/事件/确定性关闭原则；Operation 六个可见状态；ErrorDomain、OperationValue、
 event schema 与 registry identity；public C ABI 与四语言；ADR-0019 C1 lexer 合同及其独立 implementation 授权；Phase 2A
@@ -291,7 +380,8 @@ ADR-0020 fixed-SHA proposal
   -> fixed-SHA independent implementation review
   -> separate Phase 1 refreeze
   -> resume D1 with the existing four RED unchanged
-  -> D1 ControllerTransport/system serial/fake acceptance, interrupt,
+  -> D1 ControllerTransport/system serial/fake backend settlement,
+     acceptance, interrupt,
      partial-I/O and close-takeover implementation
   -> all affected Phase 2A and Runtime gates
   -> D2 fixed-SHA independent review and separate Controller refreeze
@@ -299,17 +389,28 @@ ADR-0020 fixed-SHA proposal
 
 R0-v2 至少必须只用 Runtime fake/model 与 deterministic/Loom/conformance 证据覆盖：SystemClock 在任意 consumer 无进展时
 deadline signal 仍可触发、VirtualClock 只随 advance 且同点排序稳定、registration resolve/drop/Runtime close 恰好一次、
-generic effect/cancel/close claim 竞态、accepted claim 与 terminal commit 间的 late cancellation、owner panic/takeover、
-event/registry/waiter 唯一顺序，以及 deadline/Operation/task/resource registry 最终无泄漏。R0-v2 的 source/test diff 不得
-包含 production ControllerTransport、system serial 或 Controller fake。归档 `c6e01b65` 可作为设计输入或测试来源，但新的
-Runtime-only implementation candidate 必须以自己的 fixed SHA 接受审查。
+outstanding generic work 只登记 cancellation intent 且不能抢先 claim、settlement evidence 与 claim 的原子性、accepted claim
+与 terminal commit 间的 late cancellation、预持有 transferable owner 的合法 handoff、无 transferable owner 时的
+`CloseFailed`/registry 保留、event/registry/waiter 唯一顺序，以及 external task join、Operation fallback、deadline internal
+worker join 与最终 registry 检查顺序。R0-v2 的 source/test diff 不得包含 production ControllerTransport、system serial 或
+Controller fake。归档 `c6e01b65` 可作为设计输入或测试来源，但新的 Runtime-only implementation candidate 必须以自己的
+fixed SHA 接受审查。
 
 Phase 1 refreeze 不改变四条现有 D1 RED 的治理状态。D1 恢复后必须先按原样运行它们，不能删除、放宽 bounded deadline、
-以 sleep 拉长掩盖竞态或预先改写为“已通过”；随后才实现 ControllerTransport/system serial/fake acceptance hook、分层
-interrupt、partial-I/O settlement 与 close takeover，并增加 full acceptance/close 确定性 barrier、cancel-before-acceptance、
-partial prefix/late completion、release takeover 和 system serial/fake parity。D1 必须运行所有受影响 Phase 2A 与 Runtime
-门禁；D2 再固定完整 D1 candidate SHA，完成独立 review 与单独 Controller refreeze。R0-v2 refreeze、单条 D1 测试通过或
-D1 自报完整门禁都不能代替 D2。
+以 sleep 拉长掩盖竞态或预先改写为“已通过”；随后才实现 ControllerTransport/system serial/fake backend settlement/
+acceptance hook、分层 interrupt、partial-I/O settlement 与 close takeover。D1 exact conformance 至少还必须新增：
+
+- last-byte completion 与 cancellation intent 的双向 deterministic barrier；完整 completion 即使尚未被 lane 消费也必须
+  胜过迟到 cancel，confirmed abort/not-delivered 才按 first reason 取消；
+- Windows `CancelIoEx == ERROR_NOT_FOUND` 后 `GetOverlappedResult` 返回完整 transferred bytes，必须投影
+  `FullAccepted`/`Succeeded`，不得投影 `Cancelled`；
+- release `NeutralUndispatched`、`NeutralInFlight` 与 `ReleaseSettled` 三态 close takeover，分别证明唯一 close-owned
+  neutral、in-flight settlement 且不重试、以及旧 record 终结后的独立 final neutral；
+- partial prefix/late completion、system serial/fake parity，以及 Controller lane panic 无 transferable owner 时
+  `CloseFailed`、非终态/registry 保留且 interrupt handle 不冒充 transport owner。
+
+D1 必须运行所有受影响 Phase 2A 与 Runtime 门禁；D2 再固定完整 D1 candidate SHA，完成独立 review 与单独 Controller
+refreeze。R0-v2 refreeze、单条 D1 测试通过或 D1 自报完整门禁都不能代替 D2。
 
 ## 本 proposal 的 docs-only 门禁
 
@@ -319,6 +420,8 @@ D1 自报完整门禁都不能代替 D2。
 python -B tools/check_markdown_links.py
 python -B tools/check_repository_guards.py
 git diff --check
+git diff --check 2fe7eb2ef50f9ec49fe4e186b36605b6502aebb1
+git diff --cached --check
 ```
 
 这些命令只证明 proposal 文档引用、仓库边界和 diff hygiene，不证明 Runtime/Controller/serial implementation、Rust/Loom、
