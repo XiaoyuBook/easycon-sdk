@@ -89,6 +89,59 @@ function Wait-ContractFileCreated {
     }
 }
 
+function Wait-ContractFilesCreated {
+    param(
+        [Parameter(Mandatory)]
+        [string[]]$Path,
+
+        [int]$TimeoutMilliseconds = 15000
+    )
+
+    Assert-Contract ($Path.Count -gt 0) `
+        "synchronized contract file set must not be empty"
+    $fullPaths = @($Path | ForEach-Object { [System.IO.Path]::GetFullPath($_) })
+    $directory = Split-Path -Parent $fullPaths[0]
+    foreach ($candidate in $fullPaths) {
+        Assert-Contract (
+            (Split-Path -Parent $candidate) -ceq $directory
+        ) "synchronized contract files must share one watched directory"
+    }
+
+    $watcher = [System.IO.FileSystemWatcher]::new($directory)
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        $watcher.NotifyFilter = [System.IO.NotifyFilters]::FileName
+        $watcher.EnableRaisingEvents = $true
+        while ($true) {
+            $missing = @($fullPaths | Where-Object {
+                -not (Test-Path -LiteralPath $_ -PathType Leaf)
+            })
+            if ($missing.Count -eq 0) {
+                return
+            }
+
+            $remaining = $TimeoutMilliseconds - [int]$timer.ElapsedMilliseconds
+            Assert-Contract ($remaining -gt 0) (
+                "timed out waiting for synchronized contract files: {0}" -f
+                    ($missing -join ', ')
+            )
+            $change = $watcher.WaitForChanged(
+                [System.IO.WatcherChangeTypes]::Created -bor
+                    [System.IO.WatcherChangeTypes]::Renamed,
+                $remaining
+            )
+            Assert-Contract (-not $change.TimedOut) (
+                "timed out waiting for synchronized contract files: {0}" -f
+                    ($missing -join ', ')
+            )
+        }
+    }
+    finally {
+        $timer.Stop()
+        $watcher.Dispose()
+    }
+}
+
 function Set-ContractFile {
     param(
         [Parameter(Mandatory)]
@@ -2635,8 +2688,10 @@ param(
     [Parameter(Mandatory)][string]$ExpectedWorkspaceRoot,
     [Parameter(Mandatory)][string]$EnvironmentReadyMarker,
     [Parameter(Mandatory)][string]$EnvironmentReadyValue,
+    [Parameter(Mandatory)][string]$StartMarker,
     [Parameter(Mandatory)][string]$ReadyMarker,
     [Parameter(Mandatory)][string]$ReleaseMarker,
+    [Parameter(Mandatory)][int]$ReleaseTimeoutMilliseconds,
     [Parameter(Mandatory)][string]$ResultPath,
     [Parameter(Mandatory)][string]$VcpkgRoot,
     [Parameter(Mandatory)][string]$VcpkgExecutable,
@@ -2650,24 +2705,30 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
-function Wait-ProbeRelease {
-    if (Test-Path -LiteralPath $ReleaseMarker -PathType Leaf) {
+function Wait-ProbeMarker {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Description,
+        [Parameter(Mandatory)][int]$TimeoutMilliseconds
+    )
+
+    if (Test-Path -LiteralPath $Path -PathType Leaf) {
         return
     }
     $watcher = [System.IO.FileSystemWatcher]::new(
-        (Split-Path -Parent $ReleaseMarker),
-        (Split-Path -Leaf $ReleaseMarker)
+        (Split-Path -Parent $Path),
+        (Split-Path -Leaf $Path)
     )
     try {
         $watcher.NotifyFilter = [System.IO.NotifyFilters]::FileName
         $watcher.EnableRaisingEvents = $true
-        if (-not (Test-Path -LiteralPath $ReleaseMarker -PathType Leaf)) {
+        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
             $change = $watcher.WaitForChanged(
                 [System.IO.WatcherChangeTypes]::Created,
-                15000
+                $TimeoutMilliseconds
             )
-            if ($change.TimedOut -or -not (Test-Path -LiteralPath $ReleaseMarker -PathType Leaf)) {
-                throw "concurrent Verify probe timed out waiting for release"
+            if ($change.TimedOut -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+                throw "concurrent Verify probe timed out waiting for $Description"
             }
         }
     }
@@ -2675,6 +2736,9 @@ function Wait-ProbeRelease {
         $watcher.Dispose()
     }
 }
+
+Wait-ProbeMarker -Path $StartMarker -Description "parent start" `
+    -TimeoutMilliseconds $ReleaseTimeoutMilliseconds
 
 Import-Module -Name $ModulePath -Force
 $module = Get-Module windows_workspace
@@ -2716,7 +2780,8 @@ $verify = {
         "ready",
         [System.Text.UTF8Encoding]::new($false)
     )
-    Wait-ProbeRelease
+    Wait-ProbeMarker -Path $ReleaseMarker -Description "release" `
+        -TimeoutMilliseconds $ReleaseTimeoutMilliseconds
     & $module {
         param($Root, $Configuration, $Executable)
         Assert-EasyConVcpkgCheckout -VcpkgRoot $Root `
@@ -2756,6 +2821,19 @@ $result = [ordered]@{
 )
 '@
 
+            $probeReadinessTimeoutMilliseconds = 15000
+            $legacySequentialReadinessBudgetMilliseconds =
+                2 * $probeReadinessTimeoutMilliseconds
+            $probeReleaseTimeoutMilliseconds =
+                $legacySequentialReadinessBudgetMilliseconds + 5000
+            Assert-Contract (
+                $probeReleaseTimeoutMilliseconds -ge
+                    ($legacySequentialReadinessBudgetMilliseconds + 5000)
+            ) (
+                "a ready Verify child release watchdog must cover the former sequential " +
+                "parent readiness budget with margin"
+            )
+
             $verifyProcesses = [System.Collections.Generic.List[object]]::new()
             try {
                 foreach ($entry in @(
@@ -2770,6 +2848,7 @@ $result = [ordered]@{
                         Location = $secondLocation
                     }
                 )) {
+                    $start = Join-Path $verifyProbeRoot "$($entry.Name)-start.txt"
                     $ready = Join-Path $verifyProbeRoot "$($entry.Name)-ready.txt"
                     $release = Join-Path $verifyProbeRoot "$($entry.Name)-release.txt"
                     $result = Join-Path $verifyProbeRoot "$($entry.Name)-result.json"
@@ -2788,8 +2867,10 @@ $result = [ordered]@{
                         "-ExpectedWorkspaceRoot", $entry.Location.WorkspaceRoot,
                         "-EnvironmentReadyMarker", $readyMarker,
                         "-EnvironmentReadyValue", $fixedSha,
+                        "-StartMarker", $start,
                         "-ReadyMarker", $ready,
                         "-ReleaseMarker", $release,
+                        "-ReleaseTimeoutMilliseconds", $probeReleaseTimeoutMilliseconds,
                         "-ResultPath", $result,
                         "-VcpkgRoot", $preparedVcpkgRoot,
                         "-VcpkgExecutable", $preparedVcpkgTool,
@@ -2804,6 +2885,7 @@ $result = [ordered]@{
                     $verifyProcesses.Add([pscustomobject]@{
                         Name = $entry.Name
                         Process = [System.Diagnostics.Process]::Start($startInfo)
+                        Start = $start
                         Ready = $ready
                         Release = $release
                         Result = $result
@@ -2811,10 +2893,93 @@ $result = [ordered]@{
                     }) | Out-Null
                 }
 
+                $readinessTimer = [System.Diagnostics.Stopwatch]::StartNew()
+                [System.IO.File]::WriteAllText(
+                    $verifyProcesses[0].Start,
+                    "start",
+                    [System.Text.UTF8Encoding]::new($false)
+                )
+                $remainingReadiness = $probeReadinessTimeoutMilliseconds -
+                    [int]$readinessTimer.ElapsedMilliseconds
+                Assert-Contract ($remainingReadiness -gt 0) `
+                    "startup-skew readiness budget must remain positive"
+                Wait-ContractFileCreated -Path $verifyProcesses[0].Ready `
+                    -TimeoutMilliseconds $remainingReadiness
+                Assert-Contract (
+                    -not (Test-Path -LiteralPath $verifyProcesses[1].Ready -PathType Leaf)
+                ) "the startup-skew probe must remain parent-gated until the first probe is ready"
+                [System.IO.File]::WriteAllText(
+                    $verifyProcesses[1].Start,
+                    "start",
+                    [System.Text.UTF8Encoding]::new($false)
+                )
+                $remainingReadiness = $probeReadinessTimeoutMilliseconds -
+                    [int]$readinessTimer.ElapsedMilliseconds
+                Assert-Contract ($remainingReadiness -gt 0) `
+                    "the single parent readiness deadline expired before the second probe start"
+                Wait-ContractFilesCreated `
+                    -Path @($verifyProcesses | ForEach-Object { $_.Ready }) `
+                    -TimeoutMilliseconds $remainingReadiness
+                $readinessTimer.Stop()
+
                 foreach ($probe in $verifyProcesses) {
-                    Wait-ContractFileCreated -Path $probe.Ready
                     Assert-Contract (-not $probe.Process.HasExited) `
                         "real Verify probe $($probe.Name) must remain inside the marker barrier"
+                }
+                Assert-Contract (
+                    $verifyProcesses[0].Location.EnvironmentRoot -ceq
+                        $verifyProcesses[1].Location.EnvironmentRoot -and
+                    $verifyProcesses[0].Location.WorkspaceRoot -cne
+                        $verifyProcesses[1].Location.WorkspaceRoot
+                ) "startup-skew probes must share e/ and retain distinct w/<key> roots"
+
+                $environmentLease = $null
+                $environmentLeaseFailure = $null
+                try {
+                    $environmentLease = Invoke-PrivateCommand `
+                        -CommandName "Enter-EasyConEnvironmentLease" -Parameters @{
+                            Location = $firstLocation
+                            Access = "Exclusive"
+                            TimeoutMilliseconds = 0
+                            RetryMilliseconds = 0
+                        }
+                }
+                catch {
+                    $environmentLeaseFailure = $_
+                }
+                finally {
+                    if ($null -ne $environmentLease) {
+                        $environmentLease.Dispose()
+                    }
+                }
+                Assert-Contract (
+                    $null -ne $environmentLeaseFailure -and
+                    $environmentLeaseFailure.Exception.Message -match 'busy|ownership'
+                ) "both ready probes must keep the shared environment lease occupied"
+
+                foreach ($probe in $verifyProcesses) {
+                    $workspaceLease = $null
+                    $workspaceLeaseFailure = $null
+                    try {
+                        $workspaceLease = Invoke-PrivateCommand `
+                            -CommandName "Enter-EasyConWorkspaceLease" -Parameters @{
+                                Location = $probe.Location
+                                TimeoutMilliseconds = 0
+                                RetryMilliseconds = 0
+                            }
+                    }
+                    catch {
+                        $workspaceLeaseFailure = $_
+                    }
+                    finally {
+                        if ($null -ne $workspaceLease) {
+                            $workspaceLease.Dispose()
+                        }
+                    }
+                    Assert-Contract (
+                        $null -ne $workspaceLeaseFailure -and
+                        $workspaceLeaseFailure.Exception.Message -match 'busy|ownership'
+                    ) "ready probe $($probe.Name) must hold its distinct w/<key> lease"
                 }
                 foreach ($probe in $verifyProcesses) {
                     [System.IO.File]::WriteAllText(
@@ -3158,6 +3323,36 @@ $result = [ordered]@{
         & $expectPreparedLeak $jsonBoundaryLeak "writable absolute path" `
             "extensionless escaped writable JSON crossing the audit window"
 
+        foreach ($trailingLeak in @(
+            [pscustomobject]@{
+                Path = Join-Path $installed "contract-trailing-source.json.in"
+                Value = '{"path":' + $escapedRepository + '} trailing'
+                Name = "JSON template escaped source before trailing junk"
+            },
+            [pscustomobject]@{
+                Path = Join-Path $installed "contract-trailing-writable-extensionless"
+                Value = '{"path":' + $escapedOtherWritable + '} trailing'
+                Name = "extensionless escaped writable path before trailing junk"
+            }
+        )) {
+            Set-ContractUtf8Text -Path $trailingLeak.Path -Value $trailingLeak.Value
+            & $expectPreparedLeak $trailingLeak.Path `
+                "source worktree absolute path|writable absolute path" $trailingLeak.Name
+        }
+
+        foreach ($afterErrorControl in @(
+            (Join-Path $installed "contract-forbidden-text-after-json-error.json.in"),
+            (Join-Path $installed "contract-forbidden-text-after-json-error-extensionless")
+        )) {
+            Set-ContractUtf8Text -Path $afterErrorControl -Value (
+                '{"portable":true} trailing ' + $escapedRepository
+            )
+            Invoke-PrivateCommand `
+                -CommandName "Assert-EasyConPreparedTreeDoesNotReferenceRepository" `
+                -Parameters $auditParameters | Out-Null
+            Remove-Item -LiteralPath $afterErrorControl -Force
+        }
+
         $utf16JsonPropertyLeak = Join-Path $installed `
             "contract-no-bom-utf16le-json.targets"
         [System.IO.File]::WriteAllText(
@@ -3216,6 +3411,128 @@ $result = [ordered]@{
                 -Parameters $auditParameters
         }
         Remove-Item -LiteralPath $invalidJson -Force
+
+        Assert-Contract ($missedLeaks.Count -eq 0) (
+            "prepared audit accepted forbidden structured paths before parser failure: {0}" -f
+                ($missedLeaks -join ', ')
+        )
+
+        $directPreparedAudit = {
+            param([Parameter(Mandatory)][string]$Fixture)
+            & $workspaceModule {
+                param($AuditPath, $RepositoryReference)
+                Initialize-EasyConPreparedArtifactAuditor
+                [EasyCon.WindowsWorkspace.PreparedArtifactAuditor]::Audit(
+                    $AuditPath,
+                    [string[]]@("source worktree"),
+                    [string[]]@($RepositoryReference)
+                )
+            } $Fixture $repositoryRoot
+        }.GetNewClosure()
+        $getInstalledFingerprint = {
+            Invoke-PrivateCommand -CommandName "Get-EasyConTreeFingerprint" `
+                -Parameters @{
+                    Path = $installed
+                    TrustedRoot = $location.EnvironmentRoot
+                }
+        }.GetNewClosure()
+
+        $oversizedToken = Join-Path $installed "contract-oversized-token.json.in"
+        Set-ContractUtf8Text -Path $oversizedToken -Value (
+            '{"payload":"' + ("x" * 65537) + '"}'
+        )
+        $beforeResourceFailure = & $getInstalledFingerprint
+        Assert-Throws -Pattern "structured JSON audit failed closed.*token exceeds" -Action {
+            Invoke-PrivateCommand `
+                -CommandName "Assert-EasyConPreparedTreeDoesNotReferenceRepository" `
+                -Parameters $auditParameters
+        }
+        $oversizedAudit = & $directPreparedAudit $oversizedToken
+        $afterResourceFailure = & $getInstalledFingerprint
+        Assert-Contract (
+            $oversizedAudit.JsonLimitExceeded -and
+            $oversizedAudit.MaximumJsonWindowBytes -le
+                [EasyCon.WindowsWorkspace.PreparedArtifactAuditor]::JsonWindowLimitBytes -and
+            $beforeResourceFailure.Files -eq $afterResourceFailure.Files -and
+            $beforeResourceFailure.Sha256 -ceq $afterResourceFailure.Sha256
+        ) "single-token resource failure must stay bounded, fail closed, and preserve the tree"
+        Remove-Item -LiteralPath $oversizedToken -Force
+
+        $oversizedAfterMatch = Join-Path $installed `
+            "contract-match-before-oversized-token.json.in"
+        Set-ContractUtf8Text -Path $oversizedAfterMatch -Value (
+            '{"path":' + $escapedRepository + ',"payload":"' +
+            ("x" * 65537) + '"}'
+        )
+        $oversizedMatchedAudit = & $directPreparedAudit $oversizedAfterMatch
+        Assert-Throws -Pattern "source worktree absolute path" -Action {
+            Invoke-PrivateCommand `
+                -CommandName "Assert-EasyConPreparedTreeDoesNotReferenceRepository" `
+                -Parameters $auditParameters
+        }
+        Assert-Contract (
+            $oversizedMatchedAudit.JsonLimitExceeded -and
+            $oversizedMatchedAudit.StructuredMatchedLabel -ceq "source worktree" -and
+            $oversizedMatchedAudit.MaximumJsonWindowBytes -le
+                [EasyCon.WindowsWorkspace.PreparedArtifactAuditor]::JsonWindowLimitBytes
+        ) "a match decoded before an oversized token must survive bounded-reader failure"
+        Remove-Item -LiteralPath $oversizedAfterMatch -Force
+
+        $excessiveDepth = Join-Path $installed "contract-excessive-depth-extensionless"
+        Set-ContractUtf8Text -Path $excessiveDepth -Value (
+            '{"path":' + $escapedRepository + ',"nested":' +
+            ("[" * 257) + '0' + ("]" * 257) + '}'
+        )
+        $beforeDepthFailure = & $getInstalledFingerprint
+        $depthAudit = & $directPreparedAudit $excessiveDepth
+        Assert-Throws -Pattern "source worktree absolute path" -Action {
+            Invoke-PrivateCommand `
+                -CommandName "Assert-EasyConPreparedTreeDoesNotReferenceRepository" `
+                -Parameters $auditParameters
+        }
+        $afterDepthFailure = & $getInstalledFingerprint
+        Assert-Contract (
+            $depthAudit.JsonLimitExceeded -and
+            $depthAudit.StructuredMatchedLabel -ceq "source worktree" -and
+            $depthAudit.MaximumJsonWindowBytes -le
+                [EasyCon.WindowsWorkspace.PreparedArtifactAuditor]::JsonWindowLimitBytes -and
+            $beforeDepthFailure.Files -eq $afterDepthFailure.Files -and
+            $beforeDepthFailure.Sha256 -ceq $afterDepthFailure.Sha256
+        ) (
+            "a match decoded before excessive JSON depth must survive reader-state " +
+            "failure without polluting the tree"
+        )
+        Remove-Item -LiteralPath $excessiveDepth -Force
+
+        $lockedAuditFixture = Join-Path $installed "contract-read-failure.json.in"
+        Set-ContractUtf8Text -Path $lockedAuditFixture -Value '{"mode":"portable"}'
+        $beforeReadFailure = & $getInstalledFingerprint
+        $lockedAuditHandle = [System.IO.File]::Open(
+            $lockedAuditFixture,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::ReadWrite,
+            [System.IO.FileShare]::None
+        )
+        try {
+            $lockedDirectAudit = & $directPreparedAudit $lockedAuditFixture
+            Assert-Contract (
+                -not [string]::IsNullOrWhiteSpace($lockedDirectAudit.ResourceFailure)
+            ) "injected prepared read failure must return controlled resource state"
+            Assert-Throws -Pattern "audit failed closed" -Action {
+                Invoke-PrivateCommand `
+                    -CommandName "Assert-EasyConPreparedTreeDoesNotReferenceRepository" `
+                    -Parameters $auditParameters
+            }
+        }
+        finally {
+            $lockedAuditHandle.Dispose()
+        }
+        $afterReadFailure = & $getInstalledFingerprint
+        Assert-Contract (
+            $beforeReadFailure.Files -eq $afterReadFailure.Files -and
+            $beforeReadFailure.Sha256 -ceq $afterReadFailure.Sha256
+        ) "injected prepared read failure must fail closed without polluting the tree"
+        Remove-Item -LiteralPath $lockedAuditFixture -Force
 
         $damagedBomText = Join-Path $installed "contract-damaged-utf16.template"
         [System.IO.File]::WriteAllBytes($damagedBomText, [byte[]](0xff, 0xfe, 0x41))

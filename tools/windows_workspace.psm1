@@ -1171,6 +1171,14 @@ namespace EasyCon.WindowsWorkspace
             {
                 result.ResourceFailure = "memory allocation failed: " + exception.Message;
             }
+            catch (IOException exception)
+            {
+                result.ResourceFailure = "file read failed: " + exception.Message;
+            }
+            catch (UnauthorizedAccessException exception)
+            {
+                result.ResourceFailure = "file access failed: " + exception.Message;
+            }
             return result;
         }
 
@@ -1347,78 +1355,84 @@ namespace EasyCon.WindowsWorkspace
             bool sawToken = false;
             string matchedLabel = null;
 
-            using (Stream jsonStream = Encoding.CreateTranscodingStream(
-                stream,
-                encoding.Encoding,
-                StrictUtf8,
-                true))
+            try
             {
-                while (true)
+                using (Stream jsonStream = Encoding.CreateTranscodingStream(
+                    stream,
+                    encoding.Encoding,
+                    StrictUtf8,
+                    true))
                 {
-                    int read = jsonStream.Read(buffer, buffered, buffer.Length - buffered);
-                    int available = buffered + read;
-                    bool isFinalBlock = read == 0;
-                    result.MaximumJsonWindowBytes = Math.Max(
-                        result.MaximumJsonWindowBytes,
-                        available);
-
-                    Utf8JsonReader reader = new Utf8JsonReader(
-                        new ReadOnlySpan<byte>(buffer, 0, available),
-                        isFinalBlock,
-                        state);
-                    try
+                    while (true)
                     {
-                        while (reader.Read())
+                        int read = jsonStream.Read(buffer, buffered, buffer.Length - buffered);
+                        int available = buffered + read;
+                        bool isFinalBlock = read == 0;
+                        result.MaximumJsonWindowBytes = Math.Max(
+                            result.MaximumJsonWindowBytes,
+                            available);
+
+                        Utf8JsonReader reader = new Utf8JsonReader(
+                            new ReadOnlySpan<byte>(buffer, 0, available),
+                            isFinalBlock,
+                            state);
+                        try
                         {
-                            sawToken = true;
-                            if (matchedLabel == null &&
-                                (reader.TokenType == JsonTokenType.PropertyName ||
-                                 reader.TokenType == JsonTokenType.String))
+                            while (reader.Read())
                             {
-                                matchedLabel = FindReference(
-                                    reader.GetString(),
-                                    labels,
-                                    references);
+                                sawToken = true;
+                                if (matchedLabel == null &&
+                                    (reader.TokenType == JsonTokenType.PropertyName ||
+                                     reader.TokenType == JsonTokenType.String))
+                                {
+                                    matchedLabel = FindReference(
+                                        reader.GetString(),
+                                        labels,
+                                        references);
+                                }
                             }
                         }
-                    }
-                    catch (JsonException exception)
-                    {
-                        if (reader.CurrentDepth >= MaximumJsonDepth - 1 ||
-                            exception.Message.IndexOf(
-                                "maximum depth",
-                                StringComparison.OrdinalIgnoreCase) >= 0)
+                        catch (JsonException exception)
+                        {
+                            if (reader.CurrentDepth >= MaximumJsonDepth - 1 ||
+                                exception.Message.IndexOf(
+                                    "maximum depth",
+                                    StringComparison.OrdinalIgnoreCase) >= 0)
+                            {
+                                result.JsonLimitExceeded = true;
+                            }
+                            result.JsonError = exception.Message;
+                            return;
+                        }
+
+                        int consumed = checked((int)reader.BytesConsumed);
+                        state = reader.CurrentState;
+                        int remaining = available - consumed;
+                        if (remaining > 0 && consumed > 0)
+                        {
+                            Buffer.BlockCopy(buffer, consumed, buffer, 0, remaining);
+                        }
+                        buffered = remaining;
+
+                        if (isFinalBlock)
+                        {
+                            result.IsJson = sawToken;
+                            return;
+                        }
+                        if (buffered == buffer.Length)
                         {
                             result.JsonLimitExceeded = true;
+                            result.JsonError =
+                                "a JSON token exceeds the bounded " +
+                                JsonWindowLimitBytes + " byte audit window";
+                            return;
                         }
-                        result.JsonError = exception.Message;
-                        return;
-                    }
-
-                    int consumed = checked((int)reader.BytesConsumed);
-                    state = reader.CurrentState;
-                    int remaining = available - consumed;
-                    if (remaining > 0 && consumed > 0)
-                    {
-                        Buffer.BlockCopy(buffer, consumed, buffer, 0, remaining);
-                    }
-                    buffered = remaining;
-
-                    if (isFinalBlock)
-                    {
-                        result.IsJson = sawToken;
-                        result.StructuredMatchedLabel = matchedLabel;
-                        return;
-                    }
-                    if (buffered == buffer.Length)
-                    {
-                        result.JsonLimitExceeded = true;
-                        result.JsonError =
-                            "a JSON token exceeds the bounded " +
-                            JsonWindowLimitBytes + " byte audit window";
-                        return;
                     }
                 }
+            }
+            finally
+            {
+                result.StructuredMatchedLabel = matchedLabel;
             }
         }
 
@@ -1475,6 +1489,12 @@ function Assert-EasyConPreparedTextArtifactDoesNotReferenceRoots {
         throw "$Description audit failed closed for ${Path}: $($_.Exception.Message)"
     }
 
+    if ($audit.IsText -and -not [string]::IsNullOrWhiteSpace($audit.RawMatchedLabel)) {
+        throw "$Description contains a $($audit.RawMatchedLabel) absolute path: $Path"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($audit.StructuredMatchedLabel)) {
+        throw "$Description contains a $($audit.StructuredMatchedLabel) absolute path: $Path"
+    }
     if (-not [string]::IsNullOrWhiteSpace($audit.ResourceFailure)) {
         throw "$Description audit failed closed for ${Path}: $($audit.ResourceFailure)"
     }
@@ -1486,9 +1506,6 @@ function Assert-EasyConPreparedTextArtifactDoesNotReferenceRoots {
             "damaged $($audit.TextDamageKind) text artifact"
         }
         throw "$Description contains $damageDescription ${Path}: $($audit.TextDamage)"
-    }
-    if ($audit.IsText -and -not [string]::IsNullOrWhiteSpace($audit.RawMatchedLabel)) {
-        throw "$Description contains a $($audit.RawMatchedLabel) absolute path: $Path"
     }
     if ($audit.JsonLimitExceeded) {
         throw "$Description structured JSON audit failed closed for ${Path}: $($audit.JsonError)"
@@ -1506,11 +1523,6 @@ function Assert-EasyConPreparedTextArtifactDoesNotReferenceRoots {
             $audit.JsonError
         }
         throw "$Description contains damaged structured JSON ${Path}: $jsonDamage"
-    }
-    if ($audit.IsJson -and -not [string]::IsNullOrWhiteSpace(
-        $audit.StructuredMatchedLabel
-    )) {
-        throw "$Description contains a $($audit.StructuredMatchedLabel) absolute path: $Path"
     }
     return $audit
 }
