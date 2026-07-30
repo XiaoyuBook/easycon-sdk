@@ -1,28 +1,38 @@
-# 0019：提议冻结 Phase 4 C1 lexer 合同
+# 0019：冻结 Phase 4 C1 lexer 合同
 
-- 状态：Proposed / Not Effective
+- 状态：Accepted / Frozen C1 Lexer Contract
 - 提议日期：2026-07-31
+- 接受与冻结日期：2026-07-31
 - 固定起点：`ecbd39f4fc89a4a0c3768b0689e7ae495c29d664`
+- 初始 proposal：`8256fde2b760899c36cc1efa79e68a3f3a88e6ba`，tree
+  `84027d071471be3ff9f4eee15caf1d889f3bc194`，parent
+  `ecbd39f4fc89a4a0c3768b0689e7ae495c29d664`
+- 固定接受候选 / 修订：`e4b12b5fa9569df51b371c5bd9cf0b5cf38c8553`，tree
+  `3dcefcda750986aff9d71462292e7b438380b5f8`，parent
+  `8256fde2b760899c36cc1efa79e68a3f3a88e6ba`
+- 最终独立 full review：任务 `019fb40a-ef77-7f12-8075-885be6a0e917`，结论 `APPROVE`，
+  P0/P1/P2=`0/0/0`
 - 上位目标：[ADR-0017](0017-phase-4-ecs-automation-target.md) 的
   `Accepted / Frozen Phase 4 ECS/Automation Target`
 - S0 证据：[ECS provenance manifest](../../spec/fixtures/ecs/manifest.json) 与
   [fixture generator](../../tools/generate_ecs_provenance_fixtures.py)
 - 只读裁定：任务 `019fb3c0-17dd-7eb0-a00a-ee09e881049d`
-- 编号说明：ADR-0018 已被 Controller D0 占用，本提议使用 0019
+- 编号说明：ADR-0018 已被 Controller D0 占用，本 ADR 使用 0019
 
 ## 状态、生效条件与范围
 
-本文件只是 C1 lexer contract proposal，不是已接受决定，不冻结实现，也不授权或表示 C1 已经启动。它必须依次完成：
+固定接受候选 `e4b12b5fa9569df51b371c5bd9cf0b5cf38c8553` 已由独立 reviewer 对固定对象完成只读 full review，
+结论为 `APPROVE`，P0/P1/P2=`0/0/0`。本 ADR 现接受并冻结该候选的 C1 lexer 合同，并授权后续 C1 implementation
+节点按本文的 RED 顺序启动。本次 docs-only acceptance 只改变状态、治理链和审查证据，不修改 reviewer 已批准的
+token/value/span、恢复、diagnostic、ownership 或 conformance 合同。
 
-1. 固定本 proposal 的 Git SHA/tree/parent，由新的独立 reviewer 对固定对象做只读完整审查；
-2. 清零全部可复现、可行动且 in-scope 的 P0/P1/P2 finding；
-3. 由后续单独的 docs-only acceptance/freeze commit 把本 ADR 推进为 Accepted/Frozen。
+本 acceptance 不冻结或声明任何 C1 实现，不表示 Rust、Workspace、fixture reproduction、conformance、CI、硬件或
+发布已经通过。C1 仍须形成独立实现提交，完成本文要求的 exact tests、完整门禁与 fixed-SHA implementation review；
+这些证据不能由 proposal 或 acceptance 的 docs-only 门禁替代。任何后续语义修订都必须形成新的固定候选并按受影响
+冻结面重新接受独立审查与单独 refreeze。候选和本 acceptance 的自身 SHA/tree 只由提交后的 Git 对象、固定 ref 与
+外部结构化报告记录，不在 tracked 文件中预言。
 
-第三步完成前，C1 保持未启动；本 proposal 的 docs-only 门禁不能充当 C1 实现、测试或 conformance 证据。任何
-语义修订都必须形成新的固定候选并重新接受独立审查。候选和未来 acceptance 的自身 SHA/tree 只由提交后的 Git
-对象、固定 ref 与外部结构化报告记录，不在 tracked 文件中预言。
-
-本提议只补齐 ADR-0017 未唯一回答的 lexer 决策，不修改其已经冻结的 ownership、ProgramHash、单个 leading BOM
+本合同只补齐 ADR-0017 未唯一回答的 lexer 决策，不修改其已经冻结的 ownership、ProgramHash、单个 leading BOM
 处理、LF/CRLF/CR、UTF-8 byte span、statement/expression builtin 分层或 user-symbol case 合同。它不修改 S0 exact
 source/hash/profile/expected，不修改 `EasyCon/`，也不扩展 parser、binder、lowerer、evaluator、port、Runtime、ABI
 或 public API。当前 W0/S0 已完成，R0 尚未完成独立 review/refreeze；Controller D0 的 ADR-0018 已接受，但
@@ -234,7 +244,7 @@ AST 与 unexpected-EOF parser diagnostic；unexpected EOF 也只能引用既有 
 BOM/newline、重新解释 raw-tail 或 backslash、剥离 PRINT 尾反斜杠，或为同一 lexical defect 重复发出 C1 diagnostic。
 它可以围绕 `InvalidString`/`Unknown` 同步语法，但不能把 lexical error 改写成 partial valid AST。
 
-本提议不改变 binder 或 evaluator。statement/expression builtin 分层、boolean binding、PRINT continuation 和最终
+本合同不改变 binder 或 evaluator。statement/expression builtin 分层、boolean binding、PRINT continuation 和最终
 OutputPort effect 仍分别由 ADR-0017 与其后拥有节点验证；C1/C2 的通过不能替代这些证据。
 
 ## C1 conformance 与 RED 顺序
@@ -265,9 +275,10 @@ C1 builder 必须按以下 RED 顺序推进；每一步先形成失败断言，�
 implementation review。未来 C2 language-contract 直接引用本 ADR 的 token/value/span 和 ownership，不再另建一套
 source slicing 或 escape 规则。
 
-## Proposal 验证边界
+## Proposal 与 acceptance 验证边界
 
-本 proposal 只新增本 ADR，并更新根 README 与 docs README 的索引/当前状态。提交前只运行 docs-only 门禁：
+本合同的 proposal 与 acceptance 只新增或更新本 ADR，并同步根 README 与 docs README 的索引/当前状态。两次提交前
+都只运行 docs-only 门禁：
 
 ```powershell
 python -B tools/check_markdown_links.py

@@ -40,9 +40,10 @@ implementation、public-neutral contract 和平台/支持状态均未改变；�
 `APPROVE`，P0/P1/P2=`0/0/0`。`main` 已在实现基线 `87544d9` 完成并合入 W0 与 S0：W0 只建立零依赖、可编译的
 `easycon-ecs` workspace 骨架，S0 只建立 11 条自包含 provenance records、33 个 SDK-local artifacts 及静态
 validator。[ADR-0018](docs/decisions/0018-phase-2a-controller-lease-reopen.md) 已接受独立 Phase 5 Controller D0
-窄重开合同，但 D1/D2 尚未启动；[ADR-0019](docs/decisions/0019-phase-4-c1-lexer-contract.md) 只是
-`Proposed / Not Effective` 的 C1 lexer 合同候选，仍须 fixed-SHA 独立 review 与后续单独 acceptance/freeze。
-R0 尚未完成独立 review/refreeze，C1 及其后节点仍未启动。这些进展不表示 Phase 4 实现、硬件、支持或发布已经完成。
+窄重开合同，但 D1/D2 尚未形成已接受实现；[ADR-0019](docs/decisions/0019-phase-4-c1-lexer-contract.md) 已接受并冻结
+C1 lexer 合同，固定接受候选为 `e4b12b5`，独立 full review 任务
+`019fb40a-ef77-7f12-8075-885be6a0e917` 结论为 `APPROVE`、P0/P1/P2=`0/0/0`。C1 实现现已获授权但尚未形成
+implementation candidate；R0 仍未完成独立 review/refreeze。这些进展不表示 Phase 4 实现、硬件、支持或发布已经完成。
 
 此前的实验性共享运行基线已经移除，不再作为本项目的产品架构或兼容性约束。后续 public C ABI 和各语言绑定
 将在当前 Rust 共享核心之上按 Phase 5/6 的独立门禁实现。
