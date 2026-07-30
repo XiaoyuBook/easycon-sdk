@@ -1,7 +1,8 @@
-# 0021：提议冻结 Phase 4 C1 Windows high-resolution file-identity foundation 前置合同
+# 0021：冻结 Phase 4 C1 Windows high-resolution file-identity foundation 前置合同
 
-- 状态：Proposed / Not Effective
+- 状态：Accepted / Effective
 - proposal/decision 日期：2026-07-30；这不是任何 probe 或 review 的执行时间
+- 接受与生效日期：2026-07-30
 - proposal 基线：`main@2fe7eb2ef50f9ec49fe4e186b36605b6502aebb1`
 - proposal 基线 tree：`1281e677ae4e26bfc7a85b19dd6a392d9736eff0`
 - 初始 fixed-SHA proposal：`7f35f68d5620a581f51d1db081881fff7f416f21`，tree
@@ -12,6 +13,11 @@
   `d100348bc1674c31ae442dad779d9d544f33638f`，parent
   `7f35f68d5620a581f51d1db081881fff7f416f21`
 - 第一轮修订独立 fixed-SHA review：`REWORK`，P0/P1/P2=`0/4/3`
+- 固定接受候选 / 第二轮修订：`ff10956578c4cce4f405b13bfdffbbe134175d68`，tree
+  `b39d9822eec129122ec944c6e62ed2fd534f4aa6`，parent
+  `507ada447ccef7acd78b8bc0ca54238d2ccce7c1`
+- 最终 fixed-SHA 独立 review：任务 `019fb4f5-362b-7003-8415-0eacd208341f`，`APPROVE`，
+  P0/P1/P2=`0/0/0`
 - 上位冻结决定：[ADR-0017](0017-phase-4-ecs-automation-target.md) 与
   [ADR-0019](0019-phase-4-c1-lexer-contract.md)
 - 现有 system-leaf 证据：[qualification-private manifest](../../tests/hardware/file-id-handle/Cargo.toml)、
@@ -20,35 +26,32 @@
 - 编号说明：`main@2fe7eb2` 尚未包含 ADR-0020，但本地并行 ref `c09c323` 已为另一项 proposal
   分配 ADR-0020；本提议使用 ADR-0021，不链接、修改或取代该并行 proposal 的合同
 
-## 状态、REWORK 结论与生效条件
+## 状态、接受决定与授权边界
 
-本文仍只是 docs-only proposal，当前不生效，也不授权移动 qualification helper、创建 root crate、修改 production
-Rust、Cargo manifest/lock、repository guard、fixture、conformance、测试或 public ABI。candidate `7f35f68` 与
-`3a7bf3a` 都没有通过各自的 fixed-SHA review，不能被实现、accept、沿用为部分批准，旧 verdict 也不能复用于本轮
-修订后的新对象。本轮继续保留两项上位设计结论：
+固定接受候选 `ff10956578c4cce4f405b13bfdffbbe134175d68` 已完成 fixed-SHA 独立 review 并获得 `APPROVE`，
+P0/P1/P2=`0/0/0`。本 ADR 现接受并生效，下文规范性合同从本次 docs-only acceptance/refreeze 起成为后续实现与
+审查的冻结依据。本次 acceptance 只改变状态、治理链与索引，不修改固定候选已经审查通过的 foundation public
+authority、唯一 unsafe leaf、dependency admission、Windows object-authority、stable assertions、两套门禁或实施 DAG。
+
+candidate `7f35f68` 与 `3a7bf3a` 都没有通过各自的 fixed-SHA review，继续只作为被取代的历史对象；旧 verdict 不得
+复用于固定接受候选。本文接受两项上位设计结论：
 
 1. 放弃低分辨率 identity 方案，不把 C1 限定为 NTFS，也不增加无法可靠执行的 filesystem admission；改为一个
    先行、共享、high-resolution `FILE_ID_INFO` foundation；
 2. 冻结从 lexical input、每层 ancestor、root/`lib` directory、candidate admission 到 pre-read binding 的完整
    object-authority 顺序，并把 share exclusion 与 identity mismatch 拆成独立 RED。
 
-本修订必须重新依次完成：
+本 acceptance 仅解锁独立的 Windows high-resolution file-identity foundation 节点 F0：先建立 stable RED/assertions，
+再完成 dependency admission、qualification-private helper 迁移、扩展后的 guards、root/hardware 两套完整门禁、一个
+F0 implementation commit、fixed-SHA 独立 review 与单独 refreeze。F0 refreeze 完成前，ADR-0017 的 root workspace/W0
+零依赖 guard 与 ADR-0019 的 C1 RED 顺序继续有效；不得给 `easycon-ecs` 增加依赖，也不得开始 C1 loader/lexer 实现。
+本 acceptance 不声明 foundation、dependency admission、hardware migration、guard、F0 assertions、门禁或 C1 已完成，
+也不接受任何 implementation candidate。本 acceptance 自身的 SHA/tree 不在 tracked 文档中预言，只由提交后的 Git 对象
+与外部验收记录固定。
 
-1. 固定修订 proposal 的 Git SHA/tree/parent；
-2. 由新的、独立的 Sol Ultra reviewer 在独立 worktree 中对该固定对象做只读完整审查，并清零全部可复现、
-   可行动且 in-scope 的 P0/P1/P2 finding；
-3. 由后续单独的 docs-only acceptance/refreeze commit 明确把本文推进为 Accepted/Frozen。
-
-第三步完成前，ADR-0017 的 root workspace/W0 零依赖 guard 与 ADR-0019 的 C1 RED 顺序继续有效；不得先创建
-foundation，也不得给 `easycon-ecs` 增加依赖。proposal、REWORK、review 和 docs-only 门禁都不能充当 acceptance、
-foundation implementation 或 C1 implementation evidence。任何语义修订必须形成新的固定 candidate 并重新接受完整
-独立审查；未来 acceptance 的自身 SHA/tree 不得在 tracked 文件中预言。
-
-若本文以后被接受，它只窄覆盖 ADR-0017/0019 的 root member/dependency whitelist 和 Safe DAG：先增加独立的
-Windows high-resolution file-identity foundation 节点 F0；F0 完成实现、两套完整门禁、fixed-SHA 独立 review 与
-单独 refreeze 后，C1 才能依赖该 safe leaf。SourceBundle、limits、ProgramHash framing、restricted loader、
-UTF-8/BOM、lexer、diagnostic、其余 RED 与后续 C2-C3/E1-E2 全部保持不变。这是 system boundary 的窄开，不是
-loader 安全合同降级，也不接受任何实现或硬件结论。
+本文只窄覆盖 ADR-0017/0019 的 root member/dependency whitelist 和 Safe DAG。SourceBundle、limits、ProgramHash
+framing、restricted loader、UTF-8/BOM、lexer、diagnostic、其余 RED 与后续 C2-C3/E1-E2 全部保持不变。这是 system
+boundary 的窄开，不是 loader 安全合同降级，也不接受任何实现或硬件结论。
 
 ## 问题与可复现工具链证据
 
@@ -366,10 +369,7 @@ foundation source candidate 和被 F0 executable/dependency 变更重新打开�
 ## 唯一实施 DAG
 
 ```text
-ADR-0021 revised fixed-SHA proposal
-  -> independent Sol Ultra full review
-  -> separate docs-only acceptance/refreeze
-  -> F0 stable RED/assertions + dependency admission + migration implementation
+F0 stable RED/assertions + dependency admission + migration implementation
   -> full root Workspace + hardware workspace gates
   -> one F0 implementation commit
   -> fixed-SHA independent implementation review
@@ -380,20 +380,21 @@ ADR-0021 revised fixed-SHA proposal
   -> fixed-SHA independent C1 implementation review
 ```
 
-不得把 proposal acceptance、F0 implementation、F0 refreeze 或 C1 implementation 合并为同一提交，也不得让 C1
+不得把本 acceptance、F0 implementation、F0 refreeze 或 C1 implementation 合并为同一提交，也不得让 C1
 临时复制 FFI 等待 foundation。F0 不实现 lexer/loader；C1 不修改 foundation unsafe leaf 或 hardware qualification。
 
-## 本修订 proposal 的验证边界
+## 本 acceptance 的 docs-only 门禁
 
-本次单一修订提交只修改 ADR-0021 与原三处 proposal 状态索引，并只运行：
+本 acceptance 只修改 ADR-0021 与原三处状态索引，并运行：
 
 ```text
 python -B tools/check_markdown_links.py
 python -B tools/check_repository_guards.py
 git diff --check
+git diff --cached --check
 ```
 
-这些命令只证明 proposal 文档引用、现有 repository guard 基线仍通过和 diff hygiene。当前 guard 不验证
+这些命令只证明 acceptance 文档引用、现有 repository guard 基线仍通过和 diff hygiene。当前 guard 不验证
 `tests/hardware` manifest/lock/helper identity 合同，也不存在 F0 crate、expanded guard 或本 ADR 冻结的 stable
 assertions；因此本次 guard 结果不能证明任何 F0/hardware migration 项。它也不证明 foundation/`sha2` dependency
 admission、unsafe correctness、MSRV compile、loader behavior、RED、Rust、Workspace、conformance、CI、hardware 或发布

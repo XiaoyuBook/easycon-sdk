@@ -190,13 +190,13 @@ RED 恢复 D1；只有 D1 才修改 ControllerTransport/system serial/fake 并�
 独立 review/refreeze。R0-v2 implementation candidate 尚未形成，四条 RED 在 R0-v2 后仍不是通过证据；Phase 1 重新冻结前，
 Controller D1 保持暂停。不得宣称 R0-v2、D1 或 D2 已通过；C1 的既有独立授权不受本 acceptance 影响。
 
-[ADR-0021](../decisions/0021-phase-4-c1-windows-loader-handle-identity-dependency.md) 只是
-`Proposed / Not Effective` 的 Windows high-resolution file-identity foundation 前置合同。修订 proposal 的固定 SHA
-独立 Sol Ultra review 与单独 acceptance/refreeze 完成后，仍须先把 qualification-private `FILE_ID_INFO` leaf 迁移为
-唯一 root safe foundation，完成 F0 stable assertions、dependency admission、扩展后的 guards、root/hardware 两套
-完整门禁、fixed-SHA review 与单独 refreeze，C1 才能增加依赖并实现 loader。此前 W0/root workspace guard 继续生效，
-不授权移动代码、Cargo、guard 或 loader 实现变更。不得把 W0/S0、ADR-0021 proposal 或未来 foundation 节点描述为
-Phase 4 implementation freeze。
+[ADR-0021](../decisions/0021-phase-4-c1-windows-loader-handle-identity-dependency.md) 现已
+`Accepted / Effective`，固定接受候选为 `ff109565`；独立 Sol Ultra review 结论为 `APPROVE`、P0/P1/P2=`0/0/0`。
+它冻结 Windows high-resolution file-identity foundation 前置合同，并只解锁 F0 作为下一独立实现节点：先把
+qualification-private `FILE_ID_INFO` leaf 迁移为唯一 root safe foundation，再完成 stable assertions、dependency
+admission、扩展后的 guards、root/hardware 两套完整门禁、一个 implementation commit、fixed-SHA review 与单独
+refreeze。F0 refreeze 前 C1 继续暂停，W0/root workspace guard 继续生效；不得给 `easycon-ecs` 增加依赖或实现 loader。
+不得把 W0/S0、本 acceptance 或未来 foundation 节点描述为 Phase 4 implementation freeze。
 
 交付：
 

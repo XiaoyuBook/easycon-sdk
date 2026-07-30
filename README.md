@@ -47,12 +47,13 @@ implementation candidate。[ADR-0020](docs/decisions/0020-controller-settlement-
 `Accepted / Effective`，固定接受候选为 `a617e084`；它冻结 Runtime-only R0-v2 对 D1 的前置合同，并只解锁 R0-v2
 作为下一独立实现节点。R0-v2 implementation candidate、Phase 1 refreeze、D1 Controller/serial 集成与 D2 均尚未完成；
 D1 保持暂停并保留现有四条 RED，C1 的独立授权不变。
-[ADR-0021](docs/decisions/0021-phase-4-c1-windows-loader-handle-identity-dependency.md) 是
-`Proposed / Not Effective` 的 C1 Windows high-resolution file-identity foundation 前置合同：它提议先把现有
-qualification-private `FILE_ID_INFO` leaf 迁移为唯一共享 root safe foundation；F0 stable assertions、dependency
-admission、扩展后的 guards、root/hardware 两套完整门禁及 review/refreeze 完成后 C1 才能依赖。新修订 proposal 的
-fixed-SHA 独立 Sol Ultra review 与后续单独 acceptance/refreeze 完成前，W0/root workspace guard 继续有效，本文不
-授权移动代码、Cargo 或 loader 实现变更。这些进展不表示 Phase 4 实现、硬件、支持或发布已经完成。
+[ADR-0021](docs/decisions/0021-phase-4-c1-windows-loader-handle-identity-dependency.md) 现已
+`Accepted / Effective`，固定接受候选为 `ff109565`；独立 Sol Ultra review 任务
+`019fb4f5-362b-7003-8415-0eacd208341f` 结论为 `APPROVE`、P0/P1/P2=`0/0/0`。它冻结先把现有
+qualification-private `FILE_ID_INFO` leaf 迁移为唯一共享 root safe foundation 的前置合同，并只解锁 F0 作为下一
+独立实现节点。F0 stable assertions、dependency admission、扩展后的 guards、root/hardware 两套完整门禁、fixed-SHA
+review 与单独 refreeze 尚未完成；此前 C1 继续暂停，W0/root workspace guard 继续有效。这些进展不表示 Phase 4 实现、
+硬件、支持或发布已经完成。
 
 此前的实验性共享运行基线已经移除，不再作为本项目的产品架构或兼容性约束。后续 public C ABI 和各语言绑定
 将在当前 Rust 共享核心之上按 Phase 5/6 的独立门禁实现。
