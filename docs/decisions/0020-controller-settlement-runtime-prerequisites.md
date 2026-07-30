@@ -9,6 +9,11 @@
   `2fe7eb2ef50f9ec49fe4e186b36605b6502aebb1`
 - 初始 fixed-SHA review：`REQUEST CHANGES`，P0/P1/P2=`0/4/0`；本修订逐项针对四项 P1，但仍是
   `Proposed / Not Effective`，必须重新接受 fixed-SHA 独立 review
+- 第一轮修订：`362df95b5fdc03c9e2f285de4b456a61f8b6a09f`，tree
+  `b1af657a2ed03c94a8ea580a0ed8062239d03aee`，parent
+  `c09c323476a5f0ed972aec6b7f2ee2acbeb139c0`
+- 第一轮修订 fixed-SHA review：`REQUEST CHANGES`，P0/P1/P2=`0/1/0`；本次最小修订只处理 ownership-loss
+  waiter settlement 例外与 ADR-0018 的冲突，状态仍为 `Proposed / Not Effective`
 - 上位冻结决定：[ADR-0004](0004-operations-events-shutdown.md)、
   [ADR-0006](0006-runtime-stabilization.md)、[ADR-0007](0007-phase-1-freeze.md)、
   [ADR-0009](0009-phase-2a-freeze.md)、[ADR-0017](0017-phase-4-ecs-automation-target.md) 与
@@ -28,8 +33,10 @@ docs-only acceptance/refreeze 决定明确接受后，下文的规范性合同�
 当前 D1 必须暂停在已有 RED 证据，不得把 bounded teardown fallback、单个测试进程退出或未提交 worktree 当作通过。
 proposal 期间，ADR-0018 的历史原文和 Accepted 状态保持不变；本文不通过修改该原文来倒写历史。若本文以后被接受，
 它只取代 ADR-0018 中“D1 与 R0 相互独立”“D1 只拥有 production Controller 且不触及 serial transport 内部边界”两项
-实施假设，并按下文窄重开冻结面。ADR-0018 的 lease API、五态 acquire outcome、同点优先级、generation、pacing、
-release outcome、硬件未验证和 D2 独立 refreeze 要求继续有效。
+实施假设，并且只在“Controller lane ownership 已丢失、没有可验证 transferable transport/settlement owner、completion 与
+stream settlement 均不可证明”三个条件同时成立的极窄分支，取代 ADR-0018 对 action/release waiter 无条件 settlement
+以及 close join 前 release record 必须终结的要求。该三条件分支之外，ADR-0018 的 waiter/record 完成要求、lease API、
+五态 acquire outcome、同点优先级、generation、pacing、release outcome、硬件未验证和 D2 独立 refreeze 要求继续有效。
 
 ## 问题与证据
 
@@ -198,7 +205,7 @@ claim cancellation/close winner，也不得仅因 token bit、lane command 或 w
 | 累计 transferred bytes 精确达到完整 report 长度 | `FullAccepted` 必须胜出；正常 cleanup 后 action 为 `Succeeded`，已经登记或较晚到达的 cancel/deadline/close intent 都不能改写为 `Cancelled`，已登记 first reason 保持 immutable diagnostic 但不成为 terminal winner |
 | 已确认 I/O aborted/not dispatched，完整 report 未接受，且存在 first cancellation reason | 先证明 stream settled，再按该 immutable first reason claim cancellation/deadline/close 的既有投影；禁止 late success |
 | partial bytes 或 I/O failure，完整 report 未接受 | 按下节 settle/关闭 stream 后，以既有 first-reason/first-error 优先级 claim cancellation 或 failure；禁止伪造 acceptance |
-| completion/byte count 仍不确定 | 没有合法 winner；必须继续 settlement 或进入 `CloseFailed`，不能提交 terminal、唤醒 terminal waiter 或清零 registry |
+| completion/byte count 仍不确定 | 没有合法 winner，合法 owner 必须继续 settlement；只有下文 ownership-loss 三条件同时成立时才进入 `CloseFailed`，不能提交 terminal、唤醒 terminal waiter 或清零 registry |
 
 Windows overlapped adapter 必须把 `CancelIoEx` 只视为 interrupt request。`ERROR_NOT_FOUND` 不能投影为 cancelled，也不能推断
 未发生 effect；adapter 必须继续以 `GetOverlappedResult` 或等价的唯一 completion consumer 取得最终 transferred byte count。
@@ -267,9 +274,26 @@ neutral dispatch：
 | `ReleaseSettled` | close 不得重开或改写旧 record；若 resource close 此后才独立开始，则按既有合同另行执行一次 final paced neutral，并使用新的 close-owned token |
 
 因此“close 在 acceptance 前到达”本身不足以宣告 `NeutralNotDeliveredStreamSettled`：neutral 尚未 dispatch 时 close 必须执行
-同一 record 的唯一 neutral；neutral 已 outstanding 时必须先消费真实 completion。不可恢复的 interrupt/close/ownership
-failure 继续使用 ADR-0018 已有 `Err(cleanup_failure)`，永久 seal Controller；若无法证明 stream settled 或合法 owner，
-不得清零 registry、伪造 `Closed` 或唤醒 completion waiter。
+同一 record 的唯一 neutral；neutral 已 outstanding 时必须先消费真实 completion。
+
+### cleanup failure 与 ownership-loss 例外优先级
+
+以下两条路径互斥，合法 owner 与 settlement evidence 优先于 ownership-loss 例外：
+
+1. **owner/evidence 可证明，cleanup failure**：合法 owner 已取得唯一 completion 与 stream-settled evidence 后，即使后续
+   interrupt、transport close 或 bookkeeping cleanup 返回 failure，也不是 ownership-loss 例外。owner 必须按 ADR-0018 在
+   同一 record 投影 `Err(cleanup_failure)`，为每个受影响 action/release waiter 写入确定结果并唤醒，按既有顺序恰好一次
+   执行适用的 Operation terminal/event/registry unlink 与 cleanup-record notify，然后才能完成 lane join。Controller 永久
+   seal 并保留真实 first error，但该 record 已完成，不能改写成非终态或普通 `CloseFailed` 残留。
+2. **owner/evidence 均不可证明**：只有 Controller lane ownership 已丢失、没有可验证 transferable transport/settlement
+   owner、且 completion 与 stream settlement 均不可证明三个条件同时成立，才进入本 ADR 的极窄例外。close caller/close
+   waiter 得到 `CloseFailed`；对应 action/release waiter 保持非终态且不得被伪唤醒，record 与 registry identity 保留供诊断
+   或后续合法 owner settlement。该路径不得称为普通 cleanup failure、不得发布 terminal/event、不得 unlink/notify，也不得
+   声称 Controller close 已完成。
+
+该例外不适用于 deadline、ordinary cancellation、已有合法/transferable owner、`NotDispatched`、完整 acceptance、partial
+但已证明 stream settled，或任何已经取得 completion/settlement evidence 的路径；这些路径继续遵守 ADR-0018 的确定性
+waiter completion 与 close-before-join 顺序。
 
 Controller close 的精确 lane 顺序为：seal acquire/action admission；按 ADR-0018 优先级结算 pending acquire；对未接受且
 `NotDispatched` 的 action 直接 settle cancellation，对 `Outstanding` action 只登记 first reason 并 interrupt；按上述三态
@@ -305,9 +329,10 @@ cleanup ownership 已从 panicked lane 完整转移的 Drop-settlement contract�
 - lane panic 后，interrupt handle 可以请求 OS I/O 返回，但不能消费 completion、调用/解释 acceptance hook、接管或关闭
   lane-owned transport，也不能提交 action/release terminal；transport Drop 或 OS handle close 本身不证明 logical stream
   settled。
-- Runtime/Controller close 必须投影 ADR-0006 的 `CloseFailed`，保留 panic/owner identity/Controller identity 的可诊断
-  first error，并保留尚未合法 settlement 的 Operation、cleanup record 与 registry identity；不得伪造 `Cancelled`、
-  `Failed`、`Closed`、waiter completion 或 registry zero。
+- 三条件 ownership-loss 例外成立时，Runtime/Controller close caller 与 close waiter 必须得到 ADR-0006 的 `CloseFailed`，
+  保留 panic/owner identity/Controller identity 的可诊断 first error，并保留尚未合法 settlement 的 Operation、cleanup
+  record 与 registry identity；对应 action/release waiter 不得被伪造为 `Cancelled`、`Failed`、`Closed` 或 completion，
+  registry 也不得伪装为 zero。若 owner/evidence 可证明而只有 cleanup failure，则必须改走上节第一条并完成这些 waiter。
 - 非终态与 registry 保留持续到合法 owner settlement；本 proposal 不授权构造该 owner。未来若要接管 Controller lane，
   必须另行完整冻结 owner identity、panic detection、transport ownership transfer、completion consumption、cleanup/error
   projection 与 exactly-once commit，并重新审查受影响冻结面。
@@ -359,8 +384,11 @@ Runtime 等 Controller、Controller 反向等待 Runtime internal worker 的 joi
   adapter、fake 与 partial-I/O/overlapped-completion conformance；R0-v2 不得修改这些 production 表面，单 writer、协议、
   pacing、ACK 与 Hardware Unverified 状态不变；
 - ADR-0017：只以 Runtime-only R0-v2 取代旧 R0 窄范围，并把其 Phase 1 refreeze 设为 D1 的真实前置；
-- ADR-0018：只取代 D1/R0 独立性和“不触及 serial transport 内部边界”的实施假设，并把 success-after-acceptance 落到
-  completion settlement gate；其五态 acquire 优先级、immutable first cancellation reason 与其余 D0 合同继续有效。
+- ADR-0018：取代 D1/R0 独立性和“不触及 serial transport 内部边界”的实施假设，并把 success-after-acceptance 落到
+  completion settlement gate；另仅在 Controller lane ownership 丢失、无可验证 transferable transport/settlement owner、
+  completion 与 stream settlement 均不可证明的三条件分支，取代其无条件 action/release waiter settlement 与 close join 前
+  release-record 终结要求。三条件之外，包括 owner/evidence 可证明但 cleanup failure 的路径，ADR-0018 的 waiter completion、
+  五态 acquire 优先级、immutable first cancellation reason 与其余 D0 合同继续有效。
 
 保持不变：ADR-0004 的根 Runtime/Operation/事件/确定性关闭原则；Operation 六个可见状态；ErrorDomain、OperationValue、
 event schema 与 registry identity；public C ABI 与四语言；ADR-0019 C1 lexer 合同及其独立 implementation 授权；Phase 2A
@@ -408,6 +436,16 @@ acceptance hook、分层 interrupt、partial-I/O settlement 与 close takeover�
   neutral、in-flight settlement 且不重试、以及旧 record 终结后的独立 final neutral；
 - partial prefix/late completion、system serial/fake parity，以及 Controller lane panic 无 transferable owner 时
   `CloseFailed`、非终态/registry 保留且 interrupt handle 不冒充 transport owner。
+
+D1 还必须用 exact fault injection 固定下列 acceptance matrix，不能只断言 close 返回了错误：
+
+| 注入场景 | close 与 domain waiter | record/registry |
+| --- | --- | --- |
+| 合法 owner 已取得 completion 与 stream-settled evidence，随后 cleanup 返回 failure | action/release waiter 得到同一 `Err(cleanup_failure)` 并恰好唤醒一次；close 保留真实 failure，完成必要 join | record 完成；适用的 Operation terminal/event/registry unlink 与 cleanup-record notify 各恰好一次，不保留假非终态 |
+| Controller lane ownership 丢失，无可验证 transferable owner，completion 与 stream settlement 均不可证明 | close caller/close waiter 得到 `CloseFailed`；对应 action/release waiter 保持非终态且不唤醒 | record 与 registry identity 保留；无 terminal/event、unlink、notify，close 不得声明完成 |
+
+该矩阵是新增 D1 acceptance obligation，不把四条既有 D1 teardown-safe RED 改成通过；它们仍须按原名、原 bounded teardown
+约束保留为 RED，直至 Phase 1 refreeze 后恢复 D1 并形成独立实现证据。
 
 D1 必须运行所有受影响 Phase 2A 与 Runtime 门禁；D2 再固定完整 D1 candidate SHA，完成独立 review 与单独 Controller
 refreeze。R0-v2 refreeze、单条 D1 测试通过或 D1 自报完整门禁都不能代替 D2。
