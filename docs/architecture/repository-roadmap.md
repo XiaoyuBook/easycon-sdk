@@ -190,6 +190,14 @@ RED 恢复 D1；只有 D1 才修改 ControllerTransport/system serial/fake 并�
 独立 review/refreeze。R0-v2 implementation candidate 尚未形成，四条 RED 在 R0-v2 后仍不是通过证据；Phase 1 重新冻结前，
 Controller D1 保持暂停。不得宣称 R0-v2、D1 或 D2 已通过；C1 的既有独立授权不受本 acceptance 影响。
 
+[ADR-0021](../decisions/0021-phase-4-c1-windows-loader-handle-identity-dependency.md) 只是
+`Proposed / Not Effective` 的 Windows high-resolution file-identity foundation 前置合同。修订 proposal 的固定 SHA
+独立 Sol Ultra review 与单独 acceptance/refreeze 完成后，仍须先把 qualification-private `FILE_ID_INFO` leaf 迁移为
+唯一 root safe foundation，完成 F0 stable assertions、dependency admission、扩展后的 guards、root/hardware 两套
+完整门禁、fixed-SHA review 与单独 refreeze，C1 才能增加依赖并实现 loader。此前 W0/root workspace guard 继续生效，
+不授权移动代码、Cargo、guard 或 loader 实现变更。不得把 W0/S0、ADR-0021 proposal 或未来 foundation 节点描述为
+Phase 4 implementation freeze。
+
 交付：
 
 - Rust ECS lexer/parser/binder/lowerer/evaluator。

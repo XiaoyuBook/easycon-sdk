@@ -71,6 +71,7 @@
 - [ADR-0018：窄重开 Phase 2A Controller lease 结算合同（Accepted）](decisions/0018-phase-2a-controller-lease-reopen.md)
 - [ADR-0019：冻结 Phase 4 C1 lexer 合同（Accepted / Frozen）](decisions/0019-phase-4-c1-lexer-contract.md)
 - [ADR-0020：冻结 Controller 结算的 Runtime 前置合同（Accepted / Effective）](decisions/0020-controller-settlement-runtime-prerequisites.md)
+- [ADR-0021：提议冻结 Phase 4 C1 Windows high-resolution file-identity foundation 前置合同（Proposed / Not Effective）](decisions/0021-phase-4-c1-windows-loader-handle-identity-dependency.md)
 
 ## v1 固定范围
 
@@ -129,7 +130,13 @@ C1 lexer 合同，固定接受候选为 `e4b12b5`，独立 full review 任务
 implementation candidate。[ADR-0020](decisions/0020-controller-settlement-runtime-prerequisites.md) 现已
 `Accepted / Effective`，固定接受候选为 `a617e084`；它冻结 Runtime-only R0-v2 对 D1 的前置合同，并只解锁 R0-v2
 作为下一独立实现节点。R0-v2 implementation candidate、Phase 1 refreeze、D1 Controller/serial 集成与 D2 均尚未完成；
-D1 保持暂停并保留现有四条 RED，C1 的独立授权不变。这些进展不代表 Phase 4 实现、硬件、支持或发布完成。
+D1 保持暂停并保留现有四条 RED，C1 的独立授权不变。
+[ADR-0021](decisions/0021-phase-4-c1-windows-loader-handle-identity-dependency.md) 当前只是
+`Proposed / Not Effective` 的 C1 Windows high-resolution file-identity foundation 前置合同；它提议把现有
+qualification-private `FILE_ID_INFO` leaf 迁移为唯一共享 root safe foundation；F0 stable assertions、dependency
+admission、扩展后的 guards、root/hardware 两套完整门禁及 review/refreeze 完成后 C1 才能依赖。新修订 proposal 的
+fixed-SHA 独立 Sol Ultra review 与单独 acceptance/refreeze 之前不授权移动代码、Cargo、guard 或 loader 实现变更，
+W0/root workspace 合同仍然有效。这些进展不代表 Phase 4 实现、硬件、支持或发布完成。
 
 ## 首发基线
 
