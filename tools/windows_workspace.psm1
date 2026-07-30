@@ -1079,137 +1079,440 @@ function Get-EasyConTreeFingerprint {
     }
 }
 
+function Initialize-EasyConPreparedArtifactAuditor {
+    if ($null -ne ("EasyCon.WindowsWorkspace.PreparedArtifactAuditor" -as [type])) {
+        return
+    }
+
+    Add-Type -Language CSharp -TypeDefinition @'
+using System;
+using System.IO;
+using System.Text;
+using System.Text.Json;
+
+namespace EasyCon.WindowsWorkspace
+{
+    public sealed class PreparedArtifactAuditResult
+    {
+        public bool IsText { get; internal set; }
+        public bool IsJson { get; internal set; }
+        public string RawMatchedLabel { get; internal set; }
+        public string StructuredMatchedLabel { get; internal set; }
+        public string TextDamage { get; internal set; }
+        public string TextDamageKind { get; internal set; }
+        public string JsonError { get; internal set; }
+        public string ResourceFailure { get; internal set; }
+        public bool JsonLimitExceeded { get; internal set; }
+        public long BytesRead { get; internal set; }
+        public int MaximumJsonWindowBytes { get; internal set; }
+    }
+
+    public static class PreparedArtifactAuditor
+    {
+        public const int JsonWindowLimitBytes = 65536;
+        private const int EncodingProbeBytes = 512;
+        private const int TextWindowCharacters = 16384;
+        private const int MaximumJsonDepth = 256;
+
+        private static readonly Encoding StrictUtf8 = new UTF8Encoding(false, true);
+        private static readonly Encoding StrictUtf16Le = new UnicodeEncoding(false, false, true);
+        private static readonly Encoding StrictUtf16Be = new UnicodeEncoding(true, false, true);
+
+        private sealed class DetectedEncoding
+        {
+            internal Encoding Encoding;
+            internal int PreambleLength;
+            internal bool ProtectedText;
+            internal string DamageKind;
+        }
+
+        public static PreparedArtifactAuditResult Audit(
+            string path,
+            string[] forbiddenLabels,
+            string[] forbiddenReferences)
+        {
+            if (forbiddenLabels == null || forbiddenReferences == null ||
+                forbiddenLabels.Length != forbiddenReferences.Length)
+            {
+                throw new ArgumentException("forbidden labels and references must have equal length");
+            }
+
+            PreparedArtifactAuditResult result = new PreparedArtifactAuditResult();
+            try
+            {
+                using (FileStream stream = new FileStream(
+                    path,
+                    FileMode.Open,
+                    FileAccess.Read,
+                    FileShare.Read,
+                    4096,
+                    FileOptions.SequentialScan))
+                {
+                    result.BytesRead = stream.Length;
+                    DetectedEncoding encoding = DetectEncoding(stream);
+                    ScanDecodedText(
+                        stream,
+                        encoding,
+                        forbiddenLabels,
+                        forbiddenReferences,
+                        result);
+                    if (result.IsText && result.TextDamage == null)
+                    {
+                        ScanStructuredJson(
+                            stream,
+                            encoding,
+                            forbiddenLabels,
+                            forbiddenReferences,
+                            result);
+                    }
+                }
+            }
+            catch (OutOfMemoryException exception)
+            {
+                result.ResourceFailure = "memory allocation failed: " + exception.Message;
+            }
+            return result;
+        }
+
+        private static DetectedEncoding DetectEncoding(FileStream stream)
+        {
+            byte[] probe = new byte[EncodingProbeBytes];
+            int length = 0;
+            while (length < probe.Length)
+            {
+                int read = stream.Read(probe, length, probe.Length - length);
+                if (read == 0)
+                {
+                    break;
+                }
+                length += read;
+            }
+            stream.Position = 0;
+
+            if (length >= 3 && probe[0] == 0xef && probe[1] == 0xbb && probe[2] == 0xbf)
+            {
+                return NewEncoding(StrictUtf8, 3, true, "BOM");
+            }
+            if (length >= 2 && probe[0] == 0xff && probe[1] == 0xfe)
+            {
+                return NewEncoding(StrictUtf16Le, 2, true, "BOM");
+            }
+            if (length >= 2 && probe[0] == 0xfe && probe[1] == 0xff)
+            {
+                return NewEncoding(StrictUtf16Be, 2, true, "BOM");
+            }
+            if (LooksLikeUtf16(probe, length, true))
+            {
+                return NewEncoding(StrictUtf16Le, 0, true, "inferred UTF-16LE");
+            }
+            if (LooksLikeUtf16(probe, length, false))
+            {
+                return NewEncoding(StrictUtf16Be, 0, true, "inferred UTF-16BE");
+            }
+            return NewEncoding(StrictUtf8, 0, false, "UTF-8");
+        }
+
+        private static DetectedEncoding NewEncoding(
+            Encoding encoding,
+            int preambleLength,
+            bool protectedText,
+            string damageKind)
+        {
+            return new DetectedEncoding
+            {
+                Encoding = encoding,
+                PreambleLength = preambleLength,
+                ProtectedText = protectedText,
+                DamageKind = damageKind
+            };
+        }
+
+        private static bool LooksLikeUtf16(byte[] probe, int length, bool littleEndian)
+        {
+            int pairs = length / 2;
+            if (pairs < 2)
+            {
+                return false;
+            }
+
+            int compatible = 0;
+            int nullLane = 0;
+            for (int index = 0; index < pairs; index++)
+            {
+                byte text = probe[(index * 2) + (littleEndian ? 0 : 1)];
+                byte expectedNull = probe[(index * 2) + (littleEndian ? 1 : 0)];
+                if (expectedNull == 0)
+                {
+                    nullLane++;
+                    if (text == 0x09 || text == 0x0a || text == 0x0d ||
+                        (text >= 0x20 && text <= 0x7e))
+                    {
+                        compatible++;
+                    }
+                }
+            }
+            return nullLane >= 2 &&
+                nullLane * 100 >= pairs * 75 &&
+                compatible * 100 >= pairs * 75;
+        }
+
+        private static void ScanDecodedText(
+            FileStream stream,
+            DetectedEncoding encoding,
+            string[] labels,
+            string[] references,
+            PreparedArtifactAuditResult result)
+        {
+            stream.Position = encoding.PreambleLength;
+            int maximumReferenceLength = 0;
+            foreach (string reference in references)
+            {
+                maximumReferenceLength = Math.Max(maximumReferenceLength, reference.Length);
+            }
+
+            result.IsText = true;
+            char[] buffer = new char[TextWindowCharacters];
+            string tail = String.Empty;
+            try
+            {
+                using (StreamReader reader = new StreamReader(
+                    stream,
+                    encoding.Encoding,
+                    false,
+                    TextWindowCharacters,
+                    true))
+                {
+                    int read;
+                    while ((read = reader.Read(buffer, 0, buffer.Length)) > 0)
+                    {
+                        string chunk = new string(buffer, 0, read);
+                        if (chunk.IndexOf('\0') >= 0)
+                        {
+                            if (encoding.ProtectedText)
+                            {
+                                result.TextDamage = "contains a NUL character";
+                                result.TextDamageKind = encoding.DamageKind;
+                            }
+                            else
+                            {
+                                result.IsText = false;
+                            }
+                            return;
+                        }
+
+                        if (result.RawMatchedLabel == null)
+                        {
+                            string search = tail + chunk;
+                            result.RawMatchedLabel = FindReference(search, labels, references);
+                            if (maximumReferenceLength > 1)
+                            {
+                                int tailLength = Math.Min(maximumReferenceLength - 1, search.Length);
+                                tail = search.Substring(search.Length - tailLength);
+                            }
+                        }
+                    }
+                }
+            }
+            catch (DecoderFallbackException exception)
+            {
+                if (encoding.ProtectedText)
+                {
+                    result.TextDamage = exception.Message;
+                    result.TextDamageKind = encoding.DamageKind;
+                }
+                else
+                {
+                    result.IsText = false;
+                }
+            }
+        }
+
+        private static void ScanStructuredJson(
+            FileStream stream,
+            DetectedEncoding encoding,
+            string[] labels,
+            string[] references,
+            PreparedArtifactAuditResult result)
+        {
+            stream.Position = encoding.PreambleLength;
+            byte[] buffer = new byte[JsonWindowLimitBytes];
+            JsonReaderOptions options = new JsonReaderOptions
+            {
+                AllowTrailingCommas = false,
+                CommentHandling = JsonCommentHandling.Disallow,
+                MaxDepth = MaximumJsonDepth
+            };
+            JsonReaderState state = new JsonReaderState(options);
+            int buffered = 0;
+            bool sawToken = false;
+            string matchedLabel = null;
+
+            using (Stream jsonStream = Encoding.CreateTranscodingStream(
+                stream,
+                encoding.Encoding,
+                StrictUtf8,
+                true))
+            {
+                while (true)
+                {
+                    int read = jsonStream.Read(buffer, buffered, buffer.Length - buffered);
+                    int available = buffered + read;
+                    bool isFinalBlock = read == 0;
+                    result.MaximumJsonWindowBytes = Math.Max(
+                        result.MaximumJsonWindowBytes,
+                        available);
+
+                    Utf8JsonReader reader = new Utf8JsonReader(
+                        new ReadOnlySpan<byte>(buffer, 0, available),
+                        isFinalBlock,
+                        state);
+                    try
+                    {
+                        while (reader.Read())
+                        {
+                            sawToken = true;
+                            if (matchedLabel == null &&
+                                (reader.TokenType == JsonTokenType.PropertyName ||
+                                 reader.TokenType == JsonTokenType.String))
+                            {
+                                matchedLabel = FindReference(
+                                    reader.GetString(),
+                                    labels,
+                                    references);
+                            }
+                        }
+                    }
+                    catch (JsonException exception)
+                    {
+                        if (reader.CurrentDepth >= MaximumJsonDepth - 1 ||
+                            exception.Message.IndexOf(
+                                "maximum depth",
+                                StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            result.JsonLimitExceeded = true;
+                        }
+                        result.JsonError = exception.Message;
+                        return;
+                    }
+
+                    int consumed = checked((int)reader.BytesConsumed);
+                    state = reader.CurrentState;
+                    int remaining = available - consumed;
+                    if (remaining > 0 && consumed > 0)
+                    {
+                        Buffer.BlockCopy(buffer, consumed, buffer, 0, remaining);
+                    }
+                    buffered = remaining;
+
+                    if (isFinalBlock)
+                    {
+                        result.IsJson = sawToken;
+                        result.StructuredMatchedLabel = matchedLabel;
+                        return;
+                    }
+                    if (buffered == buffer.Length)
+                    {
+                        result.JsonLimitExceeded = true;
+                        result.JsonError =
+                            "a JSON token exceeds the bounded " +
+                            JsonWindowLimitBytes + " byte audit window";
+                        return;
+                    }
+                }
+            }
+        }
+
+        private static string FindReference(
+            string text,
+            string[] labels,
+            string[] references)
+        {
+            if (text == null)
+            {
+                return null;
+            }
+            for (int index = 0; index < references.Length; index++)
+            {
+                if (text.IndexOf(references[index], StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    return labels[index];
+                }
+            }
+            return null;
+        }
+    }
+}
+'@
+}
+
 function Assert-EasyConPreparedTextArtifactDoesNotReferenceRoots {
     param(
         [Parameter(Mandatory)]
         [string]$Path,
 
         [Parameter(Mandatory)]
-        [object[]]$ForbiddenRoots,
+        [string[]]$ForbiddenLabels,
+
+        [Parameter(Mandatory)]
+        [string[]]$ForbiddenReferences,
 
         [Parameter(Mandatory)]
         [string]$Description
     )
 
-    $maximumReferenceLength = 0
-    foreach ($root in $ForbiddenRoots) {
-        foreach ($reference in @($root.References)) {
-            $maximumReferenceLength = [Math]::Max($maximumReferenceLength, $reference.Length)
-        }
-    }
-
-    $stream = $null
-    $reader = $null
-    $hasByteOrderMark = $false
-    $isText = $true
-    $damagedText = $null
-    $matchedRoot = $null
+    Initialize-EasyConPreparedArtifactAuditor
     try {
-        $stream = [System.IO.File]::Open(
+        $audit = [EasyCon.WindowsWorkspace.PreparedArtifactAuditor]::Audit(
             $Path,
-            [System.IO.FileMode]::Open,
-            [System.IO.FileAccess]::Read,
-            [System.IO.FileShare]::Read
+            $ForbiddenLabels,
+            $ForbiddenReferences
         )
-        $prefix = [byte[]]::new(3)
-        $prefixLength = 0
-        while ($prefixLength -lt $prefix.Length) {
-            $prefixRead = $stream.Read(
-                $prefix,
-                $prefixLength,
-                $prefix.Length - $prefixLength
-            )
-            if ($prefixRead -eq 0) {
-                break
-            }
-            $prefixLength += $prefixRead
-        }
-        $encoding = [System.Text.UTF8Encoding]::new($false, $true)
-        $preambleLength = 0
-        if (
-            $prefixLength -ge 3 -and
-            $prefix[0] -eq 0xef -and $prefix[1] -eq 0xbb -and $prefix[2] -eq 0xbf
-        ) {
-            $hasByteOrderMark = $true
-            $preambleLength = 3
-        }
-        elseif ($prefixLength -ge 2 -and $prefix[0] -eq 0xff -and $prefix[1] -eq 0xfe) {
-            $hasByteOrderMark = $true
-            $preambleLength = 2
-            $encoding = [System.Text.UnicodeEncoding]::new($false, $false, $true)
-        }
-        elseif ($prefixLength -ge 2 -and $prefix[0] -eq 0xfe -and $prefix[1] -eq 0xff) {
-            $hasByteOrderMark = $true
-            $preambleLength = 2
-            $encoding = [System.Text.UnicodeEncoding]::new($true, $false, $true)
-        }
-        $stream.Position = $preambleLength
-        $reader = [System.IO.StreamReader]::new($stream, $encoding, $false, 16384, $true)
-
-        $buffer = [char[]]::new(16384)
-        $tail = ""
-        while (($read = $reader.Read($buffer, 0, $buffer.Length)) -gt 0) {
-            $chunk = [string]::new($buffer, 0, $read)
-            if ($chunk.IndexOf([char]0) -ge 0) {
-                if ($hasByteOrderMark) {
-                    $damagedText = "contains a NUL character"
-                }
-                else {
-                    $isText = $false
-                }
-                break
-            }
-
-            if ($null -eq $matchedRoot) {
-                $search = $tail + $chunk
-                foreach ($root in $ForbiddenRoots) {
-                    foreach ($reference in @($root.References)) {
-                        if ($search.IndexOf(
-                            $reference,
-                            [System.StringComparison]::OrdinalIgnoreCase
-                        ) -ge 0) {
-                            $matchedRoot = $root
-                            break
-                        }
-                    }
-                    if ($null -ne $matchedRoot) {
-                        break
-                    }
-                }
-                if ($maximumReferenceLength -gt 1) {
-                    $tailLength = [Math]::Min($maximumReferenceLength - 1, $search.Length)
-                    $tail = $search.Substring($search.Length - $tailLength)
-                }
-            }
-        }
+    }
+    catch [System.OutOfMemoryException] {
+        throw "$Description audit failed closed for ${Path}: memory allocation failed"
     }
     catch {
-        $baseException = $_.Exception.GetBaseException()
-        if ($baseException -isnot [System.Text.DecoderFallbackException]) {
-            throw
-        }
-        if ($hasByteOrderMark) {
-            $damagedText = $baseException.Message
-        }
-        else {
-            $isText = $false
-        }
-    }
-    finally {
-        if ($null -ne $reader) {
-            $reader.Dispose()
-        }
-        if ($null -ne $stream) {
-            $stream.Dispose()
-        }
+        throw "$Description audit failed closed for ${Path}: $($_.Exception.Message)"
     }
 
-    if ($null -ne $damagedText) {
-        throw "$Description contains damaged BOM text artifact ${Path}: $damagedText"
+    if (-not [string]::IsNullOrWhiteSpace($audit.ResourceFailure)) {
+        throw "$Description audit failed closed for ${Path}: $($audit.ResourceFailure)"
     }
-    if ($isText -and $null -ne $matchedRoot) {
-        throw "$Description contains a $($matchedRoot.Label) absolute path: $Path"
+    if (-not [string]::IsNullOrWhiteSpace($audit.TextDamage)) {
+        $damageDescription = if ($audit.TextDamageKind -ceq "BOM") {
+            "damaged BOM text artifact"
+        }
+        else {
+            "damaged $($audit.TextDamageKind) text artifact"
+        }
+        throw "$Description contains $damageDescription ${Path}: $($audit.TextDamage)"
     }
+    if ($audit.IsText -and -not [string]::IsNullOrWhiteSpace($audit.RawMatchedLabel)) {
+        throw "$Description contains a $($audit.RawMatchedLabel) absolute path: $Path"
+    }
+    if ($audit.JsonLimitExceeded) {
+        throw "$Description structured JSON audit failed closed for ${Path}: $($audit.JsonError)"
+    }
+
+    $requiresJson = [System.IO.Path]::GetExtension($Path).Equals(
+        ".json",
+        [System.StringComparison]::OrdinalIgnoreCase
+    )
+    if ($requiresJson -and (-not $audit.IsText -or -not $audit.IsJson)) {
+        $jsonDamage = if ([string]::IsNullOrWhiteSpace($audit.JsonError)) {
+            "the file is not strict supported text JSON"
+        }
+        else {
+            $audit.JsonError
+        }
+        throw "$Description contains damaged structured JSON ${Path}: $jsonDamage"
+    }
+    if ($audit.IsJson -and -not [string]::IsNullOrWhiteSpace(
+        $audit.StructuredMatchedLabel
+    )) {
+        throw "$Description contains a $($audit.StructuredMatchedLabel) absolute path: $Path"
+    }
+    return $audit
 }
 
 function Assert-EasyConPreparedTreeDoesNotReferenceRepository {
@@ -1227,10 +1530,15 @@ function Assert-EasyConPreparedTreeDoesNotReferenceRepository {
         [string]$WritableRoot,
 
         [Parameter(Mandatory)]
-        [string]$Description
+        [string]$Description,
+
+        [switch]$PassThru
     )
 
-    $tree = Assert-EasyConPhysicalTree -Path $Path -TrustedRoot $TrustedRoot
+    $tree = Assert-EasyConPhysicalPath -Path $Path -TrustedRoot $TrustedRoot
+    if (-not (Test-Path -LiteralPath $tree -PathType Container)) {
+        throw "required environment tree is missing: $tree"
+    }
     $forbiddenRoots = [System.Collections.Generic.List[object]]::new()
     $repository = Resolve-EasyConFullPath -Path $RepositoryRoot
     $forbiddenRoots.Add([pscustomobject]@{
@@ -1244,63 +1552,86 @@ function Assert-EasyConPreparedTreeDoesNotReferenceRepository {
             References = @($writable, $writable.Replace("\", "/")) | Select-Object -Unique
         }) | Out-Null
     }
-    $assertText = {
-        param([string]$Text, [string]$File)
-        foreach ($root in $forbiddenRoots) {
-            foreach ($reference in @($root.References)) {
-                if ($Text.IndexOf($reference, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
-                    throw "$Description contains a $($root.Label) absolute path: $File"
+
+    $forbiddenLabels = [System.Collections.Generic.List[string]]::new()
+    $forbiddenReferences = [System.Collections.Generic.List[string]]::new()
+    foreach ($root in $forbiddenRoots) {
+        foreach ($reference in @($root.References)) {
+            $forbiddenLabels.Add($root.Label) | Out-Null
+            $forbiddenReferences.Add($reference) | Out-Null
+        }
+    }
+
+    Initialize-EasyConPreparedArtifactAuditor
+    $summary = [ordered]@{
+        FilesScanned = 0L
+        TextFilesScanned = 0L
+        JsonDocumentsScanned = 0L
+        TotalBytesRead = 0L
+        MaximumJsonWindowBytes = 0
+        JsonWindowLimitBytes = `
+            [EasyCon.WindowsWorkspace.PreparedArtifactAuditor]::JsonWindowLimitBytes
+    }
+    $enumerators = [System.Collections.Generic.Stack[System.Collections.IEnumerator]]::new()
+    try {
+        $enumerators.Push(
+            [System.IO.Directory]::EnumerateFileSystemEntries($tree).GetEnumerator()
+        )
+        while ($enumerators.Count -gt 0) {
+            $enumerator = $enumerators.Peek()
+            if (-not $enumerator.MoveNext()) {
+                $completed = $enumerators.Pop()
+                if ($completed -is [System.IDisposable]) {
+                    $completed.Dispose()
                 }
+                continue
+            }
+
+            $entryPath = [string]$enumerator.Current
+            Assert-EasyConPhysicalPath -Path $entryPath -TrustedRoot $tree | Out-Null
+            $attributes = [System.IO.File]::GetAttributes($entryPath)
+            if (($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "physical tree contains a reparse point: $entryPath"
+            }
+            if (($attributes -band [System.IO.FileAttributes]::Directory) -ne 0) {
+                $enumerators.Push(
+                    [System.IO.Directory]::EnumerateFileSystemEntries($entryPath).GetEnumerator()
+                )
+                continue
+            }
+
+            $audit = Assert-EasyConPreparedTextArtifactDoesNotReferenceRoots `
+                -Path $entryPath -ForbiddenLabels $forbiddenLabels.ToArray() `
+                -ForbiddenReferences $forbiddenReferences.ToArray() -Description $Description
+            Assert-EasyConPhysicalPath -Path $entryPath -TrustedRoot $tree | Out-Null
+            $summary.FilesScanned++
+            $summary.TotalBytesRead += $audit.BytesRead
+            if ($audit.IsText) {
+                $summary.TextFilesScanned++
+            }
+            if ($audit.IsJson) {
+                $summary.JsonDocumentsScanned++
+            }
+            $summary.MaximumJsonWindowBytes = [Math]::Max(
+                $summary.MaximumJsonWindowBytes,
+                $audit.MaximumJsonWindowBytes
+            )
+        }
+    }
+    catch [System.OutOfMemoryException] {
+        throw "$Description tree audit failed closed: memory allocation failed"
+    }
+    finally {
+        while ($enumerators.Count -gt 0) {
+            $remaining = $enumerators.Pop()
+            if ($remaining -is [System.IDisposable]) {
+                $remaining.Dispose()
             }
         }
-    }.GetNewClosure()
-    foreach ($file in @(Get-ChildItem -LiteralPath $tree -Recurse -Force -File)) {
-        Assert-EasyConPhysicalPath -Path $file.FullName -TrustedRoot $tree | Out-Null
-        if ($file.Extension.Equals(".json", [System.StringComparison]::OrdinalIgnoreCase)) {
-            $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
-            try {
-                $json = [System.Text.UTF8Encoding]::new($false, $true).GetString($bytes)
-                if ($json.Length -gt 0 -and $json[0] -eq [char]0xfeff) {
-                    $json = $json.Substring(1)
-                }
-                $options = [System.Text.Json.JsonDocumentOptions]::new()
-                $options.AllowTrailingCommas = $false
-                $options.CommentHandling = [System.Text.Json.JsonCommentHandling]::Disallow
-                $document = [System.Text.Json.JsonDocument]::Parse($json, $options)
-            }
-            catch {
-                throw "$Description contains damaged structured JSON $($file.FullName): $($_.Exception.Message)"
-            }
-            try {
-                $pending = [System.Collections.Generic.Stack[System.Text.Json.JsonElement]]::new()
-                $pending.Push($document.RootElement.Clone())
-                while ($pending.Count -gt 0) {
-                    $element = $pending.Pop()
-                    switch ($element.ValueKind) {
-                        ([System.Text.Json.JsonValueKind]::Object) {
-                            foreach ($property in $element.EnumerateObject()) {
-                                & $assertText $property.Name $file.FullName
-                                $pending.Push($property.Value.Clone())
-                            }
-                        }
-                        ([System.Text.Json.JsonValueKind]::Array) {
-                            foreach ($item in $element.EnumerateArray()) {
-                                $pending.Push($item.Clone())
-                            }
-                        }
-                        ([System.Text.Json.JsonValueKind]::String) {
-                            & $assertText $element.GetString() $file.FullName
-                        }
-                    }
-                }
-            }
-            finally {
-                $document.Dispose()
-            }
-            continue
-        }
-        Assert-EasyConPreparedTextArtifactDoesNotReferenceRoots -Path $file.FullName `
-            -ForbiddenRoots $forbiddenRoots.ToArray() -Description $Description
+    }
+
+    if ($PassThru) {
+        return [pscustomobject]$summary
     }
 }
 

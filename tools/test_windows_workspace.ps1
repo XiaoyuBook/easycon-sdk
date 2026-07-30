@@ -54,6 +54,41 @@ function Invoke-ContractCase {
     Write-Output ("CONTRACT_PASS name={0} durationMs={1}" -f $Name, $timer.ElapsedMilliseconds)
 }
 
+function Wait-ContractFileCreated {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [int]$TimeoutMilliseconds = 15000
+    )
+
+    if (Test-Path -LiteralPath $Path -PathType Leaf) {
+        return
+    }
+    $watcher = [System.IO.FileSystemWatcher]::new(
+        (Split-Path -Parent $Path),
+        (Split-Path -Leaf $Path)
+    )
+    try {
+        $watcher.NotifyFilter = [System.IO.NotifyFilters]::FileName
+        $watcher.EnableRaisingEvents = $true
+        if (Test-Path -LiteralPath $Path -PathType Leaf) {
+            return
+        }
+        $change = $watcher.WaitForChanged(
+            [System.IO.WatcherChangeTypes]::Created,
+            $TimeoutMilliseconds
+        )
+        Assert-Contract (
+            -not $change.TimedOut -and
+            (Test-Path -LiteralPath $Path -PathType Leaf)
+        ) "timed out waiting for synchronized contract file $Path"
+    }
+    finally {
+        $watcher.Dispose()
+    }
+}
+
 function Set-ContractFile {
     param(
         [Parameter(Mandatory)]
@@ -2425,11 +2460,64 @@ try {
                     "matching real worktrees must isolate writable $name output"
             }
 
-            $state = [pscustomobject]@{ Provisions = 0; Downloads = 0 }
+            $preparedVcpkgRoot = Join-Path $firstLocation.EnvironmentRoot `
+                "setup/vcpkg/scripts"
+            $preparedVcpkgRelease = "2026-01-01"
+            $preparedVcpkgToolCommit = "2" * 40
+            $preparedVcpkgTool = Join-Path $firstLocation.EnvironmentRoot "tools/vcpkg.cmd"
+            $state = [pscustomobject]@{
+                Provisions = 0
+                Downloads = 0
+                PreparedVcpkgCommit = $null
+                PreparedVcpkgToolBytes = 0L
+                PreparedVcpkgToolHash = $null
+            }
             $readyMarker = Join-Path $firstLocation.EnvironmentRoot "contract-ready.txt"
             $setup = {
                 $state.Provisions++
                 $state.Downloads++
+                foreach ($relative in @(
+                    ".vcpkg-root",
+                    "bootstrap-vcpkg.bat",
+                    "bootstrap-vcpkg.sh",
+                    "scripts/buildsystems/vcpkg.cmake"
+                )) {
+                    Set-ContractFile -Path (Join-Path $preparedVcpkgRoot $relative) `
+                        -Value "real worktree prepared-vcpkg contract"
+                }
+                & $git -c core.longpaths=true init --quiet $preparedVcpkgRoot
+                Assert-Contract ($LASTEXITCODE -eq 0) `
+                    "the shared prepared-vcpkg fixture must initialize Git"
+                & $git -c core.longpaths=true -C $preparedVcpkgRoot add -- .
+                Assert-Contract ($LASTEXITCODE -eq 0) `
+                    "the shared prepared-vcpkg fixture must stage required files"
+                & $git -c core.longpaths=true -c user.name=EasyConContract `
+                    -c user.email=contract@example.invalid `
+                    -C $preparedVcpkgRoot commit --quiet -m "real worktree contract fixture"
+                Assert-Contract ($LASTEXITCODE -eq 0) `
+                    "the shared prepared-vcpkg fixture must commit required files"
+                $preparedCommit = @(
+                    & $git -c core.longpaths=true -C $preparedVcpkgRoot rev-parse HEAD
+                )
+                Assert-Contract (
+                    $LASTEXITCODE -eq 0 -and $preparedCommit.Count -eq 1
+                ) "the shared prepared-vcpkg fixture must resolve its commit"
+                $state.PreparedVcpkgCommit = $preparedCommit[0]
+
+                Set-ContractFile -Path $preparedVcpkgTool -Value (
+                    "@echo off`r`necho vcpkg package management program version " +
+                    "$preparedVcpkgRelease-$preparedVcpkgToolCommit`r`n"
+                )
+                $preparedTool = Get-Item -LiteralPath $preparedVcpkgTool
+                $state.PreparedVcpkgToolBytes = [long]$preparedTool.Length
+                $state.PreparedVcpkgToolHash = (
+                    Get-FileHash -LiteralPath $preparedVcpkgTool -Algorithm SHA256
+                ).Hash.ToLowerInvariant()
+                $preparedTrackedFile = Get-Item -LiteralPath (
+                    Join-Path $preparedVcpkgRoot "bootstrap-vcpkg.bat"
+                )
+                $preparedTrackedFile.LastWriteTimeUtc = `
+                    $preparedTrackedFile.LastWriteTimeUtc.AddMinutes(-10)
                 Set-ContractFile -Path $readyMarker -Value $fixedSha
             }.GetNewClosure()
             $newVerify = {
@@ -2499,15 +2587,316 @@ try {
                 $environmentDirectories.Count -eq 1 -and
                 $environmentDirectories[0].FullName -ceq $firstLocation.EnvironmentRoot
             ) "two real worktrees must leave exactly one shared prepared environment"
+
+            $getGitIndexPath = {
+                param([Parameter(Mandatory)][string]$Worktree)
+                $output = @(& $git -C $Worktree rev-parse --git-path index)
+                Assert-Contract (
+                    $LASTEXITCODE -eq 0 -and
+                    $output.Count -eq 1 -and
+                    -not [string]::IsNullOrWhiteSpace($output[0])
+                ) "the real worktree contract must resolve one Git index path"
+                $indexPath = if ([System.IO.Path]::IsPathFullyQualified($output[0])) {
+                    $output[0]
+                }
+                else {
+                    Join-Path $Worktree $output[0]
+                }
+                return [System.IO.Path]::GetFullPath($indexPath)
+            }.GetNewClosure()
+            $getIndexSnapshot = {
+                param([Parameter(Mandatory)][string]$IndexPath)
+                $item = Get-Item -LiteralPath $IndexPath
+                return [pscustomobject]@{
+                    Hash = (Get-FileHash -LiteralPath $IndexPath -Algorithm SHA256).Hash
+                    LastWriteTicks = $item.LastWriteTimeUtc.Ticks
+                }
+            }.GetNewClosure()
+
+            $indexPaths = [ordered]@{
+                FirstSource = & $getGitIndexPath $firstWorktree
+                SecondSource = & $getGitIndexPath $secondWorktree
+                PreparedVcpkg = Join-Path $preparedVcpkgRoot ".git/index"
+            }
+            $beforeIndexes = [ordered]@{}
+            foreach ($name in $indexPaths.Keys) {
+                $beforeIndexes[$name] = & $getIndexSnapshot $indexPaths[$name]
+            }
+
+            $verifyProbeRoot = Join-Path $temporaryRoot "real concurrent verify probes"
+            $verifyProbeScript = Join-Path $verifyProbeRoot "verify-probe.ps1"
+            [System.IO.Directory]::CreateDirectory($verifyProbeRoot) | Out-Null
+            Set-ContractFile -Path $verifyProbeScript -Value @'
+param(
+    [Parameter(Mandatory)][string]$ModulePath,
+    [Parameter(Mandatory)][string]$RepositoryRoot,
+    [Parameter(Mandatory)][string]$CacheRoot,
+    [Parameter(Mandatory)][string]$ExpectedEnvironmentRoot,
+    [Parameter(Mandatory)][string]$ExpectedWorkspaceRoot,
+    [Parameter(Mandatory)][string]$EnvironmentReadyMarker,
+    [Parameter(Mandatory)][string]$EnvironmentReadyValue,
+    [Parameter(Mandatory)][string]$ReadyMarker,
+    [Parameter(Mandatory)][string]$ReleaseMarker,
+    [Parameter(Mandatory)][string]$ResultPath,
+    [Parameter(Mandatory)][string]$VcpkgRoot,
+    [Parameter(Mandatory)][string]$VcpkgExecutable,
+    [Parameter(Mandatory)][string]$VcpkgCommit,
+    [Parameter(Mandatory)][string]$VcpkgToolRelease,
+    [Parameter(Mandatory)][string]$VcpkgToolCommit,
+    [Parameter(Mandatory)][long]$VcpkgToolBytes,
+    [Parameter(Mandatory)][string]$VcpkgToolSha256
+)
+
+$ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
+
+function Wait-ProbeRelease {
+    if (Test-Path -LiteralPath $ReleaseMarker -PathType Leaf) {
+        return
+    }
+    $watcher = [System.IO.FileSystemWatcher]::new(
+        (Split-Path -Parent $ReleaseMarker),
+        (Split-Path -Leaf $ReleaseMarker)
+    )
+    try {
+        $watcher.NotifyFilter = [System.IO.NotifyFilters]::FileName
+        $watcher.EnableRaisingEvents = $true
+        if (-not (Test-Path -LiteralPath $ReleaseMarker -PathType Leaf)) {
+            $change = $watcher.WaitForChanged(
+                [System.IO.WatcherChangeTypes]::Created,
+                15000
+            )
+            if ($change.TimedOut -or -not (Test-Path -LiteralPath $ReleaseMarker -PathType Leaf)) {
+                throw "concurrent Verify probe timed out waiting for release"
+            }
+        }
+    }
+    finally {
+        $watcher.Dispose()
+    }
+}
+
+Import-Module -Name $ModulePath -Force
+$module = Get-Module windows_workspace
+$location = & $module {
+    param($Root, $Cache)
+    $configurationPath = Join-Path $Root "tools/windows_build_environment.json"
+    $configuration = Get-EasyConWindowsBuildConfiguration -Path $configurationPath
+    $fingerprint = Get-EasyConEnvironmentFingerprint `
+        -RepositoryRoot $Root -Configuration $configuration
+    Get-EasyConEnvironmentLocation -RepositoryRoot $Root `
+        -Fingerprint $fingerprint.Value -Configuration $configuration -CacheRoot $Cache
+} $RepositoryRoot $CacheRoot
+if (
+    $location.EnvironmentRoot -cne $ExpectedEnvironmentRoot -or
+    $location.WorkspaceRoot -cne $ExpectedWorkspaceRoot
+) {
+    throw "real worktree Verify recomputed an unexpected e/ or w/<key> location"
+}
+$vcpkgConfiguration = [pscustomobject]@{
+    vcpkg = [pscustomobject]@{
+        scriptsCommit = $VcpkgCommit
+        toolRelease = $VcpkgToolRelease
+        toolCommit = $VcpkgToolCommit
+        windowsAsset = [pscustomobject]@{
+            bytes = $VcpkgToolBytes
+            sha256 = $VcpkgToolSha256
+        }
+    }
+}
+$verify = {
+    if (
+        -not (Test-Path -LiteralPath $EnvironmentReadyMarker -PathType Leaf) -or
+        (Get-Content -Raw -LiteralPath $EnvironmentReadyMarker) -cne $EnvironmentReadyValue
+    ) {
+        throw "real concurrent Verify environment is not ready"
+    }
+    [System.IO.File]::WriteAllText(
+        $ReadyMarker,
+        "ready",
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    Wait-ProbeRelease
+    & $module {
+        param($Root, $Configuration, $Executable)
+        Assert-EasyConVcpkgCheckout -VcpkgRoot $Root `
+            -Configuration $Configuration -VcpkgExecutable $Executable
+    } $VcpkgRoot $vcpkgConfiguration $VcpkgExecutable | Out-Null
+    [System.IO.Directory]::CreateDirectory($location.WorkspaceRoot) | Out-Null
+    [System.IO.File]::WriteAllText(
+        (Join-Path $location.WorkspaceRoot "concurrent-verify.txt"),
+        $location.WorkspaceKey,
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    return [pscustomobject]@{
+        status = "ready"
+        environmentRoot = $location.EnvironmentRoot
+        workspaceRoot = $location.WorkspaceRoot
+    }
+}.GetNewClosure()
+
+$summary = & $module {
+    param($OwnedLocation, $VerifyAction)
+    Invoke-EasyConEnvironmentLifecycle -Mode Verify -Location $OwnedLocation `
+        -SetupAction { throw "concurrent Verify probe must not provision" } `
+        -VerifyAction $VerifyAction `
+        -WorkspaceAction { throw "concurrent Verify probe must not run workspace gates" } `
+        -LeaseTimeoutMilliseconds 15000
+} $location $verify
+
+$result = [ordered]@{
+    status = $summary.status
+    environmentRoot = $summary.environmentRoot
+    workspaceRoot = $location.WorkspaceRoot
+}
+[System.IO.File]::WriteAllText(
+    $ResultPath,
+    ($result | ConvertTo-Json -Compress),
+    [System.Text.UTF8Encoding]::new($false)
+)
+'@
+
+            $verifyProcesses = [System.Collections.Generic.List[object]]::new()
+            try {
+                foreach ($entry in @(
+                    [pscustomobject]@{
+                        Name = "one"
+                        RepositoryRoot = $firstWorktree
+                        Location = $firstLocation
+                    },
+                    [pscustomobject]@{
+                        Name = "two"
+                        RepositoryRoot = $secondWorktree
+                        Location = $secondLocation
+                    }
+                )) {
+                    $ready = Join-Path $verifyProbeRoot "$($entry.Name)-ready.txt"
+                    $release = Join-Path $verifyProbeRoot "$($entry.Name)-release.txt"
+                    $result = Join-Path $verifyProbeRoot "$($entry.Name)-result.json"
+                    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+                    $startInfo.FileName = Join-Path $PSHOME "pwsh.exe"
+                    $startInfo.WorkingDirectory = $entry.RepositoryRoot
+                    $startInfo.UseShellExecute = $false
+                    $startInfo.RedirectStandardOutput = $true
+                    $startInfo.RedirectStandardError = $true
+                    foreach ($argument in @(
+                        "-NoLogo", "-NoProfile", "-File", $verifyProbeScript,
+                        "-ModulePath", $modulePath,
+                        "-RepositoryRoot", $entry.RepositoryRoot,
+                        "-CacheRoot", $entry.Location.CacheRoot,
+                        "-ExpectedEnvironmentRoot", $entry.Location.EnvironmentRoot,
+                        "-ExpectedWorkspaceRoot", $entry.Location.WorkspaceRoot,
+                        "-EnvironmentReadyMarker", $readyMarker,
+                        "-EnvironmentReadyValue", $fixedSha,
+                        "-ReadyMarker", $ready,
+                        "-ReleaseMarker", $release,
+                        "-ResultPath", $result,
+                        "-VcpkgRoot", $preparedVcpkgRoot,
+                        "-VcpkgExecutable", $preparedVcpkgTool,
+                        "-VcpkgCommit", $state.PreparedVcpkgCommit,
+                        "-VcpkgToolRelease", $preparedVcpkgRelease,
+                        "-VcpkgToolCommit", $preparedVcpkgToolCommit,
+                        "-VcpkgToolBytes", $state.PreparedVcpkgToolBytes,
+                        "-VcpkgToolSha256", $state.PreparedVcpkgToolHash
+                    )) {
+                        $startInfo.ArgumentList.Add([string]$argument)
+                    }
+                    $verifyProcesses.Add([pscustomobject]@{
+                        Name = $entry.Name
+                        Process = [System.Diagnostics.Process]::Start($startInfo)
+                        Ready = $ready
+                        Release = $release
+                        Result = $result
+                        Location = $entry.Location
+                    }) | Out-Null
+                }
+
+                foreach ($probe in $verifyProcesses) {
+                    Wait-ContractFileCreated -Path $probe.Ready
+                    Assert-Contract (-not $probe.Process.HasExited) `
+                        "real Verify probe $($probe.Name) must remain inside the marker barrier"
+                }
+                foreach ($probe in $verifyProcesses) {
+                    [System.IO.File]::WriteAllText(
+                        $probe.Release,
+                        "release",
+                        [System.Text.UTF8Encoding]::new($false)
+                    )
+                }
+                foreach ($probe in $verifyProcesses) {
+                    Assert-Contract ($probe.Process.WaitForExit(30000)) `
+                        "real Verify probe $($probe.Name) must finish after release"
+                    $probeOutput = $probe.Process.StandardOutput.ReadToEnd()
+                    $probeError = $probe.Process.StandardError.ReadToEnd()
+                    Assert-Contract (
+                        $probe.Process.ExitCode -eq 0 -and
+                        (Test-Path -LiteralPath $probe.Result -PathType Leaf)
+                    ) "real Verify probe $($probe.Name) failed; output=$probeOutput error=$probeError"
+                    $probe.Result = Get-Content -Raw -LiteralPath $probe.Result | `
+                        ConvertFrom-Json
+                    Assert-Contract (
+                        $probe.Result.status -ceq "ready" -and
+                        $probe.Result.environmentRoot -ceq $firstLocation.EnvironmentRoot -and
+                        $probe.Result.workspaceRoot -ceq $probe.Location.WorkspaceRoot
+                    ) "real concurrent Verify must report shared e/ and its own w/<key>"
+                }
+            }
+            finally {
+                foreach ($probe in $verifyProcesses) {
+                    if (-not $probe.Process.HasExited) {
+                        $probe.Process.Kill($true)
+                        $probe.Process.WaitForExit()
+                    }
+                    $probe.Process.Dispose()
+                }
+            }
+
+            Assert-Contract (
+                $verifyProcesses[0].Result.environmentRoot -ceq `
+                    $verifyProcesses[1].Result.environmentRoot -and
+                $verifyProcesses[0].Result.workspaceRoot -cne `
+                    $verifyProcesses[1].Result.workspaceRoot
+            ) "concurrent real Verify must use one e/ and distinct w/<key> roots"
+            $finalEnvironmentDirectories = @(
+                Get-ChildItem -LiteralPath (Join-Path $cache "e") -Directory -Force
+            )
+            Assert-Contract (
+                $finalEnvironmentDirectories.Count -eq 1 -and
+                $finalEnvironmentDirectories[0].FullName -ceq `
+                    $firstLocation.EnvironmentRoot -and
+                $state.Provisions -eq 1 -and
+                $state.Downloads -eq 1
+            ) "concurrent real Verify must not duplicate e/, provision, or download"
+
+            foreach ($name in $indexPaths.Keys) {
+                $after = & $getIndexSnapshot $indexPaths[$name]
+                Assert-Contract (
+                    $after.Hash -ceq $beforeIndexes[$name].Hash -and
+                    $after.LastWriteTicks -eq $beforeIndexes[$name].LastWriteTicks -and
+                    -not (Test-Path -LiteralPath "$($indexPaths[$name]).lock")
+                ) "concurrent real Verify must preserve $name index hash/mtime and avoid index.lock"
+            }
+
             foreach ($worktree in @($firstWorktree, $secondWorktree)) {
                 $finalHead = @(& $git -C $worktree rev-parse --verify HEAD)
-                $finalStatus = @(& $git -C $worktree status --porcelain=v1 --untracked-files=all)
+                $finalStatus = @(
+                    & $git --no-optional-locks -c core.fsmonitor=false `
+                        -c core.untrackedCache=false -C $worktree status `
+                        --porcelain=v1 --untracked-files=all
+                )
                 Assert-Contract (
                     $LASTEXITCODE -eq 0 -and
                     $finalHead.Count -eq 1 -and
                     $finalHead[0] -ceq $fixedSha -and
                     $finalStatus.Count -eq 0
-                ) "both Setup lifecycles must leave each fixed-SHA checkout clean"
+                ) "Setup and concurrent Verify must leave each fixed-SHA checkout clean"
+            }
+            foreach ($name in @("FirstSource", "SecondSource")) {
+                $afterCleanCheck = & $getIndexSnapshot $indexPaths[$name]
+                Assert-Contract (
+                    $afterCleanCheck.Hash -ceq $beforeIndexes[$name].Hash -and
+                    $afterCleanCheck.LastWriteTicks -eq $beforeIndexes[$name].LastWriteTicks
+                ) "the read-only clean check must also preserve the $name index"
             }
         }
         finally {
@@ -2707,6 +3096,275 @@ try {
                     Description = "contract escaped prepared writable tree"
                 }
         }
+        Remove-Item -LiteralPath $escapedWritableLeak -Force
+
+        $auditParameters = @{
+            Path = $installed
+            TrustedRoot = $location.EnvironmentRoot
+            RepositoryRoot = $repositoryRoot
+            WritableRoot = $location.WritableRoot
+            Description = "contract streaming prepared tree"
+        }
+        $missedLeaks = [System.Collections.Generic.List[string]]::new()
+        $expectPreparedLeak = {
+            param(
+                [Parameter(Mandatory)]
+                [string]$Fixture,
+
+                [Parameter(Mandatory)]
+                [string]$Pattern,
+
+                [Parameter(Mandatory)]
+                [string]$Name
+            )
+
+            $failure = $null
+            try {
+                Invoke-PrivateCommand `
+                    -CommandName "Assert-EasyConPreparedTreeDoesNotReferenceRepository" `
+                    -Parameters $auditParameters | Out-Null
+            }
+            catch {
+                $failure = $_
+            }
+            if ($null -eq $failure) {
+                $missedLeaks.Add($Name) | Out-Null
+            }
+            else {
+                Assert-Contract ($failure.Exception.Message -match $Pattern) `
+                    "prepared leak '$Name' failure '$($failure.Exception.Message)' must match '$Pattern'"
+            }
+            Remove-Item -LiteralPath $Fixture -Force
+        }.GetNewClosure()
+
+        $escapedRepository = $repositoryRoot | ConvertTo-Json -Compress
+        $escapedOtherWritable = $otherWorktreeWrite | ConvertTo-Json -Compress
+        $jsonTemplateLeak = Join-Path $installed "contract-escaped-source.json.in"
+        [System.IO.File]::WriteAllText(
+            $jsonTemplateLeak,
+            "  {`n  `"generated`": { `"path`": $escapedRepository }`n}",
+            [System.Text.UTF8Encoding]::new($true, $true)
+        )
+        & $expectPreparedLeak $jsonTemplateLeak "source worktree absolute path" `
+            "BOM JSON template escaped source"
+
+        $jsonBoundaryLeak = Join-Path $installed "contract-escaped-writable-extensionless"
+        $jsonPrefix = '{"portable":true,'
+        $jsonProperty = '"generatedPath":'
+        $jsonBoundary = 65536
+        $jsonPadding = " " * ($jsonBoundary - 6 - $jsonPrefix.Length - $jsonProperty.Length)
+        Set-ContractUtf8Text -Path $jsonBoundaryLeak `
+            -Value ($jsonPrefix + $jsonPadding + $jsonProperty + $escapedOtherWritable + '}')
+        & $expectPreparedLeak $jsonBoundaryLeak "writable absolute path" `
+            "extensionless escaped writable JSON crossing the audit window"
+
+        $utf16JsonPropertyLeak = Join-Path $installed `
+            "contract-no-bom-utf16le-json.targets"
+        [System.IO.File]::WriteAllText(
+            $utf16JsonPropertyLeak,
+            ('{' + $escapedRepository + ':"generated"}'),
+            [System.Text.UnicodeEncoding]::new($false, $false, $true)
+        )
+        & $expectPreparedLeak $utf16JsonPropertyLeak "source worktree absolute path" `
+            "no-BOM UTF-16LE JSON escaped property name"
+
+        $xmlRepository = [System.Security.SecurityElement]::Escape($repositoryRoot)
+        $utf16LeLeak = Join-Path $installed "contract-no-bom-utf16le.targets"
+        $utf16LeXml = '<?xml version="1.0" encoding="utf-16"?>' +
+            '<Project><PropertyGroup><ContractPath>' + $xmlRepository +
+            '</ContractPath></PropertyGroup></Project>'
+        [System.IO.File]::WriteAllText(
+            $utf16LeLeak,
+            $utf16LeXml,
+            [System.Text.UnicodeEncoding]::new($false, $false, $true)
+        )
+        $xmlReader = [System.Xml.XmlReader]::Create($utf16LeLeak)
+        try {
+            while ($xmlReader.Read()) {}
+        }
+        finally {
+            $xmlReader.Dispose()
+        }
+        & $expectPreparedLeak $utf16LeLeak "source worktree absolute path" `
+            "no-BOM UTF-16LE XML targets"
+
+        $utf16BeLeak = Join-Path $installed "contract-no-bom-utf16be.targets"
+        $utf16BePadding = "x" * 16400
+        $utf16BeXml = '<?xml version="1.0" encoding="utf-16BE"?>' +
+            '<Project><PropertyGroup><ContractPath>' + $utf16BePadding + $xmlRepository +
+            '</ContractPath></PropertyGroup></Project>'
+        [System.IO.File]::WriteAllText(
+            $utf16BeLeak,
+            $utf16BeXml,
+            [System.Text.UnicodeEncoding]::new($true, $false, $true)
+        )
+        $xmlReader = [System.Xml.XmlReader]::Create($utf16BeLeak)
+        try {
+            while ($xmlReader.Read()) {}
+        }
+        finally {
+            $xmlReader.Dispose()
+        }
+        & $expectPreparedLeak $utf16BeLeak "source worktree absolute path" `
+            "no-BOM UTF-16BE XML targets crossing the text window"
+
+        $invalidJson = Join-Path $installed "contract-invalid.json"
+        Set-ContractUtf8Text -Path $invalidJson -Value '{"unterminated":'
+        Assert-Throws -Pattern "damaged structured JSON" -Action {
+            Invoke-PrivateCommand `
+                -CommandName "Assert-EasyConPreparedTreeDoesNotReferenceRepository" `
+                -Parameters $auditParameters
+        }
+        Remove-Item -LiteralPath $invalidJson -Force
+
+        $damagedBomText = Join-Path $installed "contract-damaged-utf16.template"
+        [System.IO.File]::WriteAllBytes($damagedBomText, [byte[]](0xff, 0xfe, 0x41))
+        Assert-Throws -Pattern "damaged BOM text artifact" -Action {
+            Invoke-PrivateCommand `
+                -CommandName "Assert-EasyConPreparedTreeDoesNotReferenceRepository" `
+                -Parameters $auditParameters
+        }
+        Remove-Item -LiteralPath $damagedBomText -Force
+
+        $binaryWithSource = Join-Path $installed "contract-binary-with-source.bin"
+        $binaryBytes = [System.Collections.Generic.List[byte]]::new()
+        $binaryBytes.AddRange([byte[]](0x00, 0xff, 0x80, 0x7f))
+        $binaryBytes.AddRange([System.Text.Encoding]::UTF8.GetBytes($repositoryRoot))
+        [System.IO.File]::WriteAllBytes($binaryWithSource, $binaryBytes.ToArray())
+        Invoke-PrivateCommand `
+            -CommandName "Assert-EasyConPreparedTreeDoesNotReferenceRepository" `
+            -Parameters $auditParameters | Out-Null
+
+        Assert-Contract ($missedLeaks.Count -eq 0) (
+            "prepared audit accepted forbidden text carriers: {0}" -f
+                ($missedLeaks -join ', ')
+        )
+
+        $cleanJsonTemplate = Join-Path $installed "contract-clean-json.json.in"
+        [System.IO.File]::WriteAllText(
+            $cleanJsonTemplate,
+            " `r`n { `"mode`": `"portable`" }",
+            [System.Text.UTF8Encoding]::new($true, $true)
+        )
+        $manyFiles = Join-Path $installed "contract-many-files"
+        for ($directoryIndex = 0; $directoryIndex -lt 16; $directoryIndex++) {
+            $directory = Join-Path $manyFiles $directoryIndex
+            [System.IO.Directory]::CreateDirectory($directory) | Out-Null
+            for ($fileIndex = 0; $fileIndex -lt 32; $fileIndex++) {
+                [System.IO.File]::WriteAllText(
+                    (Join-Path $directory ("artifact-{0}.txt" -f $fileIndex)),
+                    "portable prepared artifact",
+                    [System.Text.UTF8Encoding]::new($false, $true)
+                )
+            }
+        }
+        $largeJson = Join-Path $installed "contract-large-json.json.in"
+        $largeJsonBuilder = [System.Text.StringBuilder]::new(2MB)
+        [void]$largeJsonBuilder.Append('{"items":[')
+        for ($index = 0; $index -lt 140000; $index++) {
+            if ($index -ne 0) {
+                [void]$largeJsonBuilder.Append(',')
+            }
+            [void]$largeJsonBuilder.Append('"portable"')
+        }
+        [void]$largeJsonBuilder.Append(']}')
+        Set-ContractUtf8Text -Path $largeJson -Value $largeJsonBuilder.ToString()
+
+        $boundedAuditParameters = $auditParameters.Clone()
+        $boundedAuditParameters.PassThru = $true
+        $audit = Invoke-PrivateCommand `
+            -CommandName "Assert-EasyConPreparedTreeDoesNotReferenceRepository" `
+            -Parameters $boundedAuditParameters
+        Assert-Contract ($audit.FilesScanned -ge 520) `
+            "streaming prepared audit must process the complete many-file tree"
+        Assert-Contract ($audit.JsonDocumentsScanned -ge 2) `
+            "structured JSON detection must not depend on the file extension"
+        Assert-Contract (
+            $audit.TotalBytesRead -gt (8 * $audit.JsonWindowLimitBytes) -and
+            $audit.MaximumJsonWindowBytes -le $audit.JsonWindowLimitBytes
+        ) "large JSON must use the declared bounded incremental reader window"
+
+        $preparedAuditSource = & $workspaceModule {
+            @(
+                ${function:Assert-EasyConPreparedTreeDoesNotReferenceRepository}.Ast.Extent.Text
+                ${function:Assert-EasyConPreparedTextArtifactDoesNotReferenceRoots}.Ast.Extent.Text
+            ) -join "`n"
+        }
+        Assert-Contract ($preparedAuditSource -notmatch 'ReadAllBytes|JsonDocument\b|\.Clone\(') `
+            "prepared audit must not materialize whole JSON documents or cloned nodes"
+        Assert-Contract ($preparedAuditSource -notmatch 'Get-ChildItem[^\r\n]*-Recurse') `
+            "prepared audit must not materialize a recursive FileInfo list"
+
+        $performanceRoot = Join-Path $installed "contract-streaming-performance"
+        $performanceJson = $largeJsonBuilder.ToString()
+        $newPerformanceTree = {
+            param(
+                [Parameter(Mandatory)]
+                [string]$Root,
+
+                [Parameter(Mandatory)]
+                [int]$Scale
+            )
+
+            [System.IO.Directory]::CreateDirectory($Root) | Out-Null
+            for ($index = 0; $index -lt (64 * $Scale); $index++) {
+                [System.IO.File]::WriteAllText(
+                    (Join-Path $Root ("artifact-{0}.txt" -f $index)),
+                    "portable prepared performance artifact",
+                    [System.Text.UTF8Encoding]::new($false, $true)
+                )
+            }
+            for ($index = 0; $index -lt $Scale; $index++) {
+                [System.IO.File]::WriteAllText(
+                    (Join-Path $Root ("structured-{0}.json.in" -f $index)),
+                    $performanceJson,
+                    [System.Text.UTF8Encoding]::new($false, $true)
+                )
+            }
+        }.GetNewClosure()
+        $smallPerformanceTree = Join-Path $performanceRoot "one"
+        $largePerformanceTree = Join-Path $performanceRoot "two"
+        & $newPerformanceTree $smallPerformanceTree 1
+        & $newPerformanceTree $largePerformanceTree 2
+
+        $performanceParameters = $auditParameters.Clone()
+        $performanceParameters.PassThru = $true
+        $performanceParameters.Path = $smallPerformanceTree
+        $performanceParameters.Description = "contract small streaming performance tree"
+        $smallTimer = [System.Diagnostics.Stopwatch]::StartNew()
+        $smallAudit = Invoke-PrivateCommand `
+            -CommandName "Assert-EasyConPreparedTreeDoesNotReferenceRepository" `
+            -Parameters $performanceParameters
+        $smallTimer.Stop()
+
+        $performanceParameters.Path = $largePerformanceTree
+        $performanceParameters.Description = "contract large streaming performance tree"
+        $largeTimer = [System.Diagnostics.Stopwatch]::StartNew()
+        $largeAudit = Invoke-PrivateCommand `
+            -CommandName "Assert-EasyConPreparedTreeDoesNotReferenceRepository" `
+            -Parameters $performanceParameters
+        $largeTimer.Stop()
+
+        Assert-Contract (
+            $largeAudit.FilesScanned -eq (2 * $smallAudit.FilesScanned) -and
+            $largeAudit.TotalBytesRead -eq (2 * $smallAudit.TotalBytesRead)
+        ) "relative streaming performance fixture must exactly double files and bytes"
+        $relativeTimeLimit = (3 * $smallTimer.ElapsedMilliseconds) + 3000
+        Assert-Contract ($largeTimer.ElapsedMilliseconds -le $relativeTimeLimit) (
+            "doubling the prepared tree must remain bounded and near-linear; " +
+            "smallMs=$($smallTimer.ElapsedMilliseconds) " +
+            "largeMs=$($largeTimer.ElapsedMilliseconds) limitMs=$relativeTimeLimit"
+        )
+        Write-Output (
+            "CONTRACT_METRIC name=prepared-streaming-relative-time " +
+            "smallFiles=$($smallAudit.FilesScanned) " +
+            "smallBytes=$($smallAudit.TotalBytesRead) " +
+            "smallMs=$($smallTimer.ElapsedMilliseconds) " +
+            "largeFiles=$($largeAudit.FilesScanned) " +
+            "largeBytes=$($largeAudit.TotalBytesRead) " +
+            "largeMs=$($largeTimer.ElapsedMilliseconds) " +
+            "limitMs=$relativeTimeLimit"
+        )
     }
 
     Invoke-ContractCase -Name "missing-damaged-and-mismatched-stamp" -Action {
