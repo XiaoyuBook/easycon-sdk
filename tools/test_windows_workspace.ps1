@@ -174,11 +174,42 @@ function Set-ContractUtf8Text {
     )
 }
 
+function Get-ContractFileIdentity {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    $fsutil = Join-Path $env:SystemRoot "System32/fsutil.exe"
+    $identity = @(& $fsutil file queryfileid $Path)
+    Assert-Contract (
+        $LASTEXITCODE -eq 0 -and
+        $identity.Count -eq 1 -and
+        -not [string]::IsNullOrWhiteSpace($identity[0])
+    ) "contract file identity query must return one NTFS file ID for $Path"
+    return $identity[0].Trim()
+}
+
+function Get-ContractFileSnapshot {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    $item = Get-Item -Force -LiteralPath $Path -ErrorAction Stop
+    return [pscustomobject]@{
+        Bytes = [long]$item.Length
+        Hash = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+        Identity = Get-ContractFileIdentity -Path $Path
+        LastWriteTicks = $item.LastWriteTimeUtc.Ticks
+    }
+}
+
 $modulePath = Join-Path $PSScriptRoot "windows_workspace.psm1"
 $repository = Resolve-Path (Join-Path $PSScriptRoot "..")
 $configurationPath = Join-Path $PSScriptRoot "windows_build_environment.json"
 $temporaryRoot = Join-Path ([System.IO.Path]::GetTempPath()) (
-    "easycon environment contract {0}" -f [guid]::NewGuid().ToString("N")
+    "ecw-{0}" -f [guid]::NewGuid().ToString("N").Substring(0, 12)
 )
 New-Item -ItemType Directory -Path $temporaryRoot | Out-Null
 Import-Module -Name $modulePath -Force
@@ -2450,6 +2481,10 @@ try {
             $head[0] -cmatch '^[0-9a-f]{40}$'
         ) "the real worktree contract must resolve one fixed Git SHA"
         $fixedSha = $head[0]
+        $fixedTree = @(& $git -C $repository.Path rev-parse "$fixedSha`^{tree}")[0]
+        Assert-Contract (
+            $LASTEXITCODE -eq 0 -and $fixedTree -cmatch '^[0-9a-f]{40}$'
+        ) "the real worktree contract must resolve the fixed source tree"
         $createdWorktrees = [System.Collections.Generic.List[string]]::new()
         try {
             New-Item -ItemType Directory -Force -Path $checkoutRoot | Out-Null
@@ -2518,6 +2553,8 @@ try {
             $preparedVcpkgRelease = "2026-01-01"
             $preparedVcpkgToolCommit = "2" * 40
             $preparedVcpkgTool = Join-Path $firstLocation.EnvironmentRoot "tools/vcpkg.cmd"
+            $preparedVcpkgInstalled = Join-Path $firstLocation.EnvironmentRoot `
+                "setup/vcpkg/installed"
             $state = [pscustomobject]@{
                 Provisions = 0
                 Downloads = 0
@@ -2571,6 +2608,7 @@ try {
                 )
                 $preparedTrackedFile.LastWriteTimeUtc = `
                     $preparedTrackedFile.LastWriteTimeUtc.AddMinutes(-10)
+                New-Item -ItemType Directory -Force -Path $preparedVcpkgInstalled | Out-Null
                 Set-ContractFile -Path $readyMarker -Value $fixedSha
             }.GetNewClosure()
             $newVerify = {
@@ -2675,6 +2713,23 @@ try {
             foreach ($name in $indexPaths.Keys) {
                 $beforeIndexes[$name] = & $getIndexSnapshot $indexPaths[$name]
             }
+            $immutablePaths = [ordered]@{
+                PreparedMarker = Join-Path $preparedVcpkgRoot ".vcpkg-root"
+                PreparedToolchain = Join-Path $preparedVcpkgRoot `
+                    "scripts/buildsystems/vcpkg.cmake"
+                PreparedExecutable = $preparedVcpkgTool
+                FirstManifest = Join-Path $firstWorktree "vcpkg.json"
+                SecondManifest = Join-Path $secondWorktree "vcpkg.json"
+            }
+            $beforeImmutableFiles = [ordered]@{}
+            foreach ($name in $immutablePaths.Keys) {
+                $beforeImmutableFiles[$name] = Get-ContractFileSnapshot `
+                    -Path $immutablePaths[$name]
+            }
+            $preparedTree = @(& $git -C $preparedVcpkgRoot rev-parse 'HEAD^{tree}')[0]
+            Assert-Contract (
+                $LASTEXITCODE -eq 0 -and $preparedTree -cmatch '^[0-9a-f]{40}$'
+            ) "the prepared vcpkg fixture must resolve its immutable Git tree"
 
             $verifyProbeRoot = Join-Path $temporaryRoot "real concurrent verify probes"
             $verifyProbeScript = Join-Path $verifyProbeRoot "verify-probe.ps1"
@@ -2695,6 +2750,7 @@ param(
     [Parameter(Mandatory)][string]$ResultPath,
     [Parameter(Mandatory)][string]$VcpkgRoot,
     [Parameter(Mandatory)][string]$VcpkgExecutable,
+    [Parameter(Mandatory)][string]$VcpkgInstalledRoot,
     [Parameter(Mandatory)][string]$VcpkgCommit,
     [Parameter(Mandatory)][string]$VcpkgToolRelease,
     [Parameter(Mandatory)][string]$VcpkgToolCommit,
@@ -2775,28 +2831,33 @@ $verify = {
     ) {
         throw "real concurrent Verify environment is not ready"
     }
+    $vcpkg = & $module {
+        param($Root, $Configuration, $Executable)
+        Assert-EasyConVcpkgCheckout -VcpkgRoot $Root `
+            -Configuration $Configuration -VcpkgExecutable $Executable
+    } $VcpkgRoot $vcpkgConfiguration $VcpkgExecutable
     [System.IO.File]::WriteAllText(
         $ReadyMarker,
         "ready",
         [System.Text.UTF8Encoding]::new($false)
     )
-    Wait-ProbeMarker -Path $ReleaseMarker -Description "release" `
+    Wait-ProbeMarker -Path $ReleaseMarker -Description "layout release" `
         -TimeoutMilliseconds $ReleaseTimeoutMilliseconds
-    & $module {
-        param($Root, $Configuration, $Executable)
-        Assert-EasyConVcpkgCheckout -VcpkgRoot $Root `
-            -Configuration $Configuration -VcpkgExecutable $Executable
-    } $VcpkgRoot $vcpkgConfiguration $VcpkgExecutable | Out-Null
-    [System.IO.Directory]::CreateDirectory($location.WorkspaceRoot) | Out-Null
-    [System.IO.File]::WriteAllText(
-        (Join-Path $location.WorkspaceRoot "concurrent-verify.txt"),
-        $location.WorkspaceKey,
-        [System.Text.UTF8Encoding]::new($false)
-    )
+    $layout = & $module {
+        param($VerifiedVcpkg, $Root, $Workspace, $Cache, $Environment, $Installed)
+        New-EasyConVcpkgWorkspaceLayout -Vcpkg $VerifiedVcpkg `
+            -RepositoryRoot $Root -WorkspaceRoot $Workspace -CacheRoot $Cache `
+            -EnvironmentRoot $Environment -InstalledRoot $Installed
+    } $vcpkg $RepositoryRoot $location.WorkspaceRoot $CacheRoot `
+        $location.EnvironmentRoot $VcpkgInstalledRoot
     return [pscustomobject]@{
         status = "ready"
         environmentRoot = $location.EnvironmentRoot
         workspaceRoot = $location.WorkspaceRoot
+        vcpkgRoot = $layout.Root
+        vcpkgExecutable = Join-Path $layout.Root "vcpkg.exe"
+        vcpkgMarker = Join-Path $layout.Root ".vcpkg-root"
+        vcpkgWrapper = $layout.Toolchain
     }
 }.GetNewClosure()
 
@@ -2813,6 +2874,10 @@ $result = [ordered]@{
     status = $summary.status
     environmentRoot = $summary.environmentRoot
     workspaceRoot = $location.WorkspaceRoot
+    vcpkgRoot = $summary.vcpkgRoot
+    vcpkgExecutable = $summary.vcpkgExecutable
+    vcpkgMarker = $summary.vcpkgMarker
+    vcpkgWrapper = $summary.vcpkgWrapper
 }
 [System.IO.File]::WriteAllText(
     $ResultPath,
@@ -2835,6 +2900,7 @@ $result = [ordered]@{
             )
 
             $verifyProcesses = [System.Collections.Generic.List[object]]::new()
+            $layoutRelease = Join-Path $verifyProbeRoot "layout-release.txt"
             try {
                 foreach ($entry in @(
                     [pscustomobject]@{
@@ -2850,7 +2916,6 @@ $result = [ordered]@{
                 )) {
                     $start = Join-Path $verifyProbeRoot "$($entry.Name)-start.txt"
                     $ready = Join-Path $verifyProbeRoot "$($entry.Name)-ready.txt"
-                    $release = Join-Path $verifyProbeRoot "$($entry.Name)-release.txt"
                     $result = Join-Path $verifyProbeRoot "$($entry.Name)-result.json"
                     $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
                     $startInfo.FileName = Join-Path $PSHOME "pwsh.exe"
@@ -2869,11 +2934,12 @@ $result = [ordered]@{
                         "-EnvironmentReadyValue", $fixedSha,
                         "-StartMarker", $start,
                         "-ReadyMarker", $ready,
-                        "-ReleaseMarker", $release,
+                        "-ReleaseMarker", $layoutRelease,
                         "-ReleaseTimeoutMilliseconds", $probeReleaseTimeoutMilliseconds,
                         "-ResultPath", $result,
                         "-VcpkgRoot", $preparedVcpkgRoot,
                         "-VcpkgExecutable", $preparedVcpkgTool,
+                        "-VcpkgInstalledRoot", $preparedVcpkgInstalled,
                         "-VcpkgCommit", $state.PreparedVcpkgCommit,
                         "-VcpkgToolRelease", $preparedVcpkgRelease,
                         "-VcpkgToolCommit", $preparedVcpkgToolCommit,
@@ -2887,7 +2953,7 @@ $result = [ordered]@{
                         Process = [System.Diagnostics.Process]::Start($startInfo)
                         Start = $start
                         Ready = $ready
-                        Release = $release
+                        Release = $layoutRelease
                         Result = $result
                         Location = $entry.Location
                     }) | Out-Null
@@ -2981,13 +3047,11 @@ $result = [ordered]@{
                         $workspaceLeaseFailure.Exception.Message -match 'busy|ownership'
                     ) "ready probe $($probe.Name) must hold its distinct w/<key> lease"
                 }
-                foreach ($probe in $verifyProcesses) {
-                    [System.IO.File]::WriteAllText(
-                        $probe.Release,
-                        "release",
-                        [System.Text.UTF8Encoding]::new($false)
-                    )
-                }
+                [System.IO.File]::WriteAllText(
+                    $layoutRelease,
+                    "release both workspace layouts",
+                    [System.Text.UTF8Encoding]::new($false)
+                )
                 foreach ($probe in $verifyProcesses) {
                     Assert-Contract ($probe.Process.WaitForExit(30000)) `
                         "real Verify probe $($probe.Name) must finish after release"
@@ -3002,7 +3066,12 @@ $result = [ordered]@{
                     Assert-Contract (
                         $probe.Result.status -ceq "ready" -and
                         $probe.Result.environmentRoot -ceq $firstLocation.EnvironmentRoot -and
-                        $probe.Result.workspaceRoot -ceq $probe.Location.WorkspaceRoot
+                        $probe.Result.workspaceRoot -ceq $probe.Location.WorkspaceRoot -and
+                        $probe.Result.vcpkgRoot -ceq
+                            (Join-Path $probe.Location.WorkspaceRoot "vcpkg/root") -and
+                        (Test-Path -LiteralPath $probe.Result.vcpkgExecutable -PathType Leaf) -and
+                        (Test-Path -LiteralPath $probe.Result.vcpkgMarker -PathType Leaf) -and
+                        (Test-Path -LiteralPath $probe.Result.vcpkgWrapper -PathType Leaf)
                     ) "real concurrent Verify must report shared e/ and its own w/<key>"
                 }
             }
@@ -3022,6 +3091,57 @@ $result = [ordered]@{
                 $verifyProcesses[0].Result.workspaceRoot -cne `
                     $verifyProcesses[1].Result.workspaceRoot
             ) "concurrent real Verify must use one e/ and distinct w/<key> roots"
+            for ($index = 0; $index -lt $verifyProcesses.Count; $index++) {
+                $probe = $verifyProcesses[$index]
+                $sourceManifestName = if ($index -eq 0) { "FirstManifest" } else { "SecondManifest" }
+                $workspaceManifest = Join-Path $probe.Result.workspaceRoot `
+                    "vcpkg/manifest/vcpkg.json"
+                $wrapperText = Get-Content -Raw -LiteralPath $probe.Result.vcpkgWrapper
+                $rootBinding = "set(Z_VCPKG_ROOT_DIR `"$($probe.Result.vcpkgRoot.Replace('\', '/'))`""
+                Assert-Contract (
+                    (Get-FileHash -LiteralPath $probe.Result.vcpkgExecutable `
+                        -Algorithm SHA256).Hash.ToLowerInvariant() -ceq
+                        $state.PreparedVcpkgToolHash -and
+                    (Get-FileHash -LiteralPath $probe.Result.vcpkgMarker `
+                        -Algorithm SHA256).Hash.ToLowerInvariant() -ceq
+                        $beforeImmutableFiles.PreparedMarker.Hash -and
+                    (Get-FileHash -LiteralPath $workspaceManifest `
+                        -Algorithm SHA256).Hash.ToLowerInvariant() -ceq
+                        $beforeImmutableFiles[$sourceManifestName].Hash -and
+                    (Get-ContractFileIdentity -Path $probe.Result.vcpkgExecutable) -cne
+                        $beforeImmutableFiles.PreparedExecutable.Identity -and
+                    (Get-ContractFileIdentity -Path $probe.Result.vcpkgMarker) -cne
+                        $beforeImmutableFiles.PreparedMarker.Identity -and
+                    (Get-ContractFileIdentity -Path $probe.Result.vcpkgWrapper) -cne
+                        $beforeImmutableFiles.PreparedToolchain.Identity -and
+                    (Get-ContractFileIdentity -Path $workspaceManifest) -cne
+                        $beforeImmutableFiles[$sourceManifestName].Identity -and
+                    $wrapperText.IndexOf($rootBinding, [System.StringComparison]::Ordinal) -ge 0 -and
+                    $wrapperText.IndexOf($rootBinding, [System.StringComparison]::Ordinal) -lt
+                        $wrapperText.IndexOf("include(`"", [System.StringComparison]::Ordinal)
+                ) "real concurrent layout $($probe.Name) must publish detached exact files and bind root before include"
+                $rootEntries = @(Get-ChildItem -Force -LiteralPath $probe.Result.vcpkgRoot |
+                    Select-Object -ExpandProperty Name | Sort-Object)
+                Assert-Contract (
+                    ($rootEntries -join ',') -ceq '.vcpkg-root,scripts,vcpkg.exe'
+                ) "real concurrent layout $($probe.Name) must retain the exact applocal root"
+            }
+            foreach ($property in @(
+                "vcpkgExecutable", "vcpkgMarker", "vcpkgWrapper"
+            )) {
+                Assert-Contract (
+                    (Get-ContractFileIdentity -Path $verifyProcesses[0].Result.$property) -cne
+                        (Get-ContractFileIdentity -Path $verifyProcesses[1].Result.$property)
+                ) "concurrent real layouts must use independent $property file identities"
+            }
+            Assert-Contract (
+                (Get-ContractFileIdentity -Path (
+                    Join-Path $verifyProcesses[0].Result.workspaceRoot "vcpkg/manifest/vcpkg.json"
+                )) -cne
+                (Get-ContractFileIdentity -Path (
+                    Join-Path $verifyProcesses[1].Result.workspaceRoot "vcpkg/manifest/vcpkg.json"
+                ))
+            ) "concurrent real layouts must use independent manifest file identities"
             $finalEnvironmentDirectories = @(
                 Get-ChildItem -LiteralPath (Join-Path $cache "e") -Directory -Force
             )
@@ -3041,9 +3161,33 @@ $result = [ordered]@{
                     -not (Test-Path -LiteralPath "$($indexPaths[$name]).lock")
                 ) "concurrent real Verify must preserve $name index hash/mtime and avoid index.lock"
             }
+            foreach ($name in $immutablePaths.Keys) {
+                $afterImmutable = Get-ContractFileSnapshot -Path $immutablePaths[$name]
+                Assert-Contract (
+                    $afterImmutable.Hash -ceq $beforeImmutableFiles[$name].Hash -and
+                    $afterImmutable.Identity -ceq $beforeImmutableFiles[$name].Identity -and
+                    $afterImmutable.LastWriteTicks -eq
+                        $beforeImmutableFiles[$name].LastWriteTicks
+                ) "concurrent real layouts must preserve immutable $name hash, identity, and mtime"
+            }
+            $preparedHeadAfter = @(& $git -C $preparedVcpkgRoot rev-parse HEAD)[0]
+            $preparedTreeAfter = @(& $git -C $preparedVcpkgRoot rev-parse 'HEAD^{tree}')[0]
+            $preparedStatusAfter = @(
+                & $git --no-optional-locks -c core.fsmonitor=false `
+                    -c core.untrackedCache=false -C $preparedVcpkgRoot status `
+                    --porcelain=v1 --untracked-files=all --ignored=matching
+            )
+            Assert-Contract (
+                $LASTEXITCODE -eq 0 -and
+                $preparedHeadAfter -ceq $state.PreparedVcpkgCommit -and
+                $preparedTreeAfter -ceq $preparedTree -and
+                $preparedStatusAfter.Count -eq 0 -and
+                -not (Test-Path -LiteralPath (Join-Path $preparedVcpkgRoot ".git/index.lock"))
+            ) "concurrent real layouts must leave the prepared vcpkg HEAD/tree/status immutable"
 
             foreach ($worktree in @($firstWorktree, $secondWorktree)) {
                 $finalHead = @(& $git -C $worktree rev-parse --verify HEAD)
+                $finalTree = @(& $git -C $worktree rev-parse 'HEAD^{tree}')[0]
                 $finalStatus = @(
                     & $git --no-optional-locks -c core.fsmonitor=false `
                         -c core.untrackedCache=false -C $worktree status `
@@ -3053,15 +3197,24 @@ $result = [ordered]@{
                     $LASTEXITCODE -eq 0 -and
                     $finalHead.Count -eq 1 -and
                     $finalHead[0] -ceq $fixedSha -and
+                    $finalTree -ceq $fixedTree -and
                     $finalStatus.Count -eq 0
                 ) "Setup and concurrent Verify must leave each fixed-SHA checkout clean"
+                & $git --no-optional-locks -c core.fsmonitor=false `
+                    -c core.untrackedCache=false -C $worktree diff --quiet --exit-code
+                $worktreeDiffExit = $LASTEXITCODE
+                & $git --no-optional-locks -c core.fsmonitor=false `
+                    -c core.untrackedCache=false -C $worktree diff --cached --quiet --exit-code
+                Assert-Contract (
+                    $worktreeDiffExit -eq 0 -and $LASTEXITCODE -eq 0
+                ) "Setup and concurrent Verify must leave source index and worktree diffs empty"
             }
-            foreach ($name in @("FirstSource", "SecondSource")) {
+            foreach ($name in $indexPaths.Keys) {
                 $afterCleanCheck = & $getIndexSnapshot $indexPaths[$name]
                 Assert-Contract (
                     $afterCleanCheck.Hash -ceq $beforeIndexes[$name].Hash -and
                     $afterCleanCheck.LastWriteTicks -eq $beforeIndexes[$name].LastWriteTicks
-                ) "the read-only clean check must also preserve the $name index"
+                ) "the read-only status/diff checks must also preserve the $name index"
             }
         }
         finally {
@@ -3076,6 +3229,122 @@ $result = [ordered]@{
         }
     }
 
+    Invoke-ContractCase -Name "workspace-file-publication-failures-are-atomic" -Action {
+        $publicationRoot = Join-Path $temporaryRoot "workspace file atomic publication"
+        $destination = Join-Path $publicationRoot "vcpkg.exe"
+        Set-ContractFile -Path $destination -Value "complete original final"
+        $original = Get-ContractFileSnapshot -Path $destination
+        $content = [System.Text.Encoding]::UTF8.GetBytes("verified replacement content")
+        $contentHash = [Convert]::ToHexString(
+            [System.Security.Cryptography.SHA256]::HashData($content)
+        ).ToLowerInvariant()
+        $materialize = {
+            param($Temporary)
+            $stream = [System.IO.FileStream]::new(
+                $Temporary,
+                [System.IO.FileMode]::CreateNew,
+                [System.IO.FileAccess]::Write,
+                [System.IO.FileShare]::None
+            )
+            try {
+                $stream.Write($content, 0, $content.Length)
+                $stream.Flush($true)
+            }
+            finally {
+                $stream.Dispose()
+            }
+        }.GetNewClosure()
+        $publicationParameters = @{
+            Destination = $destination
+            Algorithm = "SHA256"
+            Hash = $contentHash
+            Bytes = [long]$content.Length
+            TrustedRoot = $publicationRoot
+            Description = "contract workspace file"
+            MaterializeAction = $materialize
+            CleanupMaxAttempts = 1
+            CleanupRetryMilliseconds = 0
+        }
+
+        $publishFailureParameters = $publicationParameters.Clone()
+        $publishFailureParameters.MoveAction = {
+            param($Temporary, $Final)
+            $null = $Temporary, $Final
+            throw [System.IO.IOException]::new("synthetic atomic file publish failure")
+        }
+        Assert-Throws -Pattern "synthetic atomic file publish failure" -Action {
+            Invoke-PrivateCommand -CommandName "Publish-EasyConContentFileAtomically" `
+                -Parameters $publishFailureParameters
+        }
+        $afterPublishFailure = Get-ContractFileSnapshot -Path $destination
+        Assert-Contract (
+            $afterPublishFailure.Hash -ceq $original.Hash -and
+            $afterPublishFailure.Identity -ceq $original.Identity -and
+            @(Get-ChildItem -Force -LiteralPath $publicationRoot |
+                Where-Object { $_.Name -like '*.publish-*' }).Count -eq 0
+        ) "a move failure must preserve the complete final and remove its verified temporary"
+
+        $cleanupState = [pscustomobject]@{ Handle = $null; Temporary = $null }
+        $cleanupFailureParameters = $publicationParameters.Clone()
+        $cleanupFailureParameters.MoveAction = {
+            param($Temporary, $Final)
+            $null = $Final
+            $cleanupState.Temporary = $Temporary
+            $cleanupState.Handle = [System.IO.File]::Open(
+                $Temporary,
+                [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::Read,
+                [System.IO.FileShare]::None
+            )
+            throw [System.IO.IOException]::new("synthetic atomic file primary failure")
+        }.GetNewClosure()
+        $cleanupFailure = $null
+        try {
+            try {
+                Invoke-PrivateCommand -CommandName "Publish-EasyConContentFileAtomically" `
+                    -Parameters $cleanupFailureParameters | Out-Null
+            }
+            catch {
+                $cleanupFailure = $_
+            }
+            Assert-Contract (
+                $null -ne $cleanupFailure -and
+                $cleanupFailure.Exception.Message -match "synthetic atomic file primary failure" -and
+                $cleanupFailure.Exception.Message -match "cleanup" -and
+                $cleanupFailure.Exception.Data.Contains("EasyConTemporaryCleanupFailure") -and
+                $cleanupFailure.Exception.Data["EasyConResidualTemporary"] -ceq
+                    $cleanupState.Temporary -and
+                (Test-Path -LiteralPath $cleanupState.Temporary -PathType Leaf)
+            ) "temporary cleanup failure must retain the publish primary and residual diagnostic"
+            $afterCleanupFailure = Get-ContractFileSnapshot -Path $destination
+            Assert-Contract (
+                $afterCleanupFailure.Hash -ceq $original.Hash -and
+                $afterCleanupFailure.Identity -ceq $original.Identity
+            ) "temporary cleanup failure must not replace or truncate the complete final"
+        }
+        finally {
+            if ($null -ne $cleanupState.Handle) {
+                $cleanupState.Handle.Dispose()
+            }
+            if (
+                -not [string]::IsNullOrWhiteSpace($cleanupState.Temporary) -and
+                (Test-Path -LiteralPath $cleanupState.Temporary -PathType Leaf)
+            ) {
+                Remove-Item -LiteralPath $cleanupState.Temporary -Force
+            }
+        }
+
+        Invoke-PrivateCommand -CommandName "Publish-EasyConContentFileAtomically" `
+            -Parameters $publicationParameters | Out-Null
+        Assert-Contract (
+            (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant() -ceq
+                $contentHash -and
+            (Get-ContractFileIdentity -Path $destination) -cne $original.Identity -and
+            @(Get-ChildItem -Force -LiteralPath $publicationRoot |
+                Where-Object { $_.Name -like '*.publish-*' }).Count -eq 0
+        ) "a later atomic publication must replace the final completely after failures clear"
+    }
+
     Invoke-ContractCase -Name "prepared-and-workspace-path-boundary" -Action {
         $cache = Join-Path $temporaryRoot "prepared workspace boundary cache"
         $repositoryRoot = Join-Path $temporaryRoot "prepared workspace boundary source"
@@ -3087,11 +3356,23 @@ $result = [ordered]@{
         $installed = Join-Path $location.EnvironmentRoot "setup/vcpkg/installed"
         $vcpkgRoot = Join-Path $location.EnvironmentRoot "vcpkg/scripts"
         $toolchain = Join-Path $vcpkgRoot "scripts/buildsystems/vcpkg.cmake"
+        $vcpkgExecutable = Join-Path $location.EnvironmentRoot "downloads/vcpkg.exe"
         Set-ContractFile -Path (Join-Path $vendor "contract-crate/Cargo.toml") `
             -Value "[package]`nname='contract-crate'`nversion='1.0.0'"
         Set-ContractFile -Path (Join-Path $installed "x64-windows-static-md/lib/contract.lib") `
             -Value "native"
         Set-ContractFile -Path $toolchain -Value "# shared vcpkg toolchain"
+        [System.IO.File]::WriteAllBytes((Join-Path $vcpkgRoot ".vcpkg-root"), [byte[]]@())
+        Set-ContractFile -Path $vcpkgExecutable -Value "verified vcpkg executable"
+        $vcpkgExecutableItem = Get-Item -Force -LiteralPath $vcpkgExecutable
+        $vcpkgExecutableHash = (
+            Get-FileHash -LiteralPath $vcpkgExecutable -Algorithm SHA256
+        ).Hash.ToLowerInvariant()
+        $vcpkgMarker = Join-Path $vcpkgRoot ".vcpkg-root"
+        $vcpkgMarkerItem = Get-Item -Force -LiteralPath $vcpkgMarker
+        $vcpkgMarkerHash = (
+            Get-FileHash -LiteralPath $vcpkgMarker -Algorithm SHA256
+        ).Hash.ToLowerInvariant()
 
         $cargoLayout = Invoke-PrivateCommand -CommandName "New-EasyConCargoWorkspaceLayout" `
             -Parameters @{
@@ -3100,17 +3381,67 @@ $result = [ordered]@{
                 VendorRoot = $vendor
                 EnvironmentRoot = $location.EnvironmentRoot
             }
-        $vcpkgLayout = Invoke-PrivateCommand -CommandName "New-EasyConVcpkgWorkspaceLayout" `
-            -Parameters @{
-                Vcpkg = [pscustomobject]@{ Root = $vcpkgRoot; Toolchain = $toolchain }
-                RepositoryRoot = $repositoryRoot
-                WorkspaceRoot = $location.WorkspaceRoot
-                CacheRoot = $location.CacheRoot
-                EnvironmentRoot = $location.EnvironmentRoot
-                InstalledRoot = $installed
+        $expectedManifest = Join-Path $location.WorkspaceRoot "vcpkg/manifest/vcpkg.json"
+        $expectedRoot = Join-Path $location.WorkspaceRoot "vcpkg/root"
+        $expectedExecutable = Join-Path $expectedRoot "vcpkg.exe"
+        $expectedMarker = Join-Path $expectedRoot ".vcpkg-root"
+        $expectedWrapper = Join-Path $expectedRoot "scripts/buildsystems/vcpkg.cmake"
+        foreach ($parent in @(
+            (Split-Path -Parent $expectedManifest),
+            (Split-Path -Parent $expectedWrapper)
+        )) {
+            New-Item -ItemType Directory -Force -Path $parent | Out-Null
+        }
+        $hardlinkSources = [ordered]@{
+            Manifest = Join-Path $repositoryRoot "vcpkg.json"
+            Executable = $vcpkgExecutable
+            Marker = $vcpkgMarker
+            Wrapper = $toolchain
+        }
+        $hardlinkDestinations = [ordered]@{
+            Manifest = $expectedManifest
+            Executable = $expectedExecutable
+            Marker = $expectedMarker
+            Wrapper = $expectedWrapper
+        }
+        $sourceSnapshots = [ordered]@{}
+        foreach ($name in $hardlinkSources.Keys) {
+            New-Item -ItemType HardLink -Path $hardlinkDestinations[$name] `
+                -Target $hardlinkSources[$name] | Out-Null
+            $sourceSnapshots[$name] = Get-ContractFileSnapshot -Path $hardlinkSources[$name]
+            Assert-Contract (
+                (Get-ContractFileIdentity -Path $hardlinkDestinations[$name]) -ceq
+                    $sourceSnapshots[$name].Identity
+            ) "preseeded workspace $name must begin as a real hardlink to its source"
+        }
+
+        $vcpkgLayoutParameters = @{
+            Vcpkg = [pscustomobject]@{
+                Root = $vcpkgRoot
+                Toolchain = $toolchain
+                Executable = $vcpkgExecutable
+                ExecutableBytes = [long]$vcpkgExecutableItem.Length
+                ExecutableSha256 = $vcpkgExecutableHash
+                Marker = $vcpkgMarker
+                MarkerBytes = [long]$vcpkgMarkerItem.Length
+                MarkerSha256 = $vcpkgMarkerHash
             }
+            RepositoryRoot = $repositoryRoot
+            WorkspaceRoot = $location.WorkspaceRoot
+            CacheRoot = $location.CacheRoot
+            EnvironmentRoot = $location.EnvironmentRoot
+            InstalledRoot = $installed
+        }
+        $vcpkgLayout = Invoke-PrivateCommand -CommandName "New-EasyConVcpkgWorkspaceLayout" `
+            -Parameters $vcpkgLayoutParameters
         $cargoConfig = Get-Content -Raw -LiteralPath $cargoLayout.Configuration
         $vcpkgWrapper = Get-Content -Raw -LiteralPath $vcpkgLayout.Toolchain
+        $workspaceVcpkgExecutable = Join-Path $vcpkgLayout.Root "vcpkg.exe"
+        $workspaceVcpkgMarker = Join-Path $vcpkgLayout.Root ".vcpkg-root"
+        Assert-Contract (
+            (Test-Path -LiteralPath $workspaceVcpkgExecutable -PathType Leaf) -and
+            (Test-Path -LiteralPath $workspaceVcpkgMarker -PathType Leaf)
+        ) "workspace vcpkg projection must provide an executable applocal root"
         Assert-Contract ($cargoLayout.CargoHome.StartsWith(
             $location.WorkspaceRoot, [System.StringComparison]::OrdinalIgnoreCase
         )) "Cargo home must be per-worktree writable state"
@@ -3125,8 +3456,172 @@ $result = [ordered]@{
             "workspace vcpkg wrapper must reference the shared installed tree"
         Assert-Contract ($vcpkgWrapper.Contains($toolchain.Replace("\", "/"))) `
             "workspace vcpkg wrapper must include the shared scripts checkout"
+        $workspaceRootBinding = "set(Z_VCPKG_ROOT_DIR `"$($vcpkgLayout.Root.Replace("\", "/"))`""
+        Assert-Contract (
+            $vcpkgWrapper.IndexOf($workspaceRootBinding, [System.StringComparison]::Ordinal) -ge 0 -and
+            $vcpkgWrapper.IndexOf($workspaceRootBinding, [System.StringComparison]::Ordinal) -lt
+                $vcpkgWrapper.IndexOf("include(`"", [System.StringComparison]::Ordinal)
+        ) "workspace vcpkg wrapper must bind its applocal root before including prepared scripts"
         Assert-Contract (-not $vcpkgWrapper.Contains($repositoryRoot)) `
             "workspace vcpkg wrapper must not bind to the source worktree"
+        foreach ($name in $hardlinkSources.Keys) {
+            $sourceAfter = Get-ContractFileSnapshot -Path $hardlinkSources[$name]
+            Assert-Contract (
+                $sourceAfter.Hash -ceq $sourceSnapshots[$name].Hash -and
+                $sourceAfter.Bytes -eq $sourceSnapshots[$name].Bytes -and
+                $sourceAfter.Identity -ceq $sourceSnapshots[$name].Identity -and
+                (Get-ContractFileIdentity -Path $hardlinkDestinations[$name]) -cne
+                    $sourceSnapshots[$name].Identity
+            ) "workspace $name publication must detach a hardlink without changing its source"
+        }
+        Assert-Contract (
+            (Get-FileHash -LiteralPath $workspaceVcpkgExecutable -Algorithm SHA256).Hash.ToLowerInvariant() -ceq
+                $vcpkgExecutableHash -and
+            (Get-Item -Force -LiteralPath $workspaceVcpkgMarker).Length -eq 0 -and
+            (Get-FileHash -LiteralPath $workspaceVcpkgMarker -Algorithm SHA256).Hash.ToLowerInvariant() -ceq
+                $vcpkgMarkerHash
+        ) "workspace vcpkg executable and root marker must exactly match verified sources"
+        $rootEntries = @(Get-ChildItem -Force -LiteralPath $vcpkgLayout.Root |
+            Select-Object -ExpandProperty Name | Sort-Object)
+        $scriptsEntries = @(Get-ChildItem -Force -LiteralPath (Join-Path $vcpkgLayout.Root "scripts") |
+            Select-Object -ExpandProperty Name | Sort-Object)
+        $buildsystemEntries = @(Get-ChildItem -Force -LiteralPath (
+            Join-Path $vcpkgLayout.Root "scripts/buildsystems"
+        ) | Select-Object -ExpandProperty Name | Sort-Object)
+        Assert-Contract (
+            ($rootEntries -join ',') -ceq '.vcpkg-root,scripts,vcpkg.exe' -and
+            ($scriptsEntries -join ',') -ceq 'buildsystems' -and
+            ($buildsystemEntries -join ',') -ceq 'vcpkg.cmake'
+        ) "workspace vcpkg applocal root must contain only its exact controlled layout"
+
+        Set-ContractFile -Path $workspaceVcpkgExecutable -Value "damaged workspace tool"
+        $vcpkgLayout = Invoke-PrivateCommand -CommandName "New-EasyConVcpkgWorkspaceLayout" `
+            -Parameters $vcpkgLayoutParameters
+        Assert-Contract (
+            (Get-FileHash -LiteralPath $workspaceVcpkgExecutable -Algorithm SHA256).Hash.ToLowerInvariant() -ceq
+                $vcpkgExecutableHash
+        ) "a damaged workspace vcpkg executable must recover from the verified source"
+
+        $ordinaryIdentity = Get-ContractFileIdentity -Path $workspaceVcpkgExecutable
+        $lockedSnapshot = Get-ContractFileSnapshot -Path $workspaceVcpkgExecutable
+        $lockedHandle = [System.IO.File]::Open(
+            $workspaceVcpkgExecutable,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::Read
+        )
+        $lockedFailure = $null
+        try {
+            try {
+                Invoke-PrivateCommand -CommandName "New-EasyConVcpkgWorkspaceLayout" `
+                    -Parameters $vcpkgLayoutParameters | Out-Null
+            }
+            catch {
+                $lockedFailure = $_
+            }
+            Assert-Contract ($null -ne $lockedFailure) `
+                "a same-hash locked workspace vcpkg executable must not use a reuse fast path"
+            $lockedAfter = Get-ContractFileSnapshot -Path $workspaceVcpkgExecutable
+            Assert-Contract (
+                $lockedAfter.Hash -ceq $lockedSnapshot.Hash -and
+                $lockedAfter.Identity -ceq $lockedSnapshot.Identity -and
+                @(Get-ChildItem -Force -Recurse -LiteralPath $vcpkgLayout.Root |
+                    Where-Object { $_.Name -like '*.publish-*' }).Count -eq 0
+            ) "locked atomic replacement must preserve the complete final and clean its temporary"
+        }
+        finally {
+            $lockedHandle.Dispose()
+        }
+        $vcpkgLayout = Invoke-PrivateCommand -CommandName "New-EasyConVcpkgWorkspaceLayout" `
+            -Parameters $vcpkgLayoutParameters
+        Assert-Contract (
+            (Get-ContractFileIdentity -Path $workspaceVcpkgExecutable) -cne $ordinaryIdentity -and
+            (Get-FileHash -LiteralPath $workspaceVcpkgExecutable -Algorithm SHA256).Hash.ToLowerInvariant() -ceq
+                $vcpkgExecutableHash
+        ) "an unlocked same-hash ordinary destination must be replaced by a fresh byte copy"
+
+        $beforeWrongKind = [ordered]@{}
+        foreach ($name in $hardlinkDestinations.Keys) {
+            $beforeWrongKind[$name] = Get-ContractFileSnapshot -Path $hardlinkDestinations[$name]
+        }
+        Remove-Item -LiteralPath $workspaceVcpkgMarker -Force
+        New-Item -ItemType Directory -Path $workspaceVcpkgMarker | Out-Null
+        Assert-Throws -Pattern "regular file" -Action {
+            Invoke-PrivateCommand -CommandName "New-EasyConVcpkgWorkspaceLayout" `
+                -Parameters $vcpkgLayoutParameters
+        }
+        foreach ($name in @("Manifest", "Executable", "Wrapper")) {
+            $afterWrongKind = Get-ContractFileSnapshot -Path $hardlinkDestinations[$name]
+            Assert-Contract (
+                $afterWrongKind.Hash -ceq $beforeWrongKind[$name].Hash -and
+                $afterWrongKind.Identity -ceq $beforeWrongKind[$name].Identity
+            ) "wrong-kind preflight must not publish a new $name file"
+        }
+        Remove-Item -LiteralPath $workspaceVcpkgMarker -Force
+        Invoke-PrivateCommand -CommandName "New-EasyConVcpkgWorkspaceLayout" `
+            -Parameters $vcpkgLayoutParameters | Out-Null
+        Assert-Contract (
+            (Test-Path -LiteralPath $workspaceVcpkgMarker -PathType Leaf) -and
+            (Get-Item -Force -LiteralPath $workspaceVcpkgMarker).Length -eq 0
+        ) "wrong-kind workspace marker must recover after the blocking directory is removed"
+
+        $unexpectedWorkspace = Join-Path $location.WritableRoot "unexpected-vcpkg-layout"
+        $unexpectedRoot = Join-Path $unexpectedWorkspace "vcpkg/root"
+        Set-ContractFile -Path (Join-Path $unexpectedRoot "unexpected.txt") -Value "blocked"
+        $unexpectedParameters = $vcpkgLayoutParameters.Clone()
+        $unexpectedParameters.WorkspaceRoot = $unexpectedWorkspace
+        Assert-Throws -Pattern "unexpected input" -Action {
+            Invoke-PrivateCommand -CommandName "New-EasyConVcpkgWorkspaceLayout" `
+                -Parameters $unexpectedParameters
+        }
+        Assert-Contract (
+            -not (Test-Path -LiteralPath (Join-Path $unexpectedRoot "vcpkg.exe")) -and
+            -not (Test-Path -LiteralPath (Join-Path $unexpectedRoot ".vcpkg-root")) -and
+            -not (Test-Path -LiteralPath (
+                Join-Path $unexpectedRoot "scripts/buildsystems/vcpkg.cmake"
+            )) -and
+            -not (Test-Path -LiteralPath (
+                Join-Path $unexpectedWorkspace "vcpkg/manifest/vcpkg.json"
+            ))
+        ) "unexpected workspace root input must fail before publishing any controlled file"
+        Remove-Item -LiteralPath (Join-Path $unexpectedRoot "unexpected.txt") -Force
+        Invoke-PrivateCommand -CommandName "New-EasyConVcpkgWorkspaceLayout" `
+            -Parameters $unexpectedParameters | Out-Null
+
+        $reparseWorkspace = Join-Path $location.WritableRoot "reparse-vcpkg-layout"
+        $reparseRoot = Join-Path $reparseWorkspace "vcpkg/root"
+        $reparseExternal = Join-Path $temporaryRoot "vcpkg layout reparse external"
+        $reparseSentinel = Join-Path $reparseExternal "sentinel.txt"
+        Set-ContractFile -Path $reparseSentinel -Value "external must remain unchanged"
+        $reparseSentinelHash = (
+            Get-FileHash -LiteralPath $reparseSentinel -Algorithm SHA256
+        ).Hash
+        New-Item -ItemType Directory -Force -Path $reparseRoot | Out-Null
+        New-Item -ItemType Junction -Path (Join-Path $reparseRoot ".vcpkg-root") `
+            -Target $reparseExternal | Out-Null
+        $reparseParameters = $vcpkgLayoutParameters.Clone()
+        $reparseParameters.WorkspaceRoot = $reparseWorkspace
+        Assert-Throws -Pattern "reparse point" -Action {
+            Invoke-PrivateCommand -CommandName "New-EasyConVcpkgWorkspaceLayout" `
+                -Parameters $reparseParameters
+        }
+        Assert-Contract (
+            (Get-FileHash -LiteralPath $reparseSentinel -Algorithm SHA256).Hash -ceq
+                $reparseSentinelHash -and
+            -not (Test-Path -LiteralPath (Join-Path $reparseExternal "vcpkg.exe")) -and
+            -not (Test-Path -LiteralPath (Join-Path $reparseRoot "vcpkg.exe"))
+        ) "reparse workspace layout must fail closed without following or partially publishing"
+        Remove-Item -LiteralPath (Join-Path $reparseRoot ".vcpkg-root") -Force
+        Invoke-PrivateCommand -CommandName "New-EasyConVcpkgWorkspaceLayout" `
+            -Parameters $reparseParameters | Out-Null
+
+        foreach ($name in $hardlinkSources.Keys) {
+            $sourceAfterRecovery = Get-ContractFileSnapshot -Path $hardlinkSources[$name]
+            Assert-Contract (
+                $sourceAfterRecovery.Hash -ceq $sourceSnapshots[$name].Hash -and
+                $sourceAfterRecovery.Identity -ceq $sourceSnapshots[$name].Identity
+            ) "all workspace recovery paths must preserve the $name source file"
+        }
 
         $leak = Join-Path $installed "contract-leak.cmake"
         Set-ContractFile -Path $leak -Value "set(CONTRACT_SOURCE `"$repositoryRoot`")"
@@ -4511,4 +5006,4 @@ finally {
     }
 }
 
-Write-Output "Windows workspace contracts passed: 41 cases"
+Write-Output "Windows workspace contracts passed: 42 cases"

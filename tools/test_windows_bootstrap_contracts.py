@@ -336,5 +336,61 @@ class WindowsBuildEnvironmentContracts(unittest.TestCase):
         )
 
 
+class WindowsWorkspaceModuleContracts(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.module = (ROOT / "tools/windows_workspace.psm1").read_text(
+            encoding="utf-8"
+        )
+
+    def assert_rejected(self, module, label):
+        self.assertTrue(
+            GUARD.windows_workspace_module_failures(module),
+            "{} mutation must be rejected".format(label),
+        )
+
+    def test_current_workspace_vcpkg_projection_is_guarded(self):
+        self.assertEqual(GUARD.windows_workspace_module_failures(self.module), [])
+
+    def test_workspace_vcpkg_projection_mutations_are_rejected(self):
+        mutations = {
+            "missing root binding": (
+                '"set(Z_VCPKG_ROOT_DIR',
+                '"set(EASYCON_UNUSED_ROOT',
+            ),
+            "non-internal root binding": (
+                'CACHE INTERNAL `"EasyCon workspace-local vcpkg applocal root',
+                'CACHE PATH `"EasyCon workspace-local vcpkg applocal root',
+            ),
+            "same-hash reuse": ("-ReplaceExisting", ""),
+            "in-place wrapper write": (
+                "Write-EasyConUtf8FileAtomically -Path $wrapper",
+                "[System.IO.File]::WriteAllText($wrapper",
+            ),
+            "non-overwrite publish": (
+                "[System.IO.File]::Move($temporary, $destinationPath, $true)",
+                "[System.IO.File]::Move($temporary, $destinationPath, $false)",
+            ),
+            "non-unique temporary": (
+                "[System.IO.FileMode]::CreateNew",
+                "[System.IO.FileMode]::OpenOrCreate",
+            ),
+            "broadened root": (
+                'Allowed = @(".vcpkg-root", "scripts", "vcpkg.exe")',
+                'Allowed = @(".vcpkg-root", "scripts", "vcpkg.exe", "other")',
+            ),
+        }
+        for label, (original, replacement) in mutations.items():
+            with self.subTest(label=label):
+                self.assertIn(original, self.module)
+                mutated = self.module.replace(original, replacement, 1)
+                self.assertNotEqual(mutated, self.module)
+                self.assert_rejected(mutated, label)
+        self.assert_rejected(
+            self.module + "\n$env:VCPKG_APPLOCAL_DEPS = '0'\n",
+            "disabled applocal",
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -1152,6 +1152,96 @@ def windows_build_environment_failures(configuration, native_quality):
     return failures
 
 
+def _powershell_function_text(module_text, name):
+    marker = re.search(
+        r"(?m)^function\s+{}\s*\{{".format(re.escape(name)), module_text
+    )
+    if marker is None:
+        return None
+    following = re.search(r"(?m)^function\s+[A-Za-z0-9-]+\s*\{", module_text[marker.end() :])
+    end = len(module_text) if following is None else marker.end() + following.start()
+    return module_text[marker.start() : end]
+
+
+def windows_workspace_module_failures(module_text):
+    failures = []
+    layout = _powershell_function_text(
+        module_text, "New-EasyConVcpkgWorkspaceLayout"
+    )
+    publisher = _powershell_function_text(
+        module_text, "Publish-EasyConContentFileAtomically"
+    )
+    copier = _powershell_function_text(
+        module_text, "Copy-EasyConContentFileAtomically"
+    )
+    writer = _powershell_function_text(module_text, "Write-EasyConUtf8FileAtomically")
+    for name, body in (
+        ("workspace vcpkg layout", layout),
+        ("atomic file publisher", publisher),
+        ("atomic content copier", copier),
+        ("atomic UTF-8 writer", writer),
+    ):
+        if body is None:
+            failures.append("Windows workspace module is missing {}".format(name))
+    if failures:
+        return failures
+
+    root_binding = layout.find('"set(Z_VCPKG_ROOT_DIR')
+    prepared_include = layout.find('"include(`"')
+    if (
+        root_binding < 0
+        or prepared_include < 0
+        or root_binding >= prepared_include
+        or "CACHE INTERNAL" not in layout[root_binding:prepared_include]
+    ):
+        failures.append(
+            "workspace vcpkg wrapper must bind Z_VCPKG_ROOT_DIR as CACHE INTERNAL "
+            "before including prepared scripts"
+        )
+    if layout.count("-ReplaceExisting") != 3:
+        failures.append(
+            "workspace vcpkg tool, marker, and manifest must each use fresh replacement"
+        )
+    if "Write-EasyConUtf8FileAtomically -Path $wrapper" not in layout:
+        failures.append("workspace vcpkg wrapper must use atomic UTF-8 publication")
+    if "Copy-Item -Force" in layout or "WriteAllText($wrapper" in layout:
+        failures.append(
+            "workspace vcpkg final files must not be opened or overwritten in place"
+        )
+    for exact_shape in (
+        'Allowed = @(".vcpkg-root", "scripts", "vcpkg.exe")',
+        'Expected = @(".vcpkg-root", "scripts", "vcpkg.exe")',
+        'Allowed = @("buildsystems")',
+        'Expected = @("buildsystems")',
+    ):
+        if exact_shape not in layout:
+            failures.append(
+                "workspace vcpkg applocal root exact-shape guard is missing: {}".format(
+                    exact_shape
+                )
+            )
+    if "[System.IO.File]::Move($temporary, $destinationPath, $true)" not in publisher:
+        failures.append(
+            "workspace atomic file publication must replace the final with one overwrite move"
+        )
+    if "[switch]$ReplaceExisting" not in copier or "-not $ReplaceExisting" not in copier:
+        failures.append(
+            "atomic content copy must expose a private fresh-replacement mode"
+        )
+    if "[System.IO.FileMode]::CreateNew" not in copier:
+        failures.append("fresh content copies must create a unique new temporary file")
+    if "[System.IO.FileMode]::CreateNew" not in writer:
+        failures.append("generated UTF-8 files must create a unique new temporary file")
+    for forbidden in ("VCPKG_APPLOCAL_DEPS", "X_VCPKG_APPLOCAL_DEPS_INSTALL"):
+        if forbidden in module_text:
+            failures.append(
+                "Windows workspace module must not disable or switch applocal mode: {}".format(
+                    forbidden
+                )
+            )
+    return failures
+
+
 def main():
     failures = repository_guard_regression_failures()
     windows_build_configuration_text = (
@@ -1293,6 +1383,7 @@ def main():
     windows_module = (ROOT / "tools/windows_workspace.psm1").read_text(
         encoding="utf-8"
     )
+    failures.extend(windows_workspace_module_failures(windows_module))
     for forbidden in (
         r"C:\\Users\\",
         r"D:\\project",

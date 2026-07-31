@@ -106,7 +106,9 @@ pwsh -NoProfile -File tools/run_windows_workspace.ps1 -Mode Workspace
 
 Verify 与 Workspace 都不 provision、install 或 download。Verify 重新计算 fingerprint，验证 stamp、所有显式工具
 路径/hash、MSVC/SDK、Rust、vcpkg checkout/tool/audit pins、OCR 与完整 native install tree，并只为当前 worktree 创建
-Cargo source replacement、vcpkg wrapper、target 与临时目录。Workspace 必须先通过同一 Verify，再执行 Cargo、Loom、规范、
+Cargo source replacement、vcpkg applocal root、target 与临时目录。applocal root 只含独立 byte-copy 的 `vcpkg.exe`、精确
+`.vcpkg-root` 和先绑定该 local root 再 include prepared toolchain 的 wrapper；每次发布都会替换目标目录项，不复用可能与
+source/prepared 文件共享 identity 的同 hash 文件。Workspace 必须先通过同一 Verify，再执行 Cargo、Loom、规范、
 链接、repository contracts 与 diff 门禁。缺失、损坏、环境 schema/host-target/fingerprint 失配都在第一个 build gate 前失败，
 并明确要求重新运行 Setup；worktree 切换本身只改变隔离的可写输出。
 

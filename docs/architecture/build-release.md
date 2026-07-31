@@ -77,8 +77,11 @@ immutable prepared tree。Setup 使用 `cargo vendor --locked` 把 lockfile 与�
 安装进环境。Cargo 不从 ambient PATH 解析；rustup 必须先为固定 channel 返回受控 Rust home 精确 toolchain 目录中的
 `cargo.exe`，Setup 在首次 Cargo 执行前核对该路径、release 与 host。`Verify` 与 `Workspace` 不安装或下载；两者只接受
 当前 shared identity 对应且未损坏的 stamp，缺失或失配时要求重新运行 Setup。新建或切换 worktree 不构成 Setup 理由，
-必须先 Verify。canonical worktree key 仅选择 `CARGO_TARGET_DIR`、CMake cache、Cargo home/config、vcpkg wrapper/downloads
-和测试临时目录等可写/source-bound 输出。`Workspace` 在 Verify 后运行完整仓库门禁。
+必须先 Verify。canonical worktree key 仅选择 `CARGO_TARGET_DIR`、CMake cache、Cargo home/config、vcpkg applocal
+root/downloads 和测试临时目录等可写/source-bound 输出。local root 严格只含 `.vcpkg-root`、独立 byte-copy 的
+`vcpkg.exe` 与 `scripts/buildsystems/vcpkg.cmake` wrapper；wrapper 在 include immutable prepared toolchain 前绑定该 root，
+使 CMake 的 z-applocal 后处理只执行当前 worktree 拥有的工具副本。tool、marker、manifest 与 wrapper 都经同目录临时文件
+完整校验后原子替换 final，不沿预置 hardlink 覆写 shared environment 或 source。`Workspace` 在 Verify 后运行完整仓库门禁。
 
 环境目录之外有跨 fingerprint/worktree 的共享资产层。直接固定资产以 SHA-256/SHA-512 内容寻址，命中时每次重验
 hash/bytes，损坏项在逐资产锁内隔离，唯一同卷 temporary 通过验证后才原子发布。CMake、Ninja、vcpkg.exe、7-Zip/7zr

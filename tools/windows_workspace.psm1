@@ -616,6 +616,150 @@ function Get-EasyConSharedContentAsset {
     }
 }
 
+function Assert-EasyConAtomicFileDestination {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [string]$TrustedRoot,
+
+        [Parameter(Mandatory)]
+        [string]$Description
+    )
+
+    $resolved = Assert-EasyConPhysicalPath -Path $Path -TrustedRoot $TrustedRoot
+    New-EasyConSafeDirectory -Path (Split-Path -Parent $resolved) `
+        -TrustedRoot $TrustedRoot | Out-Null
+    Assert-EasyConPhysicalPath -Path $resolved -TrustedRoot $TrustedRoot | Out-Null
+    if (Test-Path -LiteralPath $resolved) {
+        $item = Get-Item -Force -LiteralPath $resolved -ErrorAction Stop
+        if ($item.PSIsContainer -or $item -isnot [System.IO.FileInfo]) {
+            throw "$Description destination must be a regular file: $resolved"
+        }
+    }
+    return $resolved
+}
+
+function Publish-EasyConContentFileAtomically {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Destination,
+
+        [Parameter(Mandatory)]
+        [ValidateSet("SHA256", "SHA512")]
+        [string]$Algorithm,
+
+        [Parameter(Mandatory)]
+        [string]$Hash,
+
+        [Parameter(Mandatory)]
+        [long]$Bytes,
+
+        [Parameter(Mandatory)]
+        [string]$TrustedRoot,
+
+        [Parameter(Mandatory)]
+        [string]$Description,
+
+        [Parameter(Mandatory)]
+        [scriptblock]$MaterializeAction,
+
+        [scriptblock]$MoveAction,
+
+        [ValidateRange(1, 10)]
+        [int]$CleanupMaxAttempts = 4,
+
+        [ValidateRange(0, 5000)]
+        [int]$CleanupRetryMilliseconds = 250,
+
+        [scriptblock]$CleanupRetryAction
+    )
+
+    $destinationPath = Assert-EasyConAtomicFileDestination -Path $Destination `
+        -TrustedRoot $TrustedRoot -Description $Description
+    $temporary = "$destinationPath.publish-$PID-$([guid]::NewGuid().ToString('N'))"
+    Assert-EasyConPhysicalPath -Path $temporary -TrustedRoot $TrustedRoot | Out-Null
+    $primaryFailure = $null
+    try {
+        & $MaterializeAction $temporary | Out-Null
+        Assert-EasyConContentFile -Path $temporary -Algorithm $Algorithm -Hash $Hash `
+            -Bytes $Bytes -TrustedRoot $TrustedRoot `
+            -Description "$Description materialized file" | Out-Null
+        Assert-EasyConAtomicFileDestination -Path $destinationPath `
+            -TrustedRoot $TrustedRoot -Description $Description | Out-Null
+        if ($null -eq $MoveAction) {
+            [System.IO.File]::Move($temporary, $destinationPath, $true)
+        }
+        else {
+            & $MoveAction $temporary $destinationPath | Out-Null
+        }
+        Assert-EasyConPhysicalPath -Path $destinationPath -TrustedRoot $TrustedRoot | Out-Null
+    }
+    catch {
+        $primaryFailure = $_
+        throw
+    }
+    finally {
+        $cleanupParameters = @{
+            Path = $temporary
+            TrustedRoot = $TrustedRoot
+            Description = "$Description atomic publication"
+            PrimaryFailure = $primaryFailure
+            MaxAttempts = $CleanupMaxAttempts
+            RetryMilliseconds = $CleanupRetryMilliseconds
+        }
+        if ($null -ne $CleanupRetryAction) {
+            $cleanupParameters.RetryAction = $CleanupRetryAction
+        }
+        Complete-EasyConTemporaryFileCleanup @cleanupParameters
+    }
+    return Assert-EasyConContentFile -Path $destinationPath -Algorithm $Algorithm `
+        -Hash $Hash -Bytes $Bytes -TrustedRoot $TrustedRoot `
+        -Description "$Description destination"
+}
+
+function Write-EasyConUtf8FileAtomically {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$Text,
+
+        [Parameter(Mandatory)]
+        [string]$TrustedRoot,
+
+        [Parameter(Mandatory)]
+        [string]$Description
+    )
+
+    $content = [System.Text.UTF8Encoding]::new($false, $true).GetBytes($Text)
+    $hash = [Convert]::ToHexString(
+        [System.Security.Cryptography.SHA256]::HashData($content)
+    ).ToLowerInvariant()
+    $materialize = {
+        param($Temporary)
+        $stream = [System.IO.FileStream]::new(
+            $Temporary,
+            [System.IO.FileMode]::CreateNew,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::None
+        )
+        try {
+            $stream.Write($content, 0, $content.Length)
+            $stream.Flush($true)
+        }
+        finally {
+            $stream.Dispose()
+        }
+    }.GetNewClosure()
+    return Publish-EasyConContentFileAtomically -Destination $Path -Algorithm SHA256 `
+        -Hash $hash -Bytes $content.Length -TrustedRoot $TrustedRoot `
+        -Description $Description -MaterializeAction $materialize
+}
+
 function Copy-EasyConContentFileAtomically {
     param(
         [Parameter(Mandatory)]
@@ -640,17 +784,20 @@ function Copy-EasyConContentFileAtomically {
         [string]$DestinationTrustedRoot,
 
         [Parameter(Mandatory)]
-        [string]$Description
+        [string]$Description,
+
+        [switch]$ReplaceExisting
     )
 
     $sourcePath = Assert-EasyConContentFile -Path $Source -Algorithm $Algorithm `
         -Hash $Hash -Bytes $Bytes -TrustedRoot $SourceTrustedRoot `
         -Description "$Description source"
-    $destinationPath = Assert-EasyConPhysicalPath -Path $Destination `
-        -TrustedRoot $DestinationTrustedRoot
-    New-EasyConSafeDirectory -Path (Split-Path -Parent $destinationPath) `
-        -TrustedRoot $DestinationTrustedRoot | Out-Null
-    if (Test-Path -LiteralPath $destinationPath -PathType Leaf) {
+    $destinationPath = Assert-EasyConAtomicFileDestination -Path $Destination `
+        -TrustedRoot $DestinationTrustedRoot -Description $Description
+    if ($sourcePath.Equals($destinationPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "$Description source and destination must be different files"
+    }
+    if (-not $ReplaceExisting -and (Test-Path -LiteralPath $destinationPath -PathType Leaf)) {
         try {
             return Assert-EasyConContentFile -Path $destinationPath -Algorithm $Algorithm `
                 -Hash $Hash -Bytes $Bytes -TrustedRoot $DestinationTrustedRoot `
@@ -658,31 +805,45 @@ function Copy-EasyConContentFileAtomically {
         }
         catch {
             Remove-Item -Force -LiteralPath $destinationPath -ErrorAction Stop
+            if (Test-Path -LiteralPath $destinationPath) {
+                throw "$Description damaged destination remains after removal: $destinationPath"
+            }
         }
     }
 
-    $temporary = "$destinationPath.copy-$PID-$([guid]::NewGuid().ToString('N'))"
-    Assert-EasyConPhysicalPath -Path $temporary -TrustedRoot $DestinationTrustedRoot | Out-Null
-    $primaryFailure = $null
-    try {
-        Copy-Item -LiteralPath $sourcePath -Destination $temporary
-        Assert-EasyConContentFile -Path $temporary -Algorithm $Algorithm -Hash $Hash `
-            -Bytes $Bytes -TrustedRoot $DestinationTrustedRoot `
-            -Description "$Description materialized copy" | Out-Null
-        [System.IO.File]::Move($temporary, $destinationPath)
-    }
-    catch {
-        $primaryFailure = $_
-        throw
-    }
-    finally {
-        Complete-EasyConTemporaryFileCleanup -Path $temporary `
-            -TrustedRoot $DestinationTrustedRoot -Description "$Description materialization" `
-            -PrimaryFailure $primaryFailure
-    }
-    return Assert-EasyConContentFile -Path $destinationPath -Algorithm $Algorithm `
-        -Hash $Hash -Bytes $Bytes -TrustedRoot $DestinationTrustedRoot `
-        -Description "$Description destination"
+    $materialize = {
+        param($Temporary)
+        $sourceStream = $null
+        $destinationStream = $null
+        try {
+            $sourceStream = [System.IO.FileStream]::new(
+                $sourcePath,
+                [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::Read,
+                [System.IO.FileShare]::Read
+            )
+            $destinationStream = [System.IO.FileStream]::new(
+                $Temporary,
+                [System.IO.FileMode]::CreateNew,
+                [System.IO.FileAccess]::Write,
+                [System.IO.FileShare]::None
+            )
+            $sourceStream.CopyTo($destinationStream, 65536)
+            $destinationStream.Flush($true)
+        }
+        finally {
+            if ($null -ne $destinationStream) {
+                $destinationStream.Dispose()
+            }
+            if ($null -ne $sourceStream) {
+                $sourceStream.Dispose()
+            }
+        }
+    }.GetNewClosure()
+    return Publish-EasyConContentFileAtomically -Destination $destinationPath `
+        -Algorithm $Algorithm -Hash $Hash -Bytes $Bytes `
+        -TrustedRoot $DestinationTrustedRoot -Description $Description `
+        -MaterializeAction $materialize
 }
 
 function Get-EasyConFingerprintInputHash {
@@ -2493,11 +2654,20 @@ function Assert-EasyConVcpkgCheckout {
     if ($versionOutput[0].Trim() -cne $expected) {
         throw "unexpected vcpkg tool version: $($versionOutput[0].Trim())"
     }
+    $marker = Get-EasyConPhysicalFile -Path (Join-Path $root ".vcpkg-root") `
+        -TrustedRoot $root
+    $markerBytes = [long](Get-Item -Force -LiteralPath $marker).Length
+    $markerSha256 = Get-EasyConFileHash -Path $marker -Algorithm SHA256
     $toolchain = Join-Path $root "scripts/buildsystems/vcpkg.cmake"
     Assert-EasyConPhysicalPath -Path $toolchain -TrustedRoot $root | Out-Null
     return [pscustomobject]@{
         Root = $root
         Executable = $executable
+        ExecutableBytes = [long]$asset.bytes
+        ExecutableSha256 = ([string]$asset.sha256).ToLowerInvariant()
+        Marker = $marker
+        MarkerBytes = $markerBytes
+        MarkerSha256 = $markerSha256
         Version = $versionOutput[0].Trim()
         Toolchain = $toolchain
     }
@@ -3788,55 +3958,159 @@ function New-EasyConVcpkgWorkspaceLayout {
     $workspace = New-EasyConSafeDirectory -Path $WorkspaceRoot -TrustedRoot $cache
     $environment = Assert-EasyConPhysicalPath -Path $EnvironmentRoot -TrustedRoot $EnvironmentRoot
     $installed = Assert-EasyConPhysicalTree -Path $InstalledRoot -TrustedRoot $environment
-    $workspaceRoot = Join-Path $workspace "vcpkg"
+    $workspaceRoot = New-EasyConSafeDirectory -Path (Join-Path $workspace "vcpkg") `
+        -TrustedRoot $cache
     $manifestRoot = New-EasyConSafeDirectory -Path (Join-Path $workspaceRoot "manifest") `
         -TrustedRoot $cache
     $executionRoot = New-EasyConSafeDirectory -Path (Join-Path $workspaceRoot "root") `
         -TrustedRoot $cache
-    $buildsystems = New-EasyConSafeDirectory `
-        -Path (Join-Path $executionRoot "scripts/buildsystems") -TrustedRoot $cache
+    $scripts = New-EasyConSafeDirectory -Path (Join-Path $executionRoot "scripts") `
+        -TrustedRoot $cache
+    $buildsystems = New-EasyConSafeDirectory -Path (Join-Path $scripts "buildsystems") `
+        -TrustedRoot $cache
     $downloads = New-EasyConSafeDirectory -Path (Join-Path $workspaceRoot "downloads") `
         -TrustedRoot $cache
 
-    $manifestEntries = @(Get-ChildItem -Force -LiteralPath $manifestRoot -ErrorAction Stop |
-        Where-Object { $_.Name -cne "vcpkg.json" })
-    if ($manifestEntries.Count -ne 0) {
-        throw "generated workspace vcpkg manifest directory contains unexpected input: $($manifestEntries[0].FullName)"
-    }
-    $toolchainEntries = @(Get-ChildItem -Force -LiteralPath $buildsystems -ErrorAction Stop |
-        Where-Object { $_.Name -cne "vcpkg.cmake" })
-    if ($toolchainEntries.Count -ne 0) {
-        throw "generated workspace vcpkg toolchain directory contains unexpected input: $($toolchainEntries[0].FullName)"
+    foreach ($shape in @(
+        [pscustomobject]@{
+            Path = $manifestRoot
+            Allowed = @("vcpkg.json")
+            Description = "generated workspace vcpkg manifest directory"
+        },
+        [pscustomobject]@{
+            Path = $executionRoot
+            Allowed = @(".vcpkg-root", "scripts", "vcpkg.exe")
+            Description = "generated workspace vcpkg root"
+        },
+        [pscustomobject]@{
+            Path = $scripts
+            Allowed = @("buildsystems")
+            Description = "generated workspace vcpkg scripts directory"
+        },
+        [pscustomobject]@{
+            Path = $buildsystems
+            Allowed = @("vcpkg.cmake")
+            Description = "generated workspace vcpkg toolchain directory"
+        }
+    )) {
+        $unexpected = @(Get-ChildItem -Force -LiteralPath $shape.Path -ErrorAction Stop |
+            Where-Object { $shape.Allowed -cnotcontains $_.Name })
+        if ($unexpected.Count -ne 0) {
+            throw "$($shape.Description) contains unexpected input: $($unexpected[0].FullName)"
+        }
     }
 
-    $sourceManifest = Join-Path $repository "vcpkg.json"
+    $preparedRoot = Assert-EasyConPhysicalPath -Path $Vcpkg.Root -TrustedRoot $environment
+    if (-not (Test-Path -LiteralPath $preparedRoot -PathType Container)) {
+        throw "prepared vcpkg scripts root is missing: $preparedRoot"
+    }
+    $actualToolchain = Get-EasyConPhysicalFile -Path $Vcpkg.Toolchain `
+        -TrustedRoot $preparedRoot
+    $expectedToolchain = Resolve-EasyConFullPath `
+        -Path (Join-Path $preparedRoot "scripts/buildsystems/vcpkg.cmake")
+    if (-not $actualToolchain.Equals(
+        $expectedToolchain,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw "prepared vcpkg toolchain path does not match its fixed scripts checkout"
+    }
+    $actualMarker = Get-EasyConPhysicalFile -Path $Vcpkg.Marker -TrustedRoot $preparedRoot
+    $expectedMarker = Resolve-EasyConFullPath -Path (Join-Path $preparedRoot ".vcpkg-root")
+    if (-not $actualMarker.Equals($expectedMarker, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "prepared vcpkg root marker path does not match its fixed scripts checkout"
+    }
+    $actualExecutable = Get-EasyConPhysicalFile -Path $Vcpkg.Executable `
+        -TrustedRoot $environment
+    if (Test-EasyConPathWithin -Path $actualExecutable -Root $preparedRoot) {
+        throw "vcpkg executable must remain outside the immutable scripts checkout"
+    }
+
+    $sourceManifest = Get-EasyConPhysicalFile -Path (Join-Path $repository "vcpkg.json") `
+        -TrustedRoot $repository
+    $manifestBytes = [long](Get-Item -Force -LiteralPath $sourceManifest).Length
+    $manifestHash = Get-EasyConFileHash -Path $sourceManifest -Algorithm SHA256
+    $toolchainBytes = [long](Get-Item -Force -LiteralPath $actualToolchain).Length
+    $toolchainHash = Get-EasyConFileHash -Path $actualToolchain -Algorithm SHA256
+    Assert-EasyConContentFile -Path $actualExecutable -Algorithm SHA256 `
+        -Hash ([string]$Vcpkg.ExecutableSha256) -Bytes ([long]$Vcpkg.ExecutableBytes) `
+        -TrustedRoot $environment -Description "verified workspace vcpkg.exe source" | Out-Null
+    Assert-EasyConContentFile -Path $actualMarker -Algorithm SHA256 `
+        -Hash ([string]$Vcpkg.MarkerSha256) -Bytes ([long]$Vcpkg.MarkerBytes) `
+        -TrustedRoot $preparedRoot -Description "verified workspace .vcpkg-root source" | Out-Null
+
     $executionManifest = Join-Path $manifestRoot "vcpkg.json"
-    Assert-EasyConPhysicalPath -Path $sourceManifest -TrustedRoot $repository | Out-Null
-    Assert-EasyConPhysicalPath -Path $executionManifest -TrustedRoot $workspace | Out-Null
-    $manifestHash = Get-EasyConFileSha256 -Path $sourceManifest
-    Copy-Item -Force -LiteralPath $sourceManifest -Destination $executionManifest
-    Assert-EasyConPhysicalPath -Path $executionManifest -TrustedRoot $workspace | Out-Null
-    if ((Get-EasyConFileSha256 -Path $executionManifest) -cne $manifestHash) {
-        throw "generated workspace vcpkg manifest does not match the tracked manifest"
+    $workspaceExecutable = Join-Path $executionRoot "vcpkg.exe"
+    $workspaceMarker = Join-Path $executionRoot ".vcpkg-root"
+    $wrapper = Join-Path $buildsystems "vcpkg.cmake"
+    foreach ($destination in @(
+        [pscustomobject]@{ Path = $executionManifest; Description = "workspace vcpkg manifest" },
+        [pscustomobject]@{ Path = $workspaceExecutable; Description = "workspace vcpkg executable" },
+        [pscustomobject]@{ Path = $workspaceMarker; Description = "workspace vcpkg root marker" },
+        [pscustomobject]@{ Path = $wrapper; Description = "workspace vcpkg toolchain wrapper" }
+    )) {
+        Assert-EasyConAtomicFileDestination -Path $destination.Path -TrustedRoot $workspace `
+            -Description $destination.Description | Out-Null
     }
 
-    $actualToolchain = Assert-EasyConPhysicalPath -Path $Vcpkg.Toolchain `
-        -TrustedRoot $Vcpkg.Root
-    $wrapper = Join-Path $buildsystems "vcpkg.cmake"
-    Assert-EasyConPhysicalPath -Path $wrapper -TrustedRoot $workspace | Out-Null
+    Copy-EasyConContentFileAtomically -Source $actualExecutable `
+        -Destination $workspaceExecutable -Algorithm SHA256 `
+        -Hash ([string]$Vcpkg.ExecutableSha256) -Bytes ([long]$Vcpkg.ExecutableBytes) `
+        -SourceTrustedRoot $environment -DestinationTrustedRoot $workspace `
+        -Description "workspace vcpkg executable" -ReplaceExisting | Out-Null
+    Copy-EasyConContentFileAtomically -Source $actualMarker `
+        -Destination $workspaceMarker -Algorithm SHA256 `
+        -Hash ([string]$Vcpkg.MarkerSha256) -Bytes ([long]$Vcpkg.MarkerBytes) `
+        -SourceTrustedRoot $preparedRoot -DestinationTrustedRoot $workspace `
+        -Description "workspace vcpkg root marker" -ReplaceExisting | Out-Null
+    Copy-EasyConContentFileAtomically -Source $sourceManifest `
+        -Destination $executionManifest -Algorithm SHA256 -Hash $manifestHash `
+        -Bytes $manifestBytes -SourceTrustedRoot $repository `
+        -DestinationTrustedRoot $workspace -Description "workspace vcpkg manifest" `
+        -ReplaceExisting | Out-Null
+
     $wrapperText = @(
         "# Generated by tools/windows_workspace.psm1; do not edit.",
+        "set(Z_VCPKG_ROOT_DIR `"$(ConvertTo-EasyConCMakePathLiteral -Path $executionRoot)`" CACHE INTERNAL `"EasyCon workspace-local vcpkg applocal root`" FORCE)",
         "set(VCPKG_MANIFEST_DIR `"$(ConvertTo-EasyConCMakePathLiteral -Path $manifestRoot)`" CACHE PATH `"EasyCon verified local manifest`" FORCE)",
         "set(VCPKG_MANIFEST_INSTALL OFF CACHE BOOL `"EasyCon Setup owns vcpkg installation`" FORCE)",
         "set(VCPKG_INSTALLED_DIR `"$(ConvertTo-EasyConCMakePathLiteral -Path $installed)`" CACHE PATH `"EasyCon external vcpkg install tree`" FORCE)",
         "include(`"$(ConvertTo-EasyConCMakePathLiteral -Path $actualToolchain)`")",
         ""
     ) -join "`n"
-    [System.IO.File]::WriteAllText($wrapper, $wrapperText, [System.Text.UTF8Encoding]::new($false))
-    Assert-EasyConPhysicalPath -Path $wrapper -TrustedRoot $workspace | Out-Null
+    Write-EasyConUtf8FileAtomically -Path $wrapper -Text $wrapperText `
+        -TrustedRoot $workspace -Description "workspace vcpkg toolchain wrapper" | Out-Null
     if ([System.IO.File]::ReadAllText($wrapper, [System.Text.Encoding]::UTF8) -cne $wrapperText) {
         throw "generated workspace vcpkg toolchain wrapper changed during creation"
     }
+
+    Assert-EasyConPhysicalTree -Path $manifestRoot -TrustedRoot $workspace | Out-Null
+    Assert-EasyConPhysicalTree -Path $executionRoot -TrustedRoot $workspace | Out-Null
+    foreach ($shape in @(
+        [pscustomobject]@{ Path = $manifestRoot; Expected = @("vcpkg.json") },
+        [pscustomobject]@{ Path = $executionRoot; Expected = @(".vcpkg-root", "scripts", "vcpkg.exe") },
+        [pscustomobject]@{ Path = $scripts; Expected = @("buildsystems") },
+        [pscustomobject]@{ Path = $buildsystems; Expected = @("vcpkg.cmake") }
+    )) {
+        $actualEntries = @(Get-ChildItem -Force -LiteralPath $shape.Path -ErrorAction Stop |
+            Select-Object -ExpandProperty Name | Sort-Object)
+        $expectedEntries = @($shape.Expected | Sort-Object)
+        if (($actualEntries -join "`n") -cne ($expectedEntries -join "`n")) {
+            throw "generated workspace vcpkg layout is incomplete or contains unexpected entries: $($shape.Path)"
+        }
+    }
+
+    Assert-EasyConContentFile -Path $actualExecutable -Algorithm SHA256 `
+        -Hash ([string]$Vcpkg.ExecutableSha256) -Bytes ([long]$Vcpkg.ExecutableBytes) `
+        -TrustedRoot $environment -Description "verified workspace vcpkg.exe source" | Out-Null
+    Assert-EasyConContentFile -Path $actualMarker -Algorithm SHA256 `
+        -Hash ([string]$Vcpkg.MarkerSha256) -Bytes ([long]$Vcpkg.MarkerBytes) `
+        -TrustedRoot $preparedRoot -Description "verified workspace .vcpkg-root source" | Out-Null
+    Assert-EasyConContentFile -Path $sourceManifest -Algorithm SHA256 -Hash $manifestHash `
+        -Bytes $manifestBytes -TrustedRoot $repository `
+        -Description "tracked workspace vcpkg manifest source" | Out-Null
+    Assert-EasyConContentFile -Path $actualToolchain -Algorithm SHA256 -Hash $toolchainHash `
+        -Bytes $toolchainBytes -TrustedRoot $preparedRoot `
+        -Description "prepared workspace vcpkg toolchain source" | Out-Null
 
     return [pscustomobject]@{
         Root = Assert-EasyConPhysicalPath -Path $executionRoot -TrustedRoot $workspace
