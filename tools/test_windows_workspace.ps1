@@ -4096,6 +4096,90 @@ $result = [ordered]@{
             $audit.MaximumJsonWindowBytes -le $audit.JsonWindowLimitBytes
         ) "large JSON must use the declared bounded incremental reader window"
 
+        $singleScanRoot = Join-Path $location.EnvironmentRoot "contract-single-scan"
+        Set-ContractUtf8Text -Path (Join-Path $singleScanRoot "a.txt") -Value "a"
+        Set-ContractUtf8Text -Path (Join-Path $singleScanRoot "nested/b.txt") -Value "b"
+        $singleScan = Invoke-PrivateCommand `
+            -CommandName "Get-EasyConPreparedTreeVerification" `
+            -Parameters @{
+                Path = $singleScanRoot
+                TrustedRoot = $location.EnvironmentRoot
+                RepositoryRoot = $repositoryRoot
+                WritableRoot = $location.WritableRoot
+                Description = "contract single scan prepared tree"
+            }
+        Assert-Contract (
+            $singleScan.ControlledEnumerationPasses -eq 1 -and
+            $singleScan.FilesScanned -eq 2 -and
+            $singleScan.FileContentReads -eq $singleScan.FilesScanned -and
+            $singleScan.FileHashesComputed -eq $singleScan.FilesScanned -and
+            $singleScan.PhysicalEntriesChecked -ge $singleScan.FilesScanned
+        ) "prepared tree verification must enumerate once and combine every file read, hash, and physical boundary check"
+        Assert-Contract (
+            $singleScan.TreeFiles -eq 2 -and
+            $singleScan.TreeSha256 -ceq
+                "ea515f52b71f9c89f77908efa68aed580cf901fedd831fcbdcd1c42ce216efa2"
+        ) "prepared tree verification must preserve the stamp v2 sorted digest format"
+        $legacyDigestBuilder = [System.Text.StringBuilder]::new()
+        $legacyFiles = @(Get-ChildItem -LiteralPath $singleScanRoot -Recurse -Force -File |
+            Sort-Object FullName)
+        foreach ($legacyFile in $legacyFiles) {
+            $legacyRelative = [System.IO.Path]::GetRelativePath(
+                $singleScanRoot, $legacyFile.FullName
+            ).Replace('\', '/')
+            $legacyHash = (
+                Get-FileHash -LiteralPath $legacyFile.FullName -Algorithm SHA256
+            ).Hash.ToLowerInvariant()
+            [void]$legacyDigestBuilder.Append($legacyRelative).Append("`0").Append(
+                $legacyFile.Length
+            ).Append("`0").Append($legacyHash).Append("`n")
+        }
+        $legacyTreeSha256 = [System.Convert]::ToHexString(
+            [System.Security.Cryptography.SHA256]::HashData(
+                [System.Text.Encoding]::UTF8.GetBytes($legacyDigestBuilder.ToString())
+            )
+        ).ToLowerInvariant()
+        Assert-Contract (
+            $singleScan.TreeFiles -eq $legacyFiles.Count -and
+            $singleScan.TreeSha256 -ceq $legacyTreeSha256
+        ) "prepared tree verification must remain byte-compatible with the prior stamp v2 fingerprint"
+        $singlePhysicalPath = Invoke-PrivateCommand `
+            -CommandName "Assert-EasyConPreparedPhysicalTree" `
+            -Parameters @{
+                Path = $singleScanRoot
+                TrustedRoot = $location.EnvironmentRoot
+            }
+        Assert-Contract ($singlePhysicalPath -ceq $singleScanRoot) `
+            "physical-only prepared tree traversal must preserve its resolved root"
+        $singlePhysicalAudit = Invoke-PrivateCommand `
+            -CommandName "Assert-EasyConPreparedPhysicalTree" `
+            -Parameters @{
+                Path = $singleScanRoot
+                TrustedRoot = $location.EnvironmentRoot
+                PassThru = $true
+            }
+        Assert-Contract (
+            $singlePhysicalAudit.ControlledEnumerationPasses -eq 1 -and
+            $singlePhysicalAudit.FilesScanned -eq $singleScan.FilesScanned -and
+            $singlePhysicalAudit.PhysicalEntriesChecked -ge $singlePhysicalAudit.FilesScanned
+        ) "physical-only prepared tree traversal must return a concrete single-pass audit only when requested internally"
+        $physicalReparseExternal = Join-Path $temporaryRoot "single physical reparse external"
+        $physicalReparse = Join-Path $singleScanRoot "blocked-reparse"
+        New-Item -ItemType Directory -Force -Path $physicalReparseExternal | Out-Null
+        New-Item -ItemType Junction -Path $physicalReparse -Target $physicalReparseExternal | Out-Null
+        try {
+            Assert-Throws -Pattern "reparse point" -Action {
+                Invoke-PrivateCommand -CommandName "Assert-EasyConPreparedPhysicalTree" `
+                    -Parameters @{
+                        Path = $singleScanRoot
+                        TrustedRoot = $location.EnvironmentRoot
+                    }
+            }
+        }
+        finally {
+            Remove-Item -LiteralPath $physicalReparse -Force
+        }
+
         $preparedAuditSource = & $workspaceModule {
             @(
                 ${function:Assert-EasyConPreparedTreeDoesNotReferenceRepository}.Ast.Extent.Text

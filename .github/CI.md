@@ -119,6 +119,13 @@ source worktree 或整个 `CacheRoot/w`，工具记录也不得位于 source rep
 损坏或 identity 不匹配的 stamp 都 fail closed；Verify/Workspace 对 `e/` 只读，prepared vcpkg Git 检查禁止 optional lock 和
 index refresh，全部可写状态必须留在当前 `w/`。
 
+Cargo vendor 与 vcpkg installed 每棵 prepared tree 在 Setup 的最终核验及日常 Verify 中各只走一次受控 C# 扫描：根与祖先
+物理边界只检查一次，目录 entry 按固定 ordinal 顺序枚举且不跟随 reparse point；每个文件只打开一个 `FileShare.Read` 的顺序
+流，同时完成 SHA-256、stamp v2 digest record、text/escaped JSON source/writable path 审计。digest 保持既有排序及
+`relative-path NUL decimal-bytes NUL lowercase-sha256 LF` 格式；读失败、reparse、损坏受保护文本/JSON、路径泄漏和
+files/hash 不匹配仍在第一个 build gate 前 fail closed，绝不以跳过内容 hash 或 audit 换取速度。Verify 的 pinned vcpkg
+scripts 也先做一次 physical-only C# traversal，并只把该具体 audit result 交给后续 immutable Git/pin 检查。
+
 每个 fingerprint/schema/host-target identity 在环境根外有一个 ownership lock。Setup 从检查 stamp、删除旧树、安装到
 发布并复验 stamp 全程持有独占 lease；Verify 持共享 lease；Workspace 的同一个共享 lease 覆盖 Verify 和全部 gates，
 因而 Setup 不能与同一环境的读取或构建竞争。每个 canonical worktree 另有只覆盖 `w/<workspace-key>` 的独占 writable-

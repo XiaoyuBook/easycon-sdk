@@ -143,6 +143,14 @@ field 与字符串、小数或 exponent 数值都 fail closed。工具路径同�
 JSON 先解码 escaped string 再审计 source/writable reference。Verify 的 prepared vcpkg Git 查询禁止 optional lock/index refresh，
 因此共享 `e/` 在 Verify 与 Workspace 中保持只读。
 
+Cargo vendor 与 vcpkg installed 是完整内容核验而非 cache hint：每棵 tree 在 Setup 最终检查和 Verify 中各做一次有界、
+确定性 C# traversal。scanner 对 root/ancestor 做一次 physical boundary 检查，逐目录固定排序枚举、遇到任意 reparse 即拒绝；
+每个 regular file 只使用一个顺序读取流，同步计算 SHA-256、v2 digest 行、raw text 与 escaped JSON 的 source/writable
+reference 审计。v2 digest 继续使用既有相对路径排序、NUL 分隔十进制长度/lowercase hash 和 LF 行终止格式，因此既有 stamp
+语义不变。任何读取、解码、JSON、边界或 digest/count 异常都在 gate 启动前 fail closed；不引入按组件 fingerprint、
+Preflight mode 或 GC 路径。pinned vcpkg scripts 在 Verify 也先完成一轮 physical-only C# traversal；后续 Git commit、
+tracked-file、cleanliness 与 tool pin 检查只接受该同根、成功的 audit result，不能通过布尔 bypass 跳过边界验证。
+
 ## 3. 单一原生构建
 
 每个 release version + target 只生成一份 canonical runtime bundle：

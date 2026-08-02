@@ -437,6 +437,10 @@ Windows 环境生命周期另有无网络轻量合同：两个不同物理 workt
 必须解析同一个 prepared `EnvironmentRoot` 和 environment lease，首个 Setup 后第二个 Setup 必须 `already-ready` 且零 provision/
 download；Cargo target、CMake cache、Cargo home/config、vcpkg wrapper/downloads 和测试临时目录必须不同。prepared tree、stamp、
 Cargo vendor/config、vcpkg installed tree 和工具记录必须审计 worktree absolute path 与潜在写入边界，泄漏 fixture 必须 fail closed。
+prepared Cargo/native tree 的性能回归还必须用确定性合同证明每棵 tree 只受控枚举一次、`FilesScanned` 等于内容读取和 SHA
+计算次数，并对固定两文件 fixture 比较既有 stamp v2 digest；wall-clock 仅可输出诊断，不能作为安全或正确性唯一断言。
+同一合同继续注入 reparse、锁定读失败、损坏 BOM text/strict JSON、raw/escaped source 或任意 writable path 及
+files/hash mismatch，并要求 Verify/Workspace 在任一环境缺陷下零 gate 启动。
 两个 fixture 都必须是同一 fixed SHA 的独立 clean checkout，禁止复制 fingerprint inputs；合同必须真实走首次 Setup 与第二次
 already-ready Setup，证明单一 `e/`、不同 `w/` 及 provision/download 计数不增加。prepared JSON 的 escaped source/任意
 `CacheRoot/w` path、source/writable tool record、stamp 每层 duplicate/unknown/type/integer mutation 都要独立 fail closed。

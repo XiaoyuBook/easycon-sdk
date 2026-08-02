@@ -1175,11 +1175,41 @@ def windows_workspace_module_failures(module_text):
         module_text, "Copy-EasyConContentFileAtomically"
     )
     writer = _powershell_function_text(module_text, "Write-EasyConUtf8FileAtomically")
+    prepared_tree = _powershell_function_text(
+        module_text, "Get-EasyConPreparedTreeVerification"
+    )
+    prepared_tree_assert = _powershell_function_text(
+        module_text, "Assert-EasyConPreparedTreeDoesNotReferenceRepository"
+    )
+    prepared_physical_tree = _powershell_function_text(
+        module_text, "Assert-EasyConPreparedPhysicalTree"
+    )
+    prepared_tree_auditor = _powershell_function_text(
+        module_text, "Initialize-EasyConPreparedTreeAuditor"
+    )
+    vcpkg_checkout = _powershell_function_text(
+        module_text, "Assert-EasyConVcpkgCheckout"
+    )
+    fingerprint = _powershell_function_text(module_text, "Get-EasyConTreeFingerprint")
+    verify_core = _powershell_function_text(
+        module_text, "Invoke-EasyConWindowsVerifyCore"
+    )
+    setup_install = _powershell_function_text(
+        module_text, "Install-EasyConWindowsEnvironment"
+    )
     for name, body in (
         ("workspace vcpkg layout", layout),
         ("atomic file publisher", publisher),
         ("atomic content copier", copier),
         ("atomic UTF-8 writer", writer),
+        ("prepared tree verification", prepared_tree),
+        ("prepared tree assertion", prepared_tree_assert),
+        ("prepared physical tree assertion", prepared_physical_tree),
+        ("prepared tree auditor", prepared_tree_auditor),
+        ("vcpkg checkout assertion", vcpkg_checkout),
+        ("prepared tree fingerprint", fingerprint),
+        ("Windows Verify core", verify_core),
+        ("Windows Setup install", setup_install),
     ):
         if body is None:
             failures.append("Windows workspace module is missing {}".format(name))
@@ -1239,6 +1269,118 @@ def windows_workspace_module_failures(module_text):
                     forbidden
                 )
             )
+
+    if "PreparedTreeAuditor]::AuditTree(" not in prepared_tree:
+        failures.append(
+            "prepared tree verification must delegate to the unified C# tree auditor"
+        )
+    if "Get-EasyConPreparedTreeVerification -Path $Path" not in prepared_tree_assert:
+        failures.append(
+            "prepared tree assertion must delegate to the unified tree verification"
+        )
+    if "PreparedTreeAuditor]::ValidatePhysicalTree(" not in prepared_physical_tree:
+        failures.append(
+            "prepared physical tree assertion must use the controlled C# traversal"
+        )
+    if "PreparedTreeAuditor]::FingerprintTree(" not in fingerprint:
+        failures.append(
+            "prepared tree fingerprint must use the controlled C# tree scanner"
+        )
+    for required in (
+        "PhysicalTreeAudit",
+        "Assert-EasyConPhysicalTree",
+        "IsInstanceOfType",
+        "ControlledEnumerationPasses",
+    ):
+        if required not in vcpkg_checkout:
+            failures.append(
+                "vcpkg checkout assertion is missing its validated physical-tree handoff: {}".format(
+                    required
+                )
+            )
+    for required in (
+        "Directory.EnumerateFileSystemEntries",
+        "File.GetAttributes",
+        "FileOptions.SequentialScan",
+        "IncrementalHash.CreateHash",
+        "StringComparer.OrdinalIgnoreCase",
+        "ValidatePhysicalTree",
+    ):
+        if required not in prepared_tree_auditor:
+            failures.append(
+                "prepared tree auditor is missing its single-scan primitive: {}".format(
+                    required
+                )
+            )
+    if "Get-ChildItem" in prepared_tree or "Assert-EasyConPhysicalPath" in prepared_tree:
+        failures.append(
+            "prepared tree verification must not reintroduce PowerShell per-entry traversal"
+        )
+
+    verify_calls = re.findall(
+        r"Get-EasyConPreparedTreeVerification\s+-Path\s+"
+        r"\$preparedPaths\.(cargoVendor|vcpkgInstalled)",
+        verify_core,
+    )
+    if sorted(verify_calls) != ["cargoVendor", "vcpkgInstalled"]:
+        failures.append(
+            "Windows Verify must scan each prepared Cargo/native tree exactly once"
+        )
+    if verify_core.count("Assert-EasyConPreparedPhysicalTree") != 4:
+        failures.append(
+            "Windows Verify must use the physical-only scanner for shared cache, Rust home, vcpkg scripts, and OCR"
+        )
+    if not re.search(
+        r"\$preparedPaths\.vcpkgScriptsAudit\s*=\s*"
+        r"Assert-EasyConPreparedPhysicalTree\s+`\s*\r?\n\s*"
+        r"-Path \(\[string\]\$stamp\.paths\.vcpkgScriptsRoot\) "
+        r"-TrustedRoot \$location\.EnvironmentRoot -PassThru",
+        verify_core,
+    ):
+        failures.append(
+            "Windows Verify must C#-validate vcpkg scripts before checkout validation"
+        )
+    if not re.search(
+        r"Assert-EasyConVcpkgCheckout\s+-VcpkgRoot "
+        r"\$preparedPaths\.vcpkgScriptsRoot\s+`\s*\r?\n\s*"
+        r"-Configuration \$configuration -VcpkgExecutable \$tools\.vcpkg\s+`\s*\r?\n\s*"
+        r"-PhysicalTreeAudit \$preparedPaths\.vcpkgScriptsAudit",
+        verify_core,
+    ):
+        failures.append(
+            "Windows Verify must pass the matching vcpkg C# physical-tree audit to checkout validation"
+        )
+    for legacy in (
+        "Get-EasyConTreeFingerprint -Path $preparedPaths.",
+        "Assert-EasyConPreparedTreeDoesNotReferenceRepository -Path $preparedPaths.",
+    ):
+        if legacy in verify_core:
+            failures.append(
+                "Windows Verify must not reintroduce a duplicate prepared-tree scan: {}".format(
+                    legacy
+                )
+            )
+    for name in ("cargoVendor", "vcpkgInstalled"):
+        if re.search(
+            r"Assert-EasyConPhysicalTree\s+`\s*\r?\n\s*"
+            r"-Path \(\[string\]\$stamp\.paths\.{}\)".format(name),
+            verify_core,
+        ):
+            failures.append(
+                "Windows Verify must leave {} physical-tree traversal to the unified scanner".format(
+                    name
+                )
+            )
+
+    setup_calls = re.findall(
+        r"Get-EasyConPreparedTreeVerification\s+-Path\s+"
+        r"(\$cargoSources\.VendorRoot|\$vcpkgLayout\.Installed)",
+        setup_install,
+    )
+    if sorted(setup_calls) != ["$cargoSources.VendorRoot", "$vcpkgLayout.Installed"]:
+        failures.append(
+            "Windows Setup must produce each prepared tree digest and audit from one scan"
+        )
     return failures
 
 

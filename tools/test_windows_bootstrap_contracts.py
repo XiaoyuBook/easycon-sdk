@@ -391,6 +391,40 @@ class WindowsWorkspaceModuleContracts(unittest.TestCase):
             "disabled applocal",
         )
 
+    def test_prepared_tree_single_scan_mutations_are_rejected(self):
+        mutations = {
+            "missing controlled enumeration": (
+                "Directory.EnumerateFileSystemEntries",
+                "Directory.GetFiles",
+            ),
+            "nonincremental hash": (
+                "IncrementalHash.CreateHash",
+                "SHA256.Create",
+            ),
+            "Verify Cargo fallback fingerprint": (
+                "Get-EasyConPreparedTreeVerification -Path $preparedPaths.cargoVendor",
+                "Get-EasyConTreeFingerprint -Path $preparedPaths.cargoVendor",
+            ),
+            "assertion bypass": (
+                "Get-EasyConPreparedTreeVerification -Path $Path",
+                "Get-EasyConLegacyPreparedTreeVerification -Path $Path",
+            ),
+            "physical boundary bypass": (
+                "PreparedTreeAuditor]::ValidatePhysicalTree",
+                "PreparedTreeAuditor]::LegacyPhysicalTree",
+            ),
+            "Verify vcpkg physical audit handoff": (
+                "-PhysicalTreeAudit $preparedPaths.vcpkgScriptsAudit",
+                "-PhysicalTreeAudit $preparedPaths.legacyVcpkgScriptsAudit",
+            ),
+        }
+        for label, (original, replacement) in mutations.items():
+            with self.subTest(label=label):
+                self.assertIn(original, self.module)
+                mutated = self.module.replace(original, replacement)
+                self.assertNotEqual(mutated, self.module)
+                self.assert_rejected(mutated, label)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
