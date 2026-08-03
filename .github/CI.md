@@ -121,10 +121,16 @@ index refresh，全部可写状态必须留在当前 `w/`。
 
 Cargo vendor 与 vcpkg installed 每棵 prepared tree 在 Setup 的最终核验及日常 Verify 中各只走一次受控 C# 扫描：根与祖先
 物理边界只检查一次，目录 entry 按固定 ordinal 顺序枚举且不跟随 reparse point；每个文件只打开一个 `FileShare.Read` 的顺序
-流，同时完成 SHA-256、stamp v2 digest record、text/escaped JSON source/writable path 审计。digest 保持既有排序及
-`relative-path NUL decimal-bytes NUL lowercase-sha256 LF` 格式；读失败、reparse、损坏受保护文本/JSON、路径泄漏和
-files/hash 不匹配仍在第一个 build gate 前 fail closed，绝不以跳过内容 hash 或 audit 换取速度。Verify 的 pinned vcpkg
-scripts 也先做一次 physical-only C# traversal，并只把该具体 audit result 交给后续 immutable Git/pin 检查。
+流，同时完成 SHA-256、stamp v2 digest record、text/escaped JSON source/writable path 审计。digest 保持旧
+`Sort-Object FullName` 当前文化、大小写不敏感排序与 `relative-path NUL decimal-bytes NUL lowercase-sha256 LF` 格式；
+读失败、reparse、损坏受保护文本/JSON、路径泄漏和 files/hash 不匹配仍在第一个 build gate 前 fail closed，绝不以跳过
+内容 hash 或 audit 换取速度。Verify 的 pinned vcpkg scripts 在首次 Git 前完成一次 physical C# traversal，对 file 用
+`FILE_READ_DATA`、directory 用 `FILE_LIST_DIRECTORY`（同一 access bit）绑定 root 及每个已枚举 entry 的 `FileShare.Read`
+句柄、每项只做一次 basic reparse/type 查询；zero access/`FILE_READ_ATTRIBUTES` 不构成 delete/rename lock。root、`.git`
+与 required paths 才在 Git 前复核 FileId/final-path identity，全部句柄保持到最后
+一次 Git cleanliness 查询完成。绑定对本地与 UNC 长路径只在 Win32 handle/final-path API 边界使用 private extended-length
+形式，立即归一回逻辑路径；stamp、digest、诊断和公开环境变量不得出现 `\\?\`。单 root handle 不能保护子项，任意
+替换/reparse/读取失败在 Git 和 gate 前 fail closed。
 
 每个 fingerprint/schema/host-target identity 在环境根外有一个 ownership lock。Setup 从检查 stamp、删除旧树、安装到
 发布并复验 stamp 全程持有独占 lease；Verify 持共享 lease；Workspace 的同一个共享 lease 覆盖 Verify 和全部 gates，

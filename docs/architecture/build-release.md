@@ -146,10 +146,16 @@ JSON 先解码 escaped string 再审计 source/writable reference。Verify 的 p
 Cargo vendor 与 vcpkg installed 是完整内容核验而非 cache hint：每棵 tree 在 Setup 最终检查和 Verify 中各做一次有界、
 确定性 C# traversal。scanner 对 root/ancestor 做一次 physical boundary 检查，逐目录固定排序枚举、遇到任意 reparse 即拒绝；
 每个 regular file 只使用一个顺序读取流，同步计算 SHA-256、v2 digest 行、raw text 与 escaped JSON 的 source/writable
-reference 审计。v2 digest 继续使用既有相对路径排序、NUL 分隔十进制长度/lowercase hash 和 LF 行终止格式，因此既有 stamp
-语义不变。任何读取、解码、JSON、边界或 digest/count 异常都在 gate 启动前 fail closed；不引入按组件 fingerprint、
-Preflight mode 或 GC 路径。pinned vcpkg scripts 在 Verify 也先完成一轮 physical-only C# traversal；后续 Git commit、
-tracked-file、cleanliness 与 tool pin 检查只接受该同根、成功的 audit result，不能通过布尔 bypass 跳过边界验证。
+reference 审计。v2 digest 继续使用既有 `Sort-Object FullName` 的当前文化、大小写不敏感排序，以及 NUL 分隔十进制
+长度/lowercase hash 和 LF 行终止格式；不得改成 ordinal 排序，因此既有 stamp 语义不变。任何读取、解码、JSON、边界或
+digest/count 异常都在 gate 启动前 fail closed；不引入按组件 fingerprint、Preflight mode 或 GC 路径。pinned vcpkg scripts
+在 Verify 的首次 Git 查询前完成一轮 physical C# traversal，并为 file 使用 `FILE_READ_DATA`、directory 使用同一 access bit
+语义的 `FILE_LIST_DIRECTORY`，均以 `FileShare.Read` 持有到最后一次 Git cleanliness 查询结束；每个 entry 只作一次
+basic reparse/type 查询，只有 root、`.git` 和 required paths 才作 FileId/final-path 绑定并在 Git 前复核 identity。zero
+access 与 `FILE_READ_ATTRIBUTES` 不能作为 delete/rename lock，单独持有
+root 句柄不足以保护子项；本地/UNC 超过 `MAX_PATH` 的 entry 仅在 private Win32 handle/final-path conversion 中使用
+extended-length 表示，随即恢复逻辑路径，绝不进入 stamp、digest、诊断或公开环境变量；任意 reparse、替换、身份变化或
+绑定读取失败都在 Git/gate 前 fail closed。
 
 ## 3. 单一原生构建
 

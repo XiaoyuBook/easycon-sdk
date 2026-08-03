@@ -1287,17 +1287,29 @@ def windows_workspace_module_failures(module_text):
             "prepared tree fingerprint must use the controlled C# tree scanner"
         )
     for required in (
-        "PhysicalTreeAudit",
-        "Assert-EasyConPhysicalTree",
-        "IsInstanceOfType",
+        "PreparedTreeAuditor]::BindVcpkgCheckout(",
+        "$binding.AssertCurrent()",
+        "PhysicalEntriesBound",
+        "$binding.Dispose()",
         "ControlledEnumerationPasses",
     ):
         if required not in vcpkg_checkout:
             failures.append(
-                "vcpkg checkout assertion is missing its validated physical-tree handoff: {}".format(
+                "vcpkg checkout assertion is missing its full-tree physical binding: {}".format(
                     required
                 )
             )
+    binding_start = vcpkg_checkout.find("PreparedTreeAuditor]::BindVcpkgCheckout(")
+    binding_current = vcpkg_checkout.find("$binding.AssertCurrent()")
+    first_git = vcpkg_checkout.find('"vcpkg scripts commit check"')
+    final_git = vcpkg_checkout.find('"vcpkg scripts cleanliness check"')
+    binding_dispose = vcpkg_checkout.find("$binding.Dispose()")
+    if not (
+        0 <= binding_start < binding_current < first_git < final_git < binding_dispose
+    ):
+        failures.append(
+            "vcpkg full-tree binding must cover every Git validation from audit through status"
+        )
     for required in (
         "Directory.EnumerateFileSystemEntries",
         "File.GetAttributes",
@@ -1305,6 +1317,26 @@ def windows_workspace_module_failures(module_text):
         "IncrementalHash.CreateHash",
         "StringComparer.OrdinalIgnoreCase",
         "ValidatePhysicalTree",
+        "BindVcpkgCheckout",
+        "ScanAndBindPhysicalDirectory",
+        "CreateFile",
+        "FileReadData",
+        "FileListDirectory",
+        "FileShareRead",
+        "GetFileInformationByHandleEx",
+        "GetFinalPathNameByHandle",
+        "GetFileInformationByHandle",
+        "GetBoundBasicInformation",
+        "PhysicalReadDataLockCalls",
+        "PhysicalBasicInformationQueries",
+        "PhysicalIdentityQueries",
+        "PhysicalFinalPathQueries",
+        "GetWin32ExtendedPath",
+        "GetLogicalPathInput",
+        "GetBoundLogicalFinalPath",
+        "ComparePowerShellFullName",
+        "vcpkg checkout binding path",
+        "current.Handle.Dispose()",
     ):
         if required not in prepared_tree_auditor:
             failures.append(
@@ -1312,6 +1344,30 @@ def windows_workspace_module_failures(module_text):
                     required
                 )
             )
+    for required in (
+        "CreateFile(\n                GetWin32ExtendedPath(logicalPath),",
+        'return @"\\\\?\\UNC\\" + logicalPath.Substring(2);',
+        "return NormalizeFullPath(buffer.ToString());",
+    ):
+        if required not in prepared_tree_auditor:
+            failures.append(
+                "prepared tree auditor is missing extended Win32 path normalization: {}".format(
+                    required
+                )
+            )
+    if "NoDesiredAccess" in prepared_tree_auditor:
+        failures.append(
+            "prepared vcpkg binding must not use a zero-access handle as its delete/rename lock"
+        )
+    if (
+        "uint desiredAccess = expectedDirectory ? FileListDirectory : FileReadData;"
+        not in prepared_tree_auditor
+        or "GetWin32ExtendedPath(logicalPath),\n                desiredAccess,\n                FileShareRead,"
+        not in prepared_tree_auditor
+    ):
+        failures.append(
+            "prepared vcpkg binding must retain each audited entry with its minimal read-data/list read-share lock"
+        )
     if "Get-ChildItem" in prepared_tree or "Assert-EasyConPhysicalPath" in prepared_tree:
         failures.append(
             "prepared tree verification must not reintroduce PowerShell per-entry traversal"
@@ -1326,29 +1382,23 @@ def windows_workspace_module_failures(module_text):
         failures.append(
             "Windows Verify must scan each prepared Cargo/native tree exactly once"
         )
-    if verify_core.count("Assert-EasyConPreparedPhysicalTree") != 4:
+    if verify_core.count("Assert-EasyConPreparedPhysicalTree") != 3:
         failures.append(
-            "Windows Verify must use the physical-only scanner for shared cache, Rust home, vcpkg scripts, and OCR"
+            "Windows Verify must reserve the physical-only scanner for shared cache, Rust home, and OCR"
         )
-    if not re.search(
-        r"\$preparedPaths\.vcpkgScriptsAudit\s*=\s*"
-        r"Assert-EasyConPreparedPhysicalTree\s+`\s*\r?\n\s*"
-        r"-Path \(\[string\]\$stamp\.paths\.vcpkgScriptsRoot\) "
-        r"-TrustedRoot \$location\.EnvironmentRoot -PassThru",
-        verify_core,
-    ):
+    if "vcpkgScriptsAudit" in verify_core:
         failures.append(
-            "Windows Verify must C#-validate vcpkg scripts before checkout validation"
+            "Windows Verify must not leave a pre-Git vcpkg physical audit window"
         )
     if not re.search(
         r"Assert-EasyConVcpkgCheckout\s+-VcpkgRoot "
         r"\$preparedPaths\.vcpkgScriptsRoot\s+`\s*\r?\n\s*"
         r"-Configuration \$configuration -VcpkgExecutable \$tools\.vcpkg\s+`\s*\r?\n\s*"
-        r"-PhysicalTreeAudit \$preparedPaths\.vcpkgScriptsAudit",
+        r"-TrustedRoot \$location\.EnvironmentRoot",
         verify_core,
     ):
         failures.append(
-            "Windows Verify must pass the matching vcpkg C# physical-tree audit to checkout validation"
+            "Windows Verify must create the vcpkg full-tree binding at the prepared root"
         )
     for legacy in (
         "Get-EasyConTreeFingerprint -Path $preparedPaths.",

@@ -1655,9 +1655,11 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using Microsoft.Win32.SafeHandles;
 
 namespace EasyCon.WindowsWorkspace
 {
@@ -1670,6 +1672,12 @@ namespace EasyCon.WindowsWorkspace
         public long FileContentReads { get; internal set; }
         public long FileHashesComputed { get; internal set; }
         public long PhysicalEntriesChecked { get; internal set; }
+        public long PhysicalEntriesBound { get; internal set; }
+        public long PhysicalCreateFileCalls { get; internal set; }
+        public long PhysicalReadDataLockCalls { get; internal set; }
+        public long PhysicalBasicInformationQueries { get; internal set; }
+        public long PhysicalIdentityQueries { get; internal set; }
+        public long PhysicalFinalPathQueries { get; internal set; }
         public long DirectoriesEnumerated { get; internal set; }
         public int ControlledEnumerationPasses { get; internal set; }
         public int MaximumJsonWindowBytes { get; internal set; }
@@ -1682,6 +1690,47 @@ namespace EasyCon.WindowsWorkspace
         public string FailureMessage { get; internal set; }
         public string MatchedLabel { get; internal set; }
         public string TextDamageKind { get; internal set; }
+    }
+
+    internal sealed class PreparedVcpkgBoundPhysicalEntry
+    {
+        internal string Path;
+        internal bool IsDirectory;
+        internal SafeFileHandle Handle;
+        internal uint VolumeSerialNumber;
+        internal uint FileIndexHigh;
+        internal uint FileIndexLow;
+        internal bool IsCritical;
+    }
+
+    public sealed class PreparedVcpkgCheckoutBinding : IDisposable
+    {
+        internal readonly List<PreparedVcpkgBoundPhysicalEntry> Entries =
+            new List<PreparedVcpkgBoundPhysicalEntry>();
+        internal readonly HashSet<string> CriticalPaths = new HashSet<string>(
+            StringComparer.OrdinalIgnoreCase);
+        internal bool IsDisposed;
+
+        public PreparedTreeAuditResult Audit { get; internal set; }
+
+        public void AssertCurrent()
+        {
+            PreparedTreeAuditor.AssertVcpkgCheckoutBindingCurrent(this);
+        }
+
+        public void Dispose()
+        {
+            if (IsDisposed)
+            {
+                return;
+            }
+            IsDisposed = true;
+            for (int index = Entries.Count - 1; index >= 0; index--)
+            {
+                Entries[index].Handle.Dispose();
+            }
+            Entries.Clear();
+        }
     }
 
     public static class PreparedTreeAuditor
@@ -1719,7 +1768,7 @@ namespace EasyCon.WindowsWorkspace
 
             public int Compare(TreeFileRecord left, TreeFileRecord right)
             {
-                return StringComparer.OrdinalIgnoreCase.Compare(left.FullPath, right.FullPath);
+                return ComparePowerShellFullName(left.FullPath, right.FullPath);
             }
         }
 
@@ -1739,6 +1788,75 @@ namespace EasyCon.WindowsWorkspace
             internal int MaximumJsonWindowBytes;
             internal string ResourceFailure;
         }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ByHandleFileInformation
+        {
+            internal FileAttributes FileAttributes;
+            internal uint CreationTimeLow;
+            internal uint CreationTimeHigh;
+            internal uint LastAccessTimeLow;
+            internal uint LastAccessTimeHigh;
+            internal uint LastWriteTimeLow;
+            internal uint LastWriteTimeHigh;
+            internal uint VolumeSerialNumber;
+            internal uint FileSizeHigh;
+            internal uint FileSizeLow;
+            internal uint NumberOfLinks;
+            internal uint FileIndexHigh;
+            internal uint FileIndexLow;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FileBasicInformation
+        {
+            internal long CreationTime;
+            internal long LastAccessTime;
+            internal long LastWriteTime;
+            internal long ChangeTime;
+            internal FileAttributes FileAttributes;
+        }
+
+        // FILE_READ_DATA and FILE_LIST_DIRECTORY intentionally share this access bit.
+        private const uint FileReadData = 0x00000001;
+        private const uint FileListDirectory = 0x00000001;
+        private const uint FileShareRead = 0x00000001;
+        private const uint OpenExisting = 3;
+        private const uint FileFlagBackupSemantics = 0x02000000;
+        private const uint FileFlagOpenReparsePoint = 0x00200000;
+        private const uint Win32ExtendedPathCapacity = 32768;
+        private const int FileBasicInformationClass = 0;
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern SafeFileHandle CreateFile(
+            string fileName,
+            uint desiredAccess,
+            uint shareMode,
+            IntPtr securityAttributes,
+            uint creationDisposition,
+            uint flagsAndAttributes,
+            IntPtr templateFile);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern uint GetFinalPathNameByHandle(
+            SafeFileHandle file,
+            StringBuilder filePath,
+            uint filePathLength,
+            uint flags);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetFileInformationByHandle(
+            SafeFileHandle file,
+            out ByHandleFileInformation information);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetFileInformationByHandleEx(
+            SafeFileHandle file,
+            int fileInformationClass,
+            out FileBasicInformation information,
+            uint informationSize);
 
         public static PreparedTreeAuditResult FingerprintTree(string path, string trustedRoot)
         {
@@ -1770,6 +1888,75 @@ namespace EasyCon.WindowsWorkspace
                 SetFailure(result, "tree", tree, exception.Message, null, null);
             }
             return result;
+        }
+
+        public static PreparedVcpkgCheckoutBinding BindVcpkgCheckout(
+            string path,
+            string trustedRoot,
+            string[] requiredRelativePaths)
+        {
+            if (requiredRelativePaths == null || requiredRelativePaths.Length == 0)
+            {
+                throw new ArgumentException("vcpkg required path set must not be empty");
+            }
+
+            PreparedTreeAuditResult result = new PreparedTreeAuditResult
+            {
+                JsonWindowLimitBytes = JsonWindowLimitBytes
+            };
+            PreparedVcpkgCheckoutBinding binding = new PreparedVcpkgCheckoutBinding
+            {
+                Audit = result
+            };
+            string tree = path;
+            try
+            {
+                tree = NormalizeFullPath(path);
+                string trusted = NormalizeFullPath(trustedRoot);
+                AssertPhysicalTreeRoot(tree, trusted);
+                result.RootPath = tree;
+                result.ControlledEnumerationPasses = 1;
+
+                binding.CriticalPaths.Add(tree);
+                binding.CriticalPaths.Add(NormalizeFullPath(Path.Combine(tree, ".git")));
+                foreach (string relative in requiredRelativePaths)
+                {
+                    if (!binding.CriticalPaths.Add(GetVcpkgRequiredPath(tree, relative)))
+                    {
+                        throw new InvalidOperationException(
+                            "vcpkg required path set contains a duplicate: " + relative);
+                    }
+                }
+                PreparedVcpkgBoundPhysicalEntry rootEntry = OpenBoundPhysicalEntry(
+                    tree,
+                    true,
+                    "vcpkg checkout root",
+                    true,
+                    result);
+                binding.Entries.Add(rootEntry);
+                result.PhysicalEntriesBound++;
+                ScanAndBindPhysicalDirectory(tree, result, binding);
+                if (result.FailureCategory == null)
+                {
+                    AssertVcpkgCriticalEntriesBound(binding, tree, requiredRelativePaths);
+                    AssertVcpkgCheckoutBindingCurrent(binding);
+                }
+            }
+            catch (OutOfMemoryException exception)
+            {
+                binding.Dispose();
+                SetFailure(result, "tree", tree, "memory allocation failed: " + exception.Message, null, null);
+            }
+            catch (Exception exception)
+            {
+                binding.Dispose();
+                SetFailure(result, "tree", tree, exception.Message, null, null);
+            }
+            if (result.FailureCategory != null)
+            {
+                binding.Dispose();
+            }
+            return binding;
         }
 
         public static PreparedTreeAuditResult AuditTree(
@@ -1916,6 +2103,415 @@ namespace EasyCon.WindowsWorkspace
                 {
                     result.FilesScanned++;
                 }
+            }
+        }
+
+        private static void ScanAndBindPhysicalDirectory(
+            string directory,
+            PreparedTreeAuditResult result,
+            PreparedVcpkgCheckoutBinding binding)
+        {
+            if (result.FailureCategory != null)
+            {
+                return;
+            }
+            List<string> entries = new List<string>();
+            try
+            {
+                foreach (string entry in Directory.EnumerateFileSystemEntries(directory))
+                {
+                    entries.Add(entry);
+                }
+            }
+            catch (OutOfMemoryException)
+            {
+                throw;
+            }
+            catch (Exception exception)
+            {
+                SetFailure(
+                    result,
+                    "tree",
+                    directory,
+                    "cannot enumerate physical tree directory " + directory + ": " + exception.Message,
+                    null,
+                    null);
+                return;
+            }
+
+            entries.Sort(StringComparer.OrdinalIgnoreCase);
+            result.DirectoriesEnumerated++;
+            foreach (string entry in entries)
+            {
+                FileAttributes attributes;
+                try
+                {
+                    attributes = File.GetAttributes(entry);
+                }
+                catch (OutOfMemoryException)
+                {
+                    throw;
+                }
+                catch (Exception exception)
+                {
+                    SetFailure(
+                        result,
+                        "tree",
+                        entry,
+                        "cannot classify physical tree entry " + entry + ": " + exception.Message,
+                        null,
+                        null);
+                    return;
+                }
+                result.PhysicalEntriesChecked++;
+                if ((attributes & FileAttributes.ReparsePoint) != 0)
+                {
+                    SetFailure(
+                        result,
+                        "tree",
+                        entry,
+                        "physical tree contains a reparse point: " + entry,
+                        null,
+                        null);
+                    return;
+                }
+                bool isDirectory = (attributes & FileAttributes.Directory) != 0;
+                PreparedVcpkgBoundPhysicalEntry bound = OpenBoundPhysicalEntry(
+                    entry,
+                    isDirectory,
+                    "vcpkg checkout audited entry",
+                    binding.CriticalPaths.Contains(NormalizeFullPath(entry)),
+                    result);
+                binding.Entries.Add(bound);
+                result.PhysicalEntriesBound++;
+                if (isDirectory)
+                {
+                    ScanAndBindPhysicalDirectory(entry, result, binding);
+                    if (result.FailureCategory != null)
+                    {
+                        return;
+                    }
+                }
+                else
+                {
+                    result.FilesScanned++;
+                }
+            }
+        }
+
+        private static void AssertVcpkgCriticalEntriesBound(
+            PreparedVcpkgCheckoutBinding binding,
+            string tree,
+            string[] requiredRelativePaths)
+        {
+            AssertVcpkgCriticalEntryBound(binding, tree, true, "vcpkg checkout root");
+            AssertVcpkgCriticalEntryBound(
+                binding,
+                NormalizeFullPath(Path.Combine(tree, ".git")),
+                true,
+                "vcpkg checkout .git");
+            foreach (string relative in requiredRelativePaths)
+            {
+                AssertVcpkgCriticalEntryBound(
+                    binding,
+                    GetVcpkgRequiredPath(tree, relative),
+                    false,
+                    "vcpkg required entry " + relative);
+            }
+        }
+
+        private static void AssertVcpkgCriticalEntryBound(
+            PreparedVcpkgCheckoutBinding binding,
+            string path,
+            bool expectedDirectory,
+            string description)
+        {
+            foreach (PreparedVcpkgBoundPhysicalEntry entry in binding.Entries)
+            {
+                if (entry.Path.Equals(path, StringComparison.OrdinalIgnoreCase))
+                {
+                    if (!entry.IsCritical || entry.IsDirectory != expectedDirectory)
+                    {
+                        throw new InvalidOperationException(description + " has an invalid physical binding");
+                    }
+                    return;
+                }
+            }
+            throw new InvalidOperationException(description + " is missing from the physical binding");
+        }
+
+        private static string GetVcpkgRequiredPath(string tree, string relative)
+        {
+            if (String.IsNullOrWhiteSpace(relative) || Path.IsPathFullyQualified(relative) ||
+                relative.StartsWith("/", StringComparison.Ordinal) ||
+                relative.StartsWith("\\", StringComparison.Ordinal) ||
+                relative.Contains("//") || relative.Contains("\\\\"))
+            {
+                throw new InvalidOperationException("vcpkg required path is not normalized: " + relative);
+            }
+            string[] components = relative.Split(
+                new char[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar },
+                StringSplitOptions.None);
+            if (components.Length == 0)
+            {
+                throw new InvalidOperationException("vcpkg required path is empty");
+            }
+            foreach (string component in components)
+            {
+                if (component.Length == 0 || component.Equals(".", StringComparison.Ordinal) ||
+                    component.Equals("..", StringComparison.Ordinal))
+                {
+                    throw new InvalidOperationException("vcpkg required path is not normalized: " + relative);
+                }
+            }
+            string path = NormalizeFullPath(Path.Combine(tree, relative));
+            if (!IsWithin(path, tree) || path.Equals(tree, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException("vcpkg required path escaped its checkout root: " + relative);
+            }
+            return path;
+        }
+
+        private static PreparedVcpkgBoundPhysicalEntry OpenBoundPhysicalEntry(
+            string path,
+            bool expectedDirectory,
+            string description,
+            bool requireIdentityAndFinalPath,
+            PreparedTreeAuditResult result)
+        {
+            string logicalPath = NormalizeFullPath(path);
+            uint flags = FileFlagOpenReparsePoint;
+            uint desiredAccess = expectedDirectory ? FileListDirectory : FileReadData;
+            if (expectedDirectory)
+            {
+                flags |= FileFlagBackupSemantics;
+            }
+            result.PhysicalCreateFileCalls++;
+            result.PhysicalReadDataLockCalls++;
+            SafeFileHandle handle = CreateFile(
+                GetWin32ExtendedPath(logicalPath),
+                desiredAccess,
+                FileShareRead,
+                IntPtr.Zero,
+                OpenExisting,
+                flags,
+                IntPtr.Zero);
+            if (handle == null || handle.IsInvalid)
+            {
+                int error = Marshal.GetLastWin32Error();
+                if (handle != null)
+                {
+                    handle.Dispose();
+                }
+                throw new IOException(
+                    "cannot bind " + description + " " + logicalPath + ": " +
+                    new System.ComponentModel.Win32Exception(error).Message);
+            }
+            try
+            {
+                FileBasicInformation basicInformation = GetBoundBasicInformation(
+                    handle,
+                    logicalPath,
+                    description,
+                    result);
+                AssertBoundPhysicalEntryState(
+                    basicInformation.FileAttributes,
+                    expectedDirectory,
+                    logicalPath,
+                    description);
+                PreparedVcpkgBoundPhysicalEntry bound = new PreparedVcpkgBoundPhysicalEntry
+                {
+                    Path = logicalPath,
+                    IsDirectory = expectedDirectory,
+                    Handle = handle,
+                    IsCritical = requireIdentityAndFinalPath
+                };
+                if (requireIdentityAndFinalPath)
+                {
+                    ByHandleFileInformation information = GetBoundFileInformation(
+                        handle,
+                        logicalPath,
+                        description,
+                        result);
+                    AssertBoundPhysicalEntryState(
+                        information.FileAttributes,
+                        expectedDirectory,
+                        logicalPath,
+                        description);
+                    string finalLogicalPath = GetBoundLogicalFinalPath(
+                        handle,
+                        logicalPath,
+                        description,
+                        result);
+                    if (!finalLogicalPath.Equals(logicalPath, StringComparison.OrdinalIgnoreCase))
+                    {
+                        throw new InvalidOperationException(
+                            description + " final path does not match the audited logical path: " +
+                            logicalPath);
+                    }
+                    bound.VolumeSerialNumber = information.VolumeSerialNumber;
+                    bound.FileIndexHigh = information.FileIndexHigh;
+                    bound.FileIndexLow = information.FileIndexLow;
+                }
+                return bound;
+            }
+            catch
+            {
+                handle.Dispose();
+                throw;
+            }
+        }
+
+        private static string GetBoundLogicalFinalPath(
+            SafeFileHandle handle,
+            string logicalPath,
+            string description,
+            PreparedTreeAuditResult result)
+        {
+            StringBuilder buffer = new StringBuilder((int)Win32ExtendedPathCapacity);
+            result.PhysicalFinalPathQueries++;
+            uint characters = GetFinalPathNameByHandle(
+                handle,
+                buffer,
+                Win32ExtendedPathCapacity,
+                0);
+            if (characters == 0)
+            {
+                int error = Marshal.GetLastWin32Error();
+                throw new IOException(
+                    "cannot resolve bound " + description + " " + logicalPath + ": " +
+                    new System.ComponentModel.Win32Exception(error).Message);
+            }
+            if (characters >= Win32ExtendedPathCapacity)
+            {
+                throw new IOException(
+                    "bound " + description + " final path exceeds the Win32 maximum: " +
+                    logicalPath);
+            }
+            return NormalizeFullPath(buffer.ToString());
+        }
+
+        internal static void AssertVcpkgCheckoutBindingCurrent(
+            PreparedVcpkgCheckoutBinding binding)
+        {
+            if (binding == null || binding.Audit == null || binding.IsDisposed)
+            {
+                throw new InvalidOperationException("vcpkg physical checkout binding is unavailable");
+            }
+            if (binding.Entries.Count == 0)
+            {
+                throw new InvalidOperationException("vcpkg physical checkout binding is empty");
+            }
+            int criticalEntries = 0;
+            foreach (PreparedVcpkgBoundPhysicalEntry entry in binding.Entries)
+            {
+                if (!entry.IsCritical)
+                {
+                    continue;
+                }
+                criticalEntries++;
+                ByHandleFileInformation heldInformation = GetBoundFileInformation(
+                    entry.Handle,
+                    entry.Path,
+                    "vcpkg checkout binding",
+                    binding.Audit);
+                AssertBoundPhysicalEntryState(
+                    heldInformation.FileAttributes,
+                    entry.IsDirectory,
+                    entry.Path,
+                    "vcpkg checkout binding");
+                if (heldInformation.VolumeSerialNumber != entry.VolumeSerialNumber ||
+                    heldInformation.FileIndexHigh != entry.FileIndexHigh ||
+                    heldInformation.FileIndexLow != entry.FileIndexLow)
+                {
+                    throw new InvalidOperationException(
+                        "vcpkg physical checkout binding identity changed: " + entry.Path);
+                }
+                PreparedVcpkgBoundPhysicalEntry current = OpenBoundPhysicalEntry(
+                    entry.Path,
+                    entry.IsDirectory,
+                    "vcpkg checkout binding path",
+                    true,
+                    binding.Audit);
+                try
+                {
+                    if (current.VolumeSerialNumber != entry.VolumeSerialNumber ||
+                        current.FileIndexHigh != entry.FileIndexHigh ||
+                        current.FileIndexLow != entry.FileIndexLow)
+                    {
+                        throw new InvalidOperationException(
+                            "vcpkg physical checkout binding path identity changed: " + entry.Path);
+                    }
+                }
+                finally
+                {
+                    current.Handle.Dispose();
+                }
+            }
+            if (criticalEntries != binding.CriticalPaths.Count)
+            {
+                throw new InvalidOperationException(
+                    "vcpkg physical checkout binding does not cover every critical path");
+            }
+        }
+
+        private static ByHandleFileInformation GetBoundFileInformation(
+            SafeFileHandle handle,
+            string path,
+            string description,
+            PreparedTreeAuditResult result)
+        {
+            ByHandleFileInformation information;
+            result.PhysicalIdentityQueries++;
+            if (!GetFileInformationByHandle(handle, out information))
+            {
+                int error = Marshal.GetLastWin32Error();
+                throw new IOException(
+                    "cannot inspect " + description + " " + path + ": " +
+                    new System.ComponentModel.Win32Exception(error).Message);
+            }
+            return information;
+        }
+
+        private static FileBasicInformation GetBoundBasicInformation(
+            SafeFileHandle handle,
+            string path,
+            string description,
+            PreparedTreeAuditResult result)
+        {
+            FileBasicInformation information;
+            result.PhysicalBasicInformationQueries++;
+            if (!GetFileInformationByHandleEx(
+                handle,
+                FileBasicInformationClass,
+                out information,
+                checked((uint)Marshal.SizeOf(typeof(FileBasicInformation)))))
+            {
+                int error = Marshal.GetLastWin32Error();
+                throw new IOException(
+                    "cannot inspect " + description + " " + path + ": " +
+                    new System.ComponentModel.Win32Exception(error).Message);
+            }
+            return information;
+        }
+
+        private static void AssertBoundPhysicalEntryState(
+            FileAttributes attributes,
+            bool expectedDirectory,
+            string path,
+            string description)
+        {
+            if ((attributes & FileAttributes.ReparsePoint) != 0)
+            {
+                throw new InvalidOperationException(
+                    description + " contains a reparse point: " + path);
+            }
+            bool isDirectory = (attributes & FileAttributes.Directory) != 0;
+            if (isDirectory != expectedDirectory)
+            {
+                string expected = expectedDirectory ? "directory" : "file";
+                throw new InvalidOperationException(
+                    description + " must be a " + expected + ": " + path);
             }
         }
 
@@ -2606,15 +3202,86 @@ namespace EasyCon.WindowsWorkspace
                 compatible * 100 >= pairs * 75;
         }
 
+        private static int ComparePowerShellFullName(string left, string right)
+        {
+            if (Object.ReferenceEquals(left, right))
+            {
+                return 0;
+            }
+            if (left == null)
+            {
+                return -1;
+            }
+            if (right == null)
+            {
+                return 1;
+            }
+            return CultureInfo.CurrentCulture.CompareInfo.Compare(
+                left,
+                right,
+                CompareOptions.IgnoreCase);
+        }
+
         private static string NormalizeFullPath(string path)
         {
-            string fullPath = Path.GetFullPath(path);
+            if (String.IsNullOrWhiteSpace(path))
+            {
+                throw new ArgumentException("path must not be empty");
+            }
+            string logicalInput = GetLogicalPathInput(path);
+            string fullPath = Path.GetFullPath(logicalInput);
             string volumeRoot = Path.GetPathRoot(fullPath);
+            if (String.IsNullOrWhiteSpace(volumeRoot))
+            {
+                throw new InvalidOperationException(
+                    "path does not have a filesystem root: " + logicalInput);
+            }
             if (fullPath.Equals(volumeRoot, StringComparison.OrdinalIgnoreCase))
             {
                 return fullPath;
             }
             return fullPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        }
+
+        private static string GetLogicalPathInput(string path)
+        {
+            if (path.StartsWith(@"\\.\", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException("device paths are not accepted");
+            }
+            if (!path.StartsWith(@"\\?\", StringComparison.OrdinalIgnoreCase))
+            {
+                return path;
+            }
+            if (path.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase))
+            {
+                return @"\\" + path.Substring(8);
+            }
+            string localPath = path.Substring(4);
+            if (localPath.Length < 3 || localPath[1] != ':' ||
+                (localPath[2] != Path.DirectorySeparatorChar &&
+                    localPath[2] != Path.AltDirectorySeparatorChar))
+            {
+                throw new InvalidOperationException("unsupported extended Win32 path");
+            }
+            return localPath;
+        }
+
+        private static string GetWin32ExtendedPath(string path)
+        {
+            string logicalPath = NormalizeFullPath(path);
+            if (logicalPath.StartsWith(@"\\", StringComparison.Ordinal))
+            {
+                return @"\\?\UNC\" + logicalPath.Substring(2);
+            }
+            if (logicalPath.Length < 3 || logicalPath[1] != ':' ||
+                (logicalPath[2] != Path.DirectorySeparatorChar &&
+                    logicalPath[2] != Path.AltDirectorySeparatorChar))
+            {
+                throw new InvalidOperationException(
+                    "path cannot be represented as an extended Win32 filesystem path: " + logicalPath);
+            }
+            return @"\\?\" + logicalPath;
         }
 
         private static void AssertPhysicalTreeRoot(string tree, string trustedRoot)
@@ -3726,71 +4393,73 @@ function Assert-EasyConVcpkgCheckout {
         [Parameter(Mandatory)]
         [string]$VcpkgExecutable,
 
-        [object]$PhysicalTreeAudit
+        [string]$TrustedRoot
     )
 
-    $root = Assert-EasyConPhysicalPath -Path $VcpkgRoot
-    if (-not (Test-Path -LiteralPath $root -PathType Container)) {
-        throw "pinned vcpkg checkout is missing: $root"
-    }
-    if ($null -eq $PhysicalTreeAudit) {
-        Assert-EasyConPhysicalTree -Path $root -TrustedRoot $root | Out-Null
-    }
-    else {
-        $auditType = "EasyCon.WindowsWorkspace.PreparedTreeAuditResult" -as [type]
-        if ($null -eq $auditType -or -not $auditType.IsInstanceOfType($PhysicalTreeAudit)) {
-            throw "prevalidated vcpkg physical tree audit has an invalid type"
-        }
-        if (
-            -not [string]::IsNullOrWhiteSpace([string]$PhysicalTreeAudit.FailureCategory) -or
-            [int]$PhysicalTreeAudit.ControlledEnumerationPasses -ne 1
-        ) {
-            throw "prevalidated vcpkg physical tree audit failed closed: $($PhysicalTreeAudit.FailureMessage)"
-        }
-        $auditedRoot = [string]$PhysicalTreeAudit.RootPath
-        if (
-            [string]::IsNullOrWhiteSpace($auditedRoot) -or
-            -not $auditedRoot.Equals($root, [System.StringComparison]::OrdinalIgnoreCase)
-        ) {
-            throw "prevalidated vcpkg physical tree audit does not match the checkout root"
-        }
-    }
     $requiredFiles = @(
         ".vcpkg-root",
         "bootstrap-vcpkg.bat",
         "bootstrap-vcpkg.sh",
         "scripts/buildsystems/vcpkg.cmake"
     )
-    foreach ($relative in $requiredFiles) {
-        $requiredPath = Join-Path $root $relative
-        Assert-EasyConPhysicalPath -Path $requiredPath -TrustedRoot $root | Out-Null
-        if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
-            throw "pinned vcpkg checkout is missing $relative"
-        }
-    }
     $git = Get-EasyConCommandPath -Name "git.exe"
-    $head = @(Invoke-EasyConNativeCapture -Program $git -Arguments @(
-        "--no-optional-locks", "-c", "core.longpaths=true", "-C", $root,
-        "rev-parse", "HEAD"
-    ) -Description "vcpkg scripts commit check")[0].Trim()
-    if ($head -cne [string]$Configuration.vcpkg.scriptsCommit) {
-        throw "vcpkg scripts commit $head does not match the frozen pin"
+    $auditTrustedRoot = if ([string]::IsNullOrWhiteSpace($TrustedRoot)) {
+        $VcpkgRoot
     }
-    foreach ($relative in $requiredFiles) {
-        $tracked = @(Invoke-EasyConNativeCapture -Program $git -Arguments @(
+    else {
+        $TrustedRoot
+    }
+    $binding = $null
+    try {
+        Initialize-EasyConPreparedTreeAuditor
+        $binding = [EasyCon.WindowsWorkspace.PreparedTreeAuditor]::BindVcpkgCheckout(
+            $VcpkgRoot,
+            $auditTrustedRoot,
+            [string[]]$requiredFiles
+        )
+        $audit = $binding.Audit
+        if (
+            -not [string]::IsNullOrWhiteSpace([string]$audit.FailureCategory) -or
+            [int]$audit.ControlledEnumerationPasses -ne 1 -or
+            [long]$audit.PhysicalEntriesBound -ne ([long]$audit.PhysicalEntriesChecked + 1)
+        ) {
+            throw "pinned vcpkg physical audit failed closed: $($audit.FailureMessage)"
+        }
+        $root = [string]$audit.RootPath
+        if ([string]::IsNullOrWhiteSpace($root)) {
+            throw "pinned vcpkg physical audit failed closed: checkout root is unavailable"
+        }
+
+        # The binding retains every audited tree entry while Git traverses the checkout.
+        $binding.AssertCurrent()
+        $head = @(Invoke-EasyConNativeCapture -Program $git -Arguments @(
             "--no-optional-locks", "-c", "core.longpaths=true", "-C", $root,
-            "ls-files", "--error-unmatch", "--", $relative
-        ) -Description "vcpkg required tracked file check")
-        if ($tracked.Count -ne 1 -or $tracked[0] -cne $relative) {
-            throw "pinned vcpkg checkout does not track required file $relative"
+            "rev-parse", "HEAD"
+        ) -Description "vcpkg scripts commit check")[0].Trim()
+        if ($head -cne [string]$Configuration.vcpkg.scriptsCommit) {
+            throw "vcpkg scripts commit $head does not match the frozen pin"
+        }
+        foreach ($relative in $requiredFiles) {
+            $tracked = @(Invoke-EasyConNativeCapture -Program $git -Arguments @(
+                "--no-optional-locks", "-c", "core.longpaths=true", "-C", $root,
+                "ls-files", "--error-unmatch", "--", $relative
+            ) -Description "vcpkg required tracked file check")
+            if ($tracked.Count -ne 1 -or $tracked[0] -cne $relative) {
+                throw "pinned vcpkg checkout does not track required file $relative"
+            }
+        }
+        $status = @(Invoke-EasyConNativeCapture -Program $git -Arguments @(
+            "--no-optional-locks", "-c", "core.longpaths=true", "-C", $root,
+            "status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching"
+        ) -Description "vcpkg scripts cleanliness check")
+        if ($status.Count -ne 0) {
+            throw "pinned vcpkg scripts checkout has tracked, untracked, or ignored content`n$($status -join [Environment]::NewLine)"
         }
     }
-    $status = @(Invoke-EasyConNativeCapture -Program $git -Arguments @(
-        "--no-optional-locks", "-c", "core.longpaths=true", "-C", $root,
-        "status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching"
-    ) -Description "vcpkg scripts cleanliness check")
-    if ($status.Count -ne 0) {
-        throw "pinned vcpkg scripts checkout has tracked, untracked, or ignored content`n$($status -join [Environment]::NewLine)"
+    finally {
+        if ($null -ne $binding) {
+            $binding.Dispose()
+        }
     }
     $asset = $Configuration.vcpkg.windowsAsset
     $executable = Get-EasyConPhysicalFile -Path $VcpkgExecutable
@@ -6545,9 +7214,7 @@ function Invoke-EasyConWindowsVerifyCore {
             -Path (Join-Path $location.CacheRoot "caches") -TrustedRoot $location.CacheRoot
         $preparedPaths.rustupHome = Assert-EasyConPreparedPhysicalTree `
             -Path (Join-Path $sharedCacheRoot "rustup-home") -TrustedRoot $sharedCacheRoot
-        $preparedPaths.vcpkgScriptsAudit = Assert-EasyConPreparedPhysicalTree `
-            -Path ([string]$stamp.paths.vcpkgScriptsRoot) -TrustedRoot $location.EnvironmentRoot -PassThru
-        $preparedPaths.vcpkgScriptsRoot = [string]$preparedPaths.vcpkgScriptsAudit.RootPath
+        $preparedPaths.vcpkgScriptsRoot = [string]$stamp.paths.vcpkgScriptsRoot
         $preparedPaths.ocrModel = Assert-EasyConPreparedPhysicalTree `
             -Path ([string]$stamp.paths.ocrModel) -TrustedRoot $location.EnvironmentRoot
         foreach ($name in @("cargoVendor", "vcpkgInstalled")) {
@@ -6682,7 +7349,7 @@ function Invoke-EasyConWindowsVerifyCore {
 
     $vcpkg = Assert-EasyConVcpkgCheckout -VcpkgRoot $preparedPaths.vcpkgScriptsRoot `
         -Configuration $configuration -VcpkgExecutable $tools.vcpkg `
-        -PhysicalTreeAudit $preparedPaths.vcpkgScriptsAudit
+        -TrustedRoot $location.EnvironmentRoot
     Assert-EasyConVcpkgAuditPins -VcpkgRoot $vcpkg.Root -Configuration $configuration
     $allowedModelRoot = Join-Path $location.EnvironmentRoot "vision-models"
     $vision = Assert-EasyConVisionModel `

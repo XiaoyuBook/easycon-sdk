@@ -413,9 +413,41 @@ class WindowsWorkspaceModuleContracts(unittest.TestCase):
                 "PreparedTreeAuditor]::ValidatePhysicalTree",
                 "PreparedTreeAuditor]::LegacyPhysicalTree",
             ),
-            "Verify vcpkg physical audit handoff": (
-                "-PhysicalTreeAudit $preparedPaths.vcpkgScriptsAudit",
-                "-PhysicalTreeAudit $preparedPaths.legacyVcpkgScriptsAudit",
+            "Verify vcpkg full-tree binding root": (
+                "-VcpkgExecutable $tools.vcpkg `\n        -TrustedRoot $location.EnvironmentRoot",
+                "-VcpkgExecutable $tools.vcpkg `\n        -TrustedRoot $location.CacheRoot",
+            ),
+            "vcpkg full-tree binding": (
+                "PreparedTreeAuditor]::BindVcpkgCheckout(",
+                "PreparedTreeAuditor]::AuditTree(",
+            ),
+            "vcpkg binding lifetime": (
+                "$binding.Dispose()",
+                "$binding.ReleaseBeforeGit()",
+            ),
+            "vcpkg critical path identity revalidation": (
+                "vcpkg checkout binding path",
+                "vcpkg checkout held handle only",
+            ),
+            "vcpkg extended Win32 CreateFile path": (
+                "GetWin32ExtendedPath(logicalPath)",
+                "logicalPath",
+            ),
+            "vcpkg minimal read-share entry binding": (
+                "uint desiredAccess = expectedDirectory ? FileListDirectory : FileReadData;",
+                "uint desiredAccess = 0;",
+            ),
+            "vcpkg basic entry audit": (
+                "GetBoundBasicInformation(",
+                "GetBoundFileInformation(",
+            ),
+            "vcpkg extended UNC normalization": (
+                'return @"\\\\?\\UNC\\" + logicalPath.Substring(2);',
+                'return logicalPath;',
+            ),
+            "vcpkg final path logical normalization": (
+                "return NormalizeFullPath(buffer.ToString());",
+                "return buffer.ToString();",
             ),
         }
         for label, (original, replacement) in mutations.items():
