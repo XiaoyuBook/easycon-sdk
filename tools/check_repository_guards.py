@@ -1344,6 +1344,108 @@ def windows_workspace_module_failures(module_text):
                     required
                 )
             )
+
+    def csharp_region(start_marker, end_marker, description):
+        start = prepared_tree_auditor.find(start_marker)
+        end = prepared_tree_auditor.find(end_marker, start + len(start_marker))
+        if start < 0 or end < 0:
+            failures.append(
+                "prepared tree auditor is missing its {} region".format(description)
+            )
+            return ""
+        return prepared_tree_auditor[start:end]
+
+    audit_tree = csharp_region(
+        "public static PreparedTreeAuditResult AuditTree(",
+        "private static void ScanPhysicalDirectory(",
+        "content audit",
+    )
+    physical_scan = csharp_region(
+        "private static void ScanPhysicalDirectory(",
+        "private static void ScanAndBindPhysicalDirectory(",
+        "physical-only scan",
+    )
+    binding_scan = csharp_region(
+        "private static void ScanAndBindPhysicalDirectory(",
+        "private static void AssertVcpkgCriticalEntriesBound(",
+        "vcpkg binding scan",
+    )
+    open_bound_entry = csharp_region(
+        "private static PreparedVcpkgBoundPhysicalEntry OpenBoundPhysicalEntry(",
+        "private static string GetBoundLogicalFinalPath(",
+        "bound entry open",
+    )
+    basic_query = csharp_region(
+        "private static FileBasicInformation GetBoundBasicInformation(",
+        "private static void AssertBoundPhysicalEntryState(",
+        "bound basic information query",
+    )
+    content_scan = csharp_region(
+        "private static bool ScanDirectory(",
+        "private static FileAuditResult ScanFile(",
+        "content scan",
+    )
+    ordinal_entry_sort = "entries.Sort(StringComparer.OrdinalIgnoreCase);"
+    if content_scan and ordinal_entry_sort in content_scan:
+        failures.append(
+            "prepared content scan must not pre-sort entries before the legacy digest sort"
+        )
+    if audit_tree and audit_tree.count(
+        "files.Sort(TreeFileRecordComparer.Instance);"
+    ) != 1:
+        failures.append(
+            "prepared content digest must perform exactly one legacy-compatible final sort"
+        )
+    for description, region in (
+        ("physical-only scan", physical_scan),
+        ("vcpkg binding scan", binding_scan),
+    ):
+        if region and region.count(ordinal_entry_sort) != 1:
+            failures.append(
+                "prepared {} must retain exactly one deterministic ordinal entry sort".format(
+                    description
+                )
+            )
+    if binding_scan:
+        if "File.GetAttributes(" in binding_scan:
+            failures.append(
+                "vcpkg binding scan must classify each entry only from its bound handle"
+            )
+        for required in (
+            "OpenBoundPhysicalEntry(\n                    entry,\n                    null,",
+            "if (bound.IsDirectory)",
+        ):
+            if required not in binding_scan:
+                failures.append(
+                    "vcpkg binding scan is missing handle-first classification: {}".format(
+                        required
+                    )
+                )
+    if open_bound_entry:
+        for required in (
+            "bool? expectedDirectory",
+            "uint flags = FileFlagOpenReparsePoint | FileFlagBackupSemantics;",
+            "uint desiredAccess = FileReadData | FileListDirectory;",
+            "FileBasicInformation basicInformation = GetBoundBasicInformation(",
+            "IsDirectory = isDirectory,",
+        ):
+            if required not in open_bound_entry:
+                failures.append(
+                    "bound entry open is missing single-query type binding: {}".format(
+                        required
+                    )
+                )
+        if open_bound_entry.count("GetBoundBasicInformation(") != 1:
+            failures.append(
+                "bound entry open must issue exactly one basic information query"
+            )
+    if basic_query and (
+        "result.PhysicalBasicInformationQueries++;\n"
+        "            if (!GetFileInformationByHandleEx(" not in basic_query
+    ):
+        failures.append(
+            "vcpkg basic-query metric must increment immediately before the real OS query"
+        )
     for required in (
         "CreateFile(\n                GetWin32ExtendedPath(logicalPath),",
         'return @"\\\\?\\UNC\\" + logicalPath.Substring(2);',
@@ -1360,7 +1462,7 @@ def windows_workspace_module_failures(module_text):
             "prepared vcpkg binding must not use a zero-access handle as its delete/rename lock"
         )
     if (
-        "uint desiredAccess = expectedDirectory ? FileListDirectory : FileReadData;"
+        "uint desiredAccess = FileReadData | FileListDirectory;"
         not in prepared_tree_auditor
         or "GetWin32ExtendedPath(logicalPath),\n                desiredAccess,\n                FileShareRead,"
         not in prepared_tree_auditor

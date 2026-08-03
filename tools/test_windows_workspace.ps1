@@ -2279,6 +2279,9 @@ try {
                 $bindingMetricsProbe.PhysicalBasicInformationQueries -eq (
                     $bindingMetricsProbe.PhysicalCreateFileCalls
                 ) -and
+                $bindingMetricsProbe.PhysicalBasicInformationQueries -eq (
+                    $bindingMetricsProbe.PhysicalEntriesBound + 6
+                ) -and
                 $bindingMetricsProbe.PhysicalReadDataLockCalls -eq (
                     $bindingMetricsProbe.PhysicalCreateFileCalls
                 ) -and
@@ -4840,6 +4843,72 @@ $result = [ordered]@{
             [System.Threading.Thread]::CurrentThread.CurrentCulture = $previousCulture
             [System.Threading.Thread]::CurrentThread.CurrentUICulture = $previousUiCulture
         }
+
+        $legacyCaseRoot = Join-Path $location.EnvironmentRoot "contract-legacy-case-digest"
+        [System.IO.Directory]::CreateDirectory($legacyCaseRoot) | Out-Null
+        $fsutil = Join-Path $env:SystemRoot "System32/fsutil.exe"
+        & $fsutil file SetCaseSensitiveInfo $legacyCaseRoot enable | Out-Null
+        Assert-Contract ($LASTEXITCODE -eq 0) `
+            "legacy digest fixture must enable Windows case-sensitive directory semantics"
+        $legacyCaseBase = "abcdef"
+        foreach ($bits in 0..39) {
+            $characters = $legacyCaseBase.ToCharArray()
+            for ($index = 0; $index -lt $characters.Length; $index++) {
+                if (($bits -band (1 -shl $index)) -ne 0) {
+                    $characters[$index] = [char]::ToUpperInvariant($characters[$index])
+                }
+            }
+            Set-ContractUtf8Text -Path (
+                Join-Path $legacyCaseRoot ((-join $characters) + ".txt")
+            ) -Value ("payload-{0:d2}" -f $bits)
+        }
+        $legacyCaseScan = Invoke-PrivateCommand `
+            -CommandName "Get-EasyConPreparedTreeVerification" `
+            -Parameters @{
+                Path = $legacyCaseRoot
+                TrustedRoot = $location.EnvironmentRoot
+                RepositoryRoot = $repositoryRoot
+                WritableRoot = $location.WritableRoot
+                Description = "contract legacy case-sensitive prepared tree"
+            }
+        $legacyCaseFiles = @(
+            Get-ChildItem -LiteralPath $legacyCaseRoot -Recurse -Force -File |
+                Sort-Object FullName
+        )
+        $legacyCaseCompare = [System.Globalization.CultureInfo]::CurrentCulture.CompareInfo
+        $legacyCaseFirstPath = $legacyCaseFiles[0].FullName
+        Assert-Contract (
+            $legacyCaseFiles.Count -eq 40 -and
+            @($legacyCaseFiles | Where-Object {
+                $legacyCaseCompare.Compare(
+                    $legacyCaseFirstPath,
+                    $_.FullName,
+                    [System.Globalization.CompareOptions]::IgnoreCase
+                ) -ne 0
+            }).Count -eq 0
+        ) "case-sensitive digest fixture must contain 40 distinct comparer-equal paths"
+        $legacyCaseBuilder = [System.Text.StringBuilder]::new()
+        foreach ($legacyCaseFile in $legacyCaseFiles) {
+            $legacyCaseRelative = [System.IO.Path]::GetRelativePath(
+                $legacyCaseRoot, $legacyCaseFile.FullName
+            ).Replace('\', '/')
+            $legacyCaseHash = (
+                Get-FileHash -LiteralPath $legacyCaseFile.FullName -Algorithm SHA256
+            ).Hash.ToLowerInvariant()
+            [void]$legacyCaseBuilder.Append($legacyCaseRelative).Append("`0").Append(
+                $legacyCaseFile.Length
+            ).Append("`0").Append($legacyCaseHash).Append("`n")
+        }
+        $legacyCaseDigest = [System.Convert]::ToHexString(
+            [System.Security.Cryptography.SHA256]::HashData(
+                [System.Text.Encoding]::UTF8.GetBytes($legacyCaseBuilder.ToString())
+            )
+        ).ToLowerInvariant()
+        Assert-Contract (
+            $legacyCaseScan.TreeFiles -eq $legacyCaseFiles.Count -and
+            $legacyCaseScan.TreeSha256 -ceq $legacyCaseDigest
+        ) "prepared tree verification must preserve single-pass legacy sorting for comparer-equal paths"
+
         $singlePhysicalPath = Invoke-PrivateCommand `
             -CommandName "Assert-EasyConPreparedPhysicalTree" `
             -Parameters @{

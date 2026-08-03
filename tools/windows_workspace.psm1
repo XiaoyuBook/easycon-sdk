@@ -2143,48 +2143,16 @@ namespace EasyCon.WindowsWorkspace
             result.DirectoriesEnumerated++;
             foreach (string entry in entries)
             {
-                FileAttributes attributes;
-                try
-                {
-                    attributes = File.GetAttributes(entry);
-                }
-                catch (OutOfMemoryException)
-                {
-                    throw;
-                }
-                catch (Exception exception)
-                {
-                    SetFailure(
-                        result,
-                        "tree",
-                        entry,
-                        "cannot classify physical tree entry " + entry + ": " + exception.Message,
-                        null,
-                        null);
-                    return;
-                }
-                result.PhysicalEntriesChecked++;
-                if ((attributes & FileAttributes.ReparsePoint) != 0)
-                {
-                    SetFailure(
-                        result,
-                        "tree",
-                        entry,
-                        "physical tree contains a reparse point: " + entry,
-                        null,
-                        null);
-                    return;
-                }
-                bool isDirectory = (attributes & FileAttributes.Directory) != 0;
                 PreparedVcpkgBoundPhysicalEntry bound = OpenBoundPhysicalEntry(
                     entry,
-                    isDirectory,
+                    null,
                     "vcpkg checkout audited entry",
                     binding.CriticalPaths.Contains(NormalizeFullPath(entry)),
                     result);
                 binding.Entries.Add(bound);
+                result.PhysicalEntriesChecked++;
                 result.PhysicalEntriesBound++;
-                if (isDirectory)
+                if (bound.IsDirectory)
                 {
                     ScanAndBindPhysicalDirectory(entry, result, binding);
                     if (result.FailureCategory != null)
@@ -2274,18 +2242,14 @@ namespace EasyCon.WindowsWorkspace
 
         private static PreparedVcpkgBoundPhysicalEntry OpenBoundPhysicalEntry(
             string path,
-            bool expectedDirectory,
+            bool? expectedDirectory,
             string description,
             bool requireIdentityAndFinalPath,
             PreparedTreeAuditResult result)
         {
             string logicalPath = NormalizeFullPath(path);
-            uint flags = FileFlagOpenReparsePoint;
-            uint desiredAccess = expectedDirectory ? FileListDirectory : FileReadData;
-            if (expectedDirectory)
-            {
-                flags |= FileFlagBackupSemantics;
-            }
+            uint flags = FileFlagOpenReparsePoint | FileFlagBackupSemantics;
+            uint desiredAccess = FileReadData | FileListDirectory;
             result.PhysicalCreateFileCalls++;
             result.PhysicalReadDataLockCalls++;
             SafeFileHandle handle = CreateFile(
@@ -2314,6 +2278,8 @@ namespace EasyCon.WindowsWorkspace
                     logicalPath,
                     description,
                     result);
+                bool isDirectory =
+                    (basicInformation.FileAttributes & FileAttributes.Directory) != 0;
                 AssertBoundPhysicalEntryState(
                     basicInformation.FileAttributes,
                     expectedDirectory,
@@ -2322,7 +2288,7 @@ namespace EasyCon.WindowsWorkspace
                 PreparedVcpkgBoundPhysicalEntry bound = new PreparedVcpkgBoundPhysicalEntry
                 {
                     Path = logicalPath,
-                    IsDirectory = expectedDirectory,
+                    IsDirectory = isDirectory,
                     Handle = handle,
                     IsCritical = requireIdentityAndFinalPath
                 };
@@ -2335,7 +2301,7 @@ namespace EasyCon.WindowsWorkspace
                         result);
                     AssertBoundPhysicalEntryState(
                         information.FileAttributes,
-                        expectedDirectory,
+                        isDirectory,
                         logicalPath,
                         description);
                     string finalLogicalPath = GetBoundLogicalFinalPath(
@@ -2497,7 +2463,7 @@ namespace EasyCon.WindowsWorkspace
 
         private static void AssertBoundPhysicalEntryState(
             FileAttributes attributes,
-            bool expectedDirectory,
+            bool? expectedDirectory,
             string path,
             string description)
         {
@@ -2507,9 +2473,9 @@ namespace EasyCon.WindowsWorkspace
                     description + " contains a reparse point: " + path);
             }
             bool isDirectory = (attributes & FileAttributes.Directory) != 0;
-            if (isDirectory != expectedDirectory)
+            if (expectedDirectory.HasValue && isDirectory != expectedDirectory.Value)
             {
-                string expected = expectedDirectory ? "directory" : "file";
+                string expected = expectedDirectory.Value ? "directory" : "file";
                 throw new InvalidOperationException(
                     description + " must be a " + expected + ": " + path);
             }
@@ -2548,7 +2514,6 @@ namespace EasyCon.WindowsWorkspace
                 return false;
             }
 
-            entries.Sort(StringComparer.OrdinalIgnoreCase);
             result.DirectoriesEnumerated++;
             foreach (string entry in entries)
             {

@@ -434,12 +434,50 @@ class WindowsWorkspaceModuleContracts(unittest.TestCase):
                 "logicalPath",
             ),
             "vcpkg minimal read-share entry binding": (
-                "uint desiredAccess = expectedDirectory ? FileListDirectory : FileReadData;",
+                "uint desiredAccess = FileReadData | FileListDirectory;",
                 "uint desiredAccess = 0;",
+            ),
+            "content digest ordinal pre-sort": (
+                "private static bool ScanDirectory(\n"
+                "            string directory,\n"
+                "            string tree,\n"
+                "            string[] labels,\n"
+                "            string[] references,\n"
+                "            bool auditContent,\n"
+                "            PreparedTreeAuditResult result,\n"
+                "            List<TreeFileRecord> files)\n"
+                "        {\n"
+                "            List<string> entries = new List<string>();",
+                "private static bool ScanDirectory(\n"
+                "            string directory,\n"
+                "            string tree,\n"
+                "            string[] labels,\n"
+                "            string[] references,\n"
+                "            bool auditContent,\n"
+                "            PreparedTreeAuditResult result,\n"
+                "            List<TreeFileRecord> files)\n"
+                "        {\n"
+                "            List<string> entries = new List<string>();\n"
+                "            entries.Sort(StringComparer.OrdinalIgnoreCase);",
+            ),
+            "vcpkg binding pre-handle attributes": (
+                "PreparedVcpkgBoundPhysicalEntry bound = OpenBoundPhysicalEntry(\n"
+                "                    entry,\n"
+                "                    null,",
+                "File.GetAttributes(entry);\n"
+                "                PreparedVcpkgBoundPhysicalEntry bound = "
+                "OpenBoundPhysicalEntry(\n"
+                "                    entry,\n"
+                "                    null,",
             ),
             "vcpkg basic entry audit": (
                 "GetBoundBasicInformation(",
                 "GetBoundFileInformation(",
+            ),
+            "vcpkg basic metric detached from OS query": (
+                "result.PhysicalBasicInformationQueries++;\n"
+                "            if (!GetFileInformationByHandleEx(",
+                "if (!GetFileInformationByHandleEx(",
             ),
             "vcpkg extended UNC normalization": (
                 'return @"\\\\?\\UNC\\" + logicalPath.Substring(2);',
