@@ -8,7 +8,6 @@ license = "GPL-3.0-only"
 publish = false
 
 [workspace]
-members = ["file-id-handle"]
 resolver = "3"
 
 [dependencies]
@@ -26,7 +25,7 @@ sha2 = "0.10.9"
 sha2 = "0.10.9"
 
 [target.'cfg(windows)'.dependencies]
-easycon-hardware-file-id = { path = "file-id-handle" }
+easycon-hardware-file-id = { package = "easycon-file-identity", path = "../../crates/easycon-file-identity" }
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
 
 [target.'cfg(windows)'.dev-dependencies]

@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "authority": "ADR-0021 F0",
+  "project_license": "GPL-3.0-only",
+  "packages": [
+    {
+      "name": "windows-link",
+      "version": "0.2.1",
+      "role": "transitive",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5",
+      "license_expression": "MIT OR Apache-2.0",
+      "license_compatible_with": "GPL-3.0-only",
+      "declared_rust_version": "1.71",
+      "tested_rust_version": "1.97.1"
+    },
+    {
+      "name": "windows-sys",
+      "version": "0.61.2",
+      "role": "direct",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc",
+      "license_expression": "MIT OR Apache-2.0",
+      "license_compatible_with": "GPL-3.0-only",
+      "declared_rust_version": "1.71",
+      "tested_rust_version": "1.97.1"
+    }
+  ],
+  "dependency_edges": [
+    {
+      "from": "easycon-file-identity",
+      "to": "windows-sys",
+      "requirement": "=0.61.2",
+      "target": "cfg(windows)",
+      "kind": "normal",
+      "optional": false,
+      "rename": null,
+      "default_features": false,
+      "features": [
+        "Win32_Foundation",
+        "Win32_Storage_FileSystem"
+      ]
+    },
+    {
+      "from": "windows-sys@0.61.2",
+      "to": "windows-link",
+      "requirement": "0.2.1",
+      "target": null,
+      "kind": "normal",
+      "optional": false,
+      "rename": null,
+      "default_features": false,
+      "features": []
+    }
+  ],
+  "fixed_toolchain_evidence": {
+    "rustc_release": "1.97.1",
+    "rustc_commit": "8bab26f4f68e0e26f0bb7960be334d5b520ea452",
+    "host": "x86_64-pc-windows-msvc",
+    "root_command": "cargo test --locked -p easycon-file-identity --all-features",
+    "hardware_command": "cargo test --locked --workspace --all-features",
+    "result": "passed"
+  }
+}

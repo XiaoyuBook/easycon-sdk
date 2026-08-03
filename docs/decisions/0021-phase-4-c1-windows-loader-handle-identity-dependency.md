@@ -20,8 +20,9 @@
   P0/P1/P2=`0/0/0`
 - 上位冻结决定：[ADR-0017](0017-phase-4-ecs-automation-target.md) 与
   [ADR-0019](0019-phase-4-c1-lexer-contract.md)
-- 现有 system-leaf 证据：[qualification-private manifest](../../tests/hardware/file-id-handle/Cargo.toml)、
-  [borrowed-handle FFI](../../tests/hardware/file-id-handle/src/lib.rs) 与
+- F0 实施后的共享 foundation 与迁移证据：[root manifest](../../crates/easycon-file-identity/Cargo.toml)、
+  [borrowed-handle facade/FFI](../../crates/easycon-file-identity/src/lib.rs)、
+  [hardware migration call site](../../tests/hardware/src/artifact.rs) 与
   [retained publication 设计](../development/phase2b-run-directory-ownership.md)
 - 编号说明：`main@2fe7eb2` 尚未包含 ADR-0020，但本地并行 ref `c09c323` 已为另一项 proposal
   分配 ADR-0020；本提议使用 ADR-0021，不链接、修改或取代该并行 proposal 的合同

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Enforce frozen workspace, dependency, license, and architecture guards."""
 
+import copy
 import datetime
 import hashlib
 import json
@@ -17,12 +18,47 @@ EXPECTED_MEMBERS = {
     "crates/easycon-runtime",
     "crates/easycon-controller",
     "crates/easycon-ecs",
+    "crates/easycon-file-identity",
     "crates/easycon-serial",
     "crates/easycon-native-sys",
     "crates/easycon-vision",
     "tests/support",
 }
 W0_ZERO_DEPENDENCY_MANIFEST = "crates/easycon-ecs/Cargo.toml"
+F0_FOUNDATION_MANIFEST = "crates/easycon-file-identity/Cargo.toml"
+F0_FOUNDATION_SOURCE = "crates/easycon-file-identity/src/lib.rs"
+F0_FOUNDATION_WINDOWS_TEST = (
+    "crates/easycon-file-identity/tests/windows_file_objects.rs"
+)
+F0_ADMISSION_RECORD = "docs/architecture/rust-dependency-admission.json"
+F0_LEGACY_MANIFEST = "tests/hardware/file-id-handle/Cargo.toml"
+F0_LEGACY_SOURCE = "tests/hardware/file-id-handle/src/lib.rs"
+F0_HARDWARE_MANIFEST = "tests/hardware/Cargo.toml"
+F0_HARDWARE_SOURCE = "tests/hardware/src/artifact.rs"
+F0_ASSERTION_IDS = (
+    "F0-NO-DETACHED-PUBLIC-AUTHORITY",
+    "F0-QUERY-QUALITY-FAIL-CLOSED",
+    "F0-TWO-LIVE-HANDLE-DROP-TRACE",
+    "F0-ROOT-DIR-FILE-BORROWED-HANDLES",
+    "F0-HARDWARE-OWNERSHIP-MIGRATION",
+)
+F0_REGISTRY_SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
+F0_EXPECTED_REGISTRY_PACKAGES = {
+    "windows-link": {
+        "name": "windows-link",
+        "version": "0.2.1",
+        "source": F0_REGISTRY_SOURCE,
+        "checksum": "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5",
+        "dependencies": [],
+    },
+    "windows-sys": {
+        "name": "windows-sys",
+        "version": "0.61.2",
+        "source": F0_REGISTRY_SOURCE,
+        "checksum": "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc",
+        "dependencies": ["windows-link"],
+    },
+}
 FORBIDDEN_PREFIXES = (
     "bindings/",
     "ci/",
@@ -154,9 +190,12 @@ def git_files():
     return [item.decode("utf-8") for item in output.split(b"\0") if item]
 
 
-def cargo_metadata():
+def cargo_metadata(manifest_path=None):
+    command = ["cargo", "metadata", "--format-version", "1", "--no-deps"]
+    if manifest_path is not None:
+        command.extend(["--locked", "--manifest-path", manifest_path])
     output = subprocess.check_output(
-        ["cargo", "metadata", "--format-version", "1", "--no-deps"],
+        command,
         cwd=str(ROOT),
         stderr=subprocess.STDOUT,
     )
@@ -222,6 +261,1239 @@ def w0_boundary_failures(tracked, metadata):
         )
     if package_dependency_entries(metadata, W0_ZERO_DEPENDENCY_MANIFEST):
         failures.append("W0 easycon-ecs dependency list must remain empty")
+    return failures
+
+
+def expected_f0_foundation_manifest():
+    return """[package]
+name = "easycon-file-identity"
+description = "Safe borrowed-handle file identity foundation for EasyCon SDK"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "GPL-3.0-only"
+publish = false
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", default-features = false, features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }
+
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+"""
+
+
+def expected_f0_admission():
+    return {
+        "schema_version": 1,
+        "authority": "ADR-0021 F0",
+        "project_license": "GPL-3.0-only",
+        "packages": [
+            {
+                "name": "windows-link",
+                "version": "0.2.1",
+                "role": "transitive",
+                "source": F0_REGISTRY_SOURCE,
+                "checksum": F0_EXPECTED_REGISTRY_PACKAGES["windows-link"]["checksum"],
+                "license_expression": "MIT OR Apache-2.0",
+                "license_compatible_with": "GPL-3.0-only",
+                "declared_rust_version": "1.71",
+                "tested_rust_version": "1.97.1",
+            },
+            {
+                "name": "windows-sys",
+                "version": "0.61.2",
+                "role": "direct",
+                "source": F0_REGISTRY_SOURCE,
+                "checksum": F0_EXPECTED_REGISTRY_PACKAGES["windows-sys"]["checksum"],
+                "license_expression": "MIT OR Apache-2.0",
+                "license_compatible_with": "GPL-3.0-only",
+                "declared_rust_version": "1.71",
+                "tested_rust_version": "1.97.1",
+            },
+        ],
+        "dependency_edges": [
+            {
+                "from": "easycon-file-identity",
+                "to": "windows-sys",
+                "requirement": "=0.61.2",
+                "target": "cfg(windows)",
+                "kind": "normal",
+                "optional": False,
+                "rename": None,
+                "default_features": False,
+                "features": [
+                    "Win32_Foundation",
+                    "Win32_Storage_FileSystem",
+                ],
+            },
+            {
+                "from": "windows-sys@0.61.2",
+                "to": "windows-link",
+                "requirement": "0.2.1",
+                "target": None,
+                "kind": "normal",
+                "optional": False,
+                "rename": None,
+                "default_features": False,
+                "features": [],
+            },
+        ],
+        "fixed_toolchain_evidence": {
+            "rustc_release": "1.97.1",
+            "rustc_commit": "8bab26f4f68e0e26f0bb7960be334d5b520ea452",
+            "host": "x86_64-pc-windows-msvc",
+            "root_command": "cargo test --locked -p easycon-file-identity --all-features",
+            "hardware_command": "cargo test --locked --workspace --all-features",
+            "result": "passed",
+        },
+    }
+
+
+def normalized_metadata_dependency(dependency):
+    path = dependency.get("path")
+    return {
+        "name": dependency.get("name"),
+        "req": dependency.get("req"),
+        "kind": dependency.get("kind"),
+        "rename": dependency.get("rename"),
+        "optional": dependency.get("optional"),
+        "uses_default_features": dependency.get("uses_default_features"),
+        "features": dependency.get("features"),
+        "target": dependency.get("target"),
+        "path": str(Path(path).resolve()) if path is not None else None,
+    }
+
+
+def f0_foundation_manifest_failures(manifest_text, package):
+    failures = []
+    if manifest_text.replace("\r\n", "\n") != expected_f0_foundation_manifest():
+        failures.append(
+            "F0-NO-DETACHED-PUBLIC-AUTHORITY: foundation package/Windows dependency/"
+            "lint manifest text differs from the exact admitted contract"
+        )
+    if (
+        package.get("name") != "easycon-file-identity"
+        or package.get("license") != "GPL-3.0-only"
+        or package.get("publish") != []
+        or package.get("rust_version") != "1.97.1"
+        or [
+            normalized_metadata_dependency(dependency)
+            for dependency in package.get("dependencies", [])
+        ]
+        != [
+            {
+                "name": "windows-sys",
+                "req": "=0.61.2",
+                "kind": None,
+                "rename": None,
+                "optional": False,
+                "uses_default_features": False,
+                "features": [
+                    "Win32_Foundation",
+                    "Win32_Storage_FileSystem",
+                ],
+                "target": "cfg(windows)",
+                "path": None,
+            }
+        ]
+    ):
+        failures.append(
+            "F0-NO-DETACHED-PUBLIC-AUTHORITY: cargo metadata does not expose the exact "
+            "internal package and Windows-only normal dependency"
+        )
+    return failures
+
+
+def f0_hardware_manifest_failures(manifest_text, package, workspace_members):
+    failures = []
+    if workspace_members != {"tests/hardware"} or re.search(
+        r"(?m)^members\s*=", manifest_text
+    ):
+        failures.append(
+            "F0-HARDWARE-OWNERSHIP-MIGRATION: hardware workspace still has a private "
+            "identity member or changed resolver shape"
+        )
+    identity_dependencies = [
+        normalized_metadata_dependency(dependency)
+        for dependency in package.get("dependencies", [])
+        if dependency.get("name") == "easycon-file-identity"
+        or dependency.get("rename") == "easycon-hardware-file-id"
+    ]
+    if identity_dependencies != [
+        {
+            "name": "easycon-file-identity",
+            "req": "*",
+            "kind": None,
+            "rename": "easycon-hardware-file-id",
+            "optional": False,
+            "uses_default_features": True,
+            "features": [],
+            "target": "cfg(windows)",
+            "path": str((ROOT / "crates/easycon-file-identity").resolve()),
+        }
+    ] or (
+        'easycon-hardware-file-id = { package = "easycon-file-identity", '
+        'path = "../../crates/easycon-file-identity" }'
+        not in manifest_text
+    ):
+        failures.append(
+            "F0-HARDWARE-OWNERSHIP-MIGRATION: hardware alias must be the exact "
+            "Windows-only root package/path dependency"
+        )
+    if "file-id-handle" in manifest_text:
+        failures.append(
+            "F0-HARDWARE-OWNERSHIP-MIGRATION: legacy helper path remains in hardware manifest"
+        )
+    return failures
+
+
+def parse_cargo_lock_packages(text):
+    packages = []
+    sections = re.split(r"(?m)^\[\[package\]\]\s*$", text)
+    for section in sections[1:]:
+        package = {}
+        for key in ("name", "version", "source", "checksum"):
+            match = re.search(r'(?m)^{} = "([^"]*)"\s*$'.format(key), section)
+            if match is not None:
+                package[key] = match.group(1)
+        dependencies = re.search(
+            r"(?ms)^dependencies = \[(.*?)^\]\s*$", section
+        )
+        if dependencies is not None:
+            package["dependencies"] = re.findall(
+                r'^\s*"([^"]+)",?\s*$', dependencies.group(1), re.MULTILINE
+            )
+        if package.get("name") is not None:
+            packages.append(package)
+    return {"package": packages}
+
+
+def normalized_lock_package(package):
+    return {
+        "name": package.get("name"),
+        "version": package.get("version"),
+        "source": package.get("source"),
+        "checksum": package.get("checksum"),
+        "dependencies": package.get("dependencies", []),
+    }
+
+
+def f0_lock_failures(lock, label):
+    failures = []
+    packages = lock.get("package", [])
+    foundation = [
+        package for package in packages if package.get("name") == "easycon-file-identity"
+    ]
+    if len(foundation) != 1 or foundation[0] != {
+        "name": "easycon-file-identity",
+        "version": "0.1.0",
+        "dependencies": ["windows-sys"],
+    }:
+        failures.append(
+            "F0-HARDWARE-OWNERSHIP-MIGRATION: {} lock does not contain the exact "
+            "foundation path package".format(label)
+        )
+    for name, expected in F0_EXPECTED_REGISTRY_PACKAGES.items():
+        matches = [package for package in packages if package.get("name") == name]
+        if len(matches) != 1 or normalized_lock_package(matches[0]) != expected:
+            failures.append(
+                "F0-QUERY-QUALITY-FAIL-CLOSED: {} lock {} version/source/checksum/"
+                "closure differs from dependency admission".format(label, name)
+            )
+    return failures
+
+
+def f0_admission_failures(admission):
+    if admission == expected_f0_admission():
+        return []
+    return [
+        "F0-QUERY-QUALITY-FAIL-CLOSED: dependency admission version/source/checksum/"
+        "license/declared-and-tested-Rust evidence differs from the frozen record"
+    ]
+
+
+def f0_foundation_source_failures(source, windows_test, ffi_sources):
+    failures = []
+    production_source = source.split("#[cfg(test)]", 1)[0]
+    if F0_ASSERTION_IDS[0] not in source:
+        failures.append(
+            "F0-NO-DETACHED-PUBLIC-AUTHORITY: stable assertion ID is missing"
+        )
+    public_items = re.findall(
+        r"(?m)^pub\s+(?:unsafe\s+)?(fn|struct|enum|type|trait|mod|const|static)\s+"
+        r"([A-Za-z_][A-Za-z0-9_]*)",
+        production_source,
+    )
+    if public_items != [
+        ("fn", "validate_file_object"),
+        ("fn", "same_file_object"),
+    ] or not re.search(
+        r"pub fn validate_file_object\(file: &File\) -> io::Result<\(\)>",
+        production_source,
+    ) or not re.search(
+        r"pub fn same_file_object\(left: &File, right: &File\) -> io::Result<bool>",
+        production_source,
+    ) or len(
+        re.findall(r"(?m)^\s*pub(?:\([^)]*\))?\s+", production_source)
+    ) != 2 or (
+        "validate_file_object_with(file, &mut SystemFileIdentityQuery)"
+        not in production_source
+    ) or (
+        "same_file_object_with(left, right, &mut SystemFileIdentityQuery)"
+        not in production_source
+    ):
+        failures.append(
+            "F0-NO-DETACHED-PUBLIC-AUTHORITY: public surface is not exactly borrowed "
+            "File validation and comparison"
+        )
+    if (
+        "#[derive(Clone, Copy, Debug, Eq, PartialEq)]\n"
+        "struct HighResolutionFileIdentity {\n    volume_serial_number: u64,\n"
+        "    file_id: u128,\n}" not in production_source
+        or "file_id: u128::from_le_bytes(identifier)" not in production_source
+        or production_source.count("left == right") != 1
+        or "std::ptr::eq" in production_source
+        or "let left_identity = validated_identity_with(left, query)?;\n"
+        "    let right_identity = validated_identity_with(right, query)?;\n"
+        "    Ok(query.compare(left_identity, right_identity))" not in production_source
+    ):
+        failures.append(
+            "F0-NO-DETACHED-PUBLIC-AUTHORITY: private full u64/u128 identity or "
+            "mandatory left-then-right borrowed comparison changed"
+        )
+    if (
+        "#![deny(unsafe_code)]" not in production_source
+        or "#![deny(unsafe_op_in_unsafe_fn)]" not in production_source
+        or production_source.count("#[allow(unsafe_code)]") != 1
+        or len(re.findall(r"\bunsafe\s*\{", production_source)) != 1
+        or production_source.count("GetFileInformationByHandleEx(") != 1
+        or production_source.count("SAFETY:") != 1
+        or "borrowed from a live `File` for this one call" not in production_source
+        or "selects the exact `FILE_ID_INFO` layout" not in production_source
+        or "buffer of exactly `buffer_size` bytes" not in production_source
+        or "retains neither the handle nor pointer" not in production_source
+    ):
+        failures.append(
+            "F0-QUERY-QUALITY-FAIL-CLOSED: unique private unsafe FILE_ID_INFO leaf or "
+            "its exact SAFETY proof changed"
+        )
+    ffi_paths = {
+        path
+        for path, text in ffi_sources.items()
+        if any(
+            token in text
+            for token in (
+                "GetFileInformationByHandleEx",
+                "FILE_ID_INFO",
+                "AsRawHandle",
+            )
+        )
+    }
+    if ffi_paths != {F0_FOUNDATION_SOURCE}:
+        failures.append(
+            "F0-QUERY-QUALITY-FAIL-CLOSED: FILE_ID_INFO FFI exists outside the unique "
+            "foundation source"
+        )
+    if (
+        F0_ASSERTION_IDS[1] not in source
+        or "identifier.ok_or_else(|| invalid_identity(\"FILE_ID_INFO result is incomplete\"))?"
+        not in production_source
+        or "if volume_serial_number == 0 {" not in production_source
+        or "if identifier_is_all_zero(&identifier) {" not in production_source
+        or "identifier.iter().all(|byte| *byte == 0)" not in production_source
+        or "file_id: u128::from_le_bytes(identifier)" not in production_source
+        or "if succeeded == 0 {" not in production_source
+        or "return Err(io::Error::last_os_error());" not in production_source
+        or "rejected_quality_results()" not in source
+        or "query_quality_failures_reach_both_safe_api_semantics_without_a_fallback"
+        not in source
+        or "io::ErrorKind::Unsupported" not in source
+        or "low_half_only" not in source
+        or "comparison_uses_volume_and_all_128_identifier_bits" not in source
+    ):
+        failures.append(
+            "F0-QUERY-QUALITY-FAIL-CLOSED: Win32/unsupported/zero/incomplete quality "
+            "assertions are incomplete"
+        )
+    if (
+        F0_ASSERTION_IDS[2] not in source
+        or "left-query" not in source
+        or "right-query" not in source
+        or "compare" not in source
+        or "return" not in source
+        or "drop-current" not in source
+        or "drop-retained" not in source
+        or "assert_two_live_handle_trace(true, true)" not in source
+        or "assert_two_live_handle_trace(false, false)" not in source
+        or "same_reference_is_queried_twice_before_comparison" not in source
+        or "same_file_object_with(&file, &file, &mut query)" not in source
+    ):
+        failures.append(
+            "F0-TWO-LIVE-HANDLE-DROP-TRACE: exact same/distinct two-live-handle event "
+            "and drop trace is missing"
+        )
+    if (
+        F0_ASSERTION_IDS[3] not in windows_test
+        or "volume_or_share_root" not in windows_test
+        or "ordinary_directory" not in windows_test
+        or "regular_file" not in windows_test
+        or "root_retained" not in windows_test
+        or "directory_retained" not in windows_test
+        or "file_retained" not in windows_test
+        or windows_test.count("assert_true_false_error(") != 4
+        or "FILE_FLAG_OPEN_REPARSE_POINT" not in windows_test
+        or 'File::open("NUL")' not in windows_test
+        or "assert_true_false_error" not in windows_test
+        or "same_file_object(retained, current)" not in windows_test
+        or "same_file_object(retained, distinct)" not in windows_test
+        or "same_file_object(retained, unsupported).is_err()" not in windows_test
+        or "#[ignore]" in windows_test
+    ):
+        failures.append(
+            "F0-ROOT-DIR-FILE-BORROWED-HANDLES: real nofollow root/directory/file "
+            "true/false/error assertion changed or became ignored"
+        )
+    if "#[ignore]" in source:
+        failures.append("F0 stable foundation assertions must remain non-ignored")
+    return failures
+
+
+def f0_hardware_source_failures(source):
+    failures = []
+    if (
+        "HighResolutionFileIdentity" in source
+        or "high_resolution_identity" in source
+        or re.search(r"(?m)^\s*identity:\s*", source)
+    ):
+        failures.append(
+            "F0-HARDWARE-OWNERSHIP-MIGRATION: hardware retains a detached identity authority"
+        )
+    if not re.search(
+        r"trait FileIdentityProvider\s*\{\s*fn same_file_object\("
+        r"&self, left: &File, right: &File\) -> io::Result<bool>;\s*\}",
+        source,
+        re.DOTALL,
+    ):
+        failures.append(
+            "F0-HARDWARE-OWNERSHIP-MIGRATION: hardware comparison seam must be "
+            "opaque io::Result<bool> over two borrowed Files"
+        )
+    guarded_match = re.search(
+        r"struct GuardedDiskFile\s*\{(?P<body>.*?)\}", source, re.DOTALL
+    )
+    if guarded_match is None or "file: File" not in guarded_match.group("body"):
+        failures.append(
+            "F0-HARDWARE-OWNERSHIP-MIGRATION: GuardedDiskFile no longer retains its File"
+        )
+    if (
+        F0_ASSERTION_IDS[4] not in source
+        or "validate_guarded_file_object(&file)" not in source
+        or "easycon_hardware_file_id::validate_file_object(file)" not in source
+        or source.count("easycon_hardware_file_id::same_file_object") != 1
+        or source.count("same_guarded_file_object(") != 5
+        or 'same_guarded_file_object(&first, &second, "checkpoint input")' not in source
+        or '"manifest staging/final"' not in source
+        or '"completion staging/final"' not in source
+        or '"manifest same_file_as"' not in source
+        or ".same_file_object(&left.file, &right.file)" not in source
+        or ".same_file_object(&staging.file, &guard)" not in source
+        or "#[ignore]" in source
+    ):
+        failures.append(
+            "F0-HARDWARE-OWNERSHIP-MIGRATION: publication/manifest/checkpoint paths "
+            "do not all compare two retained Files through the shared safe API"
+        )
+    return failures
+
+
+def f0_root_manifest_failures(manifest_text, members):
+    failures = []
+    if members != EXPECTED_MEMBERS:
+        failures.append(
+            "F0-NO-DETACHED-PUBLIC-AUTHORITY: root workspace member set does not "
+            "contain exactly one foundation"
+        )
+    normalized = manifest_text.replace("\r\n", "\n")
+    if '[workspace.lints.rust]\nunsafe_code = "forbid"\n' not in normalized:
+        failures.append("F0 root workspace unsafe_code=forbid boundary changed")
+    return failures
+
+
+def f0_legacy_path_failures(existing_paths):
+    if existing_paths:
+        return [
+            "F0-HARDWARE-OWNERSHIP-MIGRATION: legacy private helper still exists: {}".format(
+                ", ".join(sorted(existing_paths))
+            )
+        ]
+    return []
+
+
+def f0_contract_failures(tracked, root_metadata):
+    failures = []
+    required = {
+        "Cargo.toml": F0_ASSERTION_IDS[0],
+        "Cargo.lock": F0_ASSERTION_IDS[1],
+        F0_FOUNDATION_MANIFEST: F0_ASSERTION_IDS[0],
+        F0_FOUNDATION_SOURCE: F0_ASSERTION_IDS[0],
+        F0_FOUNDATION_WINDOWS_TEST: F0_ASSERTION_IDS[3],
+        F0_ADMISSION_RECORD: F0_ASSERTION_IDS[1],
+        F0_HARDWARE_MANIFEST: F0_ASSERTION_IDS[4],
+        "tests/hardware/Cargo.lock": F0_ASSERTION_IDS[4],
+        F0_HARDWARE_SOURCE: F0_ASSERTION_IDS[4],
+    }
+    for relative, assertion_id in required.items():
+        if not (ROOT / relative).is_file():
+            failures.append("{}: required F0 file is missing: {}".format(assertion_id, relative))
+    if failures:
+        return failures
+
+    try:
+        root_manifest_text = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
+        foundation_manifest_text = (ROOT / F0_FOUNDATION_MANIFEST).read_text(
+            encoding="utf-8"
+        )
+        hardware_manifest_text = (ROOT / F0_HARDWARE_MANIFEST).read_text(
+            encoding="utf-8"
+        )
+        root_lock = parse_cargo_lock_packages(
+            (ROOT / "Cargo.lock").read_text(encoding="utf-8")
+        )
+        hardware_lock = parse_cargo_lock_packages(
+            (ROOT / "tests/hardware/Cargo.lock").read_text(encoding="utf-8")
+        )
+        admission = json.loads((ROOT / F0_ADMISSION_RECORD).read_text(encoding="utf-8"))
+        hardware_metadata = cargo_metadata(F0_HARDWARE_MANIFEST)
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+        return ["F0 dependency or manifest record cannot be parsed: {}".format(error)]
+
+    foundation_packages = [
+        package
+        for package in root_metadata.get("packages", [])
+        if relative_manifest(package) == F0_FOUNDATION_MANIFEST
+    ]
+    if len(foundation_packages) != 1:
+        failures.append(
+            "F0-NO-DETACHED-PUBLIC-AUTHORITY: cargo metadata does not contain exactly "
+            "one foundation package"
+        )
+        foundation_package = {}
+    else:
+        foundation_package = foundation_packages[0]
+    hardware_packages = [
+        package
+        for package in hardware_metadata.get("packages", [])
+        if relative_manifest(package) == F0_HARDWARE_MANIFEST
+    ]
+    if len(hardware_packages) != 1:
+        failures.append(
+            "F0-HARDWARE-OWNERSHIP-MIGRATION: cargo metadata does not contain exactly "
+            "one hardware package"
+        )
+        hardware_package = {}
+    else:
+        hardware_package = hardware_packages[0]
+
+    failures.extend(
+        f0_root_manifest_failures(root_manifest_text, workspace_members(root_metadata))
+    )
+    failures.extend(
+        f0_foundation_manifest_failures(
+            foundation_manifest_text, foundation_package
+        )
+    )
+    failures.extend(
+        f0_hardware_manifest_failures(
+            hardware_manifest_text,
+            hardware_package,
+            workspace_members(hardware_metadata),
+        )
+    )
+    failures.extend(f0_lock_failures(root_lock, "root"))
+    failures.extend(f0_lock_failures(hardware_lock, "hardware"))
+    failures.extend(f0_admission_failures(admission))
+
+    foundation_source = (ROOT / F0_FOUNDATION_SOURCE).read_text(encoding="utf-8")
+    windows_test = (ROOT / F0_FOUNDATION_WINDOWS_TEST).read_text(encoding="utf-8")
+    hardware_source = (ROOT / F0_HARDWARE_SOURCE).read_text(encoding="utf-8")
+    ffi_sources = {
+        path: (ROOT / path).read_text(encoding="utf-8")
+        for path in tracked
+        if (path.startswith("crates/") or path.startswith("tests/"))
+        and path.endswith(".rs")
+        and (ROOT / path).is_file()
+    }
+    failures.extend(
+        f0_foundation_source_failures(foundation_source, windows_test, ffi_sources)
+    )
+    failures.extend(f0_hardware_source_failures(hardware_source))
+    failures.extend(
+        f0_legacy_path_failures(
+            {
+                path
+                for path in (F0_LEGACY_MANIFEST, F0_LEGACY_SOURCE)
+                if (ROOT / path).exists()
+            }
+        )
+    )
+    return failures
+
+
+def f0_guard_regression_failures():
+    failures = []
+
+    def expect_clean(label, actual):
+        if actual:
+            failures.append(
+                "F0 guard regression baseline failed for {}: {}".format(
+                    label, "; ".join(actual)
+                )
+            )
+
+    def expect_failure(label, actual, assertion_id):
+        if not actual or not any(assertion_id in failure for failure in actual):
+            failures.append(
+                "F0 guard mutation was not rejected by {}: {}".format(
+                    assertion_id, label
+                )
+            )
+
+    try:
+        root_manifest = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
+        hardware_manifest = (ROOT / F0_HARDWARE_MANIFEST).read_text(
+            encoding="utf-8"
+        )
+        foundation_source = (ROOT / F0_FOUNDATION_SOURCE).read_text(
+            encoding="utf-8"
+        )
+        windows_test = (ROOT / F0_FOUNDATION_WINDOWS_TEST).read_text(
+            encoding="utf-8"
+        )
+        hardware_source = (ROOT / F0_HARDWARE_SOURCE).read_text(encoding="utf-8")
+    except OSError as error:
+        return ["F0 guard regression input is unavailable: {}".format(error)]
+
+    foundation_dependency = {
+        "name": "windows-sys",
+        "req": "=0.61.2",
+        "kind": None,
+        "rename": None,
+        "optional": False,
+        "uses_default_features": False,
+        "features": [
+            "Win32_Foundation",
+            "Win32_Storage_FileSystem",
+        ],
+        "target": "cfg(windows)",
+        "path": None,
+    }
+    foundation_package = {
+        "name": "easycon-file-identity",
+        "license": "GPL-3.0-only",
+        "publish": [],
+        "rust_version": "1.97.1",
+        "dependencies": [copy.deepcopy(foundation_dependency)],
+    }
+    hardware_dependency = {
+        "name": "easycon-file-identity",
+        "req": "*",
+        "kind": None,
+        "rename": "easycon-hardware-file-id",
+        "optional": False,
+        "uses_default_features": True,
+        "features": [],
+        "target": "cfg(windows)",
+        "path": str((ROOT / "crates/easycon-file-identity").resolve()),
+    }
+    hardware_package = {
+        "dependencies": [copy.deepcopy(hardware_dependency)],
+    }
+
+    expect_clean(
+        "root manifest",
+        f0_root_manifest_failures(root_manifest, set(EXPECTED_MEMBERS)),
+    )
+    expect_failure(
+        "root member missing",
+        f0_root_manifest_failures(
+            root_manifest, EXPECTED_MEMBERS - {"crates/easycon-file-identity"}
+        ),
+        F0_ASSERTION_IDS[0],
+    )
+    expect_failure(
+        "root member extra",
+        f0_root_manifest_failures(
+            root_manifest, EXPECTED_MEMBERS | {"crates/unadmitted-identity"}
+        ),
+        F0_ASSERTION_IDS[0],
+    )
+    expect_failure(
+        "root unsafe lint weakened",
+        f0_root_manifest_failures(
+            root_manifest.replace('unsafe_code = "forbid"', 'unsafe_code = "deny"'),
+            set(EXPECTED_MEMBERS),
+        ),
+        "F0 root workspace",
+    )
+
+    foundation_manifest = expected_f0_foundation_manifest()
+    expect_clean(
+        "foundation manifest",
+        f0_foundation_manifest_failures(
+            foundation_manifest, copy.deepcopy(foundation_package)
+        ),
+    )
+    for field, value in (
+        ("name", "easycon-detached-identity"),
+        ("license", "MIT"),
+        ("publish", None),
+        ("rust_version", "1.96.0"),
+    ):
+        mutated = copy.deepcopy(foundation_package)
+        mutated[field] = value
+        expect_failure(
+            "foundation package {}".format(field),
+            f0_foundation_manifest_failures(foundation_manifest, mutated),
+            F0_ASSERTION_IDS[0],
+        )
+    for field, value in (
+        ("name", "windows"),
+        ("req", "^0.61.2"),
+        ("kind", "dev"),
+        ("rename", "win32"),
+        ("optional", True),
+        ("uses_default_features", True),
+        ("target", None),
+        ("path", str((ROOT / "tests").resolve())),
+    ):
+        mutated = copy.deepcopy(foundation_package)
+        mutated["dependencies"][0][field] = value
+        expect_failure(
+            "foundation dependency {}".format(field),
+            f0_foundation_manifest_failures(foundation_manifest, mutated),
+            F0_ASSERTION_IDS[0],
+        )
+    for feature in foundation_dependency["features"]:
+        mutated = copy.deepcopy(foundation_package)
+        mutated["dependencies"][0]["features"].remove(feature)
+        expect_failure(
+            "foundation dependency missing {}".format(feature),
+            f0_foundation_manifest_failures(foundation_manifest, mutated),
+            F0_ASSERTION_IDS[0],
+        )
+    mutated = copy.deepcopy(foundation_package)
+    mutated["dependencies"][0]["features"].append("Win32_System_IO")
+    expect_failure(
+        "foundation dependency extra feature",
+        f0_foundation_manifest_failures(foundation_manifest, mutated),
+        F0_ASSERTION_IDS[0],
+    )
+    mutated = copy.deepcopy(foundation_package)
+    mutated["dependencies"].append(
+        {
+            "name": "serde",
+            "req": "*",
+            "kind": None,
+            "rename": None,
+            "optional": False,
+            "uses_default_features": True,
+            "features": [],
+            "target": None,
+            "path": None,
+        }
+    )
+    expect_failure(
+        "foundation extra dependency",
+        f0_foundation_manifest_failures(foundation_manifest, mutated),
+        F0_ASSERTION_IDS[0],
+    )
+    expect_failure(
+        "foundation manifest text drift",
+        f0_foundation_manifest_failures(
+            foundation_manifest.replace("publish = false", "publish = true"),
+            copy.deepcopy(foundation_package),
+        ),
+        F0_ASSERTION_IDS[0],
+    )
+
+    expect_clean(
+        "hardware manifest",
+        f0_hardware_manifest_failures(
+            hardware_manifest,
+            copy.deepcopy(hardware_package),
+            {"tests/hardware"},
+        ),
+    )
+    for field, value in (
+        ("name", "easycon-hardware-file-id"),
+        ("rename", None),
+        ("path", str((ROOT / "tests/hardware/file-id-handle").resolve())),
+        ("target", None),
+        ("kind", "dev"),
+        ("optional", True),
+        ("uses_default_features", False),
+    ):
+        mutated = copy.deepcopy(hardware_package)
+        mutated["dependencies"][0][field] = value
+        expect_failure(
+            "hardware alias {}".format(field),
+            f0_hardware_manifest_failures(
+                hardware_manifest, mutated, {"tests/hardware"}
+            ),
+            F0_ASSERTION_IDS[4],
+        )
+    expect_failure(
+        "hardware member missing",
+        f0_hardware_manifest_failures(
+            hardware_manifest, copy.deepcopy(hardware_package), set()
+        ),
+        F0_ASSERTION_IDS[4],
+    )
+    expect_failure(
+        "hardware old helper member",
+        f0_hardware_manifest_failures(
+            hardware_manifest,
+            copy.deepcopy(hardware_package),
+            {"tests/hardware", "tests/hardware/file-id-handle"},
+        ),
+        F0_ASSERTION_IDS[4],
+    )
+    expect_failure(
+        "hardware old helper path",
+        f0_hardware_manifest_failures(
+            hardware_manifest.replace(
+                "../../crates/easycon-file-identity", "file-id-handle"
+            ),
+            copy.deepcopy(hardware_package),
+            {"tests/hardware"},
+        ),
+        F0_ASSERTION_IDS[4],
+    )
+    for legacy_path in (F0_LEGACY_MANIFEST, F0_LEGACY_SOURCE):
+        expect_failure(
+            "legacy helper {}".format(legacy_path),
+            f0_legacy_path_failures({legacy_path}),
+            F0_ASSERTION_IDS[4],
+        )
+
+    lock_fixture = {
+        "package": [
+            {
+                "name": "easycon-file-identity",
+                "version": "0.1.0",
+                "dependencies": ["windows-sys"],
+            },
+            copy.deepcopy(F0_EXPECTED_REGISTRY_PACKAGES["windows-link"]),
+            copy.deepcopy(F0_EXPECTED_REGISTRY_PACKAGES["windows-sys"]),
+        ]
+    }
+
+    def lock_package(lock, name):
+        return next(package for package in lock["package"] if package["name"] == name)
+
+    for lock_label in ("root", "hardware"):
+        expect_clean(
+            "{} lock".format(lock_label),
+            f0_lock_failures(copy.deepcopy(lock_fixture), lock_label),
+        )
+        mutated = copy.deepcopy(lock_fixture)
+        lock_package(mutated, "easycon-file-identity")["version"] = "0.1.1"
+        expect_failure(
+            "{} foundation lock version".format(lock_label),
+            f0_lock_failures(mutated, lock_label),
+            F0_ASSERTION_IDS[4],
+        )
+        mutated = copy.deepcopy(lock_fixture)
+        lock_package(mutated, "easycon-file-identity")["dependencies"] = []
+        expect_failure(
+            "{} foundation lock dependency edge".format(lock_label),
+            f0_lock_failures(mutated, lock_label),
+            F0_ASSERTION_IDS[4],
+        )
+        for package_name in ("windows-link", "windows-sys"):
+            for field in ("version", "source", "checksum"):
+                mutated = copy.deepcopy(lock_fixture)
+                lock_package(mutated, package_name)[field] += "-mutated"
+                expect_failure(
+                    "{} lock {} {}".format(lock_label, package_name, field),
+                    f0_lock_failures(mutated, lock_label),
+                    F0_ASSERTION_IDS[1],
+                )
+            mutated = copy.deepcopy(lock_fixture)
+            package = lock_package(mutated, package_name)
+            if package["dependencies"]:
+                package["dependencies"].pop()
+            else:
+                package["dependencies"].append("unexpected-edge")
+            expect_failure(
+                "{} lock {} dependency edge".format(lock_label, package_name),
+                f0_lock_failures(mutated, lock_label),
+                F0_ASSERTION_IDS[1],
+            )
+            mutated = copy.deepcopy(lock_fixture)
+            mutated["package"] = [
+                package
+                for package in mutated["package"]
+                if package["name"] != package_name
+            ]
+            expect_failure(
+                "{} lock missing {}".format(lock_label, package_name),
+                f0_lock_failures(mutated, lock_label),
+                F0_ASSERTION_IDS[1],
+            )
+            mutated = copy.deepcopy(lock_fixture)
+            extra = copy.deepcopy(lock_package(mutated, package_name))
+            extra["version"] = "0.0.0"
+            mutated["package"].append(extra)
+            expect_failure(
+                "{} lock extra {} version".format(lock_label, package_name),
+                f0_lock_failures(mutated, lock_label),
+                F0_ASSERTION_IDS[1],
+            )
+
+    admission = expected_f0_admission()
+    expect_clean("dependency admission", f0_admission_failures(copy.deepcopy(admission)))
+
+    def scalar_paths(value, path=()):
+        if isinstance(value, dict):
+            for key in sorted(value):
+                for item in scalar_paths(value[key], path + (key,)):
+                    yield item
+        elif isinstance(value, list):
+            for index, item in enumerate(value):
+                for nested in scalar_paths(item, path + (index,)):
+                    yield nested
+        else:
+            yield path
+
+    def mutate_scalar(document, path):
+        mutated = copy.deepcopy(document)
+        cursor = mutated
+        for component in path[:-1]:
+            cursor = cursor[component]
+        original = cursor[path[-1]]
+        if original is None:
+            replacement = "unexpected"
+        elif isinstance(original, bool):
+            replacement = not original
+        elif isinstance(original, int):
+            replacement = original + 1
+        else:
+            replacement = "{}-mutated".format(original)
+        cursor[path[-1]] = replacement
+        return mutated
+
+    for path in scalar_paths(admission):
+        label = ".".join(str(component) for component in path)
+        expect_failure(
+            "dependency admission scalar {}".format(label),
+            f0_admission_failures(mutate_scalar(admission, path)),
+            F0_ASSERTION_IDS[1],
+        )
+    for index in range(len(admission["packages"])):
+        mutated = copy.deepcopy(admission)
+        del mutated["packages"][index]
+        expect_failure(
+            "dependency admission missing package {}".format(index),
+            f0_admission_failures(mutated),
+            F0_ASSERTION_IDS[1],
+        )
+    mutated = copy.deepcopy(admission)
+    extra_package = copy.deepcopy(mutated["packages"][0])
+    extra_package["name"] = "unexpected-package"
+    mutated["packages"].append(extra_package)
+    expect_failure(
+        "dependency admission extra package",
+        f0_admission_failures(mutated),
+        F0_ASSERTION_IDS[1],
+    )
+    for field in admission:
+        mutated = copy.deepcopy(admission)
+        del mutated[field]
+        expect_failure(
+            "dependency admission missing top-level {}".format(field),
+            f0_admission_failures(mutated),
+            F0_ASSERTION_IDS[1],
+        )
+    mutated = copy.deepcopy(admission)
+    mutated["unexpected"] = True
+    expect_failure(
+        "dependency admission extra field",
+        f0_admission_failures(mutated),
+        F0_ASSERTION_IDS[1],
+    )
+
+    ffi_sources = {
+        F0_FOUNDATION_SOURCE: foundation_source,
+        F0_FOUNDATION_WINDOWS_TEST: windows_test,
+        F0_HARDWARE_SOURCE: hardware_source,
+    }
+
+    def foundation_failures(mutated_source=None, mutated_test=None, mutated_ffi=None):
+        return f0_foundation_source_failures(
+            foundation_source if mutated_source is None else mutated_source,
+            windows_test if mutated_test is None else mutated_test,
+            ffi_sources if mutated_ffi is None else mutated_ffi,
+        )
+
+    def insert_production(addition):
+        return foundation_source.replace(
+            "#[cfg(test)]", addition + "\n#[cfg(test)]", 1
+        )
+
+    expect_clean("foundation source", foundation_failures())
+    for label, addition in (
+        ("public identity struct", "\npub struct ExposedIdentity { pub volume: u64 }\n"),
+        ("public identity tuple", "\npub type ExposedIdentity = (u64, u128);\n"),
+        ("public identity value", "\npub const EXPOSED_IDENTITY: (u64, u128) = (1, 1);\n"),
+        (
+            "public identity function",
+            "\npub fn exposed_identity(_: &File) -> io::Result<(u64, u128)> { todo!() }\n",
+        ),
+    ):
+        expect_failure(
+            label,
+            foundation_failures(mutated_source=insert_production(addition)),
+            F0_ASSERTION_IDS[0],
+        )
+    expect_failure(
+        "public identity field",
+        foundation_failures(
+            mutated_source=foundation_source.replace(
+                "    volume_serial_number: u64,",
+                "    pub volume_serial_number: u64,",
+                1,
+            )
+        ),
+        F0_ASSERTION_IDS[0],
+    )
+    for delegation, replacement in (
+        (
+            "validate_file_object_with(file, &mut SystemFileIdentityQuery)",
+            "Ok(())",
+        ),
+        (
+            "same_file_object_with(left, right, &mut SystemFileIdentityQuery)",
+            "Ok(false)",
+        ),
+    ):
+        expect_failure(
+            "public safe API delegation {}".format(delegation),
+            foundation_failures(
+                mutated_source=foundation_source.replace(delegation, replacement, 1)
+            ),
+            F0_ASSERTION_IDS[0],
+        )
+    for label, addition in (
+        ("second unsafe allow", "\n#[allow(unsafe_code)]\n"),
+        ("second unsafe block", "\nfn extra_unsafe() { unsafe {} }\n"),
+        (
+            "second native query call",
+            "\nfn extra_query() { GetFileInformationByHandleEx(\n",
+        ),
+    ):
+        expect_failure(
+            label,
+            foundation_failures(mutated_source=insert_production(addition)),
+            F0_ASSERTION_IDS[1],
+        )
+    for safety_clause in (
+        "SAFETY:",
+        "borrowed from a live `File` for this one call",
+        "selects the exact `FILE_ID_INFO` layout",
+        "buffer of exactly `buffer_size` bytes",
+        "retains neither the handle nor pointer",
+    ):
+        expect_failure(
+            "missing SAFETY proof {}".format(safety_clause),
+            foundation_failures(
+                mutated_source=foundation_source.replace(safety_clause, "")
+            ),
+            F0_ASSERTION_IDS[1],
+        )
+    for quality_clause in (
+        'identifier.ok_or_else(|| invalid_identity("FILE_ID_INFO result is incomplete"))?',
+        "if volume_serial_number == 0 {",
+        "if identifier_is_all_zero(&identifier) {",
+        "identifier.iter().all(|byte| *byte == 0)",
+        "if succeeded == 0 {",
+        "return Err(io::Error::last_os_error());",
+        "io::ErrorKind::Unsupported",
+        "low_half_only",
+        "comparison_uses_volume_and_all_128_identifier_bits",
+    ):
+        expect_failure(
+            "quality clause {}".format(quality_clause),
+            foundation_failures(
+                mutated_source=foundation_source.replace(quality_clause, "")
+            ),
+            F0_ASSERTION_IDS[1],
+        )
+    expect_failure(
+        "comparison truncates high identity bits",
+        foundation_failures(
+            mutated_source=foundation_source.replace(
+                "left == right",
+                "left.file_id as u64 == right.file_id as u64",
+                1,
+            )
+        ),
+        F0_ASSERTION_IDS[0],
+    )
+    expect_failure(
+        "same-reference query shortcut",
+        foundation_failures(
+            mutated_source=foundation_source.replace(
+                "    let left_identity = validated_identity_with(left, query)?;",
+                "    if std::ptr::eq(left, right) { return Ok(true); }\n"
+                "    let left_identity = validated_identity_with(left, query)?;",
+                1,
+            )
+        ),
+        F0_ASSERTION_IDS[0],
+    )
+    for assertion_id in F0_ASSERTION_IDS[:3]:
+        expect_failure(
+            "foundation stable ID removed {}".format(assertion_id),
+            foundation_failures(
+                mutated_source=foundation_source.replace(assertion_id, "")
+            ),
+            assertion_id,
+        )
+    expect_failure(
+        "foundation assertion ignored",
+        foundation_failures(mutated_source=foundation_source + "\n#[ignore]\n"),
+        "F0 stable foundation assertions",
+    )
+    for trace_clause in (
+        "left-query",
+        "right-query",
+        "compare",
+        "return",
+        "drop-current",
+        "drop-retained",
+        "assert_two_live_handle_trace(true, true)",
+        "assert_two_live_handle_trace(false, false)",
+        "same_reference_is_queried_twice_before_comparison",
+    ):
+        expect_failure(
+            "two-live trace {}".format(trace_clause),
+            foundation_failures(
+                mutated_source=foundation_source.replace(trace_clause, "")
+            ),
+            F0_ASSERTION_IDS[2],
+        )
+    duplicated_ffi = dict(ffi_sources)
+    duplicated_ffi["tests/hardware/src/duplicate_file_id.rs"] = "FILE_ID_INFO"
+    expect_failure(
+        "second FFI authority",
+        foundation_failures(mutated_ffi=duplicated_ffi),
+        F0_ASSERTION_IDS[1],
+    )
+
+    for test_clause in (
+        F0_ASSERTION_IDS[3],
+        "volume_or_share_root",
+        "ordinary_directory",
+        "regular_file",
+        "root_retained",
+        "directory_retained",
+        "file_retained",
+        "FILE_FLAG_OPEN_REPARSE_POINT",
+        'File::open("NUL")',
+        "same_file_object(retained, current)",
+        "same_file_object(retained, distinct)",
+        "same_file_object(retained, unsupported).is_err()",
+    ):
+        expect_failure(
+            "root/directory/file clause {}".format(test_clause),
+            foundation_failures(mutated_test=windows_test.replace(test_clause, "")),
+            F0_ASSERTION_IDS[3],
+        )
+    expect_failure(
+        "root/directory/file assertion ignored",
+        foundation_failures(mutated_test=windows_test + "\n#[ignore]\n"),
+        F0_ASSERTION_IDS[3],
+    )
+
+    expect_clean("hardware source", f0_hardware_source_failures(hardware_source))
+    for label, mutation in (
+        (
+            "hardware detached field",
+            hardware_source + "\nidentity: (u64, u128),\n",
+        ),
+        (
+            "hardware detached type",
+            hardware_source + "\nstruct HighResolutionFileIdentity;\n",
+        ),
+        (
+            "hardware path provider",
+            hardware_source.replace(
+                "fn same_file_object(&self, left: &File, right: &File)",
+                "fn same_file_object(&self, left: &Path, right: &Path)",
+                1,
+            ),
+        ),
+        (
+            "hardware tuple provider",
+            hardware_source.replace(
+                "fn same_file_object(&self, left: &File, right: &File)",
+                "fn same_file_object(&self, left: (u64, u128), right: (u64, u128))",
+                1,
+            ),
+        ),
+        (
+            "GuardedDiskFile retained File removed",
+            hardware_source.replace(
+                "struct GuardedDiskFile {\n    bytes: Vec<u8>,\n    file: File,\n}",
+                "struct GuardedDiskFile {\n    bytes: Vec<u8>,\n}",
+                1,
+            ),
+        ),
+    ):
+        expect_failure(
+            label,
+            f0_hardware_source_failures(mutation),
+            F0_ASSERTION_IDS[4],
+        )
+    for hardware_clause in (
+        F0_ASSERTION_IDS[4],
+        "validate_guarded_file_object(&file)",
+        "easycon_hardware_file_id::validate_file_object(file)",
+        'same_guarded_file_object(&first, &second, "checkpoint input")',
+        '"manifest staging/final"',
+        '"completion staging/final"',
+        '"manifest same_file_as"',
+        ".same_file_object(&left.file, &right.file)",
+        ".same_file_object(&staging.file, &guard)",
+    ):
+        expect_failure(
+            "hardware shared comparison {}".format(hardware_clause),
+            f0_hardware_source_failures(
+                hardware_source.replace(hardware_clause, "")
+            ),
+            F0_ASSERTION_IDS[4],
+        )
+    removed_shared = hardware_source.replace(
+        "easycon_hardware_file_id::same_file_object", "removed_shared_comparison", 1
+    )
+    expect_failure(
+        "hardware shared API delegation removed",
+        f0_hardware_source_failures(removed_shared),
+        F0_ASSERTION_IDS[4],
+    )
+    expect_failure(
+        "hardware assertion ignored",
+        f0_hardware_source_failures(hardware_source + "\n#[ignore]\n"),
+        F0_ASSERTION_IDS[4],
+    )
     return failures
 
 
@@ -323,6 +1595,7 @@ def repository_guard_regression_failures():
         [],
         False,
     )
+    failures.extend(f0_guard_regression_failures())
     return failures
 class _StrictWorkflowParser:
     """Parse the small, intentionally frozen YAML subset used by required-ci.yml."""
@@ -1537,6 +2810,7 @@ def windows_workspace_module_failures(module_text):
 
 
 def main():
+    metadata = cargo_metadata()
     failures = repository_guard_regression_failures()
     windows_build_configuration_text = (
         ROOT / "tools/windows_build_environment.json"
@@ -1552,6 +2826,7 @@ def main():
     failures.extend(required_ci_failures(required_ci))
     tracked = git_files()
     tracked_set = set(tracked)
+    failures.extend(f0_contract_failures(tracked, metadata))
     if any(path == "EasyCon" or path.startswith("EasyCon/") for path in tracked):
         failures.append("outer repository tracks EasyCon content")
     if ".gitmodules" in tracked_set:
@@ -1566,7 +2841,6 @@ def main():
     if not WINDOWS_BUILD_FILES.issubset(tracked_set):
         failures.append("tracked Windows workspace bootstrap files are incomplete")
 
-    metadata = cargo_metadata()
     failures.extend(w0_boundary_failures(tracked, metadata))
     if workspace_members(metadata) != EXPECTED_MEMBERS:
         failures.append("workspace members differ from frozen workspace packages")

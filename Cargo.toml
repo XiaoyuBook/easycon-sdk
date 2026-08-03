@@ -4,6 +4,7 @@ members = [
     "crates/easycon-runtime",
     "crates/easycon-controller",
     "crates/easycon-ecs",
+    "crates/easycon-file-identity",
     "crates/easycon-serial",
     "crates/easycon-native-sys",
     "crates/easycon-vision",

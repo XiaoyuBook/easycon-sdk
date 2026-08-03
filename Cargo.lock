@@ -47,6 +47,13 @@ name = "easycon-ecs"
 version = "0.1.0"
 
 [[package]]
+name = "easycon-file-identity"
+version = "0.1.0"
+dependencies = [
+ "windows-sys",
+]
+
+[[package]]
 name = "easycon-model"
 version = "0.1.0"
 

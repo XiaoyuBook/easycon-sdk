@@ -3,7 +3,7 @@ use std::ffi::OsString;
 #[cfg(windows)]
 use std::fs::OpenOptions;
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(windows)]
@@ -100,19 +100,12 @@ trait FinalGuardMetadataProvider {
     fn metadata(&self, guard: &File, path: &Path) -> Result<FinalGuardMetadata, String>;
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct HighResolutionFileIdentity {
-    volume_serial_number: u64,
-    file_id: u128,
+trait FileIdentityProvider {
+    fn same_file_object(&self, left: &File, right: &File) -> io::Result<bool>;
 }
 
-trait FileIdentityProvider {
-    fn high_resolution_identity(
-        &self,
-        file: &File,
-        path: &Path,
-    ) -> Result<HighResolutionFileIdentity, String>;
-}
+#[cfg(test)]
+const F0_HARDWARE_OWNERSHIP_MIGRATION: &str = "F0-HARDWARE-OWNERSHIP-MIGRATION";
 
 struct SystemFinalGuardOpener;
 struct SystemFinalGuardMetadataProvider;
@@ -1112,7 +1105,7 @@ impl DiskTransactionPlan {
 
 struct GuardedDiskFile {
     bytes: Vec<u8>,
-    identity: HighResolutionFileIdentity,
+    file: File,
 }
 
 pub(crate) fn classify_run_directory(directory: &Path) -> RunDirectoryInspection {
@@ -1171,7 +1164,9 @@ pub(crate) fn read_checkpoint_input_file(
 ) -> Result<Vec<u8>, String> {
     let first = read_guarded_disk_file_bounded(path, maximum_bytes)?;
     let second = read_guarded_disk_file_bounded(path, maximum_bytes)?;
-    if first.identity != second.identity || first.bytes != second.bytes {
+    if !same_guarded_file_object(&first, &second, "checkpoint input")?
+        || first.bytes != second.bytes
+    {
         return Err("checkpoint input changed while it was read".to_owned());
     }
     Ok(second.bytes)
@@ -1343,7 +1338,7 @@ fn classify_run_directory_inner(directory: &Path) -> Result<RunDirectoryInspecti
     let expected_manifest = manifest_document(&plan.lease_id, &plan.command, &members);
     let manifest_file = read_guarded_disk_file(&directory.join(&plan.manifest.final_name))?;
     let manifest_staging = read_guarded_disk_file(&directory.join(&plan.manifest.staging_name))?;
-    if manifest_staging.identity != manifest_file.identity
+    if !same_guarded_file_object(&manifest_staging, &manifest_file, "manifest staging/final")?
         || manifest_staging.bytes != manifest_file.bytes
     {
         return Err("manifest staging/final identity does not match".to_owned());
@@ -1357,8 +1352,11 @@ fn classify_run_directory_inner(directory: &Path) -> Result<RunDirectoryInspecti
     let completion_file = read_guarded_disk_file(&directory.join(&plan.completion.final_name))?;
     let completion_staging =
         read_guarded_disk_file(&directory.join(&plan.completion.staging_name))?;
-    if completion_staging.identity != completion_file.identity
-        || completion_staging.bytes != completion_file.bytes
+    if !same_guarded_file_object(
+        &completion_staging,
+        &completion_file,
+        "completion staging/final",
+    )? || completion_staging.bytes != completion_file.bytes
     {
         return Err("completion staging/final identity does not match".to_owned());
     }
@@ -1401,7 +1399,7 @@ fn disk_manifest_members(
                 files.insert(source.clone(), source_file);
                 files.get(source).expect("source was inserted")
             };
-            if source_file.identity != file.identity {
+            if !same_guarded_file_object(source_file, &file, "manifest same_file_as")? {
                 return Err("manifest same_file_as identity does not match".to_owned());
             }
         }
@@ -1435,7 +1433,12 @@ fn read_guarded_disk_file_inner(
     let mut file = SYSTEM_FINAL_GUARD_OPENER.open(path, final_guard_open_spec())?;
     let metadata = SYSTEM_FINAL_GUARD_METADATA_PROVIDER.metadata(&file, path)?;
     validate_final_guard_metadata(metadata, path)?;
-    let identity = SYSTEM_FILE_IDENTITY_PROVIDER.high_resolution_identity(&file, path)?;
+    validate_guarded_file_object(&file).map_err(|error| {
+        format!(
+            "cannot validate high-resolution file identity for {}: {error}",
+            path.display()
+        )
+    })?;
     let mut bytes = Vec::new();
     match maximum_bytes {
         Some(maximum_bytes) => {
@@ -1452,7 +1455,32 @@ fn read_guarded_disk_file_inner(
                 .map_err(|error| format!("cannot read guarded evidence file: {error}"))?;
         }
     }
-    Ok(GuardedDiskFile { bytes, identity })
+    Ok(GuardedDiskFile { bytes, file })
+}
+
+fn same_guarded_file_object(
+    left: &GuardedDiskFile,
+    right: &GuardedDiskFile,
+    context: &str,
+) -> Result<bool, String> {
+    SYSTEM_FILE_IDENTITY_PROVIDER
+        .same_file_object(&left.file, &right.file)
+        .map_err(|error| format!("cannot compare {context} file identity: {error}"))
+}
+
+fn validate_guarded_file_object(file: &File) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        easycon_hardware_file_id::validate_file_object(file)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = file;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "guarded evidence requires Windows file identity",
+        ))
+    }
 }
 
 fn directory_entries(directory: &Path) -> Result<BTreeSet<OsString>, String> {
@@ -1604,31 +1632,17 @@ fn validate_final_guard_metadata(metadata: FinalGuardMetadata, path: &Path) -> R
 }
 
 impl FileIdentityProvider for SystemFileIdentityProvider {
-    fn high_resolution_identity(
-        &self,
-        file: &File,
-        path: &Path,
-    ) -> Result<HighResolutionFileIdentity, String> {
+    fn same_file_object(&self, left: &File, right: &File) -> io::Result<bool> {
         #[cfg(windows)]
         {
-            let identity =
-                easycon_hardware_file_id::high_resolution_file_identity(file).map_err(|error| {
-                    format!(
-                        "cannot read high-resolution file identity for {}: {error}",
-                        path.display()
-                    )
-                })?;
-            Ok(HighResolutionFileIdentity {
-                volume_serial_number: identity.volume_serial_number,
-                file_id: identity.file_id,
-            })
+            easycon_hardware_file_id::same_file_object(left, right)
         }
         #[cfg(not(windows))]
         {
-            let _ = file;
-            Err(format!(
-                "cannot read high-resolution file identity for {}: guarded publication requires Windows",
-                path.display()
+            let _ = (left, right);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "guarded publication requires Windows file identity",
             ))
         }
     }
@@ -1655,10 +1669,16 @@ fn publish_owned_artifact(
     let guard = guard_opener.open(final_path, final_guard_open_spec())?;
     let guard_metadata = guard_metadata_provider.metadata(&guard, final_path)?;
     validate_final_guard_metadata(guard_metadata, final_path)?;
-    let staging_identity =
-        identity_provider.high_resolution_identity(&staging.file, &staging.path)?;
-    let final_identity = identity_provider.high_resolution_identity(&guard, final_path)?;
-    if staging_identity != final_identity {
+    let same_object = identity_provider
+        .same_file_object(&staging.file, &guard)
+        .map_err(|error| {
+            format!(
+                "cannot compare high-resolution file identity for {} and {}: {error}",
+                staging.path.display(),
+                final_path.display()
+            )
+        })?;
+    if !same_object {
         return Err(format!(
             "published artifact {} does not reference its owned staging object",
             final_path.display()
@@ -1704,7 +1724,7 @@ fn validate_directory_entries(
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::sync::{Arc, Barrier};
 
     use super::*;
@@ -2496,6 +2516,10 @@ mod tests {
 
     #[test]
     fn retained_source_and_final_handles_protect_the_published_final_link() {
+        assert_eq!(
+            F0_HARDWARE_OWNERSHIP_MIGRATION,
+            "F0-HARDWARE-OWNERSHIP-MIGRATION"
+        );
         let directory = TestDirectory::new("published-final-handle");
         let reservation =
             ArtifactReservation::begin("unknown", &directory.0).expect("reserve run directory");
@@ -2786,23 +2810,21 @@ mod tests {
         assert!(directory.0.join(RESERVATION_FILE_NAME).exists());
     }
 
-    struct FailFinalIdentityProvider {
-        file_name: &'static str,
+    struct FailFileComparisonProvider {
+        fail_on_call: usize,
+        calls: Cell<usize>,
     }
 
-    impl FileIdentityProvider for FailFinalIdentityProvider {
-        fn high_resolution_identity(
-            &self,
-            file: &File,
-            path: &Path,
-        ) -> Result<HighResolutionFileIdentity, String> {
-            if path.file_name().and_then(|name| name.to_str()) == Some(self.file_name) {
-                return Err(format!(
-                    "injected high-resolution identity failure for {}",
-                    path.display()
+    impl FileIdentityProvider for FailFileComparisonProvider {
+        fn same_file_object(&self, left: &File, right: &File) -> io::Result<bool> {
+            let call = self.calls.get() + 1;
+            self.calls.set(call);
+            if call == self.fail_on_call {
+                return Err(io::Error::other(
+                    "injected high-resolution identity failure",
                 ));
             }
-            SYSTEM_FILE_IDENTITY_PROVIDER.high_resolution_identity(file, path)
+            SYSTEM_FILE_IDENTITY_PROVIDER.same_file_object(left, right)
         }
     }
 
@@ -2823,8 +2845,9 @@ mod tests {
             &NOOP_ARTIFACT_OBSERVER,
             &SYSTEM_FINAL_GUARD_OPENER,
             &SYSTEM_FINAL_GUARD_METADATA_PROVIDER,
-            &FailFinalIdentityProvider {
-                file_name: SEQUENCE_TIMINGS_FILE_NAME,
+            &FailFileComparisonProvider {
+                fail_on_call: 1,
+                calls: Cell::new(0),
             },
         );
 
@@ -2854,8 +2877,9 @@ mod tests {
             &NOOP_ARTIFACT_OBSERVER,
             &SYSTEM_FINAL_GUARD_OPENER,
             &SYSTEM_FINAL_GUARD_METADATA_PROVIDER,
-            &FailFinalIdentityProvider {
-                file_name: "sequence.json",
+            &FailFileComparisonProvider {
+                fail_on_call: 2,
+                calls: Cell::new(0),
             },
         );
 

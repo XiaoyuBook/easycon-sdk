@@ -187,7 +187,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "easycon-hardware-file-id"
+name = "easycon-file-identity"
 version = "0.1.0"
 dependencies = [
  "windows-sys",
@@ -201,7 +201,7 @@ dependencies = [
  "csv",
  "ctrlc",
  "easycon-controller",
- "easycon-hardware-file-id",
+ "easycon-file-identity",
  "easycon-model",
  "easycon-runtime",
  "easycon-serial",
