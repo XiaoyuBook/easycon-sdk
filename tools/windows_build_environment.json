@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 4,
   "target": "x86_64-pc-windows-msvc",
   "fingerprintInputs": [
     { "path": "tools/windows_build_environment.json", "kind": "text" },

@@ -344,7 +344,7 @@ function Get-EasyConKnownVcpkgTransientTrees {
 
     $environment = Assert-EasyConPhysicalPath -Path $EnvironmentRoot `
         -TrustedRoot $TrustedRoot
-    $workspaceRoot = Join-Path $environment "w/setup/vcpkg"
+    $workspaceRoot = Join-Path $environment "setup/vcpkg"
     return @(
         Resolve-EasyConFullPath -Path (Join-Path $workspaceRoot "buildtrees")
         Resolve-EasyConFullPath -Path (Join-Path $workspaceRoot "packages")
@@ -1079,6 +1079,597 @@ function Get-EasyConTreeFingerprint {
     }
 }
 
+function Initialize-EasyConPreparedArtifactAuditor {
+    if ($null -ne ("EasyCon.WindowsWorkspace.PreparedArtifactAuditor" -as [type])) {
+        return
+    }
+
+    Add-Type -Language CSharp -TypeDefinition @'
+using System;
+using System.IO;
+using System.Text;
+using System.Text.Json;
+
+namespace EasyCon.WindowsWorkspace
+{
+    public sealed class PreparedArtifactAuditResult
+    {
+        public bool IsText { get; internal set; }
+        public bool IsJson { get; internal set; }
+        public string RawMatchedLabel { get; internal set; }
+        public string StructuredMatchedLabel { get; internal set; }
+        public string TextDamage { get; internal set; }
+        public string TextDamageKind { get; internal set; }
+        public string JsonError { get; internal set; }
+        public string ResourceFailure { get; internal set; }
+        public bool JsonLimitExceeded { get; internal set; }
+        public long BytesRead { get; internal set; }
+        public int MaximumJsonWindowBytes { get; internal set; }
+    }
+
+    public static class PreparedArtifactAuditor
+    {
+        public const int JsonWindowLimitBytes = 65536;
+        private const int EncodingProbeBytes = 512;
+        private const int TextWindowCharacters = 16384;
+        private const int MaximumJsonDepth = 256;
+
+        private static readonly Encoding StrictUtf8 = new UTF8Encoding(false, true);
+        private static readonly Encoding StrictUtf16Le = new UnicodeEncoding(false, false, true);
+        private static readonly Encoding StrictUtf16Be = new UnicodeEncoding(true, false, true);
+
+        private sealed class DetectedEncoding
+        {
+            internal Encoding Encoding;
+            internal int PreambleLength;
+            internal bool ProtectedText;
+            internal string DamageKind;
+        }
+
+        public static PreparedArtifactAuditResult Audit(
+            string path,
+            string[] forbiddenLabels,
+            string[] forbiddenReferences)
+        {
+            if (forbiddenLabels == null || forbiddenReferences == null ||
+                forbiddenLabels.Length != forbiddenReferences.Length)
+            {
+                throw new ArgumentException("forbidden labels and references must have equal length");
+            }
+
+            PreparedArtifactAuditResult result = new PreparedArtifactAuditResult();
+            try
+            {
+                using (FileStream stream = new FileStream(
+                    path,
+                    FileMode.Open,
+                    FileAccess.Read,
+                    FileShare.Read,
+                    4096,
+                    FileOptions.SequentialScan))
+                {
+                    result.BytesRead = stream.Length;
+                    DetectedEncoding encoding = DetectEncoding(stream);
+                    ScanDecodedText(
+                        stream,
+                        encoding,
+                        forbiddenLabels,
+                        forbiddenReferences,
+                        result);
+                    if (result.IsText && result.TextDamage == null)
+                    {
+                        ScanStructuredJson(
+                            stream,
+                            encoding,
+                            forbiddenLabels,
+                            forbiddenReferences,
+                            result);
+                    }
+                }
+            }
+            catch (OutOfMemoryException exception)
+            {
+                result.ResourceFailure = "memory allocation failed: " + exception.Message;
+            }
+            catch (IOException exception)
+            {
+                result.ResourceFailure = "file read failed: " + exception.Message;
+            }
+            catch (UnauthorizedAccessException exception)
+            {
+                result.ResourceFailure = "file access failed: " + exception.Message;
+            }
+            return result;
+        }
+
+        private static DetectedEncoding DetectEncoding(FileStream stream)
+        {
+            byte[] probe = new byte[EncodingProbeBytes];
+            int length = 0;
+            while (length < probe.Length)
+            {
+                int read = stream.Read(probe, length, probe.Length - length);
+                if (read == 0)
+                {
+                    break;
+                }
+                length += read;
+            }
+            stream.Position = 0;
+
+            if (length >= 3 && probe[0] == 0xef && probe[1] == 0xbb && probe[2] == 0xbf)
+            {
+                return NewEncoding(StrictUtf8, 3, true, "BOM");
+            }
+            if (length >= 2 && probe[0] == 0xff && probe[1] == 0xfe)
+            {
+                return NewEncoding(StrictUtf16Le, 2, true, "BOM");
+            }
+            if (length >= 2 && probe[0] == 0xfe && probe[1] == 0xff)
+            {
+                return NewEncoding(StrictUtf16Be, 2, true, "BOM");
+            }
+            if (LooksLikeUtf16(probe, length, true))
+            {
+                return NewEncoding(StrictUtf16Le, 0, true, "inferred UTF-16LE");
+            }
+            if (LooksLikeUtf16(probe, length, false))
+            {
+                return NewEncoding(StrictUtf16Be, 0, true, "inferred UTF-16BE");
+            }
+            return NewEncoding(StrictUtf8, 0, false, "UTF-8");
+        }
+
+        private static DetectedEncoding NewEncoding(
+            Encoding encoding,
+            int preambleLength,
+            bool protectedText,
+            string damageKind)
+        {
+            return new DetectedEncoding
+            {
+                Encoding = encoding,
+                PreambleLength = preambleLength,
+                ProtectedText = protectedText,
+                DamageKind = damageKind
+            };
+        }
+
+        private static bool LooksLikeUtf16(byte[] probe, int length, bool littleEndian)
+        {
+            int pairs = length / 2;
+            if (pairs < 2)
+            {
+                return false;
+            }
+
+            int compatible = 0;
+            int nullLane = 0;
+            for (int index = 0; index < pairs; index++)
+            {
+                byte text = probe[(index * 2) + (littleEndian ? 0 : 1)];
+                byte expectedNull = probe[(index * 2) + (littleEndian ? 1 : 0)];
+                if (expectedNull == 0)
+                {
+                    nullLane++;
+                    if (text == 0x09 || text == 0x0a || text == 0x0d ||
+                        (text >= 0x20 && text <= 0x7e))
+                    {
+                        compatible++;
+                    }
+                }
+            }
+            return nullLane >= 2 &&
+                nullLane * 100 >= pairs * 75 &&
+                compatible * 100 >= pairs * 75;
+        }
+
+        private static void ScanDecodedText(
+            FileStream stream,
+            DetectedEncoding encoding,
+            string[] labels,
+            string[] references,
+            PreparedArtifactAuditResult result)
+        {
+            stream.Position = encoding.PreambleLength;
+            int maximumReferenceLength = 0;
+            foreach (string reference in references)
+            {
+                maximumReferenceLength = Math.Max(maximumReferenceLength, reference.Length);
+            }
+
+            result.IsText = true;
+            char[] buffer = new char[TextWindowCharacters];
+            string tail = String.Empty;
+            try
+            {
+                using (StreamReader reader = new StreamReader(
+                    stream,
+                    encoding.Encoding,
+                    false,
+                    TextWindowCharacters,
+                    true))
+                {
+                    int read;
+                    while ((read = reader.Read(buffer, 0, buffer.Length)) > 0)
+                    {
+                        string chunk = new string(buffer, 0, read);
+                        if (chunk.IndexOf('\0') >= 0)
+                        {
+                            if (encoding.ProtectedText)
+                            {
+                                result.TextDamage = "contains a NUL character";
+                                result.TextDamageKind = encoding.DamageKind;
+                            }
+                            else
+                            {
+                                result.IsText = false;
+                            }
+                            return;
+                        }
+
+                        if (result.RawMatchedLabel == null)
+                        {
+                            string search = tail + chunk;
+                            result.RawMatchedLabel = FindReference(search, labels, references);
+                            if (maximumReferenceLength > 1)
+                            {
+                                int tailLength = Math.Min(maximumReferenceLength - 1, search.Length);
+                                tail = search.Substring(search.Length - tailLength);
+                            }
+                        }
+                    }
+                }
+            }
+            catch (DecoderFallbackException exception)
+            {
+                if (encoding.ProtectedText)
+                {
+                    result.TextDamage = exception.Message;
+                    result.TextDamageKind = encoding.DamageKind;
+                }
+                else
+                {
+                    result.IsText = false;
+                }
+            }
+        }
+
+        private static void ScanStructuredJson(
+            FileStream stream,
+            DetectedEncoding encoding,
+            string[] labels,
+            string[] references,
+            PreparedArtifactAuditResult result)
+        {
+            stream.Position = encoding.PreambleLength;
+            byte[] buffer = new byte[JsonWindowLimitBytes];
+            JsonReaderOptions options = new JsonReaderOptions
+            {
+                AllowTrailingCommas = false,
+                CommentHandling = JsonCommentHandling.Disallow,
+                MaxDepth = MaximumJsonDepth
+            };
+            JsonReaderState state = new JsonReaderState(options);
+            int buffered = 0;
+            bool sawToken = false;
+            string matchedLabel = null;
+
+            try
+            {
+                using (Stream jsonStream = Encoding.CreateTranscodingStream(
+                    stream,
+                    encoding.Encoding,
+                    StrictUtf8,
+                    true))
+                {
+                    while (true)
+                    {
+                        int read = jsonStream.Read(buffer, buffered, buffer.Length - buffered);
+                        int available = buffered + read;
+                        bool isFinalBlock = read == 0;
+                        result.MaximumJsonWindowBytes = Math.Max(
+                            result.MaximumJsonWindowBytes,
+                            available);
+
+                        Utf8JsonReader reader = new Utf8JsonReader(
+                            new ReadOnlySpan<byte>(buffer, 0, available),
+                            isFinalBlock,
+                            state);
+                        try
+                        {
+                            while (reader.Read())
+                            {
+                                sawToken = true;
+                                if (matchedLabel == null &&
+                                    (reader.TokenType == JsonTokenType.PropertyName ||
+                                     reader.TokenType == JsonTokenType.String))
+                                {
+                                    matchedLabel = FindReference(
+                                        reader.GetString(),
+                                        labels,
+                                        references);
+                                }
+                            }
+                        }
+                        catch (JsonException exception)
+                        {
+                            if (reader.CurrentDepth >= MaximumJsonDepth - 1 ||
+                                exception.Message.IndexOf(
+                                    "maximum depth",
+                                    StringComparison.OrdinalIgnoreCase) >= 0)
+                            {
+                                result.JsonLimitExceeded = true;
+                            }
+                            result.JsonError = exception.Message;
+                            return;
+                        }
+
+                        int consumed = checked((int)reader.BytesConsumed);
+                        state = reader.CurrentState;
+                        int remaining = available - consumed;
+                        if (remaining > 0 && consumed > 0)
+                        {
+                            Buffer.BlockCopy(buffer, consumed, buffer, 0, remaining);
+                        }
+                        buffered = remaining;
+
+                        if (isFinalBlock)
+                        {
+                            result.IsJson = sawToken;
+                            return;
+                        }
+                        if (buffered == buffer.Length)
+                        {
+                            result.JsonLimitExceeded = true;
+                            result.JsonError =
+                                "a JSON token exceeds the bounded " +
+                                JsonWindowLimitBytes + " byte audit window";
+                            return;
+                        }
+                    }
+                }
+            }
+            finally
+            {
+                result.StructuredMatchedLabel = matchedLabel;
+            }
+        }
+
+        private static string FindReference(
+            string text,
+            string[] labels,
+            string[] references)
+        {
+            if (text == null)
+            {
+                return null;
+            }
+            for (int index = 0; index < references.Length; index++)
+            {
+                if (text.IndexOf(references[index], StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    return labels[index];
+                }
+            }
+            return null;
+        }
+    }
+}
+'@
+}
+
+function Assert-EasyConPreparedTextArtifactDoesNotReferenceRoots {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [string[]]$ForbiddenLabels,
+
+        [Parameter(Mandatory)]
+        [string[]]$ForbiddenReferences,
+
+        [Parameter(Mandatory)]
+        [string]$Description
+    )
+
+    Initialize-EasyConPreparedArtifactAuditor
+    try {
+        $audit = [EasyCon.WindowsWorkspace.PreparedArtifactAuditor]::Audit(
+            $Path,
+            $ForbiddenLabels,
+            $ForbiddenReferences
+        )
+    }
+    catch [System.OutOfMemoryException] {
+        throw "$Description audit failed closed for ${Path}: memory allocation failed"
+    }
+    catch {
+        throw "$Description audit failed closed for ${Path}: $($_.Exception.Message)"
+    }
+
+    if ($audit.IsText -and -not [string]::IsNullOrWhiteSpace($audit.RawMatchedLabel)) {
+        throw "$Description contains a $($audit.RawMatchedLabel) absolute path: $Path"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($audit.StructuredMatchedLabel)) {
+        throw "$Description contains a $($audit.StructuredMatchedLabel) absolute path: $Path"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($audit.ResourceFailure)) {
+        throw "$Description audit failed closed for ${Path}: $($audit.ResourceFailure)"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($audit.TextDamage)) {
+        $damageDescription = if ($audit.TextDamageKind -ceq "BOM") {
+            "damaged BOM text artifact"
+        }
+        else {
+            "damaged $($audit.TextDamageKind) text artifact"
+        }
+        throw "$Description contains $damageDescription ${Path}: $($audit.TextDamage)"
+    }
+    if ($audit.JsonLimitExceeded) {
+        throw "$Description structured JSON audit failed closed for ${Path}: $($audit.JsonError)"
+    }
+
+    $requiresJson = [System.IO.Path]::GetExtension($Path).Equals(
+        ".json",
+        [System.StringComparison]::OrdinalIgnoreCase
+    )
+    if ($requiresJson -and (-not $audit.IsText -or -not $audit.IsJson)) {
+        $jsonDamage = if ([string]::IsNullOrWhiteSpace($audit.JsonError)) {
+            "the file is not strict supported text JSON"
+        }
+        else {
+            $audit.JsonError
+        }
+        throw "$Description contains damaged structured JSON ${Path}: $jsonDamage"
+    }
+    return $audit
+}
+
+function Assert-EasyConPreparedTreeDoesNotReferenceRepository {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [string]$TrustedRoot,
+
+        [Parameter(Mandatory)]
+        [string]$RepositoryRoot,
+
+        [string]$WritableRoot,
+
+        [Parameter(Mandatory)]
+        [string]$Description,
+
+        [switch]$PassThru
+    )
+
+    $tree = Assert-EasyConPhysicalPath -Path $Path -TrustedRoot $TrustedRoot
+    if (-not (Test-Path -LiteralPath $tree -PathType Container)) {
+        throw "required environment tree is missing: $tree"
+    }
+    $forbiddenRoots = [System.Collections.Generic.List[object]]::new()
+    $repository = Resolve-EasyConFullPath -Path $RepositoryRoot
+    $forbiddenRoots.Add([pscustomobject]@{
+        Label = "source worktree"
+        References = @($repository, $repository.Replace("\", "/")) | Select-Object -Unique
+    }) | Out-Null
+    if (-not [string]::IsNullOrWhiteSpace($WritableRoot)) {
+        $writable = Resolve-EasyConFullPath -Path $WritableRoot
+        $forbiddenRoots.Add([pscustomobject]@{
+            Label = "writable"
+            References = @($writable, $writable.Replace("\", "/")) | Select-Object -Unique
+        }) | Out-Null
+    }
+
+    $forbiddenLabels = [System.Collections.Generic.List[string]]::new()
+    $forbiddenReferences = [System.Collections.Generic.List[string]]::new()
+    foreach ($root in $forbiddenRoots) {
+        foreach ($reference in @($root.References)) {
+            $forbiddenLabels.Add($root.Label) | Out-Null
+            $forbiddenReferences.Add($reference) | Out-Null
+        }
+    }
+
+    Initialize-EasyConPreparedArtifactAuditor
+    $summary = [ordered]@{
+        FilesScanned = 0L
+        TextFilesScanned = 0L
+        JsonDocumentsScanned = 0L
+        TotalBytesRead = 0L
+        MaximumJsonWindowBytes = 0
+        JsonWindowLimitBytes = `
+            [EasyCon.WindowsWorkspace.PreparedArtifactAuditor]::JsonWindowLimitBytes
+    }
+    $enumerators = [System.Collections.Generic.Stack[System.Collections.IEnumerator]]::new()
+    try {
+        $enumerators.Push(
+            [System.IO.Directory]::EnumerateFileSystemEntries($tree).GetEnumerator()
+        )
+        while ($enumerators.Count -gt 0) {
+            $enumerator = $enumerators.Peek()
+            if (-not $enumerator.MoveNext()) {
+                $completed = $enumerators.Pop()
+                if ($completed -is [System.IDisposable]) {
+                    $completed.Dispose()
+                }
+                continue
+            }
+
+            $entryPath = [string]$enumerator.Current
+            Assert-EasyConPhysicalPath -Path $entryPath -TrustedRoot $tree | Out-Null
+            $attributes = [System.IO.File]::GetAttributes($entryPath)
+            if (($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "physical tree contains a reparse point: $entryPath"
+            }
+            if (($attributes -band [System.IO.FileAttributes]::Directory) -ne 0) {
+                $enumerators.Push(
+                    [System.IO.Directory]::EnumerateFileSystemEntries($entryPath).GetEnumerator()
+                )
+                continue
+            }
+
+            $audit = Assert-EasyConPreparedTextArtifactDoesNotReferenceRoots `
+                -Path $entryPath -ForbiddenLabels $forbiddenLabels.ToArray() `
+                -ForbiddenReferences $forbiddenReferences.ToArray() -Description $Description
+            Assert-EasyConPhysicalPath -Path $entryPath -TrustedRoot $tree | Out-Null
+            $summary.FilesScanned++
+            $summary.TotalBytesRead += $audit.BytesRead
+            if ($audit.IsText) {
+                $summary.TextFilesScanned++
+            }
+            if ($audit.IsJson) {
+                $summary.JsonDocumentsScanned++
+            }
+            $summary.MaximumJsonWindowBytes = [Math]::Max(
+                $summary.MaximumJsonWindowBytes,
+                $audit.MaximumJsonWindowBytes
+            )
+        }
+    }
+    catch [System.OutOfMemoryException] {
+        throw "$Description tree audit failed closed: memory allocation failed"
+    }
+    finally {
+        while ($enumerators.Count -gt 0) {
+            $remaining = $enumerators.Pop()
+            if ($remaining -is [System.IDisposable]) {
+                $remaining.Dispose()
+            }
+        }
+    }
+
+    if ($PassThru) {
+        return [pscustomobject]$summary
+    }
+}
+
+function Assert-EasyConSharedToolPathBoundary {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [string]$RepositoryRoot,
+
+        [Parameter(Mandatory)]
+        [string]$WritableRoot,
+
+        [Parameter(Mandatory)]
+        [string]$Description
+    )
+
+    if (Test-EasyConPathWithin -Path $Path -Root $RepositoryRoot) {
+        throw "$Description is inside the source repository"
+    }
+    if (Test-EasyConPathWithin -Path $Path -Root $WritableRoot) {
+        throw "$Description is bound to a writable workspace path"
+    }
+}
+
 function ConvertTo-EasyConStrictVersion {
     param(
         [Parameter(Mandatory)]
@@ -1174,9 +1765,9 @@ function Get-EasyConWindowsBuildConfiguration {
         if (
             $root.version.ValueKind -ne [System.Text.Json.JsonValueKind]::Number -or
             -not $root.version.TryGetInt32([ref]$version) -or
-            $version -ne 3
+            $version -ne 4
         ) {
-            throw "Windows build environment version must be the JSON integer 3"
+            throw "Windows build environment version must be the JSON integer 4"
         }
         $target = & $getString $root.target "Windows build target"
         if ($target -cne "x86_64-pc-windows-msvc") {
@@ -1867,22 +2458,24 @@ function Assert-EasyConVcpkgCheckout {
     }
     $git = Get-EasyConCommandPath -Name "git.exe"
     $head = @(Invoke-EasyConNativeCapture -Program $git -Arguments @(
-        "-c", "core.longpaths=true", "-C", $root, "rev-parse", "HEAD"
+        "--no-optional-locks", "-c", "core.longpaths=true", "-C", $root,
+        "rev-parse", "HEAD"
     ) -Description "vcpkg scripts commit check")[0].Trim()
     if ($head -cne [string]$Configuration.vcpkg.scriptsCommit) {
         throw "vcpkg scripts commit $head does not match the frozen pin"
     }
     foreach ($relative in $requiredFiles) {
         $tracked = @(Invoke-EasyConNativeCapture -Program $git -Arguments @(
-            "-c", "core.longpaths=true", "-C", $root, "ls-files", "--error-unmatch", "--", $relative
+            "--no-optional-locks", "-c", "core.longpaths=true", "-C", $root,
+            "ls-files", "--error-unmatch", "--", $relative
         ) -Description "vcpkg required tracked file check")
         if ($tracked.Count -ne 1 -or $tracked[0] -cne $relative) {
             throw "pinned vcpkg checkout does not track required file $relative"
         }
     }
     $status = @(Invoke-EasyConNativeCapture -Program $git -Arguments @(
-        "-c", "core.longpaths=true", "-C", $root, "status", "--porcelain=v1",
-        "--untracked-files=all", "--ignored=matching"
+        "--no-optional-locks", "-c", "core.longpaths=true", "-C", $root,
+        "status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching"
     ) -Description "vcpkg scripts cleanliness check")
     if ($status.Count -ne 0) {
         throw "pinned vcpkg scripts checkout has tracked, untracked, or ignored content`n$($status -join [Environment]::NewLine)"
@@ -1945,6 +2538,7 @@ function Clear-EasyConUntrustedBuildEnvironment {
         "CARGO_BUILD_TARGET", "CARGO_ENCODED_RUSTFLAGS", "CARGO_HOME", "CARGO_INCREMENTAL",
         "CARGO_TARGET_DIR", "RUSTDOCFLAGS", "RUSTUP_DIST_SERVER", "RUSTUP_HOME",
         "RUSTUP_TOOLCHAIN", "RUSTUP_UPDATE_ROOT",
+        "TEMP", "TMP", "TMPDIR", "PYTHONPYCACHEPREFIX", "PYTHONDONTWRITEBYTECODE",
         "VCPKG_ROOT", "VCPKG_BINARY_SOURCES", "VCPKG_DOWNLOADS",
         "VCPKG_DISABLE_METRICS", "VCPKG_FEATURE_FLAGS", "VCPKG_OVERLAY_PORTS",
         "VCPKG_OVERLAY_TRIPLETS", "VCPKG_CHAINLOAD_TOOLCHAIN_FILE",
@@ -2464,6 +3058,9 @@ function Get-EasyConEnvironmentLocation {
         [Parameter(Mandatory)]
         [string]$Fingerprint,
 
+        [Parameter(Mandatory)]
+        [object]$Configuration,
+
         [string]$CacheRoot
     )
 
@@ -2485,20 +3082,68 @@ function Get-EasyConEnvironmentLocation {
         throw "environment storage inside the repository must remain under ignored .tools storage"
     }
     $workspacePath = Get-EasyConWorkspaceTargetDirectory -RepositoryRoot $repository `
-        -CacheRoot (Join-Path $cache "workspace-keys")
+        -CacheRoot $cache
     $workspaceKey = Split-Path -Leaf $workspacePath
-    $identityBytes = [System.Text.Encoding]::UTF8.GetBytes("$Fingerprint`0$workspaceKey")
+    $environmentSchema = [int]$Configuration.version
+    $hostTargetIdentity = @(
+        [string]$Configuration.target,
+        [string]$Configuration.hostTools.visualStudioMajorVersion,
+        [string]$Configuration.hostTools.msvcToolsVersion,
+        [string]$Configuration.hostTools.windowsSdkVersion
+    ) -join "`0"
+    $identityBytes = [System.Text.Encoding]::UTF8.GetBytes(
+        "$environmentSchema`0$hostTargetIdentity`0$Fingerprint"
+    )
     $identityDigest = [System.Security.Cryptography.SHA256]::HashData($identityBytes)
     $identityKey = [System.Convert]::ToHexString($identityDigest).Substring(0, 24).ToLowerInvariant()
-    $environment = Join-Path $cache (Join-Path "e" $identityKey)
-    $lockPath = Join-Path $cache (Join-Path "locks" "$identityKey.lock")
+    $environmentKey = "v$environmentSchema-$identityKey"
+    $environment = Join-Path $cache (Join-Path "e" $environmentKey)
+    $writableRoot = Join-Path $cache "w"
+    $lockPath = Join-Path $cache (Join-Path "locks" "environment-$environmentKey.lock")
+    $workspaceLockPath = Join-Path $cache (Join-Path "locks" "workspace-$workspaceKey.lock")
     return [pscustomobject]@{
         CacheRoot = $cache
         EnvironmentRoot = Resolve-EasyConFullPath -Path $environment
         StampPath = Resolve-EasyConFullPath -Path (Join-Path $environment "environment-stamp.json")
         LockPath = Resolve-EasyConFullPath -Path $lockPath
-        IdentityKey = $identityKey
+        IdentityKey = $environmentKey
+        EnvironmentSchema = $environmentSchema
+        HostTargetIdentity = $hostTargetIdentity
         WorkspaceKey = $workspaceKey
+        WritableRoot = Resolve-EasyConFullPath -Path $writableRoot
+        WorkspaceRoot = Resolve-EasyConFullPath -Path $workspacePath
+        WorkspaceLockPath = Resolve-EasyConFullPath -Path $workspaceLockPath
+        CargoTargetDirectory = Resolve-EasyConFullPath -Path (Join-Path $workspacePath "target")
+    }
+}
+
+function Set-EasyConWorkspaceRuntimeEnvironment {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$WorkspaceRoot,
+
+        [Parameter(Mandatory)]
+        [string]$WritableRoot
+    )
+
+    $writable = Resolve-EasyConFullPath -Path $WritableRoot
+    New-EasyConSafeDirectory -Path $writable -TrustedRoot $writable | Out-Null
+    $workspace = New-EasyConSafeDirectory -Path $WorkspaceRoot -TrustedRoot $writable
+    $temporary = New-EasyConSafeDirectory -Path (Join-Path $workspace "tmp") `
+        -TrustedRoot $writable
+    $pythonCache = New-EasyConSafeDirectory -Path (Join-Path $workspace "python-cache") `
+        -TrustedRoot $writable
+
+    $env:TEMP = $temporary
+    $env:TMP = $temporary
+    $env:TMPDIR = $temporary
+    $env:PYTHONPYCACHEPREFIX = $pythonCache
+    $env:PYTHONDONTWRITEBYTECODE = "1"
+    return [pscustomobject]@{
+        WorkspaceRoot = $workspace
+        Temporary = $temporary
+        PythonCache = $pythonCache
     }
 }
 
@@ -2564,6 +3209,43 @@ function Enter-EasyConEnvironmentLease {
             Start-Sleep -Milliseconds $delay
         }
     }
+}
+
+function Enter-EasyConWorkspaceLease {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object]$Location,
+
+        [ValidateRange(0, 7200000)]
+        [int]$TimeoutMilliseconds = 1800000,
+
+        [ValidateRange(0, 1000)]
+        [int]$RetryMilliseconds = 100
+    )
+
+    $workspaceLock = $Location.PSObject.Properties["WorkspaceLockPath"]
+    $workspaceRoot = $Location.PSObject.Properties["WorkspaceRoot"]
+    $workspaceKey = $Location.PSObject.Properties["WorkspaceKey"]
+    if (
+        $null -eq $workspaceLock -or $null -eq $workspaceRoot -or $null -eq $workspaceKey -or
+        [string]::IsNullOrWhiteSpace([string]$workspaceLock.Value) -or
+        [string]::IsNullOrWhiteSpace([string]$workspaceRoot.Value) -or
+        [string]::IsNullOrWhiteSpace([string]$workspaceKey.Value)
+    ) {
+        throw "Windows workspace location is missing its isolated writable output identity"
+    }
+    $cache = Resolve-EasyConFullPath -Path ([string]$Location.CacheRoot)
+    $resolvedWorkspace = Assert-EasyConPhysicalPath -Path ([string]$workspaceRoot.Value) `
+        -TrustedRoot $cache
+    $leaseLocation = [pscustomobject]@{
+        CacheRoot = $cache
+        LockPath = Resolve-EasyConFullPath -Path ([string]$workspaceLock.Value)
+        IdentityKey = "workspace-$([string]$workspaceKey.Value)"
+        EnvironmentRoot = $resolvedWorkspace
+    }
+    return Enter-EasyConEnvironmentLease -Location $leaseLocation -Access Exclusive `
+        -TimeoutMilliseconds $TimeoutMilliseconds -RetryMilliseconds $RetryMilliseconds
 }
 
 function Test-EasyConVcpkgToolManifestRecord {
@@ -3029,6 +3711,56 @@ function ConvertTo-EasyConCMakePathLiteral {
     return $resolved.Replace("\", "/")
 }
 
+function New-EasyConVcpkgProvisionLayout {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object]$Vcpkg,
+
+        [Parameter(Mandatory)]
+        [string]$RepositoryRoot,
+
+        [Parameter(Mandatory)]
+        [string]$EnvironmentRoot
+    )
+
+    $repository = Assert-EasyConPhysicalPath -Path $RepositoryRoot
+    $environment = Assert-EasyConPhysicalPath -Path $EnvironmentRoot
+    $workspaceRoot = Join-Path $environment "setup/vcpkg"
+    $manifestRoot = New-EasyConSafeDirectory -Path (Join-Path $workspaceRoot "manifest") `
+        -TrustedRoot $environment
+    $buildtrees = New-EasyConSafeDirectory -Path (Join-Path $workspaceRoot "buildtrees") `
+        -TrustedRoot $environment
+    $packages = New-EasyConSafeDirectory -Path (Join-Path $workspaceRoot "packages") `
+        -TrustedRoot $environment
+    $installed = New-EasyConSafeDirectory `
+        -Path (Join-Path $workspaceRoot "installed") -TrustedRoot $environment
+
+    $manifestEntries = @(Get-ChildItem -Force -LiteralPath $manifestRoot -ErrorAction Stop |
+        Where-Object { $_.Name -cne "vcpkg.json" })
+    if ($manifestEntries.Count -ne 0) {
+        throw "generated vcpkg manifest directory contains unexpected input: $($manifestEntries[0].FullName)"
+    }
+
+    $sourceManifest = Join-Path $repository "vcpkg.json"
+    $executionManifest = Join-Path $manifestRoot "vcpkg.json"
+    Assert-EasyConPhysicalPath -Path $sourceManifest -TrustedRoot $repository | Out-Null
+    Assert-EasyConPhysicalPath -Path $executionManifest -TrustedRoot $environment | Out-Null
+    $manifestHash = Get-EasyConFileSha256 -Path $sourceManifest
+    Copy-Item -Force -LiteralPath $sourceManifest -Destination $executionManifest
+    Assert-EasyConPhysicalPath -Path $executionManifest -TrustedRoot $environment | Out-Null
+    if ((Get-EasyConFileSha256 -Path $executionManifest) -cne $manifestHash) {
+        throw "generated vcpkg manifest does not match the tracked manifest"
+    }
+
+    return [pscustomobject]@{
+        ManifestRoot = $manifestRoot
+        Buildtrees = $buildtrees
+        Packages = $packages
+        Installed = $installed
+    }
+}
+
 function New-EasyConVcpkgWorkspaceLayout {
     [CmdletBinding()]
     param(
@@ -3039,54 +3771,59 @@ function New-EasyConVcpkgWorkspaceLayout {
         [string]$RepositoryRoot,
 
         [Parameter(Mandatory)]
-        [string]$CargoTargetDirectory,
+        [string]$WorkspaceRoot,
 
         [Parameter(Mandatory)]
-        [string]$CacheRoot
+        [string]$CacheRoot,
+
+        [Parameter(Mandatory)]
+        [string]$EnvironmentRoot,
+
+        [Parameter(Mandatory)]
+        [string]$InstalledRoot
     )
 
     $repository = Assert-EasyConPhysicalPath -Path $RepositoryRoot
     $cache = Assert-EasyConPhysicalPath -Path $CacheRoot
-    $target = Assert-EasyConPhysicalPath -Path $CargoTargetDirectory -TrustedRoot $cache
-    $workspaceRoot = Join-Path $target (Join-Path "setup" "vcpkg")
+    $workspace = New-EasyConSafeDirectory -Path $WorkspaceRoot -TrustedRoot $cache
+    $environment = Assert-EasyConPhysicalPath -Path $EnvironmentRoot -TrustedRoot $EnvironmentRoot
+    $installed = Assert-EasyConPhysicalTree -Path $InstalledRoot -TrustedRoot $environment
+    $workspaceRoot = Join-Path $workspace "vcpkg"
     $manifestRoot = New-EasyConSafeDirectory -Path (Join-Path $workspaceRoot "manifest") `
         -TrustedRoot $cache
-    $buildtrees = New-EasyConSafeDirectory -Path (Join-Path $workspaceRoot "buildtrees") `
+    $executionRoot = New-EasyConSafeDirectory -Path (Join-Path $workspaceRoot "root") `
         -TrustedRoot $cache
-    $packages = New-EasyConSafeDirectory -Path (Join-Path $workspaceRoot "packages") `
-        -TrustedRoot $cache
-    $installed = New-EasyConSafeDirectory `
-        -Path (Join-Path $workspaceRoot "installed") -TrustedRoot $cache
-    $toolchainRoot = Join-Path $workspaceRoot "toolchain"
     $buildsystems = New-EasyConSafeDirectory `
-        -Path (Join-Path $toolchainRoot "scripts/buildsystems") -TrustedRoot $cache
+        -Path (Join-Path $executionRoot "scripts/buildsystems") -TrustedRoot $cache
+    $downloads = New-EasyConSafeDirectory -Path (Join-Path $workspaceRoot "downloads") `
+        -TrustedRoot $cache
 
     $manifestEntries = @(Get-ChildItem -Force -LiteralPath $manifestRoot -ErrorAction Stop |
         Where-Object { $_.Name -cne "vcpkg.json" })
     if ($manifestEntries.Count -ne 0) {
-        throw "generated vcpkg manifest directory contains unexpected input: $($manifestEntries[0].FullName)"
+        throw "generated workspace vcpkg manifest directory contains unexpected input: $($manifestEntries[0].FullName)"
     }
     $toolchainEntries = @(Get-ChildItem -Force -LiteralPath $buildsystems -ErrorAction Stop |
         Where-Object { $_.Name -cne "vcpkg.cmake" })
     if ($toolchainEntries.Count -ne 0) {
-        throw "generated vcpkg toolchain directory contains unexpected input: $($toolchainEntries[0].FullName)"
+        throw "generated workspace vcpkg toolchain directory contains unexpected input: $($toolchainEntries[0].FullName)"
     }
 
     $sourceManifest = Join-Path $repository "vcpkg.json"
     $executionManifest = Join-Path $manifestRoot "vcpkg.json"
     Assert-EasyConPhysicalPath -Path $sourceManifest -TrustedRoot $repository | Out-Null
-    Assert-EasyConPhysicalPath -Path $executionManifest -TrustedRoot $cache | Out-Null
+    Assert-EasyConPhysicalPath -Path $executionManifest -TrustedRoot $workspace | Out-Null
     $manifestHash = Get-EasyConFileSha256 -Path $sourceManifest
     Copy-Item -Force -LiteralPath $sourceManifest -Destination $executionManifest
-    Assert-EasyConPhysicalPath -Path $executionManifest -TrustedRoot $cache | Out-Null
+    Assert-EasyConPhysicalPath -Path $executionManifest -TrustedRoot $workspace | Out-Null
     if ((Get-EasyConFileSha256 -Path $executionManifest) -cne $manifestHash) {
-        throw "generated vcpkg manifest does not match the tracked manifest"
+        throw "generated workspace vcpkg manifest does not match the tracked manifest"
     }
 
     $actualToolchain = Assert-EasyConPhysicalPath -Path $Vcpkg.Toolchain `
         -TrustedRoot $Vcpkg.Root
     $wrapper = Join-Path $buildsystems "vcpkg.cmake"
-    Assert-EasyConPhysicalPath -Path $wrapper -TrustedRoot $cache | Out-Null
+    Assert-EasyConPhysicalPath -Path $wrapper -TrustedRoot $workspace | Out-Null
     $wrapperText = @(
         "# Generated by tools/windows_workspace.psm1; do not edit.",
         "set(VCPKG_MANIFEST_DIR `"$(ConvertTo-EasyConCMakePathLiteral -Path $manifestRoot)`" CACHE PATH `"EasyCon verified local manifest`" FORCE)",
@@ -3096,18 +3833,16 @@ function New-EasyConVcpkgWorkspaceLayout {
         ""
     ) -join "`n"
     [System.IO.File]::WriteAllText($wrapper, $wrapperText, [System.Text.UTF8Encoding]::new($false))
-    Assert-EasyConPhysicalPath -Path $wrapper -TrustedRoot $cache | Out-Null
+    Assert-EasyConPhysicalPath -Path $wrapper -TrustedRoot $workspace | Out-Null
     if ([System.IO.File]::ReadAllText($wrapper, [System.Text.Encoding]::UTF8) -cne $wrapperText) {
-        throw "generated vcpkg toolchain wrapper changed during creation"
+        throw "generated workspace vcpkg toolchain wrapper changed during creation"
     }
 
     return [pscustomobject]@{
-        Root = Assert-EasyConPhysicalPath -Path $toolchainRoot -TrustedRoot $cache
+        Root = Assert-EasyConPhysicalPath -Path $executionRoot -TrustedRoot $workspace
         Toolchain = $wrapper
         ManifestRoot = $manifestRoot
-        Buildtrees = $buildtrees
-        Packages = $packages
-        Installed = $installed
+        Downloads = $downloads
     }
 }
 
@@ -3456,10 +4191,36 @@ function Install-EasyConCargoSources {
     }
 
     $vendor = Assert-EasyConPhysicalTree -Path $vendorRoot -TrustedRoot $environment
-    $cargoHome = New-EasyConSafeDirectory -Path (Join-Path $environment "cargo-home") `
-        -TrustedRoot $environment
+    return [pscustomobject]@{
+        VendorRoot = $vendor
+        VendorTree = Get-EasyConTreeFingerprint -Path $vendor -TrustedRoot $environment
+    }
+}
+
+function New-EasyConCargoWorkspaceLayout {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$WorkspaceRoot,
+
+        [Parameter(Mandatory)]
+        [string]$CacheRoot,
+
+        [Parameter(Mandatory)]
+        [string]$VendorRoot,
+
+        [Parameter(Mandatory)]
+        [string]$EnvironmentRoot
+    )
+
+    $cache = Assert-EasyConPhysicalPath -Path $CacheRoot
+    $workspace = New-EasyConSafeDirectory -Path $WorkspaceRoot -TrustedRoot $cache
+    $environment = Assert-EasyConPhysicalPath -Path $EnvironmentRoot -TrustedRoot $EnvironmentRoot
+    $vendor = Assert-EasyConPhysicalTree -Path $VendorRoot -TrustedRoot $environment
+    $cargoHome = New-EasyConSafeDirectory -Path (Join-Path $workspace "cargo-home") `
+        -TrustedRoot $cache
     $configurationPath = Join-Path $cargoHome "config.toml"
-    Assert-EasyConPhysicalPath -Path $configurationPath -TrustedRoot $environment | Out-Null
+    Assert-EasyConPhysicalPath -Path $configurationPath -TrustedRoot $workspace | Out-Null
     $vendorLiteral = $vendor.Replace("\", "/")
     if ($vendorLiteral.IndexOfAny([char[]]@('"', "`r", "`n")) -ge 0) {
         throw "Cargo vendor path cannot be represented safely in config.toml"
@@ -3478,13 +4239,14 @@ function Install-EasyConCargoSources {
         $configurationText,
         [System.Text.UTF8Encoding]::new($false)
     )
-    $configuration = Get-EasyConPhysicalFile -Path $configurationPath -TrustedRoot $environment
+    $configuration = Get-EasyConPhysicalFile -Path $configurationPath -TrustedRoot $workspace
+    if ([System.IO.File]::ReadAllText($configuration, [System.Text.Encoding]::UTF8) -cne $configurationText) {
+        throw "generated Cargo source configuration changed during creation"
+    }
     return [pscustomobject]@{
         CargoHome = $cargoHome
         Configuration = $configuration
         ConfigurationSha256 = Get-EasyConFileHash -Path $configuration -Algorithm SHA256
-        VendorRoot = $vendor
-        VendorTree = Get-EasyConTreeFingerprint -Path $vendor -TrustedRoot $environment
     }
 }
 
@@ -3547,6 +4309,12 @@ function Install-EasyConWindowsEnvironment {
         [Parameter(Mandatory)]
         [string]$EnvironmentRoot,
 
+        [Parameter(Mandatory)]
+        [string]$WorkspaceRoot,
+
+        [Parameter(Mandatory)]
+        [string]$WritableRoot,
+
         [string]$SharedCacheRoot,
 
         [string]$VsWherePath
@@ -3586,6 +4354,9 @@ function Install-EasyConWindowsEnvironment {
     New-EasyConSafeDirectory -Path $cacheStorage -TrustedRoot $cacheStorage | Out-Null
     Assert-EasyConVcpkgEnvironmentInputs
     Clear-EasyConUntrustedBuildEnvironment -AllowProxy
+    $runtime = Set-EasyConWorkspaceRuntimeEnvironment -WorkspaceRoot $WorkspaceRoot `
+        -WritableRoot $WritableRoot
+    $setupTemporary = $runtime.Temporary
 
     $msvc = Initialize-EasyConMsvcEnvironment -VsWherePath $VsWherePath `
         -MsvcToolsVersion ([string]$configuration.hostTools.msvcToolsVersion) `
@@ -3619,14 +4390,6 @@ function Install-EasyConWindowsEnvironment {
     }
     $git = Get-EasyConCommandPath -Name "git.exe"
     $pwsh = Get-EasyConCommandPath -Name "pwsh.exe"
-
-    $cargoTarget = Resolve-EasyConFullPath -Path (Join-Path $cache "w")
-    if (-not (Test-EasyConPathWithin -Path $cargoTarget -Root $cache)) {
-        throw "derived Cargo target directory escaped the controlled cache root"
-    }
-    Assert-EasyConPhysicalPath -Path $cargoTarget -TrustedRoot $cache | Out-Null
-    Assert-EasyConCargoPathBudget -CargoTargetDirectory $cargoTarget
-    Assert-EasyConCMakeCacheIsolation -CargoTargetDirectory $cargoTarget -RepositoryRoot $repository
 
     $resolvedVcpkgRoot = Resolve-EasyConFullPath `
         -Path (Join-Path $cache (Join-Path "vcpkg" $configuration.vcpkg.scriptsCommit))
@@ -3669,33 +4432,27 @@ function Install-EasyConWindowsEnvironment {
         throw "vcpkg binary cache path cannot contain comma or semicolon"
     }
     New-EasyConSafeDirectory -Path $binaryCache -TrustedRoot $cacheStorage | Out-Null
-    New-EasyConSafeDirectory -Path $cargoTarget -TrustedRoot $cache | Out-Null
 
     $cargoSources = Install-EasyConCargoSources -CargoPath $rust.CargoPath `
         -RepositoryRoot $repository -EnvironmentRoot $cache `
         -DownloadCacheRoot (Join-Path $cacheStorage "cargo-download-cache")
-    $env:CARGO_HOME = $cargoSources.CargoHome
 
     $externalDownloads = Join-Path $cacheStorage (
         Join-Path "vcpkg-downloads" ([string]$configuration.vcpkg.scriptsCommit)
     )
     $setupVcpkgDownloads = New-EasyConSafeDirectory -Path $externalDownloads `
         -TrustedRoot $cacheStorage
-    $vcpkgDownloads = New-EasyConSafeDirectory -Path (Join-Path $cache "vcpkg-downloads") `
-        -TrustedRoot $cache
 
-    $vcpkgLayout = New-EasyConVcpkgWorkspaceLayout -Vcpkg $vcpkg `
-        -RepositoryRoot $repository -CargoTargetDirectory $cargoTarget `
-        -CacheRoot $cache
+    $vcpkgLayout = New-EasyConVcpkgProvisionLayout -Vcpkg $vcpkg `
+        -RepositoryRoot $repository -EnvironmentRoot $cache
 
-    $env:VCPKG_ROOT = $vcpkgLayout.Root
+    $env:VCPKG_ROOT = $vcpkg.Root
     $env:VCPKG_BINARY_SOURCES = "clear;files,$binaryCache,readwrite"
     $env:VCPKG_DOWNLOADS = $setupVcpkgDownloads
     $env:VCPKG_DISABLE_METRICS = "1"
     $env:VCPKG_FEATURE_FLAGS = "manifests,registries,versions"
     $env:VCPKG_FORCE_DOWNLOADED_BINARIES = "1"
     $env:CXX = [string]$msvc.Tools.'cl.exe'
-    $env:CARGO_TARGET_DIR = $cargoTarget
     $env:CARGO_INCREMENTAL = "0"
     $env:EASYCON_VISION_TEST_TESSDATA = $vision.Root
 
@@ -3726,10 +4483,15 @@ function Install-EasyConWindowsEnvironment {
     Install-EasyConVcpkgDependencies -Vcpkg $vcpkg -RepositoryRoot $repository `
         -DownloadsRoot $setupVcpkgDownloads -DownloadsTrustedRoot $cacheStorage `
         -CacheRoot $cache -WorkspaceLayout $vcpkgLayout
-    $null = Set-EasyConCargoNativeLinkSearch -InstalledRoot $vcpkgLayout.Installed `
-        -CacheRoot $cache
 
     $nativeTree = Get-EasyConTreeFingerprint -Path $vcpkgLayout.Installed -TrustedRoot $cache
+    Assert-EasyConPreparedTreeDoesNotReferenceRepository -Path $cargoSources.VendorRoot `
+        -TrustedRoot $cache -RepositoryRoot $repository -WritableRoot $WritableRoot `
+        -Description "prepared Cargo vendor tree"
+    Assert-EasyConPreparedTreeDoesNotReferenceRepository -Path $vcpkgLayout.Installed `
+        -TrustedRoot $cache -RepositoryRoot $repository -WritableRoot $WritableRoot `
+        -Description "prepared vcpkg installed tree"
+    Remove-EasyConSafeTree -Path $setupTemporary -TrustedRoot $WritableRoot
 
     $cargoVersion = $rust.CargoVersion
     $started.Stop()
@@ -3752,9 +4514,6 @@ function Install-EasyConWindowsEnvironment {
         rustupPath = $rust.RustupPath
         cargoPath = $rust.CargoPath
         cargo = $cargoVersion
-        cargoHome = $cargoSources.CargoHome
-        cargoConfig = $cargoSources.Configuration
-        cargoConfigSha256 = $cargoSources.ConfigurationSha256
         cargoVendor = $cargoSources.VendorRoot
         cargoVendorFiles = $cargoSources.VendorTree.Files
         cargoVendorSha256 = $cargoSources.VendorTree.Sha256
@@ -3767,12 +4526,9 @@ function Install-EasyConWindowsEnvironment {
         vcpkgTool = [string]$configuration.vcpkg.toolRelease
         vcpkgRoot = $vcpkg.Root
         vcpkgExecutable = $vcpkg.Executable
-        vcpkgExecutionRoot = $vcpkgLayout.Root
         vcpkgInstalled = $vcpkgLayout.Installed
-        vcpkgDownloads = $vcpkgDownloads
         vcpkgBinaryCache = $binaryCache
         ocrModel = $vision.Root
-        cargoTarget = $cargoTarget
         nativeTreeFiles = $nativeTree.Files
         nativeTreeSha256 = $nativeTree.Sha256
     }
@@ -3812,6 +4568,7 @@ function Invoke-EasyConWindowsSetupCore {
     try {
         $installed = Install-EasyConWindowsEnvironment -RepositoryRoot $repository `
             -ConfigurationPath $ConfigurationPath -EnvironmentRoot $location.EnvironmentRoot `
+            -WorkspaceRoot $location.WorkspaceRoot -WritableRoot $location.WritableRoot `
             -SharedCacheRoot $sharedCacheRoot -VsWherePath $VsWherePath
     }
     finally {
@@ -3841,6 +4598,8 @@ function Invoke-EasyConWindowsSetupCore {
         )) {
             throw "controlled tool $($entry[0]) escaped the prepared environment root"
         }
+        Assert-EasyConSharedToolPathBoundary -Path $path -RepositoryRoot $repository `
+            -WritableRoot $location.WritableRoot -Description "prepared tool $($entry[0])"
         $toolRecords.Add([ordered]@{
             name = [string]$entry[0]
             path = $path
@@ -3850,10 +4609,11 @@ function Invoke-EasyConWindowsSetupCore {
     }
 
     $stamp = [ordered]@{
-        schemaVersion = 1
+        schemaVersion = 2
+        environmentSchema = $location.EnvironmentSchema
+        hostTargetIdentity = $location.HostTargetIdentity
         fingerprint = $fingerprint.Value
         fingerprintInputs = $fingerprint.Inputs
-        workspaceKey = $location.WorkspaceKey
         createdUtc = [datetime]::UtcNow.ToString("o", [Globalization.CultureInfo]::InvariantCulture)
         environmentRoot = $location.EnvironmentRoot
         target = [string]$configuration.target
@@ -3871,22 +4631,16 @@ function Invoke-EasyConWindowsSetupCore {
             vcpkgTool = $installed.vcpkgTool
         }
         paths = [ordered]@{
-            cargoHome = $installed.cargoHome
-            cargoConfig = $installed.cargoConfig
             cargoVendor = $installed.cargoVendor
             vcpkgScriptsRoot = $installed.vcpkgRoot
-            vcpkgExecutionRoot = $installed.vcpkgExecutionRoot
             vcpkgInstalled = $installed.vcpkgInstalled
-            vcpkgDownloads = $installed.vcpkgDownloads
             ocrModel = $installed.ocrModel
-            cargoTarget = $installed.cargoTarget
         }
         nativeTree = [ordered]@{
             files = $installed.nativeTreeFiles
             sha256 = $installed.nativeTreeSha256
         }
         cargoSources = [ordered]@{
-            configSha256 = $installed.cargoConfigSha256
             files = $installed.cargoVendorFiles
             sha256 = $installed.cargoVendorSha256
         }
@@ -3898,6 +4652,316 @@ function Invoke-EasyConWindowsSetupCore {
         status = "installed"
         fingerprint = $fingerprint.Value
         environmentRoot = $location.EnvironmentRoot
+    }
+}
+
+function Get-EasyConStrictJsonObject {
+    param(
+        [Parameter(Mandatory)]
+        [System.Text.Json.JsonElement]$Element,
+
+        [Parameter(Mandatory)]
+        [string[]]$ExpectedKeys,
+
+        [Parameter(Mandatory)]
+        [string]$Description
+    )
+
+    if ($Element.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) {
+        throw "$Description must be a JSON object"
+    }
+    $properties = @{}
+    foreach ($property in $Element.EnumerateObject()) {
+        if ($properties.ContainsKey($property.Name)) {
+            throw "$Description contains duplicate key '$($property.Name)'"
+        }
+        $properties[$property.Name] = $property.Value.Clone()
+    }
+    $actual = @($properties.Keys | Sort-Object)
+    $expected = @($ExpectedKeys | Sort-Object)
+    if (($actual -join "`0") -cne ($expected -join "`0")) {
+        throw "$Description keys must be exactly: $($expected -join ', ')"
+    }
+    return $properties
+}
+
+function Get-EasyConStrictJsonString {
+    param(
+        [Parameter(Mandatory)]
+        [System.Text.Json.JsonElement]$Element,
+
+        [Parameter(Mandatory)]
+        [string]$Description
+    )
+
+    if ($Element.ValueKind -ne [System.Text.Json.JsonValueKind]::String) {
+        throw "$Description must be a JSON string"
+    }
+    return $Element.GetString()
+}
+
+function Get-EasyConStrictJsonUnsignedInteger {
+    param(
+        [Parameter(Mandatory)]
+        [System.Text.Json.JsonElement]$Element,
+
+        [Parameter(Mandatory)]
+        [string]$Description,
+
+        [long]$Minimum = 0
+    )
+
+    $value = 0L
+    if (
+        $Element.ValueKind -ne [System.Text.Json.JsonValueKind]::Number -or
+        $Element.GetRawText() -cnotmatch '^(0|[1-9][0-9]*)$' -or
+        -not $Element.TryGetInt64([ref]$value) -or
+        $value -lt $Minimum
+    ) {
+        $qualification = if ($Minimum -gt 0) { "positive" } else { "non-negative" }
+        throw "$Description must be a $qualification JSON integer"
+    }
+    return $value
+}
+
+function Get-EasyConStrictJsonBoolean {
+    param(
+        [Parameter(Mandatory)]
+        [System.Text.Json.JsonElement]$Element,
+
+        [Parameter(Mandatory)]
+        [string]$Description
+    )
+
+    if ($Element.ValueKind -eq [System.Text.Json.JsonValueKind]::True) {
+        return $true
+    }
+    if ($Element.ValueKind -eq [System.Text.Json.JsonValueKind]::False) {
+        return $false
+    }
+    throw "$Description must be a JSON Boolean"
+}
+
+function Read-EasyConEnvironmentStamp {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [string]$EnvironmentRoot
+    )
+
+    $document = $null
+    try {
+        $stampText = Read-EasyConPhysicalText -Path $Path -TrustedRoot $EnvironmentRoot
+        $options = [System.Text.Json.JsonDocumentOptions]::new()
+        $options.AllowTrailingCommas = $false
+        $options.CommentHandling = [System.Text.Json.JsonCommentHandling]::Disallow
+        $document = [System.Text.Json.JsonDocument]::Parse($stampText, $options)
+    }
+    catch {
+        throw "Windows build environment stamp is damaged. Rerun Setup: $($_.Exception.Message)"
+    }
+
+    try {
+        $root = Get-EasyConStrictJsonObject -Element $document.RootElement -ExpectedKeys @(
+            "schemaVersion", "environmentSchema", "hostTargetIdentity", "fingerprint",
+            "fingerprintInputs", "createdUtc", "environmentRoot", "target", "tools",
+            "versions", "paths", "nativeTree", "cargoSources"
+        ) -Description "stamp root"
+        $schemaVersion = Get-EasyConStrictJsonUnsignedInteger `
+            -Element $root.schemaVersion -Description "stamp schemaVersion"
+        if ($schemaVersion -ne 2) {
+            throw "stamp schemaVersion must be the JSON integer 2"
+        }
+        $environmentSchema = Get-EasyConStrictJsonUnsignedInteger `
+            -Element $root.environmentSchema -Description "stamp environmentSchema" -Minimum 1
+        if ($environmentSchema -gt [int]::MaxValue) {
+            throw "stamp environmentSchema is outside the supported integer range"
+        }
+        $hostTargetIdentity = Get-EasyConStrictJsonString `
+            -Element $root.hostTargetIdentity -Description "stamp hostTargetIdentity"
+        $fingerprint = Get-EasyConStrictJsonString `
+            -Element $root.fingerprint -Description "stamp fingerprint"
+        if ($fingerprint -cnotmatch '^[0-9a-f]{64}$') {
+            throw "stamp fingerprint must be 64 lowercase hexadecimal digits"
+        }
+        $createdUtc = Get-EasyConStrictJsonString `
+            -Element $root.createdUtc -Description "stamp createdUtc"
+        $created = [datetime]::MinValue
+        if (-not [datetime]::TryParseExact(
+            $createdUtc,
+            "yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'",
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::AssumeUniversal -bor
+                [Globalization.DateTimeStyles]::AdjustToUniversal,
+            [ref]$created
+        )) {
+            throw "stamp createdUtc must be one exact UTC timestamp"
+        }
+        $environmentRoot = Get-EasyConStrictJsonString `
+            -Element $root.environmentRoot -Description "stamp environmentRoot"
+        if (-not [System.IO.Path]::IsPathFullyQualified($environmentRoot)) {
+            throw "stamp environmentRoot must be an absolute path"
+        }
+        $target = Get-EasyConStrictJsonString -Element $root.target -Description "stamp target"
+        if ([string]::IsNullOrWhiteSpace($hostTargetIdentity) -or [string]::IsNullOrWhiteSpace($target)) {
+            throw "stamp identity strings must not be empty"
+        }
+
+        if ($root.fingerprintInputs.ValueKind -ne [System.Text.Json.JsonValueKind]::Array) {
+            throw "stamp fingerprintInputs must be a JSON array"
+        }
+        $inputRecords = [System.Collections.Generic.List[object]]::new()
+        $inputPaths = [System.Collections.Generic.HashSet[string]]::new(
+            [System.StringComparer]::OrdinalIgnoreCase
+        )
+        foreach ($element in $root.fingerprintInputs.EnumerateArray()) {
+            $input = Get-EasyConStrictJsonObject -Element $element `
+                -ExpectedKeys @("path", "kind", "sha256") -Description "stamp fingerprint input"
+            $relative = Get-EasyConStrictJsonString `
+                -Element $input.path -Description "stamp fingerprint input path"
+            $components = @($relative.Split('/'))
+            if (
+                $relative -cnotmatch '^[A-Za-z0-9._/-]+$' -or
+                $relative.StartsWith('/') -or
+                $relative.Contains('//') -or
+                $components -ccontains '.' -or
+                $components -ccontains '..' -or
+                $components -contains '' -or
+                -not $inputPaths.Add($relative)
+            ) {
+                throw "stamp fingerprint input paths must be unique normalized repository-relative paths"
+            }
+            $kind = Get-EasyConStrictJsonString `
+                -Element $input.kind -Description "stamp fingerprint input kind"
+            if ($kind -cnotin @("text", "binary")) {
+                throw "stamp fingerprint input kind must be exactly text or binary"
+            }
+            $sha256 = Get-EasyConStrictJsonString `
+                -Element $input.sha256 -Description "stamp fingerprint input SHA-256"
+            if ($sha256 -cnotmatch '^[0-9a-f]{64}$') {
+                throw "stamp fingerprint input SHA-256 must be lowercase hexadecimal"
+            }
+            $inputRecords.Add([pscustomobject][ordered]@{
+                path = $relative
+                kind = $kind
+                sha256 = $sha256
+            }) | Out-Null
+        }
+        if ($inputRecords.Count -eq 0) {
+            throw "stamp fingerprintInputs must not be empty"
+        }
+
+        if ($root.tools.ValueKind -ne [System.Text.Json.JsonValueKind]::Array) {
+            throw "stamp tools must be a JSON array"
+        }
+        $toolRecords = [System.Collections.Generic.List[object]]::new()
+        $toolNames = [System.Collections.Generic.HashSet[string]]::new(
+            [System.StringComparer]::Ordinal
+        )
+        foreach ($element in $root.tools.EnumerateArray()) {
+            $tool = Get-EasyConStrictJsonObject -Element $element `
+                -ExpectedKeys @("name", "path", "sha256", "controlled") `
+                -Description "stamp tool"
+            $name = Get-EasyConStrictJsonString -Element $tool.name -Description "stamp tool name"
+            if ($name -cnotmatch '^[a-z0-9]+$' -or -not $toolNames.Add($name)) {
+                throw "stamp tool names must be unique lowercase identifiers"
+            }
+            $toolPath = Get-EasyConStrictJsonString `
+                -Element $tool.path -Description "stamp tool path"
+            if (-not [System.IO.Path]::IsPathFullyQualified($toolPath)) {
+                throw "stamp tool path must be absolute"
+            }
+            $toolSha256 = Get-EasyConStrictJsonString `
+                -Element $tool.sha256 -Description "stamp tool SHA-256"
+            if ($toolSha256 -cnotmatch '^[0-9a-f]{64}$') {
+                throw "stamp tool SHA-256 must be lowercase hexadecimal"
+            }
+            $controlled = Get-EasyConStrictJsonBoolean `
+                -Element $tool.controlled -Description "stamp tool controlled"
+            $toolRecords.Add([pscustomobject][ordered]@{
+                name = $name
+                path = $toolPath
+                sha256 = $toolSha256
+                controlled = $controlled
+            }) | Out-Null
+        }
+        if ($toolRecords.Count -eq 0) {
+            throw "stamp tools must not be empty"
+        }
+
+        $versions = Get-EasyConStrictJsonObject -Element $root.versions -ExpectedKeys @(
+            "rust", "cargo", "python", "cmake", "ninja", "sevenZip", "msvcTools",
+            "windowsSdk", "vcpkgScripts", "vcpkgTool"
+        ) -Description "stamp versions"
+        $versionRecord = [ordered]@{}
+        foreach ($name in @(
+            "rust", "cargo", "python", "cmake", "ninja", "sevenZip", "msvcTools",
+            "windowsSdk", "vcpkgScripts", "vcpkgTool"
+        )) {
+            $value = Get-EasyConStrictJsonString `
+                -Element $versions[$name] -Description "stamp versions $name"
+            if ([string]::IsNullOrWhiteSpace($value)) {
+                throw "stamp versions $name must not be empty"
+            }
+            $versionRecord[$name] = $value
+        }
+
+        $paths = Get-EasyConStrictJsonObject -Element $root.paths -ExpectedKeys @(
+            "cargoVendor", "vcpkgScriptsRoot", "vcpkgInstalled", "ocrModel"
+        ) -Description "stamp paths"
+        $pathRecord = [ordered]@{}
+        foreach ($name in @("cargoVendor", "vcpkgScriptsRoot", "vcpkgInstalled", "ocrModel")) {
+            $value = Get-EasyConStrictJsonString `
+                -Element $paths[$name] -Description "stamp paths $name"
+            if (-not [System.IO.Path]::IsPathFullyQualified($value)) {
+                throw "stamp paths $name must be absolute"
+            }
+            $pathRecord[$name] = $value
+        }
+
+        $readTree = {
+            param([System.Text.Json.JsonElement]$Element, [string]$Description)
+            $tree = Get-EasyConStrictJsonObject -Element $Element `
+                -ExpectedKeys @("files", "sha256") -Description $Description
+            $files = Get-EasyConStrictJsonUnsignedInteger -Element $tree.files `
+                -Description "$Description files" -Minimum 1
+            if ($files -gt [int]::MaxValue) {
+                throw "$Description files is outside the supported integer range"
+            }
+            $sha256 = Get-EasyConStrictJsonString `
+                -Element $tree.sha256 -Description "$Description SHA-256"
+            if ($sha256 -cnotmatch '^[0-9a-f]{64}$') {
+                throw "$Description SHA-256 must be lowercase hexadecimal"
+            }
+            return [pscustomobject][ordered]@{ files = [int]$files; sha256 = $sha256 }
+        }
+        $nativeTree = & $readTree $root.nativeTree "stamp nativeTree"
+        $cargoSources = & $readTree $root.cargoSources "stamp cargoSources"
+
+        return [pscustomobject][ordered]@{
+            schemaVersion = [int]$schemaVersion
+            environmentSchema = [int]$environmentSchema
+            hostTargetIdentity = $hostTargetIdentity
+            fingerprint = $fingerprint
+            fingerprintInputs = $inputRecords.ToArray()
+            createdUtc = $createdUtc
+            environmentRoot = $environmentRoot
+            target = $target
+            tools = $toolRecords.ToArray()
+            versions = [pscustomobject]$versionRecord
+            paths = [pscustomobject]$pathRecord
+            nativeTree = $nativeTree
+            cargoSources = $cargoSources
+        }
+    }
+    catch {
+        throw "Windows build environment stamp is damaged. Rerun Setup: $($_.Exception.Message)"
+    }
+    finally {
+        $document.Dispose()
     }
 }
 
@@ -3957,41 +5021,55 @@ function Invoke-EasyConWindowsVerifyCore {
     $configuration = $Context.Configuration
     $fingerprint = $Context.Fingerprint
     $location = $Context.Location
+    $runtime = Set-EasyConWorkspaceRuntimeEnvironment `
+        -WorkspaceRoot $location.WorkspaceRoot -WritableRoot $location.WritableRoot
     if (-not (Test-Path -LiteralPath $location.StampPath -PathType Leaf)) {
         throw "Windows build environment is not prepared for fingerprint $($fingerprint.Value). Run: pwsh -NoProfile -File tools/run_windows_workspace.ps1 -Mode Setup"
     }
-    $stampText = Read-EasyConPhysicalText -Path $location.StampPath `
-        -TrustedRoot $location.EnvironmentRoot
-    try {
-        $stamp = $stampText | ConvertFrom-Json -Depth 64
-    }
-    catch {
-        throw "Windows build environment stamp is damaged. Rerun Setup: $($_.Exception.Message)"
-    }
+    $stamp = Read-EasyConEnvironmentStamp -Path $location.StampPath `
+        -EnvironmentRoot $location.EnvironmentRoot
     if (
-        [int]$stamp.schemaVersion -ne 1 -or
-        [string]$stamp.fingerprint -cne $fingerprint.Value -or
-        [string]$stamp.workspaceKey -cne $location.WorkspaceKey -or
-        [string]$stamp.environmentRoot -cne $location.EnvironmentRoot -or
-        [string]$stamp.target -cne [string]$configuration.target
+        $stamp.environmentSchema -ne [int]$location.EnvironmentSchema -or
+        $stamp.hostTargetIdentity -cne [string]$location.HostTargetIdentity -or
+        $stamp.fingerprint -cne $fingerprint.Value -or
+        $stamp.environmentRoot -cne $location.EnvironmentRoot -or
+        $stamp.target -cne [string]$configuration.target
     ) {
-        throw "Windows build environment stamp does not match the current fingerprint or workspace. Rerun Setup."
+        throw "Windows build environment stamp does not match the current shared identity. Rerun Setup."
+    }
+    $expectedInputs = @($fingerprint.Inputs)
+    $actualInputs = @($stamp.fingerprintInputs)
+    if ($actualInputs.Count -ne $expectedInputs.Count) {
+        throw "Windows build environment stamp fingerprint inputs do not match. Rerun Setup."
+    }
+    for ($index = 0; $index -lt $expectedInputs.Count; $index++) {
+        if (
+            $actualInputs[$index].path -cne [string]$expectedInputs[$index].path -or
+            $actualInputs[$index].kind -cne [string]$expectedInputs[$index].kind -or
+            $actualInputs[$index].sha256 -cne [string]$expectedInputs[$index].sha256
+        ) {
+            throw "Windows build environment stamp fingerprint inputs do not match. Rerun Setup."
+        }
     }
 
     $tools = @{}
+    $controlledToolNames = @("7zip", "7zr", "cmake", "ninja", "vcpkg")
     foreach ($record in @($stamp.tools)) {
-        $name = [string]$record.name
-        if ($tools.ContainsKey($name)) {
-            throw "Windows build environment stamp contains duplicate tool $name. Rerun Setup."
+        $name = $record.name
+        $expectedControlled = $controlledToolNames -ccontains $name
+        if ($record.controlled -ne $expectedControlled) {
+            throw "Windows build environment stamp tool $name has an invalid controlled classification. Rerun Setup."
         }
-        $path = Get-EasyConPhysicalFile -Path ([string]$record.path)
-        if ([bool]$record.controlled -and -not (
+        $path = Get-EasyConPhysicalFile -Path $record.path
+        if ($record.controlled -and -not (
             Test-EasyConPathWithin -Path $path -Root $location.EnvironmentRoot
         )) {
             throw "prepared tool $name escaped the controlled environment root. Rerun Setup."
         }
+        Assert-EasyConSharedToolPathBoundary -Path $path -RepositoryRoot $repository `
+            -WritableRoot $location.WritableRoot -Description "prepared tool $name"
         $actualHash = Get-EasyConFileHash -Path $path -Algorithm SHA256
-        if ($actualHash -cne [string]$record.sha256) {
+        if ($actualHash -cne $record.sha256) {
             throw "prepared tool $name is damaged: SHA-256 $actualHash does not match the Setup stamp. Rerun Setup."
         }
         if ($name -ceq "7zip") {
@@ -4011,6 +5089,29 @@ function Invoke-EasyConWindowsVerifyCore {
     if ((@($tools.Keys | Sort-Object) -join ',') -cne ($expectedToolNames -join ',')) {
         throw "Windows build environment stamp tool set is incomplete. Rerun Setup."
     }
+    $rustPin = Get-EasyConRustToolchainPin -RepositoryRoot $repository
+    $cmakePin = @($configuration.vcpkg.internalTools | Where-Object {
+        $_.name -ceq "cmake"
+    })[0]
+    $ninjaPin = @($configuration.vcpkg.internalTools | Where-Object {
+        $_.name -ceq "ninja"
+    })[0]
+    $sevenZipPin = @($configuration.vcpkg.internalTools | Where-Object {
+        $_.name -ceq "7zip"
+    })[0]
+    if (
+        $stamp.versions.rust -cne [string]$rustPin.Channel -or
+        $stamp.versions.cargo -cne [string]$rustPin.Channel -or
+        $stamp.versions.cmake -cne [string]$cmakePin.version -or
+        $stamp.versions.ninja -cne [string]$ninjaPin.version -or
+        $stamp.versions.sevenZip -cne [string]$sevenZipPin.version -or
+        $stamp.versions.msvcTools -cne [string]$configuration.hostTools.msvcToolsVersion -or
+        $stamp.versions.windowsSdk -cne [string]$configuration.hostTools.windowsSdkVersion -or
+        $stamp.versions.vcpkgScripts -cne [string]$configuration.vcpkg.scriptsCommit -or
+        $stamp.versions.vcpkgTool -cne [string]$configuration.vcpkg.toolRelease
+    ) {
+        throw "Windows build environment stamp versions do not match the fixed configuration. Rerun Setup."
+    }
 
     $preparedPaths = @{}
     try {
@@ -4019,21 +5120,14 @@ function Invoke-EasyConWindowsVerifyCore {
         $preparedPaths.rustupHome = Assert-EasyConPhysicalTree `
             -Path (Join-Path $sharedCacheRoot "rustup-home") -TrustedRoot $sharedCacheRoot
         foreach ($name in @(
-            "cargoHome", "cargoVendor", "vcpkgScriptsRoot", "vcpkgExecutionRoot",
-            "vcpkgInstalled", "vcpkgDownloads", "ocrModel", "cargoTarget"
+            "cargoVendor", "vcpkgScriptsRoot", "vcpkgInstalled", "ocrModel"
         )) {
             $preparedPaths[$name] = Assert-EasyConPhysicalTree `
                 -Path ([string]$stamp.paths.$name) -TrustedRoot $location.EnvironmentRoot
         }
-        $preparedPaths.cargoConfig = Get-EasyConPhysicalFile `
-            -Path ([string]$stamp.paths.cargoConfig) -TrustedRoot $location.EnvironmentRoot
     }
     catch {
         throw "Windows build environment contains a missing or unsafe prepared path. Rerun Setup: $($_.Exception.Message)"
-    }
-    $cargoConfigHash = Get-EasyConFileHash -Path $preparedPaths.cargoConfig -Algorithm SHA256
-    if ($cargoConfigHash -cne [string]$stamp.cargoSources.configSha256) {
-        throw "prepared Cargo source configuration is damaged. Rerun Setup."
     }
     $cargoVendorTree = Get-EasyConTreeFingerprint -Path $preparedPaths.cargoVendor `
         -TrustedRoot $location.EnvironmentRoot
@@ -4088,24 +5182,30 @@ function Invoke-EasyConWindowsVerifyCore {
         throw "SystemRoot is unavailable; cannot construct the verified process PATH"
     }
     $pathDirectories += @($systemRoot, (Join-Path $systemRoot "System32"))
-    $rustPin = Get-EasyConRustToolchainPin -RepositoryRoot $repository
+    $workspaceCargoHome = Join-Path $location.WorkspaceRoot "cargo-home"
+    $workspaceDownloads = Join-Path $location.WorkspaceRoot "vcpkg/downloads"
     $verifiedVariables = [ordered]@{
         AR = $tools.lib
         CC = $tools.cl
         CXX = $tools.cl
-        CARGO_HOME = $preparedPaths.cargoHome
+        CARGO_HOME = $workspaceCargoHome
         CARGO_INCREMENTAL = "0"
-        CARGO_TARGET_DIR = $preparedPaths.cargoTarget
+        CARGO_TARGET_DIR = $location.CargoTargetDirectory
         CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER = $tools.link
         EASYCON_VISION_TEST_TESSDATA = $preparedPaths.ocrModel
         RUSTUP_HOME = $preparedPaths.rustupHome
         RUSTUP_TOOLCHAIN = [string]$rustPin.Channel
+        TEMP = $runtime.Temporary
+        TMP = $runtime.Temporary
+        TMPDIR = $runtime.Temporary
+        PYTHONPYCACHEPREFIX = $runtime.PythonCache
+        PYTHONDONTWRITEBYTECODE = "1"
         VCPKG_BINARY_SOURCES = "clear"
         VCPKG_DISABLE_METRICS = "1"
-        VCPKG_DOWNLOADS = $preparedPaths.vcpkgDownloads
+        VCPKG_DOWNLOADS = $workspaceDownloads
         VCPKG_FEATURE_FLAGS = "manifests,registries,versions"
         VCPKG_FORCE_DOWNLOADED_BINARIES = "1"
-        VCPKG_ROOT = $preparedPaths.vcpkgExecutionRoot
+        VCPKG_ROOT = $preparedPaths.vcpkgScriptsRoot
     }
     foreach ($entry in $controlledMsvcEnvironment.GetEnumerator()) {
         $verifiedVariables[$entry.Key] = $entry.Value
@@ -4123,9 +5223,6 @@ function Invoke-EasyConWindowsVerifyCore {
     $buildTools = Get-EasyConBuildToolVersions `
         -CMakeMinimumVersion ([version]$stamp.versions.cmake) `
         -NinjaMinimumVersion ([version]$stamp.versions.ninja)
-    $sevenZipPin = @($configuration.vcpkg.internalTools | Where-Object {
-        $_.name -ceq "7zip"
-    })[0]
     if (
         -not $buildTools.CMakePath.Equals($tools.cmake, [System.StringComparison]::OrdinalIgnoreCase) -or
         -not $buildTools.NinjaPath.Equals($tools.ninja, [System.StringComparison]::OrdinalIgnoreCase) -or
@@ -4158,10 +5255,38 @@ function Invoke-EasyConWindowsVerifyCore {
     ) {
         throw "prepared native dependency tree is missing or damaged. Rerun Setup."
     }
+    Assert-EasyConPreparedTreeDoesNotReferenceRepository -Path $preparedPaths.cargoVendor `
+        -TrustedRoot $location.EnvironmentRoot -RepositoryRoot $repository `
+        -WritableRoot $location.WritableRoot `
+        -Description "prepared Cargo vendor tree"
+    Assert-EasyConPreparedTreeDoesNotReferenceRepository -Path $preparedPaths.vcpkgInstalled `
+        -TrustedRoot $location.EnvironmentRoot -RepositoryRoot $repository `
+        -WritableRoot $location.WritableRoot `
+        -Description "prepared vcpkg installed tree"
 
-    Assert-EasyConCMakeCacheIsolation -CargoTargetDirectory $preparedPaths.cargoTarget `
+    $workspaceCargo = New-EasyConCargoWorkspaceLayout `
+        -WorkspaceRoot $location.WorkspaceRoot -CacheRoot $location.CacheRoot `
+        -VendorRoot $preparedPaths.cargoVendor -EnvironmentRoot $location.EnvironmentRoot
+    $workspaceTarget = New-EasyConSafeDirectory -Path $location.CargoTargetDirectory `
+        -TrustedRoot $location.WorkspaceRoot
+    Assert-EasyConCargoPathBudget -CargoTargetDirectory $workspaceTarget
+    $workspaceTemporary = $runtime.Temporary
+    $workspaceVcpkg = New-EasyConVcpkgWorkspaceLayout -Vcpkg $vcpkg `
+        -RepositoryRoot $repository -WorkspaceRoot $location.WorkspaceRoot `
+        -CacheRoot $location.CacheRoot -EnvironmentRoot $location.EnvironmentRoot `
+        -InstalledRoot $preparedPaths.vcpkgInstalled
+    Assert-EasyConCMakeCacheIsolation -CargoTargetDirectory $workspaceTarget `
         -RepositoryRoot $repository
-    $env:EASYCON_VISION_TEST_TESSDATA = $vision.Root
+
+    $verifiedVariables.CARGO_HOME = $workspaceCargo.CargoHome
+    $verifiedVariables.CARGO_TARGET_DIR = $workspaceTarget
+    $verifiedVariables.EASYCON_VISION_TEST_TESSDATA = $vision.Root
+    $verifiedVariables.TEMP = $workspaceTemporary
+    $verifiedVariables.TMP = $workspaceTemporary
+    $verifiedVariables.VCPKG_DOWNLOADS = $workspaceVcpkg.Downloads
+    $verifiedVariables.VCPKG_ROOT = $workspaceVcpkg.Root
+    Set-EasyConVerifiedProcessEnvironment -PathDirectories $pathDirectories `
+        -Variables $verifiedVariables
     $null = Set-EasyConCargoNativeLinkSearch `
         -InstalledRoot $preparedPaths.vcpkgInstalled `
         -CacheRoot $location.EnvironmentRoot
@@ -4183,7 +5308,8 @@ function Invoke-EasyConWindowsVerifyCore {
         vcpkgTool = [string]$configuration.vcpkg.toolRelease
         nativeTreeSha256 = $nativeTree.Sha256
         ocrModel = $vision.Root
-        cargoTarget = $preparedPaths.cargoTarget
+        workspaceRoot = $location.WorkspaceRoot
+        cargoTarget = $workspaceTarget
     }
     Write-EasyConStructuredRecord -Kind "verify" -Value $summary
     return [pscustomobject]$summary
@@ -4213,11 +5339,14 @@ function Invoke-EasyConEnvironmentLifecycle {
 
     $environmentSnapshot = Get-EasyConProcessEnvironmentSnapshot
     $lease = $null
+    $workspaceLease = $null
     $sharedCacheLease = $null
     $primaryFailure = $null
     try {
         $access = if ($Mode -ceq "Setup") { "Exclusive" } else { "Shared" }
         $lease = Enter-EasyConEnvironmentLease -Location $Location -Access $access `
+            -TimeoutMilliseconds $LeaseTimeoutMilliseconds
+        $workspaceLease = Enter-EasyConWorkspaceLease -Location $Location `
             -TimeoutMilliseconds $LeaseTimeoutMilliseconds
         if ($Mode -cne "Setup") {
             $sharedCacheLease = Enter-EasyConSharedCacheLease `
@@ -4328,6 +5457,14 @@ function Invoke-EasyConEnvironmentLifecycle {
                 $cleanupFailures.Add($_)
             }
         }
+        if ($null -ne $workspaceLease) {
+            try {
+                $workspaceLease.Dispose()
+            }
+            catch {
+                $cleanupFailures.Add($_)
+            }
+        }
         if ($null -ne $lease) {
             try {
                 $lease.Dispose()
@@ -4377,7 +5514,7 @@ function Get-EasyConWindowsEnvironmentContext {
     $fingerprint = Get-EasyConEnvironmentFingerprint -RepositoryRoot $repository `
         -Configuration $configuration
     $location = Get-EasyConEnvironmentLocation -RepositoryRoot $repository `
-        -Fingerprint $fingerprint.Value -CacheRoot $CacheRoot
+        -Fingerprint $fingerprint.Value -Configuration $configuration -CacheRoot $CacheRoot
     return [pscustomobject]@{
         Repository = $repository
         Configuration = $configuration
@@ -4575,6 +5712,38 @@ function Invoke-EasyConGate {
     })
 }
 
+function Get-EasyConIgnoredPythonBytecodeSnapshot {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$RepositoryRoot
+    )
+
+    $repository = Assert-EasyConPhysicalPath -Path $RepositoryRoot
+    $git = Get-EasyConCommandPath -Name "git.exe"
+    $paths = @(Invoke-EasyConNativeCapture -Program $git -Arguments @(
+        "--no-optional-locks", "-c", "core.quotePath=false", "ls-files",
+        "--others", "--ignored", "--exclude-standard", "--", "*.pyc", "*.pyo"
+    ) -Description "ignored Python bytecode snapshot" -WorkingDirectory $repository)
+    $builder = [System.Text.StringBuilder]::new()
+    foreach ($relative in @($paths | Sort-Object)) {
+        if (
+            [string]::IsNullOrEmpty($relative) -or
+            [System.IO.Path]::IsPathFullyQualified($relative) -or
+            @($relative -split '[\\/]') -contains '..'
+        ) {
+            throw "ignored Python bytecode snapshot returned an unsafe repository path"
+        }
+        $path = Get-EasyConPhysicalFile -Path (Join-Path $repository $relative) `
+            -TrustedRoot $repository
+        $file = Get-Item -Force -LiteralPath $path
+        $hash = Get-EasyConFileHash -Path $path -Algorithm SHA256
+        [void]$builder.Append($relative.Replace("\", "/"))
+        [void]$builder.Append("`0").Append($file.Length).Append("`0").Append($hash).Append("`n")
+    }
+    return $builder.ToString()
+}
+
 function Assert-EasyConGitWorkingTreeClean {
     [CmdletBinding()]
     param(
@@ -4585,7 +5754,7 @@ function Assert-EasyConGitWorkingTreeClean {
     $repository = Assert-EasyConPhysicalPath -Path $RepositoryRoot
     $git = Get-EasyConCommandPath -Name "git.exe"
     $status = @(Invoke-EasyConNativeCapture -Program $git -Arguments @(
-        "status", "--porcelain=v1", "--untracked-files=all"
+        "--no-optional-locks", "status", "--porcelain=v1", "--untracked-files=all"
     ) -Description "workspace cleanliness check" -WorkingDirectory $repository)
     if ($status.Count -ne 0) {
         throw "workspace gates left tracked or unignored output`n$($status -join [Environment]::NewLine)"
@@ -4654,6 +5823,12 @@ function Invoke-EasyConWindowsWorkspaceGates {
         ),
         @("git diff --check", $git, @("diff", "--check"))
     )
+    $ignoredPythonBytecodeBefore = $null
+    if ($RequireCleanTree) {
+        Assert-EasyConGitWorkingTreeClean -RepositoryRoot $repository
+        $ignoredPythonBytecodeBefore = Get-EasyConIgnoredPythonBytecodeSnapshot `
+            -RepositoryRoot $repository
+    }
     foreach ($gate in $gates) {
         if ($null -eq $GateInvoker) {
             Invoke-EasyConGate -Name $gate[0] -Program $gate[1] -Arguments $gate[2] `
@@ -4671,6 +5846,11 @@ function Invoke-EasyConWindowsWorkspaceGates {
     }
     if ($RequireCleanTree) {
         Assert-EasyConGitWorkingTreeClean -RepositoryRoot $repository
+        $ignoredPythonBytecodeAfter = Get-EasyConIgnoredPythonBytecodeSnapshot `
+            -RepositoryRoot $repository
+        if ($ignoredPythonBytecodeAfter -cne $ignoredPythonBytecodeBefore) {
+            throw "workspace gates changed ignored Python bytecode inside the source tree"
+        }
     }
 }
 

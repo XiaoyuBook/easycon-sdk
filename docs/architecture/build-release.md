@@ -56,6 +56,9 @@ OCR 分别由 fingerprint 中列出的 tracked 文件共同约束。清单显式
 exact path/kind/order、规范相对 path 和 Windows 大小写不敏感 identity；Python guard 独立执行同一严格合同，防止两者
 漂移。升级任一固定输入都必须经过显式变更并重新运行 Setup。
 
+当前受控环境清单 schema 为 v4，prepared stamp schema 为 v2；两者与固定 host/target identity 都进入 shared environment
+identity。旧 schema stamp 不迁移、不降级为 cache 命中，Verify 必须 fail closed 并要求 Setup 发布新树。
+
 ### Windows 开发环境生命周期
 
 Windows 构建流程分为两个职责：
@@ -67,12 +70,15 @@ pwsh -NoProfile -File tools/run_windows_workspace.ps1 -Mode Workspace
 ```
 
 `Setup` 是可重跑的一次性在线准备步骤，安装并核验固定 Rust toolchain、受控 CMake/Ninja、vcpkg
-scripts/tool/registry/native install tree、7-Zip 与测试 OCR 模型，然后写入包含 fingerprint、显式路径、版本、文件
-hash、Cargo vendor tree hash 和 native tree hash 的 stamp。Setup 使用 `cargo vendor --locked` 把 lockfile 与全部
-workspace manifests 对应的 crate sources 安装进环境。Cargo 不从 ambient PATH 解析；rustup 必须先为固定 channel 返回
-受控 Rust home 精确 toolchain 目录中的 `cargo.exe`，Setup 在首次 Cargo 执行前核对该路径、release 与 host。
-`Verify` 与 `Workspace` 不安装或下载；两者只接受当前
-fingerprint 对应且未损坏的 stamp，缺失或失配时要求重新运行 Setup。`Workspace` 在 Verify 后运行完整仓库门禁。
+scripts/tool/registry/native install tree、7-Zip 与测试 OCR 模型，然后写入包含环境 schema、host/target identity、
+fingerprint、显式路径、版本、文件 hash、Cargo vendor tree hash 和 native tree hash 的 stamp。prepared environment 的
+identity 不含 canonical worktree path；相同 fingerprint、环境 schema 和 host/target 的物理 worktree 必须解析到同一棵
+immutable prepared tree。Setup 使用 `cargo vendor --locked` 把 lockfile 与全部 workspace manifests 对应的 crate sources
+安装进环境。Cargo 不从 ambient PATH 解析；rustup 必须先为固定 channel 返回受控 Rust home 精确 toolchain 目录中的
+`cargo.exe`，Setup 在首次 Cargo 执行前核对该路径、release 与 host。`Verify` 与 `Workspace` 不安装或下载；两者只接受
+当前 shared identity 对应且未损坏的 stamp，缺失或失配时要求重新运行 Setup。新建或切换 worktree 不构成 Setup 理由，
+必须先 Verify。canonical worktree key 仅选择 `CARGO_TARGET_DIR`、CMake cache、Cargo home/config、vcpkg wrapper/downloads
+和测试临时目录等可写/source-bound 输出。`Workspace` 在 Verify 后运行完整仓库门禁。
 
 环境目录之外有跨 fingerprint/worktree 的共享资产层。直接固定资产以 SHA-256/SHA-512 内容寻址，命中时每次重验
 hash/bytes，损坏项在逐资产锁内隔离，唯一同卷 temporary 通过验证后才原子发布。CMake、Ninja、vcpkg.exe、7-Zip/7zr
@@ -88,11 +94,14 @@ stamp、ready 状态和 prepared tree 不进入共享缓存。受控 7-Zip fetch
 同一 downloads、buildtrees 与 binary cache；最终成功或失败都安全删除 transient buildtrees/packages，不把 port source
 中合法的 reparse/symlink 带入最终 prepared tree，且删除不跟随链接目标。清理失败时保留 install 首错并附加
 cleanup/residual tree 诊断。外部句柄释放后的 Setup 在通用 prepared-tree 严格删除前，仅对固定布局可推导的
-`w/setup/vcpkg/buildtrees` 与 `packages` 重试 link-safe 清理；installed tree 不在该专用范围，其他位置的 reparse point
+`setup/vcpkg/buildtrees` 与 `packages` 重试 link-safe 清理；installed tree 不在该专用范围，其他位置的 reparse point
 仍 fail closed，通用防护不放宽。若已知 transient link 仍被占用，Verify 首错保持为主错误并附加 cleanup/residual 诊断。
 
-同一 fingerprint/worktree identity 使用环境目录外的跨进程 reader/writer lease：Setup 独占 stamp 检查、旧树删除、
-安装、stamp 发布与最终 Verify；普通 Verify 共享读取；Workspace 的共享 lease 从 Verify 连续覆盖到最后一个 gate。
+同一 fingerprint/schema/host-target identity 使用环境目录外的跨进程 reader/writer lease：Setup 独占 stamp 检查、旧树
+删除、安装、stamp 发布与最终 Verify；普通 Verify 共享读取；Workspace 的共享 lease 从 Verify 连续覆盖到最后一个 gate。
+每个 canonical worktree 另有独占 writable-output lease；它只覆盖自己的 `w/<workspace-key>`，因此不同 worktree 可以
+同时 Workspace，且不会写入 shared prepared tree。Setup 的 ready/final Verify 也必须先取得该 worktree lease；所有模式
+按 environment、workspace、shared-cache 的固定顺序获取，避免 already-ready 路径在无 lease 下创建 writable layout。
 共享资产层另有跨 identity reader/writer lease，Setup provision 独占，Verify/Workspace 全程共享，避免 Rust/vcpkg
 共享状态与读取中的环境竞争。Setup 的 ready 预检先获取共享资产 reader lease；writer busy/timeout 原样失败并保留
 stamp/环境，不被当成 Verify failure 触发删除或 provision。所有异常路径释放 lease。vcpkg checkout 先在同卷不可见
@@ -112,11 +121,13 @@ home/target、vcpkg tree 与 OCR 路径。代理只属于在线 Setup，不进�
 与 Workspace；parser、下载、安装、环境修改和无锁 gate core 等 helper 全部私有。公开 Workspace 必须持同一个 shared
 lease 完成 Verify 和全部 gates；三个生命周期命令返回时完整恢复调用进程
 进入命令前的环境，异常不会把临时净化或受控变量留在调用 shell。
+`TEMP`、`TMP`、`TMPDIR`、`PYTHONPYCACHEPREFIX` 与 bytecode policy 都由当前 `w/<workspace-key>` 重建；Setup 使用 Python
+时也遵守同一边界。`RequireCleanTree` 比较 gate 前后的 ignored pyc snapshot，不能因 `.gitignore` 漏报 source-tree 写入。
 native command/gate 会在 cwd cleanup 前把非零退出登记为主错误；原 cwd 被外部删除而无法恢复时，cleanup failure 只作为
 附加诊断且不覆盖退出码、native 输出/描述或 gate 名称。若子进程成功，cwd restore failure 本身仍使调用失败。
 
 下载包、工具二进制、native install tree 与编译缓存只存在于用户的受控环境根或 CI 临时目录，不进入 Git。完整且
-hash 匹配的直接资产 cache hit 不重新下载，即使 fingerprint/worktree 改变、旧环境损坏或前次 Setup 失败也可复用。
+hash 匹配的直接资产 cache hit 不重新下载，即使 fingerprint 改变、worktree 切换、旧环境损坏或前次 Setup 失败也可复用。
 Rust 的 rustup 检查及 vcpkg/Cargo 缺失内容仍可联网，所以这不是完全离线合同；所有 cache 只提速，miss 不改变正确性。
 PowerShell、Git、Python、rustup、VS Installer/vswhere 与 VS Build Tools 是运行 Setup 所需的宿主启动条件；
 Setup 会把实际解析到的可执行文件路径和 SHA-256 写入 stamp，日常 Verify 不会回退到另一个系统工具。`vswhere.exe`
@@ -124,6 +135,10 @@ Setup 会把实际解析到的可执行文件路径和 SHA-256 写入 stamp，�
 宿主 Python minimum 固定为 `3.8.0` 并以 `System.Version` 数值语义比较，因而 hosted runner 的 Python `3.12.x`
 是满足要求的启动宿主；Setup/Verify 只接受恰好一行、完整 `Python X.Y.Z` 的版本输出。这与 SDK Python binding
 的 `3.10+` 产品支持目标是不同合同。
+stamp v2 用结构化 JSON parser 对每层 required key、JSON kind 和十进制整数 token 做完整校验，duplicate/unknown nested
+field 与字符串、小数或 exponent 数值都 fail closed。工具路径同时排除 source repository 与整个 `CacheRoot/w`；prepared
+JSON 先解码 escaped string 再审计 source/writable reference。Verify 的 prepared vcpkg Git 查询禁止 optional lock/index refresh，
+因此共享 `e/` 在 Verify 与 Workspace 中保持只读。
 
 ## 3. 单一原生构建
 

@@ -89,7 +89,8 @@ review 与单独 refreeze 尚未完成；此前 C1 继续暂停，W0/root worksp
 
 ## Windows 构建环境
 
-新电脑或 `tools/windows_build_environment.json` 所列 fingerprint 输入变化后，运行一次在线 Setup：
+新电脑、共享 prepared environment 缺失或损坏，或 `tools/windows_build_environment.json` 所列 fingerprint、环境 schema、
+host/target identity 变化后，运行一次在线 Setup：
 
 ```powershell
 pwsh -NoProfile -File tools/run_windows_workspace.ps1 -Mode Setup
@@ -102,8 +103,9 @@ pwsh -NoProfile -File tools/run_windows_workspace.ps1 -Mode Verify
 pwsh -NoProfile -File tools/run_windows_workspace.ps1 -Mode Workspace
 ```
 
-Setup 安装并记录固定工具、Cargo vendor、native dependencies 与 OCR 资产；Verify/Workspace 不准备或修复环境。
-环境缺失、损坏、worktree/fingerprint 不匹配时会明确要求重新运行 Setup。下载包、工具二进制和缓存都位于受控的
+新建或切换 Git worktree 本身不是 Setup 理由，应先运行 Verify。同一 fingerprint、环境 schema 和 host/target identity
+的 worktree 共享一个 immutable prepared environment；Setup 安装并记录固定工具、Cargo vendor、native dependencies 与 OCR
+资产，Verify/Workspace 不准备或修复该树。环境缺失、损坏或 shared identity 不匹配时会明确要求重新运行 Setup。下载包、工具二进制和缓存都位于受控的
 Git 外目录；cache 只用于提速。环境目录之外的共享缓存按内容 hash 保存直接资产，并持久复用已复验的 vcpkg
 scripts/downloads、Cargo downloads 与 Rust home；任何环境 stamp 或 ready 状态都不进入共享缓存。命中直接资产时每次
 重新核对 hash/大小，损坏项先隔离再重新获取，发布使用逐资产锁和同卷原子 rename。Rust 因没有仓库内分发 hash，仍由
@@ -117,7 +119,12 @@ install 首错保持为主错误并附带 cleanup/residual tree 诊断。句柄�
 buildtrees/packages，再执行通用严格环境树删除；只删除这些 transient tree 内的 link 本身，不跟随外部目标，
 installed tree 不属于专用清理范围，其他位置的 reparse point 仍 fail closed。
 
-同一环境 identity 的 Setup 独占重建，Verify/Workspace 共享读取，且 Workspace 从 Verify 到最后一个 gate 持续受保护；
+prepared environment 的 identity 只包含 fingerprint、环境 schema 和固定 host/target，不包含 canonical worktree path。
+canonical worktree key 只隔离 `CARGO_TARGET_DIR`、CMake cache、Cargo home/config、vcpkg wrapper/downloads 与 `TEMP`/`TMP`
+等可写或 source-bound 输出；`TMPDIR`、Python pycache prefix 和 bytecode policy 也固定到同一 `w/<workspace-key>`，
+不会写回源码 checkout。Setup 对同一共享 identity 独占重建，Setup 的 ready/final Verify、普通 Verify 与 Workspace
+在访问 `w/` 前都取得同一 worktree writable lease，统一按 environment、workspace、shared-cache 的顺序持锁；Workspace
+从 Verify 到最后一个 gate 持续受保护；
 共享资产另有跨 identity reader/writer lease，避免 Setup 修改 Rust/vcpkg 共享状态时与 Verify 或 gates 竞争。受控 7-Zip
 获取使用空 PATH 和 downloaded-binaries-only 模式，不接受宿主 PATH 中的任意 `7z.exe`/`7zr.exe`。模块只公开 Setup、
 Verify 与 Workspace 三个命令；所有 helper 保持模块私有。
@@ -126,7 +133,10 @@ Setup 对现有 ready 环境的预检必须先取得共享资产 reader lease；
 所有 gate 只继承核验后的编译环境，命令返回后
 恢复调用 shell 原有环境。text fingerprint 对严格 UTF-8 内容规范化 CRLF/CR 为 LF，binary 输入按原始 bytes 计算，
 因此同一文本在不同 checkout 行尾下保持同一环境 identity；Setup 在任何下载前拒绝固定输入的乱序、非规范 path 或
-Windows 大小写 alias。锁定的 download/stamp temporary 无法立即删除时保持无效，错误同时保留首错与 cleanup 状态，
+Windows 大小写 alias。stamp v2 逐层拒绝 duplicate key、错误 JSON 类型、非十进制整数、缺失或未知 nested field；工具
+记录不能位于源码 repository 或整个 `CacheRoot/w`。prepared JSON 会结构化解码 escaped path，并与其他 text artifact
+一起拒绝源码及任意 worktree writable-root 引用。Verify 对 prepared vcpkg Git 只执行无 optional lock 的读取，保持共享
+`e/` 及其 `.git/index` 不变。锁定的 download/stamp temporary 无法立即删除时保持无效，错误同时保留首错与 cleanup 状态，
 句柄释放后的后续下载或 Setup 可恢复。完整、未损坏的直接固定资产 cache hit 不重新启动下载；Rust/vcpkg/Cargo
 仍按各自安全模型检查或补齐缺失内容，因此这一职责拆分不承诺完全离线或零网络请求。完整固定清单与 CI 边界见
 [GitHub CI 运维边界](.github/CI.md) 和 [构建、发布与合规](docs/architecture/build-release.md)。

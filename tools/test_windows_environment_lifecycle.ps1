@@ -209,6 +209,20 @@ $location = [pscustomobject]@{
     LockPath = Join-Path $temporaryRoot "locks/contract.lock"
     IdentityKey = "contract"
     WorkspaceKey = "contract-workspace"
+    WorkspaceRoot = Join-Path $temporaryRoot "w/contract-workspace"
+    WorkspaceLockPath = Join-Path $temporaryRoot "locks/workspace-contract-workspace.lock"
+    CargoTargetDirectory = Join-Path $temporaryRoot "w/contract-workspace/target"
+}
+$secondWorktreeLocation = [pscustomobject]@{
+    CacheRoot = $temporaryRoot
+    EnvironmentRoot = $environmentRoot
+    StampPath = Join-Path $environmentRoot "environment-stamp.json"
+    LockPath = Join-Path $temporaryRoot "locks/contract.lock"
+    IdentityKey = "contract"
+    WorkspaceKey = "contract-workspace-two"
+    WorkspaceRoot = Join-Path $temporaryRoot "w/contract-workspace-two"
+    WorkspaceLockPath = Join-Path $temporaryRoot "locks/workspace-contract-workspace-two.lock"
+    CargoTargetDirectory = Join-Path $temporaryRoot "w/contract-workspace-two/target"
 }
 Import-Module -Name $modulePath -Force
 $workspaceModule = Get-Module windows_workspace
@@ -257,6 +271,21 @@ function Enter-PrivateEnvironmentLease {
         Enter-EasyConEnvironmentLease -Location $OwnedLocation -Access $LeaseAccess `
             -TimeoutMilliseconds $Timeout
     } $Location $Access $TimeoutMilliseconds
+}
+
+function Enter-PrivateWorkspaceLease {
+    param(
+        [Parameter(Mandatory)]
+        [object]$Location,
+
+        [int]$TimeoutMilliseconds = 0
+    )
+
+    & $script:workspaceModule {
+        param($OwnedLocation, $Timeout)
+        Enter-EasyConWorkspaceLease -Location $OwnedLocation `
+            -TimeoutMilliseconds $Timeout -RetryMilliseconds 0
+    } $Location $TimeoutMilliseconds
 }
 
 function Get-PrivateSharedContentAsset {
@@ -435,6 +464,23 @@ try {
     Assert-Sequence -Actual $events.ToArray() -Expected @("verify") `
         -Description "already-ready Setup must not provision again"
 
+    $events.Clear()
+    $verifyWithWorkspaceOwnership = {
+        Assert-Throws -Pattern "busy|ownership" -Action {
+            Enter-PrivateWorkspaceLease -Location $location -TimeoutMilliseconds 0
+        }
+        $events.Add("verify") | Out-Null
+        if ((Get-Content -Raw -LiteralPath $location.StampPath).Trim() -cne "ready") {
+            throw "synthetic environment mismatch"
+        }
+        return "verified"
+    }.GetNewClosure()
+    Invoke-PrivateEnvironmentLifecycle -Mode Setup -Location $location `
+        -SetupAction $setupAction -VerifyAction $verifyWithWorkspaceOwnership `
+        -WorkspaceAction $workspaceAction -LeaseTimeoutMilliseconds 0 | Out-Null
+    Assert-Sequence -Actual $events.ToArray() -Expected @("verify") `
+        -Description "already-ready Setup VerifyCore must hold the workspace writable lease"
+
     $readyMarker = Join-Path $environmentRoot "ready-preserved.txt"
     Set-Content -LiteralPath $readyMarker -Value "preserve" -Encoding utf8NoBOM
     $readyLeaseState = [pscustomobject]@{ SetupCalls = 0; VerifyCalls = 0 }
@@ -526,6 +572,9 @@ $location = [pscustomobject]@{
     LockPath = Join-Path $CacheRoot "locks/wait-probe.lock"
     IdentityKey = "wait-probe"
     WorkspaceKey = "wait-probe-workspace"
+    WorkspaceRoot = Join-Path $CacheRoot "w/wait-probe-workspace"
+    WorkspaceLockPath = Join-Path $CacheRoot "locks/workspace-wait-probe-workspace.lock"
+    CargoTargetDirectory = Join-Path $CacheRoot "w/wait-probe-workspace/target"
 }
 $state = [pscustomobject]@{ SetupCalls = 0; VerifyCalls = 0 }
 $setup = { $state.SetupCalls++ }.GetNewClosure()
@@ -678,8 +727,11 @@ if (
         LockPath = Join-Path $temporaryRoot "locks/junction-recovery.lock"
         IdentityKey = "junction-recovery"
         WorkspaceKey = "junction-recovery-workspace"
+        WorkspaceRoot = Join-Path $temporaryRoot "w/junction-recovery-workspace"
+        WorkspaceLockPath = Join-Path $temporaryRoot "locks/workspace-junction-recovery-workspace.lock"
+        CargoTargetDirectory = Join-Path $temporaryRoot "w/junction-recovery-workspace/target"
     }
-    $vcpkgTransientRoot = Join-Path $junctionRecoveryEnvironment "w/setup/vcpkg"
+    $vcpkgTransientRoot = Join-Path $junctionRecoveryEnvironment "setup/vcpkg"
     $knownTransientTrees = @(
         Join-Path $vcpkgTransientRoot "buildtrees"
         Join-Path $vcpkgTransientRoot "packages"
@@ -879,6 +931,9 @@ if (
             LockPath = Join-Path $temporaryRoot "locks/$identityName.lock"
             IdentityKey = $identityName
             WorkspaceKey = "$identityName-workspace"
+            WorkspaceRoot = Join-Path $temporaryRoot "w/$identityName-workspace"
+            WorkspaceLockPath = Join-Path $temporaryRoot "locks/workspace-$identityName-workspace.lock"
+            CargoTargetDirectory = Join-Path $temporaryRoot "w/$identityName-workspace/target"
         }
         $alternateSetup = {
             Get-PrivateSharedContentAsset -Parameters $sharedAssetParameters | Out-Null
@@ -905,6 +960,177 @@ if (
         -WorkspaceAction $workspaceAction -LeaseTimeoutMilliseconds 0 | Out-Null
     Assert-Sequence -Actual $events.ToArray() -Expected @("verify") `
         -Description "Verify must never provision or run workspace gates"
+
+    $firstWorkspaceLease = Enter-PrivateWorkspaceLease -Location $location -TimeoutMilliseconds 0
+    $secondWorkspaceLease = $null
+    try {
+        $secondWorkspaceLease = Enter-PrivateWorkspaceLease -Location $secondWorktreeLocation `
+            -TimeoutMilliseconds 0
+        Assert-Throws -Pattern "busy|ownership" -Action {
+            Enter-PrivateWorkspaceLease -Location $location -TimeoutMilliseconds 0
+        }
+    }
+    finally {
+        if ($null -ne $secondWorkspaceLease) {
+            $secondWorkspaceLease.Dispose()
+        }
+        $firstWorkspaceLease.Dispose()
+    }
+
+    $workspaceProbeRoot = Join-Path $temporaryRoot "shared environment workspace probes"
+    $workspaceProbeChild = Join-Path $workspaceProbeRoot "workspace-probe.ps1"
+    New-Item -ItemType Directory -Force -Path $workspaceProbeRoot | Out-Null
+    Set-Content -LiteralPath $workspaceProbeChild -Encoding utf8NoBOM -Value @'
+param(
+    [Parameter(Mandatory)][string]$ModulePath,
+    [Parameter(Mandatory)][string]$CacheRoot,
+    [Parameter(Mandatory)][string]$EnvironmentRoot,
+    [Parameter(Mandatory)][string]$StampPath,
+    [Parameter(Mandatory)][string]$LockPath,
+    [Parameter(Mandatory)][string]$WorkspaceKey,
+    [Parameter(Mandatory)][string]$WorkspaceRoot,
+    [Parameter(Mandatory)][string]$WorkspaceLockPath,
+    [Parameter(Mandatory)][string]$ReadyPath,
+    [Parameter(Mandatory)][string]$ReleasePath,
+    [Parameter(Mandatory)][string]$ResultPath
+)
+$ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
+Import-Module -Name $ModulePath -Force
+$module = Get-Module windows_workspace
+$location = [pscustomobject]@{
+    CacheRoot = $CacheRoot
+    EnvironmentRoot = $EnvironmentRoot
+    StampPath = $StampPath
+    LockPath = $LockPath
+    IdentityKey = "shared-workspace-probe"
+    WorkspaceKey = $WorkspaceKey
+    WorkspaceRoot = $WorkspaceRoot
+    WorkspaceLockPath = $WorkspaceLockPath
+    CargoTargetDirectory = Join-Path $WorkspaceRoot "target"
+}
+$verify = {
+    if (
+        -not (Test-Path -LiteralPath $StampPath -PathType Leaf) -or
+        (Get-Content -Raw -LiteralPath $StampPath).Trim() -cne "ready"
+    ) {
+        throw "shared workspace probe environment is not ready"
+    }
+    return "verified"
+}.GetNewClosure()
+$workspace = {
+    param($Summary)
+    if ($Summary -cne "verified") {
+        throw "shared workspace probe did not receive verified state"
+    }
+    [System.IO.File]::WriteAllText($ReadyPath, "ready", [System.Text.UTF8Encoding]::new($false))
+    if (-not (Test-Path -LiteralPath $ReleasePath -PathType Leaf)) {
+        $watcher = [System.IO.FileSystemWatcher]::new(
+            (Split-Path -Parent $ReleasePath),
+            (Split-Path -Leaf $ReleasePath)
+        )
+        try {
+            $watcher.NotifyFilter = [System.IO.NotifyFilters]::FileName
+            $watcher.EnableRaisingEvents = $true
+            if (-not (Test-Path -LiteralPath $ReleasePath -PathType Leaf)) {
+                $change = $watcher.WaitForChanged(
+                    [System.IO.WatcherChangeTypes]::Created,
+                    10000
+                )
+                if ($change.TimedOut -or -not (Test-Path -LiteralPath $ReleasePath -PathType Leaf)) {
+                    throw "shared workspace probe timed out waiting for release"
+                }
+            }
+        }
+        finally {
+            $watcher.Dispose()
+        }
+    }
+}.GetNewClosure()
+& $module {
+    param($OwnedLocation, $VerifyAction, $WorkspaceAction)
+    Invoke-EasyConEnvironmentLifecycle -Mode Workspace -Location $OwnedLocation `
+        -SetupAction { throw "Workspace probe must not provision" } `
+        -VerifyAction $VerifyAction -WorkspaceAction $WorkspaceAction `
+        -LeaseTimeoutMilliseconds 10000
+} $location $verify $workspace | Out-Null
+[System.IO.File]::WriteAllText($ResultPath, "passed", [System.Text.UTF8Encoding]::new($false))
+'@
+    $workspaceProbeProcesses = [System.Collections.Generic.List[object]]::new()
+    try {
+        foreach ($entry in @(
+            [pscustomobject]@{ Name = "one"; Location = $location },
+            [pscustomobject]@{ Name = "two"; Location = $secondWorktreeLocation }
+        )) {
+            $ready = Join-Path $workspaceProbeRoot "$($entry.Name)-ready.txt"
+            $release = Join-Path $workspaceProbeRoot "$($entry.Name)-release.txt"
+            $result = Join-Path $workspaceProbeRoot "$($entry.Name)-result.txt"
+            $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+            $startInfo.FileName = Join-Path $PSHOME "pwsh.exe"
+            $startInfo.UseShellExecute = $false
+            $startInfo.RedirectStandardOutput = $true
+            $startInfo.RedirectStandardError = $true
+            foreach ($argument in @(
+                "-NoLogo", "-NoProfile", "-File", $workspaceProbeChild,
+                "-ModulePath", $modulePath,
+                "-CacheRoot", $entry.Location.CacheRoot,
+                "-EnvironmentRoot", $entry.Location.EnvironmentRoot,
+                "-StampPath", $entry.Location.StampPath,
+                "-LockPath", $entry.Location.LockPath,
+                "-WorkspaceKey", $entry.Location.WorkspaceKey,
+                "-WorkspaceRoot", $entry.Location.WorkspaceRoot,
+                "-WorkspaceLockPath", $entry.Location.WorkspaceLockPath,
+                "-ReadyPath", $ready,
+                "-ReleasePath", $release,
+                "-ResultPath", $result
+            )) {
+                $startInfo.ArgumentList.Add([string]$argument)
+            }
+            $workspaceProbeProcesses.Add([pscustomobject]@{
+                Name = $entry.Name
+                Process = [System.Diagnostics.Process]::Start($startInfo)
+                Ready = $ready
+                Release = $release
+                Result = $result
+            }) | Out-Null
+        }
+        foreach ($probe in $workspaceProbeProcesses) {
+            Wait-ContractFileCreated -Path $probe.Ready
+            Assert-Contract (-not $probe.Process.HasExited) `
+                "workspace probe $($probe.Name) must remain inside its synchronized gate"
+        }
+        Assert-Throws -Pattern "busy|ownership" -Action {
+            Enter-PrivateEnvironmentLease -Location $location -Access Exclusive `
+                -TimeoutMilliseconds 0
+        }
+        foreach ($probe in $workspaceProbeProcesses) {
+            [System.IO.File]::WriteAllText(
+                $probe.Release,
+                "release",
+                [System.Text.UTF8Encoding]::new($false)
+            )
+        }
+        foreach ($probe in $workspaceProbeProcesses) {
+            Assert-Contract ($probe.Process.WaitForExit(10000)) `
+                "workspace probe $($probe.Name) must finish after its release marker"
+            $output = $probe.Process.StandardOutput.ReadToEnd()
+            $probeError = $probe.Process.StandardError.ReadToEnd()
+            Assert-Contract (
+                $probe.Process.ExitCode -eq 0 -and
+                (Test-Path -LiteralPath $probe.Result -PathType Leaf) -and
+                (Get-Content -Raw -LiteralPath $probe.Result).Trim() -ceq "passed"
+            ) "workspace probe $($probe.Name) failed; output=$output error=$probeError"
+        }
+    }
+    finally {
+        foreach ($probe in $workspaceProbeProcesses) {
+            if (-not $probe.Process.HasExited) {
+                $probe.Process.Kill($true)
+                $probe.Process.WaitForExit()
+            }
+            $probe.Process.Dispose()
+        }
+    }
 
     $events.Clear()
     $workspaceWithOwnership = {
@@ -936,17 +1162,23 @@ if (
         -Description "Workspace gates must not start after verification fails"
 
     foreach ($mode in @("Setup", "Verify", "Workspace")) {
+        $contenderLocation = if ($mode -ceq "Setup") {
+            $location
+        }
+        else {
+            $secondWorktreeLocation
+        }
         $exclusive = Enter-PrivateEnvironmentLease -Location $location -Access Exclusive `
             -TimeoutMilliseconds 0
         try {
             $events.Clear()
             Assert-Throws -Pattern "busy|ownership" -Action {
-                Invoke-PrivateEnvironmentLifecycle -Mode $mode -Location $location `
+                Invoke-PrivateEnvironmentLifecycle -Mode $mode -Location $contenderLocation `
                     -SetupAction $setupAction -VerifyAction $verifyAction `
                     -WorkspaceAction $workspaceAction -LeaseTimeoutMilliseconds 0
             }
             Assert-Sequence -Actual $events.ToArray() -Expected @() `
-                -Description "an active Setup must exclude a competing $mode before state access"
+                -Description "an active Setup must exclude a competing $mode worktree before state access"
         }
         finally {
             $exclusive.Dispose()
@@ -1042,4 +1274,4 @@ finally {
     }
 }
 
-Write-Output "Windows environment lifecycle contracts passed: 20 cases"
+Write-Output "Windows environment lifecycle contracts passed: 24 cases"

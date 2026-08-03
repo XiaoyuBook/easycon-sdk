@@ -915,8 +915,8 @@ def parse_windows_build_environment(text):
     _require_json_keys(
         configuration, WINDOWS_CONFIGURATION_KEYS, "Windows build environment root"
     )
-    if type(configuration["version"]) is not int or configuration["version"] != 3:
-        raise ValueError("Windows build environment version must be the JSON integer 3")
+    if type(configuration["version"]) is not int or configuration["version"] != 4:
+        raise ValueError("Windows build environment version must be the JSON integer 4")
     if configuration["target"] != "x86_64-pc-windows-msvc":
         raise ValueError("Windows build target must remain x86_64-pc-windows-msvc")
     fingerprint_inputs = configuration["fingerprintInputs"]
