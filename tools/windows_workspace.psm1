@@ -616,6 +616,150 @@ function Get-EasyConSharedContentAsset {
     }
 }
 
+function Assert-EasyConAtomicFileDestination {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [string]$TrustedRoot,
+
+        [Parameter(Mandatory)]
+        [string]$Description
+    )
+
+    $resolved = Assert-EasyConPhysicalPath -Path $Path -TrustedRoot $TrustedRoot
+    New-EasyConSafeDirectory -Path (Split-Path -Parent $resolved) `
+        -TrustedRoot $TrustedRoot | Out-Null
+    Assert-EasyConPhysicalPath -Path $resolved -TrustedRoot $TrustedRoot | Out-Null
+    if (Test-Path -LiteralPath $resolved) {
+        $item = Get-Item -Force -LiteralPath $resolved -ErrorAction Stop
+        if ($item.PSIsContainer -or $item -isnot [System.IO.FileInfo]) {
+            throw "$Description destination must be a regular file: $resolved"
+        }
+    }
+    return $resolved
+}
+
+function Publish-EasyConContentFileAtomically {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Destination,
+
+        [Parameter(Mandatory)]
+        [ValidateSet("SHA256", "SHA512")]
+        [string]$Algorithm,
+
+        [Parameter(Mandatory)]
+        [string]$Hash,
+
+        [Parameter(Mandatory)]
+        [long]$Bytes,
+
+        [Parameter(Mandatory)]
+        [string]$TrustedRoot,
+
+        [Parameter(Mandatory)]
+        [string]$Description,
+
+        [Parameter(Mandatory)]
+        [scriptblock]$MaterializeAction,
+
+        [scriptblock]$MoveAction,
+
+        [ValidateRange(1, 10)]
+        [int]$CleanupMaxAttempts = 4,
+
+        [ValidateRange(0, 5000)]
+        [int]$CleanupRetryMilliseconds = 250,
+
+        [scriptblock]$CleanupRetryAction
+    )
+
+    $destinationPath = Assert-EasyConAtomicFileDestination -Path $Destination `
+        -TrustedRoot $TrustedRoot -Description $Description
+    $temporary = "$destinationPath.publish-$PID-$([guid]::NewGuid().ToString('N'))"
+    Assert-EasyConPhysicalPath -Path $temporary -TrustedRoot $TrustedRoot | Out-Null
+    $primaryFailure = $null
+    try {
+        & $MaterializeAction $temporary | Out-Null
+        Assert-EasyConContentFile -Path $temporary -Algorithm $Algorithm -Hash $Hash `
+            -Bytes $Bytes -TrustedRoot $TrustedRoot `
+            -Description "$Description materialized file" | Out-Null
+        Assert-EasyConAtomicFileDestination -Path $destinationPath `
+            -TrustedRoot $TrustedRoot -Description $Description | Out-Null
+        if ($null -eq $MoveAction) {
+            [System.IO.File]::Move($temporary, $destinationPath, $true)
+        }
+        else {
+            & $MoveAction $temporary $destinationPath | Out-Null
+        }
+        Assert-EasyConPhysicalPath -Path $destinationPath -TrustedRoot $TrustedRoot | Out-Null
+    }
+    catch {
+        $primaryFailure = $_
+        throw
+    }
+    finally {
+        $cleanupParameters = @{
+            Path = $temporary
+            TrustedRoot = $TrustedRoot
+            Description = "$Description atomic publication"
+            PrimaryFailure = $primaryFailure
+            MaxAttempts = $CleanupMaxAttempts
+            RetryMilliseconds = $CleanupRetryMilliseconds
+        }
+        if ($null -ne $CleanupRetryAction) {
+            $cleanupParameters.RetryAction = $CleanupRetryAction
+        }
+        Complete-EasyConTemporaryFileCleanup @cleanupParameters
+    }
+    return Assert-EasyConContentFile -Path $destinationPath -Algorithm $Algorithm `
+        -Hash $Hash -Bytes $Bytes -TrustedRoot $TrustedRoot `
+        -Description "$Description destination"
+}
+
+function Write-EasyConUtf8FileAtomically {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$Text,
+
+        [Parameter(Mandatory)]
+        [string]$TrustedRoot,
+
+        [Parameter(Mandatory)]
+        [string]$Description
+    )
+
+    $content = [System.Text.UTF8Encoding]::new($false, $true).GetBytes($Text)
+    $hash = [Convert]::ToHexString(
+        [System.Security.Cryptography.SHA256]::HashData($content)
+    ).ToLowerInvariant()
+    $materialize = {
+        param($Temporary)
+        $stream = [System.IO.FileStream]::new(
+            $Temporary,
+            [System.IO.FileMode]::CreateNew,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::None
+        )
+        try {
+            $stream.Write($content, 0, $content.Length)
+            $stream.Flush($true)
+        }
+        finally {
+            $stream.Dispose()
+        }
+    }.GetNewClosure()
+    return Publish-EasyConContentFileAtomically -Destination $Path -Algorithm SHA256 `
+        -Hash $hash -Bytes $content.Length -TrustedRoot $TrustedRoot `
+        -Description $Description -MaterializeAction $materialize
+}
+
 function Copy-EasyConContentFileAtomically {
     param(
         [Parameter(Mandatory)]
@@ -640,17 +784,20 @@ function Copy-EasyConContentFileAtomically {
         [string]$DestinationTrustedRoot,
 
         [Parameter(Mandatory)]
-        [string]$Description
+        [string]$Description,
+
+        [switch]$ReplaceExisting
     )
 
     $sourcePath = Assert-EasyConContentFile -Path $Source -Algorithm $Algorithm `
         -Hash $Hash -Bytes $Bytes -TrustedRoot $SourceTrustedRoot `
         -Description "$Description source"
-    $destinationPath = Assert-EasyConPhysicalPath -Path $Destination `
-        -TrustedRoot $DestinationTrustedRoot
-    New-EasyConSafeDirectory -Path (Split-Path -Parent $destinationPath) `
-        -TrustedRoot $DestinationTrustedRoot | Out-Null
-    if (Test-Path -LiteralPath $destinationPath -PathType Leaf) {
+    $destinationPath = Assert-EasyConAtomicFileDestination -Path $Destination `
+        -TrustedRoot $DestinationTrustedRoot -Description $Description
+    if ($sourcePath.Equals($destinationPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "$Description source and destination must be different files"
+    }
+    if (-not $ReplaceExisting -and (Test-Path -LiteralPath $destinationPath -PathType Leaf)) {
         try {
             return Assert-EasyConContentFile -Path $destinationPath -Algorithm $Algorithm `
                 -Hash $Hash -Bytes $Bytes -TrustedRoot $DestinationTrustedRoot `
@@ -658,31 +805,45 @@ function Copy-EasyConContentFileAtomically {
         }
         catch {
             Remove-Item -Force -LiteralPath $destinationPath -ErrorAction Stop
+            if (Test-Path -LiteralPath $destinationPath) {
+                throw "$Description damaged destination remains after removal: $destinationPath"
+            }
         }
     }
 
-    $temporary = "$destinationPath.copy-$PID-$([guid]::NewGuid().ToString('N'))"
-    Assert-EasyConPhysicalPath -Path $temporary -TrustedRoot $DestinationTrustedRoot | Out-Null
-    $primaryFailure = $null
-    try {
-        Copy-Item -LiteralPath $sourcePath -Destination $temporary
-        Assert-EasyConContentFile -Path $temporary -Algorithm $Algorithm -Hash $Hash `
-            -Bytes $Bytes -TrustedRoot $DestinationTrustedRoot `
-            -Description "$Description materialized copy" | Out-Null
-        [System.IO.File]::Move($temporary, $destinationPath)
-    }
-    catch {
-        $primaryFailure = $_
-        throw
-    }
-    finally {
-        Complete-EasyConTemporaryFileCleanup -Path $temporary `
-            -TrustedRoot $DestinationTrustedRoot -Description "$Description materialization" `
-            -PrimaryFailure $primaryFailure
-    }
-    return Assert-EasyConContentFile -Path $destinationPath -Algorithm $Algorithm `
-        -Hash $Hash -Bytes $Bytes -TrustedRoot $DestinationTrustedRoot `
-        -Description "$Description destination"
+    $materialize = {
+        param($Temporary)
+        $sourceStream = $null
+        $destinationStream = $null
+        try {
+            $sourceStream = [System.IO.FileStream]::new(
+                $sourcePath,
+                [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::Read,
+                [System.IO.FileShare]::Read
+            )
+            $destinationStream = [System.IO.FileStream]::new(
+                $Temporary,
+                [System.IO.FileMode]::CreateNew,
+                [System.IO.FileAccess]::Write,
+                [System.IO.FileShare]::None
+            )
+            $sourceStream.CopyTo($destinationStream, 65536)
+            $destinationStream.Flush($true)
+        }
+        finally {
+            if ($null -ne $destinationStream) {
+                $destinationStream.Dispose()
+            }
+            if ($null -ne $sourceStream) {
+                $sourceStream.Dispose()
+            }
+        }
+    }.GetNewClosure()
+    return Publish-EasyConContentFileAtomically -Destination $destinationPath `
+        -Algorithm $Algorithm -Hash $Hash -Bytes $Bytes `
+        -TrustedRoot $DestinationTrustedRoot -Description $Description `
+        -MaterializeAction $materialize
 }
 
 function Get-EasyConFingerprintInputHash {
@@ -1059,24 +1220,49 @@ function Get-EasyConTreeFingerprint {
         [string]$TrustedRoot
     )
 
-    $root = Assert-EasyConPhysicalTree -Path $Path -TrustedRoot $TrustedRoot
-    if (-not (Test-Path -LiteralPath $root -PathType Container)) {
-        throw "required environment tree is missing: $root"
+    Initialize-EasyConPreparedTreeAuditor
+    $audit = [EasyCon.WindowsWorkspace.PreparedTreeAuditor]::FingerprintTree(
+        $Path,
+        $TrustedRoot
+    )
+    if (-not [string]::IsNullOrWhiteSpace($audit.FailureCategory)) {
+        throw "prepared tree fingerprint failed closed: $($audit.FailureMessage)"
     }
-    $builder = [System.Text.StringBuilder]::new()
-    $files = @(Get-ChildItem -LiteralPath $root -Recurse -Force -File | Sort-Object FullName)
-    foreach ($file in $files) {
-        Assert-EasyConPhysicalPath -Path $file.FullName -TrustedRoot $root | Out-Null
-        $relative = [System.IO.Path]::GetRelativePath($root, $file.FullName).Replace('\', '/')
-        $hash = Get-EasyConFileHash -Path $file.FullName -Algorithm SHA256
-        [void]$builder.Append($relative).Append("`0").Append($file.Length).Append("`0").Append($hash).Append("`n")
-    }
-    $bytes = [System.Text.Encoding]::UTF8.GetBytes($builder.ToString())
-    $digest = [System.Security.Cryptography.SHA256]::HashData($bytes)
     return [pscustomobject]@{
-        Files = $files.Count
-        Sha256 = [System.Convert]::ToHexString($digest).ToLowerInvariant()
+        Files = $audit.TreeFiles
+        Sha256 = $audit.TreeSha256
     }
+}
+
+function Assert-EasyConPreparedPhysicalTree {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [string]$TrustedRoot,
+
+        [switch]$PassThru
+    )
+
+    try {
+        Initialize-EasyConPreparedTreeAuditor
+        $audit = [EasyCon.WindowsWorkspace.PreparedTreeAuditor]::ValidatePhysicalTree(
+            $Path,
+            $TrustedRoot
+        )
+    }
+    catch {
+        throw "physical tree validation failed closed: $($_.Exception.Message)"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($audit.FailureCategory)) {
+        throw $audit.FailureMessage
+    }
+    if ($PassThru) {
+        return $audit
+    }
+    return [string]$audit.RootPath
 }
 
 function Initialize-EasyConPreparedArtifactAuditor {
@@ -1459,6 +1645,1730 @@ namespace EasyCon.WindowsWorkspace
 '@
 }
 
+function Initialize-EasyConPreparedTreeAuditor {
+    if ($null -ne ("EasyCon.WindowsWorkspace.PreparedTreeAuditor" -as [type])) {
+        return
+    }
+
+    Add-Type -Language CSharp -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using Microsoft.Win32.SafeHandles;
+
+namespace EasyCon.WindowsWorkspace
+{
+    public sealed class PreparedTreeAuditResult
+    {
+        public long FilesScanned { get; internal set; }
+        public long TextFilesScanned { get; internal set; }
+        public long JsonDocumentsScanned { get; internal set; }
+        public long TotalBytesRead { get; internal set; }
+        public long FileContentReads { get; internal set; }
+        public long FileHashesComputed { get; internal set; }
+        public long PhysicalEntriesChecked { get; internal set; }
+        public long PhysicalEntriesBound { get; internal set; }
+        public long PhysicalCreateFileCalls { get; internal set; }
+        public long PhysicalReadDataLockCalls { get; internal set; }
+        public long PhysicalBasicInformationQueries { get; internal set; }
+        public long PhysicalIdentityQueries { get; internal set; }
+        public long PhysicalFinalPathQueries { get; internal set; }
+        public long DirectoriesEnumerated { get; internal set; }
+        public int ControlledEnumerationPasses { get; internal set; }
+        public int MaximumJsonWindowBytes { get; internal set; }
+        public int JsonWindowLimitBytes { get; internal set; }
+        public long TreeFiles { get; internal set; }
+        public string TreeSha256 { get; internal set; }
+        public string RootPath { get; internal set; }
+        public string FailureCategory { get; internal set; }
+        public string FailurePath { get; internal set; }
+        public string FailureMessage { get; internal set; }
+        public string MatchedLabel { get; internal set; }
+        public string TextDamageKind { get; internal set; }
+    }
+
+    internal sealed class PreparedVcpkgBoundPhysicalEntry
+    {
+        internal string Path;
+        internal bool IsDirectory;
+        internal SafeFileHandle Handle;
+        internal uint VolumeSerialNumber;
+        internal uint FileIndexHigh;
+        internal uint FileIndexLow;
+        internal bool IsCritical;
+    }
+
+    public sealed class PreparedVcpkgCheckoutBinding : IDisposable
+    {
+        internal readonly List<PreparedVcpkgBoundPhysicalEntry> Entries =
+            new List<PreparedVcpkgBoundPhysicalEntry>();
+        internal readonly HashSet<string> CriticalPaths = new HashSet<string>(
+            StringComparer.OrdinalIgnoreCase);
+        internal bool IsDisposed;
+
+        public PreparedTreeAuditResult Audit { get; internal set; }
+
+        public void AssertCurrent()
+        {
+            PreparedTreeAuditor.AssertVcpkgCheckoutBindingCurrent(this);
+        }
+
+        public void Dispose()
+        {
+            if (IsDisposed)
+            {
+                return;
+            }
+            IsDisposed = true;
+            for (int index = Entries.Count - 1; index >= 0; index--)
+            {
+                Entries[index].Handle.Dispose();
+            }
+            Entries.Clear();
+        }
+    }
+
+    public static class PreparedTreeAuditor
+    {
+        public const int JsonWindowLimitBytes = 65536;
+        private const int EncodingProbeBytes = 512;
+        private const int TextWindowCharacters = 16384;
+        private const int ContentBufferBytes = 65536;
+        private const int MaximumJsonDepth = 256;
+
+        private static readonly Encoding StrictUtf8 = new UTF8Encoding(false, true);
+        private static readonly Encoding StrictUtf16Le = new UnicodeEncoding(false, false, true);
+        private static readonly Encoding StrictUtf16Be = new UnicodeEncoding(true, false, true);
+
+        private sealed class DetectedEncoding
+        {
+            internal Encoding Encoding;
+            internal int PreambleLength;
+            internal bool ProtectedText;
+            internal string DamageKind;
+        }
+
+        private sealed class TreeFileRecord
+        {
+            internal string FullPath;
+            internal string RelativePath;
+            internal long Length;
+            internal string Sha256;
+        }
+
+        private sealed class TreeFileRecordComparer : IComparer<TreeFileRecord>
+        {
+            internal static readonly TreeFileRecordComparer Instance =
+                new TreeFileRecordComparer();
+
+            public int Compare(TreeFileRecord left, TreeFileRecord right)
+            {
+                return ComparePowerShellFullName(left.FullPath, right.FullPath);
+            }
+        }
+
+        private sealed class FileAuditResult
+        {
+            internal long BytesRead;
+            internal int ContentReadAttempts;
+            internal bool IsText;
+            internal bool IsJson;
+            internal string Sha256;
+            internal string RawMatchedLabel;
+            internal string StructuredMatchedLabel;
+            internal string TextDamage;
+            internal string TextDamageKind;
+            internal string JsonError;
+            internal bool JsonLimitExceeded;
+            internal int MaximumJsonWindowBytes;
+            internal string ResourceFailure;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ByHandleFileInformation
+        {
+            internal FileAttributes FileAttributes;
+            internal uint CreationTimeLow;
+            internal uint CreationTimeHigh;
+            internal uint LastAccessTimeLow;
+            internal uint LastAccessTimeHigh;
+            internal uint LastWriteTimeLow;
+            internal uint LastWriteTimeHigh;
+            internal uint VolumeSerialNumber;
+            internal uint FileSizeHigh;
+            internal uint FileSizeLow;
+            internal uint NumberOfLinks;
+            internal uint FileIndexHigh;
+            internal uint FileIndexLow;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FileBasicInformation
+        {
+            internal long CreationTime;
+            internal long LastAccessTime;
+            internal long LastWriteTime;
+            internal long ChangeTime;
+            internal FileAttributes FileAttributes;
+        }
+
+        // FILE_READ_DATA and FILE_LIST_DIRECTORY intentionally share this access bit.
+        private const uint FileReadData = 0x00000001;
+        private const uint FileListDirectory = 0x00000001;
+        private const uint FileShareRead = 0x00000001;
+        private const uint OpenExisting = 3;
+        private const uint FileFlagBackupSemantics = 0x02000000;
+        private const uint FileFlagOpenReparsePoint = 0x00200000;
+        private const uint Win32ExtendedPathCapacity = 32768;
+        private const int FileBasicInformationClass = 0;
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern SafeFileHandle CreateFile(
+            string fileName,
+            uint desiredAccess,
+            uint shareMode,
+            IntPtr securityAttributes,
+            uint creationDisposition,
+            uint flagsAndAttributes,
+            IntPtr templateFile);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern uint GetFinalPathNameByHandle(
+            SafeFileHandle file,
+            StringBuilder filePath,
+            uint filePathLength,
+            uint flags);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetFileInformationByHandle(
+            SafeFileHandle file,
+            out ByHandleFileInformation information);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetFileInformationByHandleEx(
+            SafeFileHandle file,
+            int fileInformationClass,
+            out FileBasicInformation information,
+            uint informationSize);
+
+        public static PreparedTreeAuditResult FingerprintTree(string path, string trustedRoot)
+        {
+            return AuditTree(path, trustedRoot, new string[0], new string[0], false);
+        }
+
+        public static PreparedTreeAuditResult ValidatePhysicalTree(string path, string trustedRoot)
+        {
+            PreparedTreeAuditResult result = new PreparedTreeAuditResult
+            {
+                JsonWindowLimitBytes = JsonWindowLimitBytes
+            };
+            string tree = path;
+            try
+            {
+                tree = NormalizeFullPath(path);
+                string trusted = NormalizeFullPath(trustedRoot);
+                AssertPhysicalTreeRoot(tree, trusted);
+                result.RootPath = tree;
+                result.ControlledEnumerationPasses = 1;
+                ScanPhysicalDirectory(tree, result);
+            }
+            catch (OutOfMemoryException exception)
+            {
+                SetFailure(result, "tree", tree, "memory allocation failed: " + exception.Message, null, null);
+            }
+            catch (Exception exception)
+            {
+                SetFailure(result, "tree", tree, exception.Message, null, null);
+            }
+            return result;
+        }
+
+        public static PreparedVcpkgCheckoutBinding BindVcpkgCheckout(
+            string path,
+            string trustedRoot,
+            string[] requiredRelativePaths)
+        {
+            if (requiredRelativePaths == null || requiredRelativePaths.Length == 0)
+            {
+                throw new ArgumentException("vcpkg required path set must not be empty");
+            }
+
+            PreparedTreeAuditResult result = new PreparedTreeAuditResult
+            {
+                JsonWindowLimitBytes = JsonWindowLimitBytes
+            };
+            PreparedVcpkgCheckoutBinding binding = new PreparedVcpkgCheckoutBinding
+            {
+                Audit = result
+            };
+            string tree = path;
+            try
+            {
+                tree = NormalizeFullPath(path);
+                string trusted = NormalizeFullPath(trustedRoot);
+                AssertPhysicalTreeRoot(tree, trusted);
+                result.RootPath = tree;
+                result.ControlledEnumerationPasses = 1;
+
+                binding.CriticalPaths.Add(tree);
+                binding.CriticalPaths.Add(NormalizeFullPath(Path.Combine(tree, ".git")));
+                foreach (string relative in requiredRelativePaths)
+                {
+                    if (!binding.CriticalPaths.Add(GetVcpkgRequiredPath(tree, relative)))
+                    {
+                        throw new InvalidOperationException(
+                            "vcpkg required path set contains a duplicate: " + relative);
+                    }
+                }
+                PreparedVcpkgBoundPhysicalEntry rootEntry = OpenBoundPhysicalEntry(
+                    tree,
+                    true,
+                    "vcpkg checkout root",
+                    true,
+                    result);
+                binding.Entries.Add(rootEntry);
+                result.PhysicalEntriesBound++;
+                ScanAndBindPhysicalDirectory(tree, result, binding);
+                if (result.FailureCategory == null)
+                {
+                    AssertVcpkgCriticalEntriesBound(binding, tree, requiredRelativePaths);
+                    AssertVcpkgCheckoutBindingCurrent(binding);
+                }
+            }
+            catch (OutOfMemoryException exception)
+            {
+                binding.Dispose();
+                SetFailure(result, "tree", tree, "memory allocation failed: " + exception.Message, null, null);
+            }
+            catch (Exception exception)
+            {
+                binding.Dispose();
+                SetFailure(result, "tree", tree, exception.Message, null, null);
+            }
+            if (result.FailureCategory != null)
+            {
+                binding.Dispose();
+            }
+            return binding;
+        }
+
+        public static PreparedTreeAuditResult AuditTree(
+            string path,
+            string trustedRoot,
+            string[] forbiddenLabels,
+            string[] forbiddenReferences,
+            bool auditContent)
+        {
+            if (forbiddenLabels == null || forbiddenReferences == null ||
+                forbiddenLabels.Length != forbiddenReferences.Length)
+            {
+                throw new ArgumentException("forbidden labels and references must have equal length");
+            }
+
+            PreparedTreeAuditResult result = new PreparedTreeAuditResult
+            {
+                JsonWindowLimitBytes = JsonWindowLimitBytes
+            };
+            string tree = path;
+            try
+            {
+                tree = NormalizeFullPath(path);
+                string trusted = NormalizeFullPath(trustedRoot);
+                AssertPhysicalTreeRoot(tree, trusted);
+                result.RootPath = tree;
+                result.ControlledEnumerationPasses = 1;
+
+                List<TreeFileRecord> files = new List<TreeFileRecord>();
+                if (!ScanDirectory(
+                    tree,
+                    tree,
+                    forbiddenLabels,
+                    forbiddenReferences,
+                    auditContent,
+                    result,
+                    files))
+                {
+                    return result;
+                }
+
+                files.Sort(TreeFileRecordComparer.Instance);
+                StringBuilder builder = new StringBuilder();
+                foreach (TreeFileRecord file in files)
+                {
+                    builder.Append(file.RelativePath)
+                        .Append('\0')
+                        .Append(file.Length.ToString(CultureInfo.InvariantCulture))
+                        .Append('\0')
+                        .Append(file.Sha256)
+                        .Append('\n');
+                }
+                byte[] digestBytes = Encoding.UTF8.GetBytes(builder.ToString());
+                result.TreeFiles = files.Count;
+                result.TreeSha256 = Convert.ToHexString(SHA256.HashData(digestBytes))
+                    .ToLowerInvariant();
+            }
+            catch (OutOfMemoryException exception)
+            {
+                SetFailure(result, "tree", tree, "memory allocation failed: " + exception.Message, null, null);
+            }
+            catch (Exception exception)
+            {
+                SetFailure(result, "tree", tree, exception.Message, null, null);
+            }
+            return result;
+        }
+
+        private static void ScanPhysicalDirectory(string directory, PreparedTreeAuditResult result)
+        {
+            if (result.FailureCategory != null)
+            {
+                return;
+            }
+            List<string> entries = new List<string>();
+            try
+            {
+                foreach (string entry in Directory.EnumerateFileSystemEntries(directory))
+                {
+                    entries.Add(entry);
+                }
+            }
+            catch (OutOfMemoryException)
+            {
+                throw;
+            }
+            catch (Exception exception)
+            {
+                SetFailure(
+                    result,
+                    "tree",
+                    directory,
+                    "cannot enumerate physical tree directory " + directory + ": " + exception.Message,
+                    null,
+                    null);
+                return;
+            }
+
+            entries.Sort(StringComparer.OrdinalIgnoreCase);
+            result.DirectoriesEnumerated++;
+            foreach (string entry in entries)
+            {
+                FileAttributes attributes;
+                try
+                {
+                    attributes = File.GetAttributes(entry);
+                }
+                catch (OutOfMemoryException)
+                {
+                    throw;
+                }
+                catch (Exception exception)
+                {
+                    SetFailure(
+                        result,
+                        "tree",
+                        entry,
+                        "cannot classify physical tree entry " + entry + ": " + exception.Message,
+                        null,
+                        null);
+                    return;
+                }
+                result.PhysicalEntriesChecked++;
+                if ((attributes & FileAttributes.ReparsePoint) != 0)
+                {
+                    SetFailure(
+                        result,
+                        "tree",
+                        entry,
+                        "physical tree contains a reparse point: " + entry,
+                        null,
+                        null);
+                    return;
+                }
+                if ((attributes & FileAttributes.Directory) != 0)
+                {
+                    ScanPhysicalDirectory(entry, result);
+                    if (result.FailureCategory != null)
+                    {
+                        return;
+                    }
+                }
+                else
+                {
+                    result.FilesScanned++;
+                }
+            }
+        }
+
+        private static void ScanAndBindPhysicalDirectory(
+            string directory,
+            PreparedTreeAuditResult result,
+            PreparedVcpkgCheckoutBinding binding)
+        {
+            if (result.FailureCategory != null)
+            {
+                return;
+            }
+            List<string> entries = new List<string>();
+            try
+            {
+                foreach (string entry in Directory.EnumerateFileSystemEntries(directory))
+                {
+                    entries.Add(entry);
+                }
+            }
+            catch (OutOfMemoryException)
+            {
+                throw;
+            }
+            catch (Exception exception)
+            {
+                SetFailure(
+                    result,
+                    "tree",
+                    directory,
+                    "cannot enumerate physical tree directory " + directory + ": " + exception.Message,
+                    null,
+                    null);
+                return;
+            }
+
+            entries.Sort(StringComparer.OrdinalIgnoreCase);
+            result.DirectoriesEnumerated++;
+            foreach (string entry in entries)
+            {
+                PreparedVcpkgBoundPhysicalEntry bound = OpenBoundPhysicalEntry(
+                    entry,
+                    null,
+                    "vcpkg checkout audited entry",
+                    binding.CriticalPaths.Contains(NormalizeFullPath(entry)),
+                    result);
+                binding.Entries.Add(bound);
+                result.PhysicalEntriesChecked++;
+                result.PhysicalEntriesBound++;
+                if (bound.IsDirectory)
+                {
+                    ScanAndBindPhysicalDirectory(entry, result, binding);
+                    if (result.FailureCategory != null)
+                    {
+                        return;
+                    }
+                }
+                else
+                {
+                    result.FilesScanned++;
+                }
+            }
+        }
+
+        private static void AssertVcpkgCriticalEntriesBound(
+            PreparedVcpkgCheckoutBinding binding,
+            string tree,
+            string[] requiredRelativePaths)
+        {
+            AssertVcpkgCriticalEntryBound(binding, tree, true, "vcpkg checkout root");
+            AssertVcpkgCriticalEntryBound(
+                binding,
+                NormalizeFullPath(Path.Combine(tree, ".git")),
+                true,
+                "vcpkg checkout .git");
+            foreach (string relative in requiredRelativePaths)
+            {
+                AssertVcpkgCriticalEntryBound(
+                    binding,
+                    GetVcpkgRequiredPath(tree, relative),
+                    false,
+                    "vcpkg required entry " + relative);
+            }
+        }
+
+        private static void AssertVcpkgCriticalEntryBound(
+            PreparedVcpkgCheckoutBinding binding,
+            string path,
+            bool expectedDirectory,
+            string description)
+        {
+            foreach (PreparedVcpkgBoundPhysicalEntry entry in binding.Entries)
+            {
+                if (entry.Path.Equals(path, StringComparison.OrdinalIgnoreCase))
+                {
+                    if (!entry.IsCritical || entry.IsDirectory != expectedDirectory)
+                    {
+                        throw new InvalidOperationException(description + " has an invalid physical binding");
+                    }
+                    return;
+                }
+            }
+            throw new InvalidOperationException(description + " is missing from the physical binding");
+        }
+
+        private static string GetVcpkgRequiredPath(string tree, string relative)
+        {
+            if (String.IsNullOrWhiteSpace(relative) || Path.IsPathFullyQualified(relative) ||
+                relative.StartsWith("/", StringComparison.Ordinal) ||
+                relative.StartsWith("\\", StringComparison.Ordinal) ||
+                relative.Contains("//") || relative.Contains("\\\\"))
+            {
+                throw new InvalidOperationException("vcpkg required path is not normalized: " + relative);
+            }
+            string[] components = relative.Split(
+                new char[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar },
+                StringSplitOptions.None);
+            if (components.Length == 0)
+            {
+                throw new InvalidOperationException("vcpkg required path is empty");
+            }
+            foreach (string component in components)
+            {
+                if (component.Length == 0 || component.Equals(".", StringComparison.Ordinal) ||
+                    component.Equals("..", StringComparison.Ordinal))
+                {
+                    throw new InvalidOperationException("vcpkg required path is not normalized: " + relative);
+                }
+            }
+            string path = NormalizeFullPath(Path.Combine(tree, relative));
+            if (!IsWithin(path, tree) || path.Equals(tree, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException("vcpkg required path escaped its checkout root: " + relative);
+            }
+            return path;
+        }
+
+        private static PreparedVcpkgBoundPhysicalEntry OpenBoundPhysicalEntry(
+            string path,
+            bool? expectedDirectory,
+            string description,
+            bool requireIdentityAndFinalPath,
+            PreparedTreeAuditResult result)
+        {
+            string logicalPath = NormalizeFullPath(path);
+            uint flags = FileFlagOpenReparsePoint | FileFlagBackupSemantics;
+            uint desiredAccess = FileReadData | FileListDirectory;
+            result.PhysicalCreateFileCalls++;
+            result.PhysicalReadDataLockCalls++;
+            SafeFileHandle handle = CreateFile(
+                GetWin32ExtendedPath(logicalPath),
+                desiredAccess,
+                FileShareRead,
+                IntPtr.Zero,
+                OpenExisting,
+                flags,
+                IntPtr.Zero);
+            if (handle == null || handle.IsInvalid)
+            {
+                int error = Marshal.GetLastWin32Error();
+                if (handle != null)
+                {
+                    handle.Dispose();
+                }
+                throw new IOException(
+                    "cannot bind " + description + " " + logicalPath + ": " +
+                    new System.ComponentModel.Win32Exception(error).Message);
+            }
+            try
+            {
+                FileBasicInformation basicInformation = GetBoundBasicInformation(
+                    handle,
+                    logicalPath,
+                    description,
+                    result);
+                bool isDirectory =
+                    (basicInformation.FileAttributes & FileAttributes.Directory) != 0;
+                AssertBoundPhysicalEntryState(
+                    basicInformation.FileAttributes,
+                    expectedDirectory,
+                    logicalPath,
+                    description);
+                PreparedVcpkgBoundPhysicalEntry bound = new PreparedVcpkgBoundPhysicalEntry
+                {
+                    Path = logicalPath,
+                    IsDirectory = isDirectory,
+                    Handle = handle,
+                    IsCritical = requireIdentityAndFinalPath
+                };
+                if (requireIdentityAndFinalPath)
+                {
+                    ByHandleFileInformation information = GetBoundFileInformation(
+                        handle,
+                        logicalPath,
+                        description,
+                        result);
+                    AssertBoundPhysicalEntryState(
+                        information.FileAttributes,
+                        isDirectory,
+                        logicalPath,
+                        description);
+                    string finalLogicalPath = GetBoundLogicalFinalPath(
+                        handle,
+                        logicalPath,
+                        description,
+                        result);
+                    if (!finalLogicalPath.Equals(logicalPath, StringComparison.OrdinalIgnoreCase))
+                    {
+                        throw new InvalidOperationException(
+                            description + " final path does not match the audited logical path: " +
+                            logicalPath);
+                    }
+                    bound.VolumeSerialNumber = information.VolumeSerialNumber;
+                    bound.FileIndexHigh = information.FileIndexHigh;
+                    bound.FileIndexLow = information.FileIndexLow;
+                }
+                return bound;
+            }
+            catch
+            {
+                handle.Dispose();
+                throw;
+            }
+        }
+
+        private static string GetBoundLogicalFinalPath(
+            SafeFileHandle handle,
+            string logicalPath,
+            string description,
+            PreparedTreeAuditResult result)
+        {
+            StringBuilder buffer = new StringBuilder((int)Win32ExtendedPathCapacity);
+            result.PhysicalFinalPathQueries++;
+            uint characters = GetFinalPathNameByHandle(
+                handle,
+                buffer,
+                Win32ExtendedPathCapacity,
+                0);
+            if (characters == 0)
+            {
+                int error = Marshal.GetLastWin32Error();
+                throw new IOException(
+                    "cannot resolve bound " + description + " " + logicalPath + ": " +
+                    new System.ComponentModel.Win32Exception(error).Message);
+            }
+            if (characters >= Win32ExtendedPathCapacity)
+            {
+                throw new IOException(
+                    "bound " + description + " final path exceeds the Win32 maximum: " +
+                    logicalPath);
+            }
+            return NormalizeFullPath(buffer.ToString());
+        }
+
+        internal static void AssertVcpkgCheckoutBindingCurrent(
+            PreparedVcpkgCheckoutBinding binding)
+        {
+            if (binding == null || binding.Audit == null || binding.IsDisposed)
+            {
+                throw new InvalidOperationException("vcpkg physical checkout binding is unavailable");
+            }
+            if (binding.Entries.Count == 0)
+            {
+                throw new InvalidOperationException("vcpkg physical checkout binding is empty");
+            }
+            int criticalEntries = 0;
+            foreach (PreparedVcpkgBoundPhysicalEntry entry in binding.Entries)
+            {
+                if (!entry.IsCritical)
+                {
+                    continue;
+                }
+                criticalEntries++;
+                ByHandleFileInformation heldInformation = GetBoundFileInformation(
+                    entry.Handle,
+                    entry.Path,
+                    "vcpkg checkout binding",
+                    binding.Audit);
+                AssertBoundPhysicalEntryState(
+                    heldInformation.FileAttributes,
+                    entry.IsDirectory,
+                    entry.Path,
+                    "vcpkg checkout binding");
+                if (heldInformation.VolumeSerialNumber != entry.VolumeSerialNumber ||
+                    heldInformation.FileIndexHigh != entry.FileIndexHigh ||
+                    heldInformation.FileIndexLow != entry.FileIndexLow)
+                {
+                    throw new InvalidOperationException(
+                        "vcpkg physical checkout binding identity changed: " + entry.Path);
+                }
+                PreparedVcpkgBoundPhysicalEntry current = OpenBoundPhysicalEntry(
+                    entry.Path,
+                    entry.IsDirectory,
+                    "vcpkg checkout binding path",
+                    true,
+                    binding.Audit);
+                try
+                {
+                    if (current.VolumeSerialNumber != entry.VolumeSerialNumber ||
+                        current.FileIndexHigh != entry.FileIndexHigh ||
+                        current.FileIndexLow != entry.FileIndexLow)
+                    {
+                        throw new InvalidOperationException(
+                            "vcpkg physical checkout binding path identity changed: " + entry.Path);
+                    }
+                }
+                finally
+                {
+                    current.Handle.Dispose();
+                }
+            }
+            if (criticalEntries != binding.CriticalPaths.Count)
+            {
+                throw new InvalidOperationException(
+                    "vcpkg physical checkout binding does not cover every critical path");
+            }
+        }
+
+        private static ByHandleFileInformation GetBoundFileInformation(
+            SafeFileHandle handle,
+            string path,
+            string description,
+            PreparedTreeAuditResult result)
+        {
+            ByHandleFileInformation information;
+            result.PhysicalIdentityQueries++;
+            if (!GetFileInformationByHandle(handle, out information))
+            {
+                int error = Marshal.GetLastWin32Error();
+                throw new IOException(
+                    "cannot inspect " + description + " " + path + ": " +
+                    new System.ComponentModel.Win32Exception(error).Message);
+            }
+            return information;
+        }
+
+        private static FileBasicInformation GetBoundBasicInformation(
+            SafeFileHandle handle,
+            string path,
+            string description,
+            PreparedTreeAuditResult result)
+        {
+            FileBasicInformation information;
+            result.PhysicalBasicInformationQueries++;
+            if (!GetFileInformationByHandleEx(
+                handle,
+                FileBasicInformationClass,
+                out information,
+                checked((uint)Marshal.SizeOf(typeof(FileBasicInformation)))))
+            {
+                int error = Marshal.GetLastWin32Error();
+                throw new IOException(
+                    "cannot inspect " + description + " " + path + ": " +
+                    new System.ComponentModel.Win32Exception(error).Message);
+            }
+            return information;
+        }
+
+        private static void AssertBoundPhysicalEntryState(
+            FileAttributes attributes,
+            bool? expectedDirectory,
+            string path,
+            string description)
+        {
+            if ((attributes & FileAttributes.ReparsePoint) != 0)
+            {
+                throw new InvalidOperationException(
+                    description + " contains a reparse point: " + path);
+            }
+            bool isDirectory = (attributes & FileAttributes.Directory) != 0;
+            if (expectedDirectory.HasValue && isDirectory != expectedDirectory.Value)
+            {
+                string expected = expectedDirectory.Value ? "directory" : "file";
+                throw new InvalidOperationException(
+                    description + " must be a " + expected + ": " + path);
+            }
+        }
+
+        private static bool ScanDirectory(
+            string directory,
+            string tree,
+            string[] labels,
+            string[] references,
+            bool auditContent,
+            PreparedTreeAuditResult result,
+            List<TreeFileRecord> files)
+        {
+            List<string> entries = new List<string>();
+            try
+            {
+                foreach (string entry in Directory.EnumerateFileSystemEntries(directory))
+                {
+                    entries.Add(entry);
+                }
+            }
+            catch (OutOfMemoryException)
+            {
+                throw;
+            }
+            catch (Exception exception)
+            {
+                SetFailure(
+                    result,
+                    "tree",
+                    directory,
+                    "cannot enumerate physical tree directory " + directory + ": " + exception.Message,
+                    null,
+                    null);
+                return false;
+            }
+
+            result.DirectoriesEnumerated++;
+            foreach (string entry in entries)
+            {
+                FileAttributes attributes;
+                try
+                {
+                    attributes = File.GetAttributes(entry);
+                }
+                catch (OutOfMemoryException)
+                {
+                    throw;
+                }
+                catch (Exception exception)
+                {
+                    SetFailure(
+                        result,
+                        "tree",
+                        entry,
+                        "cannot classify physical tree entry " + entry + ": " + exception.Message,
+                        null,
+                        null);
+                    return false;
+                }
+                result.PhysicalEntriesChecked++;
+                if ((attributes & FileAttributes.ReparsePoint) != 0)
+                {
+                    SetFailure(
+                        result,
+                        "tree",
+                        entry,
+                        "physical tree contains a reparse point: " + entry,
+                        null,
+                        null);
+                    return false;
+                }
+                if ((attributes & FileAttributes.Directory) != 0)
+                {
+                    if (!ScanDirectory(
+                        entry,
+                        tree,
+                        labels,
+                        references,
+                        auditContent,
+                        result,
+                        files))
+                    {
+                        return false;
+                    }
+                    continue;
+                }
+
+                FileAuditResult file = ScanFile(entry, labels, references, auditContent);
+                result.FileContentReads += file.ContentReadAttempts;
+                result.TotalBytesRead += file.BytesRead;
+                result.MaximumJsonWindowBytes = Math.Max(
+                    result.MaximumJsonWindowBytes,
+                    file.MaximumJsonWindowBytes);
+                if (!String.IsNullOrWhiteSpace(file.ResourceFailure))
+                {
+                    SetFailure(
+                        result,
+                        "resource",
+                        entry,
+                        file.ResourceFailure,
+                        null,
+                        null);
+                    return false;
+                }
+                if (auditContent)
+                {
+                    if (!String.IsNullOrWhiteSpace(file.RawMatchedLabel))
+                    {
+                        SetFailure(
+                            result,
+                            "raw",
+                            entry,
+                            null,
+                            file.RawMatchedLabel,
+                            null);
+                        return false;
+                    }
+                    if (!String.IsNullOrWhiteSpace(file.StructuredMatchedLabel))
+                    {
+                        SetFailure(
+                            result,
+                            "structured",
+                            entry,
+                            null,
+                            file.StructuredMatchedLabel,
+                            null);
+                        return false;
+                    }
+                    if (!String.IsNullOrWhiteSpace(file.TextDamage))
+                    {
+                        SetFailure(
+                            result,
+                            "text",
+                            entry,
+                            file.TextDamage,
+                            null,
+                            file.TextDamageKind);
+                        return false;
+                    }
+                    if (file.JsonLimitExceeded)
+                    {
+                        SetFailure(
+                            result,
+                            "json-limit",
+                            entry,
+                            file.JsonError,
+                            null,
+                            null);
+                        return false;
+                    }
+                    bool requiresJson = Path.GetExtension(entry).Equals(
+                        ".json",
+                        StringComparison.OrdinalIgnoreCase);
+                    if (requiresJson && (!file.IsText || !file.IsJson))
+                    {
+                        string jsonDamage = String.IsNullOrWhiteSpace(file.JsonError)
+                            ? "the file is not strict supported text JSON"
+                            : file.JsonError;
+                        SetFailure(result, "json", entry, jsonDamage, null, null);
+                        return false;
+                    }
+                }
+
+                result.FilesScanned++;
+                if (file.IsText)
+                {
+                    result.TextFilesScanned++;
+                }
+                if (file.IsJson)
+                {
+                    result.JsonDocumentsScanned++;
+                }
+                result.FileHashesComputed++;
+                string relative = Path.GetRelativePath(tree, entry)
+                    .Replace(Path.DirectorySeparatorChar, '/')
+                    .Replace(Path.AltDirectorySeparatorChar, '/');
+                if (relative.Equals("..", StringComparison.Ordinal) ||
+                    relative.StartsWith("../", StringComparison.Ordinal))
+                {
+                    SetFailure(
+                        result,
+                        "tree",
+                        entry,
+                        "physical tree entry escaped its root: " + entry,
+                        null,
+                        null);
+                    return false;
+                }
+                files.Add(new TreeFileRecord
+                {
+                    FullPath = entry,
+                    RelativePath = relative,
+                    Length = file.BytesRead,
+                    Sha256 = file.Sha256
+                });
+            }
+            return true;
+        }
+
+        private static FileAuditResult ScanFile(
+            string path,
+            string[] labels,
+            string[] references,
+            bool auditContent)
+        {
+            FileAuditResult result = new FileAuditResult();
+            ContentScanner scanner = null;
+            try
+            {
+                using (FileStream stream = new FileStream(
+                    path,
+                    FileMode.Open,
+                    FileAccess.Read,
+                    FileShare.Read,
+                    ContentBufferBytes,
+                    FileOptions.SequentialScan))
+                using (IncrementalHash hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256))
+                {
+                    result.ContentReadAttempts = 1;
+                    long expectedLength = stream.Length;
+                    byte[] probe = new byte[EncodingProbeBytes];
+                    int probeLength = 0;
+                    while (probeLength < probe.Length)
+                    {
+                        int read = stream.Read(probe, probeLength, probe.Length - probeLength);
+                        if (read == 0)
+                        {
+                            break;
+                        }
+                        hash.AppendData(probe, probeLength, read);
+                        result.BytesRead += read;
+                        probeLength += read;
+                    }
+
+                    if (auditContent)
+                    {
+                        DetectedEncoding encoding = DetectEncoding(probe, probeLength);
+                        scanner = new ContentScanner(encoding, labels, references);
+                        scanner.Accept(
+                            probe,
+                            encoding.PreambleLength,
+                            Math.Max(0, probeLength - encoding.PreambleLength));
+                    }
+
+                    byte[] buffer = new byte[ContentBufferBytes];
+                    int bytesRead;
+                    while ((bytesRead = stream.Read(buffer, 0, buffer.Length)) > 0)
+                    {
+                        hash.AppendData(buffer, 0, bytesRead);
+                        result.BytesRead += bytesRead;
+                        if (scanner != null)
+                        {
+                            scanner.Accept(buffer, 0, bytesRead);
+                        }
+                    }
+                    if (scanner != null)
+                    {
+                        scanner.Finish();
+                        CopyScannerResult(scanner, result);
+                    }
+                    if (result.BytesRead != expectedLength || stream.Length != expectedLength)
+                    {
+                        result.ResourceFailure = "file changed while being read";
+                        return result;
+                    }
+                    result.Sha256 = Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant();
+                }
+            }
+            catch (OutOfMemoryException exception)
+            {
+                result.ResourceFailure = "memory allocation failed: " + exception.Message;
+            }
+            catch (IOException exception)
+            {
+                result.ResourceFailure = "file read failed: " + exception.Message;
+            }
+            catch (UnauthorizedAccessException exception)
+            {
+                result.ResourceFailure = "file access failed: " + exception.Message;
+            }
+            catch (Exception exception)
+            {
+                result.ResourceFailure = "file audit failed: " + exception.Message;
+            }
+            if (scanner != null)
+            {
+                CopyScannerResult(scanner, result);
+            }
+            return result;
+        }
+
+        private static void CopyScannerResult(ContentScanner scanner, FileAuditResult result)
+        {
+            result.IsText = scanner.IsText;
+            result.IsJson = scanner.IsJson;
+            result.RawMatchedLabel = scanner.RawMatchedLabel;
+            result.StructuredMatchedLabel = scanner.StructuredMatchedLabel;
+            result.TextDamage = scanner.TextDamage;
+            result.TextDamageKind = scanner.TextDamageKind;
+            result.JsonError = scanner.JsonError;
+            result.JsonLimitExceeded = scanner.JsonLimitExceeded;
+            result.MaximumJsonWindowBytes = scanner.MaximumJsonWindowBytes;
+        }
+
+        private sealed class ContentScanner
+        {
+            private readonly DetectedEncoding encoding;
+            private readonly string[] labels;
+            private readonly string[] references;
+            private readonly Decoder decoder;
+            private readonly char[] characters = new char[TextWindowCharacters];
+            private readonly JsonStreamScanner json;
+            private readonly int maximumReferenceLength;
+            private string tail = String.Empty;
+
+            internal bool IsText { get; private set; }
+            internal bool IsJson { get; private set; }
+            internal string RawMatchedLabel { get; private set; }
+            internal string StructuredMatchedLabel { get; private set; }
+            internal string TextDamage { get; private set; }
+            internal string TextDamageKind { get; private set; }
+            internal string JsonError { get; private set; }
+            internal bool JsonLimitExceeded { get; private set; }
+            internal int MaximumJsonWindowBytes { get; private set; }
+
+            internal ContentScanner(DetectedEncoding encoding, string[] labels, string[] references)
+            {
+                this.encoding = encoding;
+                this.labels = labels;
+                this.references = references;
+                decoder = encoding.Encoding.GetDecoder();
+                IsText = true;
+                foreach (string reference in references)
+                {
+                    maximumReferenceLength = Math.Max(maximumReferenceLength, reference.Length);
+                }
+                json = new JsonStreamScanner(labels, references);
+            }
+
+            internal void Accept(byte[] bytes, int offset, int count)
+            {
+                if (!IsText || TextDamage != null || count == 0)
+                {
+                    return;
+                }
+                try
+                {
+                    int remaining = count;
+                    int current = offset;
+                    while (remaining > 0)
+                    {
+                        int bytesUsed;
+                        int charsUsed;
+                        bool completed;
+                        decoder.Convert(
+                            bytes,
+                            current,
+                            remaining,
+                            characters,
+                            0,
+                            characters.Length,
+                            false,
+                            out bytesUsed,
+                            out charsUsed,
+                            out completed);
+                        if (charsUsed > 0)
+                        {
+                            ProcessCharacters(characters, charsUsed);
+                        }
+                        if (!IsText || TextDamage != null)
+                        {
+                            return;
+                        }
+                        if (bytesUsed == 0 && charsUsed == 0)
+                        {
+                            throw new DecoderFallbackException("text decoder made no progress");
+                        }
+                        current += bytesUsed;
+                        remaining -= bytesUsed;
+                    }
+                }
+                catch (DecoderFallbackException exception)
+                {
+                    HandleDecoderFailure(exception.Message);
+                }
+                catch (EncoderFallbackException exception)
+                {
+                    HandleDecoderFailure(exception.Message);
+                }
+            }
+
+            internal void Finish()
+            {
+                if (IsText && TextDamage == null)
+                {
+                    try
+                    {
+                        bool completed = false;
+                        while (!completed)
+                        {
+                            int bytesUsed;
+                            int charsUsed;
+                            decoder.Convert(
+                                new byte[0],
+                                0,
+                                0,
+                                characters,
+                                0,
+                                characters.Length,
+                                true,
+                                out bytesUsed,
+                                out charsUsed,
+                                out completed);
+                            if (charsUsed > 0)
+                            {
+                                ProcessCharacters(characters, charsUsed);
+                            }
+                            if (!IsText || TextDamage != null)
+                            {
+                                return;
+                            }
+                            if (!completed && charsUsed == 0)
+                            {
+                                throw new DecoderFallbackException("text decoder did not complete");
+                            }
+                        }
+                    }
+                    catch (DecoderFallbackException exception)
+                    {
+                        HandleDecoderFailure(exception.Message);
+                    }
+                    catch (EncoderFallbackException exception)
+                    {
+                        HandleDecoderFailure(exception.Message);
+                    }
+                }
+                if (!IsText || TextDamage != null)
+                {
+                    return;
+                }
+                json.Finish();
+                IsJson = json.IsJson;
+                StructuredMatchedLabel = json.MatchedLabel;
+                JsonError = json.Error;
+                JsonLimitExceeded = json.LimitExceeded;
+                MaximumJsonWindowBytes = json.MaximumWindowBytes;
+            }
+
+            private void ProcessCharacters(char[] value, int length)
+            {
+                string chunk = new string(value, 0, length);
+                if (chunk.IndexOf('\0') >= 0)
+                {
+                    if (encoding.ProtectedText)
+                    {
+                        TextDamage = "contains a NUL character";
+                        TextDamageKind = encoding.DamageKind;
+                    }
+                    else
+                    {
+                        IsText = false;
+                        RawMatchedLabel = null;
+                    }
+                    return;
+                }
+                if (RawMatchedLabel == null)
+                {
+                    string search = tail + chunk;
+                    RawMatchedLabel = FindReference(search, labels, references);
+                    if (maximumReferenceLength > 1)
+                    {
+                        int tailLength = Math.Min(maximumReferenceLength - 1, search.Length);
+                        tail = search.Substring(search.Length - tailLength);
+                    }
+                }
+                try
+                {
+                    json.Accept(value, length);
+                }
+                catch (EncoderFallbackException exception)
+                {
+                    HandleDecoderFailure(exception.Message);
+                }
+            }
+
+            private void HandleDecoderFailure(string message)
+            {
+                if (encoding.ProtectedText)
+                {
+                    TextDamage = message;
+                    TextDamageKind = encoding.DamageKind;
+                }
+                else
+                {
+                    IsText = false;
+                    RawMatchedLabel = null;
+                }
+            }
+        }
+
+        private sealed class JsonStreamScanner
+        {
+            private readonly string[] labels;
+            private readonly string[] references;
+            private readonly byte[] buffer = new byte[JsonWindowLimitBytes];
+            private readonly byte[] utf8 = new byte[TextWindowCharacters * 3];
+            private readonly JsonReaderOptions options = new JsonReaderOptions
+            {
+                AllowTrailingCommas = false,
+                CommentHandling = JsonCommentHandling.Disallow,
+                MaxDepth = MaximumJsonDepth
+            };
+            private JsonReaderState state;
+            private int buffered;
+            private bool sawToken;
+            private bool failed;
+
+            internal bool IsJson { get; private set; }
+            internal string MatchedLabel { get; private set; }
+            internal string Error { get; private set; }
+            internal bool LimitExceeded { get; private set; }
+            internal int MaximumWindowBytes { get; private set; }
+
+            internal JsonStreamScanner(string[] labels, string[] references)
+            {
+                this.labels = labels;
+                this.references = references;
+                state = new JsonReaderState(options);
+            }
+
+            internal void Accept(char[] characters, int length)
+            {
+                if (failed || length == 0)
+                {
+                    return;
+                }
+                int byteCount = StrictUtf8.GetBytes(characters, 0, length, utf8, 0);
+                int offset = 0;
+                while (offset < byteCount && !failed)
+                {
+                    if (buffered == buffer.Length && !Process(false))
+                    {
+                        return;
+                    }
+                    int copied = Math.Min(buffer.Length - buffered, byteCount - offset);
+                    Buffer.BlockCopy(utf8, offset, buffer, buffered, copied);
+                    buffered += copied;
+                    offset += copied;
+                    MaximumWindowBytes = Math.Max(MaximumWindowBytes, buffered);
+                    if (!Process(false))
+                    {
+                        return;
+                    }
+                }
+            }
+
+            internal void Finish()
+            {
+                if (failed)
+                {
+                    return;
+                }
+                if (Process(true))
+                {
+                    IsJson = sawToken;
+                }
+            }
+
+            private bool Process(bool isFinalBlock)
+            {
+                Utf8JsonReader reader = new Utf8JsonReader(
+                    new ReadOnlySpan<byte>(buffer, 0, buffered),
+                    isFinalBlock,
+                    state);
+                try
+                {
+                    while (reader.Read())
+                    {
+                        sawToken = true;
+                        if (MatchedLabel == null &&
+                            (reader.TokenType == JsonTokenType.PropertyName ||
+                             reader.TokenType == JsonTokenType.String))
+                        {
+                            MatchedLabel = FindReference(reader.GetString(), labels, references);
+                        }
+                    }
+                }
+                catch (JsonException exception)
+                {
+                    if (reader.CurrentDepth >= MaximumJsonDepth - 1 ||
+                        exception.Message.IndexOf(
+                            "maximum depth",
+                            StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        LimitExceeded = true;
+                    }
+                    Error = exception.Message;
+                    failed = true;
+                    return false;
+                }
+
+                int consumed = checked((int)reader.BytesConsumed);
+                state = reader.CurrentState;
+                int remaining = buffered - consumed;
+                if (remaining > 0 && consumed > 0)
+                {
+                    Buffer.BlockCopy(buffer, consumed, buffer, 0, remaining);
+                }
+                buffered = remaining;
+                if (!isFinalBlock && buffered == buffer.Length)
+                {
+                    LimitExceeded = true;
+                    Error = "a JSON token exceeds the bounded " +
+                        JsonWindowLimitBytes + " byte audit window";
+                    failed = true;
+                    return false;
+                }
+                return true;
+            }
+        }
+
+        private static DetectedEncoding DetectEncoding(byte[] probe, int length)
+        {
+            if (length >= 3 && probe[0] == 0xef && probe[1] == 0xbb && probe[2] == 0xbf)
+            {
+                return NewEncoding(StrictUtf8, 3, true, "BOM");
+            }
+            if (length >= 2 && probe[0] == 0xff && probe[1] == 0xfe)
+            {
+                return NewEncoding(StrictUtf16Le, 2, true, "BOM");
+            }
+            if (length >= 2 && probe[0] == 0xfe && probe[1] == 0xff)
+            {
+                return NewEncoding(StrictUtf16Be, 2, true, "BOM");
+            }
+            if (LooksLikeUtf16(probe, length, true))
+            {
+                return NewEncoding(StrictUtf16Le, 0, true, "inferred UTF-16LE");
+            }
+            if (LooksLikeUtf16(probe, length, false))
+            {
+                return NewEncoding(StrictUtf16Be, 0, true, "inferred UTF-16BE");
+            }
+            return NewEncoding(StrictUtf8, 0, false, "UTF-8");
+        }
+
+        private static DetectedEncoding NewEncoding(
+            Encoding encoding,
+            int preambleLength,
+            bool protectedText,
+            string damageKind)
+        {
+            return new DetectedEncoding
+            {
+                Encoding = encoding,
+                PreambleLength = preambleLength,
+                ProtectedText = protectedText,
+                DamageKind = damageKind
+            };
+        }
+
+        private static bool LooksLikeUtf16(byte[] probe, int length, bool littleEndian)
+        {
+            int pairs = length / 2;
+            if (pairs < 2)
+            {
+                return false;
+            }
+            int compatible = 0;
+            int nullLane = 0;
+            for (int index = 0; index < pairs; index++)
+            {
+                byte text = probe[(index * 2) + (littleEndian ? 0 : 1)];
+                byte expectedNull = probe[(index * 2) + (littleEndian ? 1 : 0)];
+                if (expectedNull == 0)
+                {
+                    nullLane++;
+                    if (text == 0x09 || text == 0x0a || text == 0x0d ||
+                        (text >= 0x20 && text <= 0x7e))
+                    {
+                        compatible++;
+                    }
+                }
+            }
+            return nullLane >= 2 &&
+                nullLane * 100 >= pairs * 75 &&
+                compatible * 100 >= pairs * 75;
+        }
+
+        private static int ComparePowerShellFullName(string left, string right)
+        {
+            if (Object.ReferenceEquals(left, right))
+            {
+                return 0;
+            }
+            if (left == null)
+            {
+                return -1;
+            }
+            if (right == null)
+            {
+                return 1;
+            }
+            return CultureInfo.CurrentCulture.CompareInfo.Compare(
+                left,
+                right,
+                CompareOptions.IgnoreCase);
+        }
+
+        private static string NormalizeFullPath(string path)
+        {
+            if (String.IsNullOrWhiteSpace(path))
+            {
+                throw new ArgumentException("path must not be empty");
+            }
+            string logicalInput = GetLogicalPathInput(path);
+            string fullPath = Path.GetFullPath(logicalInput);
+            string volumeRoot = Path.GetPathRoot(fullPath);
+            if (String.IsNullOrWhiteSpace(volumeRoot))
+            {
+                throw new InvalidOperationException(
+                    "path does not have a filesystem root: " + logicalInput);
+            }
+            if (fullPath.Equals(volumeRoot, StringComparison.OrdinalIgnoreCase))
+            {
+                return fullPath;
+            }
+            return fullPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        }
+
+        private static string GetLogicalPathInput(string path)
+        {
+            if (path.StartsWith(@"\\.\", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException("device paths are not accepted");
+            }
+            if (!path.StartsWith(@"\\?\", StringComparison.OrdinalIgnoreCase))
+            {
+                return path;
+            }
+            if (path.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase))
+            {
+                return @"\\" + path.Substring(8);
+            }
+            string localPath = path.Substring(4);
+            if (localPath.Length < 3 || localPath[1] != ':' ||
+                (localPath[2] != Path.DirectorySeparatorChar &&
+                    localPath[2] != Path.AltDirectorySeparatorChar))
+            {
+                throw new InvalidOperationException("unsupported extended Win32 path");
+            }
+            return localPath;
+        }
+
+        private static string GetWin32ExtendedPath(string path)
+        {
+            string logicalPath = NormalizeFullPath(path);
+            if (logicalPath.StartsWith(@"\\", StringComparison.Ordinal))
+            {
+                return @"\\?\UNC\" + logicalPath.Substring(2);
+            }
+            if (logicalPath.Length < 3 || logicalPath[1] != ':' ||
+                (logicalPath[2] != Path.DirectorySeparatorChar &&
+                    logicalPath[2] != Path.AltDirectorySeparatorChar))
+            {
+                throw new InvalidOperationException(
+                    "path cannot be represented as an extended Win32 filesystem path: " + logicalPath);
+            }
+            return @"\\?\" + logicalPath;
+        }
+
+        private static void AssertPhysicalTreeRoot(string tree, string trustedRoot)
+        {
+            if (!IsWithin(tree, trustedRoot))
+            {
+                throw new InvalidOperationException("physical path escaped its trusted root: " + tree);
+            }
+            if (!Directory.Exists(tree))
+            {
+                throw new InvalidOperationException("required environment tree is missing: " + tree);
+            }
+            AssertPhysicalComponents(trustedRoot);
+            if (!tree.Equals(trustedRoot, StringComparison.OrdinalIgnoreCase))
+            {
+                string relative = Path.GetRelativePath(trustedRoot, tree);
+                string current = trustedRoot;
+                foreach (string component in relative.Split(
+                    new char[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar },
+                    StringSplitOptions.RemoveEmptyEntries))
+                {
+                    current = Path.Combine(current, component);
+                    AssertPhysicalComponent(current);
+                }
+            }
+        }
+
+        private static void AssertPhysicalComponents(string path)
+        {
+            string volumeRoot = Path.GetPathRoot(path);
+            AssertPhysicalComponent(volumeRoot);
+            string relative = path.Substring(volumeRoot.Length).TrimStart(
+                Path.DirectorySeparatorChar,
+                Path.AltDirectorySeparatorChar);
+            if (relative.Length == 0)
+            {
+                return;
+            }
+            string current = volumeRoot;
+            foreach (string component in relative.Split(
+                new char[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar },
+                StringSplitOptions.RemoveEmptyEntries))
+            {
+                current = Path.Combine(current, component);
+                AssertPhysicalComponent(current);
+            }
+        }
+
+        private static void AssertPhysicalComponent(string path)
+        {
+            try
+            {
+                if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0)
+                {
+                    throw new InvalidOperationException("physical tree contains a reparse point: " + path);
+                }
+            }
+            catch (OutOfMemoryException)
+            {
+                throw;
+            }
+            catch (InvalidOperationException)
+            {
+                throw;
+            }
+            catch (Exception exception)
+            {
+                throw new InvalidOperationException(
+                    "cannot classify physical path component " + path + ": " + exception.Message,
+                    exception);
+            }
+        }
+
+        private static bool IsWithin(string path, string root)
+        {
+            if (path.Equals(root, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+            string prefix = root + Path.DirectorySeparatorChar;
+            return path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static void SetFailure(
+            PreparedTreeAuditResult result,
+            string category,
+            string path,
+            string message,
+            string matchedLabel,
+            string textDamageKind)
+        {
+            if (result.FailureCategory != null)
+            {
+                return;
+            }
+            result.FailureCategory = category;
+            result.FailurePath = path;
+            result.FailureMessage = message;
+            result.MatchedLabel = matchedLabel;
+            result.TextDamageKind = textDamageKind;
+        }
+
+        private static string FindReference(string text, string[] labels, string[] references)
+        {
+            if (text == null)
+            {
+                return null;
+            }
+            for (int index = 0; index < references.Length; index++)
+            {
+                if (text.IndexOf(references[index], StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    return labels[index];
+                }
+            }
+            return null;
+        }
+    }
+}
+'@
+}
+
 function Assert-EasyConPreparedTextArtifactDoesNotReferenceRoots {
     param(
         [Parameter(Mandatory)]
@@ -1527,7 +3437,7 @@ function Assert-EasyConPreparedTextArtifactDoesNotReferenceRoots {
     return $audit
 }
 
-function Assert-EasyConPreparedTreeDoesNotReferenceRepository {
+function Get-EasyConPreparedTreeVerification {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
@@ -1542,15 +3452,9 @@ function Assert-EasyConPreparedTreeDoesNotReferenceRepository {
         [string]$WritableRoot,
 
         [Parameter(Mandatory)]
-        [string]$Description,
-
-        [switch]$PassThru
+        [string]$Description
     )
 
-    $tree = Assert-EasyConPhysicalPath -Path $Path -TrustedRoot $TrustedRoot
-    if (-not (Test-Path -LiteralPath $tree -PathType Container)) {
-        throw "required environment tree is missing: $tree"
-    }
     $forbiddenRoots = [System.Collections.Generic.List[object]]::new()
     $repository = Resolve-EasyConFullPath -Path $RepositoryRoot
     $forbiddenRoots.Add([pscustomobject]@{
@@ -1574,76 +3478,93 @@ function Assert-EasyConPreparedTreeDoesNotReferenceRepository {
         }
     }
 
-    Initialize-EasyConPreparedArtifactAuditor
-    $summary = [ordered]@{
-        FilesScanned = 0L
-        TextFilesScanned = 0L
-        JsonDocumentsScanned = 0L
-        TotalBytesRead = 0L
-        MaximumJsonWindowBytes = 0
-        JsonWindowLimitBytes = `
-            [EasyCon.WindowsWorkspace.PreparedArtifactAuditor]::JsonWindowLimitBytes
-    }
-    $enumerators = [System.Collections.Generic.Stack[System.Collections.IEnumerator]]::new()
     try {
-        $enumerators.Push(
-            [System.IO.Directory]::EnumerateFileSystemEntries($tree).GetEnumerator()
+        Initialize-EasyConPreparedTreeAuditor
+        $audit = [EasyCon.WindowsWorkspace.PreparedTreeAuditor]::AuditTree(
+            $Path,
+            $TrustedRoot,
+            $forbiddenLabels.ToArray(),
+            $forbiddenReferences.ToArray(),
+            $true
         )
-        while ($enumerators.Count -gt 0) {
-            $enumerator = $enumerators.Peek()
-            if (-not $enumerator.MoveNext()) {
-                $completed = $enumerators.Pop()
-                if ($completed -is [System.IDisposable]) {
-                    $completed.Dispose()
+    }
+    catch {
+        throw "$Description tree audit failed closed: $($_.Exception.Message)"
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($audit.FailureCategory)) {
+        switch ($audit.FailureCategory) {
+            "raw" {
+                throw "$Description contains a $($audit.MatchedLabel) absolute path: $($audit.FailurePath)"
+            }
+            "structured" {
+                throw "$Description contains a $($audit.MatchedLabel) absolute path: $($audit.FailurePath)"
+            }
+            "resource" {
+                throw "$Description audit failed closed for $($audit.FailurePath): $($audit.FailureMessage)"
+            }
+            "text" {
+                $damageDescription = if ($audit.TextDamageKind -ceq "BOM") {
+                    "damaged BOM text artifact"
                 }
-                continue
+                else {
+                    "damaged $($audit.TextDamageKind) text artifact"
+                }
+                throw "$Description contains $damageDescription $($audit.FailurePath): $($audit.FailureMessage)"
             }
-
-            $entryPath = [string]$enumerator.Current
-            Assert-EasyConPhysicalPath -Path $entryPath -TrustedRoot $tree | Out-Null
-            $attributes = [System.IO.File]::GetAttributes($entryPath)
-            if (($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-                throw "physical tree contains a reparse point: $entryPath"
+            "json-limit" {
+                throw "$Description structured JSON audit failed closed for $($audit.FailurePath): $($audit.FailureMessage)"
             }
-            if (($attributes -band [System.IO.FileAttributes]::Directory) -ne 0) {
-                $enumerators.Push(
-                    [System.IO.Directory]::EnumerateFileSystemEntries($entryPath).GetEnumerator()
-                )
-                continue
+            "json" {
+                throw "$Description contains damaged structured JSON $($audit.FailurePath): $($audit.FailureMessage)"
             }
-
-            $audit = Assert-EasyConPreparedTextArtifactDoesNotReferenceRoots `
-                -Path $entryPath -ForbiddenLabels $forbiddenLabels.ToArray() `
-                -ForbiddenReferences $forbiddenReferences.ToArray() -Description $Description
-            Assert-EasyConPhysicalPath -Path $entryPath -TrustedRoot $tree | Out-Null
-            $summary.FilesScanned++
-            $summary.TotalBytesRead += $audit.BytesRead
-            if ($audit.IsText) {
-                $summary.TextFilesScanned++
-            }
-            if ($audit.IsJson) {
-                $summary.JsonDocumentsScanned++
-            }
-            $summary.MaximumJsonWindowBytes = [Math]::Max(
-                $summary.MaximumJsonWindowBytes,
-                $audit.MaximumJsonWindowBytes
-            )
-        }
-    }
-    catch [System.OutOfMemoryException] {
-        throw "$Description tree audit failed closed: memory allocation failed"
-    }
-    finally {
-        while ($enumerators.Count -gt 0) {
-            $remaining = $enumerators.Pop()
-            if ($remaining -is [System.IDisposable]) {
-                $remaining.Dispose()
+            default {
+                throw "$Description tree audit failed closed: $($audit.FailureMessage)"
             }
         }
     }
 
+    return [pscustomobject][ordered]@{
+        FilesScanned = [long]$audit.FilesScanned
+        TextFilesScanned = [long]$audit.TextFilesScanned
+        JsonDocumentsScanned = [long]$audit.JsonDocumentsScanned
+        TotalBytesRead = [long]$audit.TotalBytesRead
+        MaximumJsonWindowBytes = [int]$audit.MaximumJsonWindowBytes
+        JsonWindowLimitBytes = [int]$audit.JsonWindowLimitBytes
+        FileContentReads = [long]$audit.FileContentReads
+        FileHashesComputed = [long]$audit.FileHashesComputed
+        PhysicalEntriesChecked = [long]$audit.PhysicalEntriesChecked
+        DirectoriesEnumerated = [long]$audit.DirectoriesEnumerated
+        ControlledEnumerationPasses = [int]$audit.ControlledEnumerationPasses
+        TreeFiles = [long]$audit.TreeFiles
+        TreeSha256 = [string]$audit.TreeSha256
+    }
+}
+
+function Assert-EasyConPreparedTreeDoesNotReferenceRepository {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [string]$TrustedRoot,
+
+        [Parameter(Mandatory)]
+        [string]$RepositoryRoot,
+
+        [string]$WritableRoot,
+
+        [Parameter(Mandatory)]
+        [string]$Description,
+
+        [switch]$PassThru
+    )
+
+    $summary = Get-EasyConPreparedTreeVerification -Path $Path -TrustedRoot $TrustedRoot `
+        -RepositoryRoot $RepositoryRoot -WritableRoot $WritableRoot -Description $Description
     if ($PassThru) {
-        return [pscustomobject]$summary
+        return $summary
     }
 }
 
@@ -2435,50 +4356,75 @@ function Assert-EasyConVcpkgCheckout {
         [object]$Configuration,
 
         [Parameter(Mandatory)]
-        [string]$VcpkgExecutable
+        [string]$VcpkgExecutable,
+
+        [string]$TrustedRoot
     )
 
-    $root = Assert-EasyConPhysicalPath -Path $VcpkgRoot
-    if (-not (Test-Path -LiteralPath $root -PathType Container)) {
-        throw "pinned vcpkg checkout is missing: $root"
-    }
-    Assert-EasyConPhysicalTree -Path $root -TrustedRoot $root | Out-Null
     $requiredFiles = @(
         ".vcpkg-root",
         "bootstrap-vcpkg.bat",
         "bootstrap-vcpkg.sh",
         "scripts/buildsystems/vcpkg.cmake"
     )
-    foreach ($relative in $requiredFiles) {
-        $requiredPath = Join-Path $root $relative
-        Assert-EasyConPhysicalPath -Path $requiredPath -TrustedRoot $root | Out-Null
-        if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
-            throw "pinned vcpkg checkout is missing $relative"
-        }
-    }
     $git = Get-EasyConCommandPath -Name "git.exe"
-    $head = @(Invoke-EasyConNativeCapture -Program $git -Arguments @(
-        "--no-optional-locks", "-c", "core.longpaths=true", "-C", $root,
-        "rev-parse", "HEAD"
-    ) -Description "vcpkg scripts commit check")[0].Trim()
-    if ($head -cne [string]$Configuration.vcpkg.scriptsCommit) {
-        throw "vcpkg scripts commit $head does not match the frozen pin"
+    $auditTrustedRoot = if ([string]::IsNullOrWhiteSpace($TrustedRoot)) {
+        $VcpkgRoot
     }
-    foreach ($relative in $requiredFiles) {
-        $tracked = @(Invoke-EasyConNativeCapture -Program $git -Arguments @(
+    else {
+        $TrustedRoot
+    }
+    $binding = $null
+    try {
+        Initialize-EasyConPreparedTreeAuditor
+        $binding = [EasyCon.WindowsWorkspace.PreparedTreeAuditor]::BindVcpkgCheckout(
+            $VcpkgRoot,
+            $auditTrustedRoot,
+            [string[]]$requiredFiles
+        )
+        $audit = $binding.Audit
+        if (
+            -not [string]::IsNullOrWhiteSpace([string]$audit.FailureCategory) -or
+            [int]$audit.ControlledEnumerationPasses -ne 1 -or
+            [long]$audit.PhysicalEntriesBound -ne ([long]$audit.PhysicalEntriesChecked + 1)
+        ) {
+            throw "pinned vcpkg physical audit failed closed: $($audit.FailureMessage)"
+        }
+        $root = [string]$audit.RootPath
+        if ([string]::IsNullOrWhiteSpace($root)) {
+            throw "pinned vcpkg physical audit failed closed: checkout root is unavailable"
+        }
+
+        # The binding retains every audited tree entry while Git traverses the checkout.
+        $binding.AssertCurrent()
+        $head = @(Invoke-EasyConNativeCapture -Program $git -Arguments @(
             "--no-optional-locks", "-c", "core.longpaths=true", "-C", $root,
-            "ls-files", "--error-unmatch", "--", $relative
-        ) -Description "vcpkg required tracked file check")
-        if ($tracked.Count -ne 1 -or $tracked[0] -cne $relative) {
-            throw "pinned vcpkg checkout does not track required file $relative"
+            "rev-parse", "HEAD"
+        ) -Description "vcpkg scripts commit check")[0].Trim()
+        if ($head -cne [string]$Configuration.vcpkg.scriptsCommit) {
+            throw "vcpkg scripts commit $head does not match the frozen pin"
+        }
+        foreach ($relative in $requiredFiles) {
+            $tracked = @(Invoke-EasyConNativeCapture -Program $git -Arguments @(
+                "--no-optional-locks", "-c", "core.longpaths=true", "-C", $root,
+                "ls-files", "--error-unmatch", "--", $relative
+            ) -Description "vcpkg required tracked file check")
+            if ($tracked.Count -ne 1 -or $tracked[0] -cne $relative) {
+                throw "pinned vcpkg checkout does not track required file $relative"
+            }
+        }
+        $status = @(Invoke-EasyConNativeCapture -Program $git -Arguments @(
+            "--no-optional-locks", "-c", "core.longpaths=true", "-C", $root,
+            "status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching"
+        ) -Description "vcpkg scripts cleanliness check")
+        if ($status.Count -ne 0) {
+            throw "pinned vcpkg scripts checkout has tracked, untracked, or ignored content`n$($status -join [Environment]::NewLine)"
         }
     }
-    $status = @(Invoke-EasyConNativeCapture -Program $git -Arguments @(
-        "--no-optional-locks", "-c", "core.longpaths=true", "-C", $root,
-        "status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching"
-    ) -Description "vcpkg scripts cleanliness check")
-    if ($status.Count -ne 0) {
-        throw "pinned vcpkg scripts checkout has tracked, untracked, or ignored content`n$($status -join [Environment]::NewLine)"
+    finally {
+        if ($null -ne $binding) {
+            $binding.Dispose()
+        }
     }
     $asset = $Configuration.vcpkg.windowsAsset
     $executable = Get-EasyConPhysicalFile -Path $VcpkgExecutable
@@ -2493,11 +4439,20 @@ function Assert-EasyConVcpkgCheckout {
     if ($versionOutput[0].Trim() -cne $expected) {
         throw "unexpected vcpkg tool version: $($versionOutput[0].Trim())"
     }
+    $marker = Get-EasyConPhysicalFile -Path (Join-Path $root ".vcpkg-root") `
+        -TrustedRoot $root
+    $markerBytes = [long](Get-Item -Force -LiteralPath $marker).Length
+    $markerSha256 = Get-EasyConFileHash -Path $marker -Algorithm SHA256
     $toolchain = Join-Path $root "scripts/buildsystems/vcpkg.cmake"
     Assert-EasyConPhysicalPath -Path $toolchain -TrustedRoot $root | Out-Null
     return [pscustomobject]@{
         Root = $root
         Executable = $executable
+        ExecutableBytes = [long]$asset.bytes
+        ExecutableSha256 = ([string]$asset.sha256).ToLowerInvariant()
+        Marker = $marker
+        MarkerBytes = $markerBytes
+        MarkerSha256 = $markerSha256
         Version = $versionOutput[0].Trim()
         Toolchain = $toolchain
     }
@@ -3788,55 +5743,159 @@ function New-EasyConVcpkgWorkspaceLayout {
     $workspace = New-EasyConSafeDirectory -Path $WorkspaceRoot -TrustedRoot $cache
     $environment = Assert-EasyConPhysicalPath -Path $EnvironmentRoot -TrustedRoot $EnvironmentRoot
     $installed = Assert-EasyConPhysicalTree -Path $InstalledRoot -TrustedRoot $environment
-    $workspaceRoot = Join-Path $workspace "vcpkg"
+    $workspaceRoot = New-EasyConSafeDirectory -Path (Join-Path $workspace "vcpkg") `
+        -TrustedRoot $cache
     $manifestRoot = New-EasyConSafeDirectory -Path (Join-Path $workspaceRoot "manifest") `
         -TrustedRoot $cache
     $executionRoot = New-EasyConSafeDirectory -Path (Join-Path $workspaceRoot "root") `
         -TrustedRoot $cache
-    $buildsystems = New-EasyConSafeDirectory `
-        -Path (Join-Path $executionRoot "scripts/buildsystems") -TrustedRoot $cache
+    $scripts = New-EasyConSafeDirectory -Path (Join-Path $executionRoot "scripts") `
+        -TrustedRoot $cache
+    $buildsystems = New-EasyConSafeDirectory -Path (Join-Path $scripts "buildsystems") `
+        -TrustedRoot $cache
     $downloads = New-EasyConSafeDirectory -Path (Join-Path $workspaceRoot "downloads") `
         -TrustedRoot $cache
 
-    $manifestEntries = @(Get-ChildItem -Force -LiteralPath $manifestRoot -ErrorAction Stop |
-        Where-Object { $_.Name -cne "vcpkg.json" })
-    if ($manifestEntries.Count -ne 0) {
-        throw "generated workspace vcpkg manifest directory contains unexpected input: $($manifestEntries[0].FullName)"
-    }
-    $toolchainEntries = @(Get-ChildItem -Force -LiteralPath $buildsystems -ErrorAction Stop |
-        Where-Object { $_.Name -cne "vcpkg.cmake" })
-    if ($toolchainEntries.Count -ne 0) {
-        throw "generated workspace vcpkg toolchain directory contains unexpected input: $($toolchainEntries[0].FullName)"
+    foreach ($shape in @(
+        [pscustomobject]@{
+            Path = $manifestRoot
+            Allowed = @("vcpkg.json")
+            Description = "generated workspace vcpkg manifest directory"
+        },
+        [pscustomobject]@{
+            Path = $executionRoot
+            Allowed = @(".vcpkg-root", "scripts", "vcpkg.exe")
+            Description = "generated workspace vcpkg root"
+        },
+        [pscustomobject]@{
+            Path = $scripts
+            Allowed = @("buildsystems")
+            Description = "generated workspace vcpkg scripts directory"
+        },
+        [pscustomobject]@{
+            Path = $buildsystems
+            Allowed = @("vcpkg.cmake")
+            Description = "generated workspace vcpkg toolchain directory"
+        }
+    )) {
+        $unexpected = @(Get-ChildItem -Force -LiteralPath $shape.Path -ErrorAction Stop |
+            Where-Object { $shape.Allowed -cnotcontains $_.Name })
+        if ($unexpected.Count -ne 0) {
+            throw "$($shape.Description) contains unexpected input: $($unexpected[0].FullName)"
+        }
     }
 
-    $sourceManifest = Join-Path $repository "vcpkg.json"
+    $preparedRoot = Assert-EasyConPhysicalPath -Path $Vcpkg.Root -TrustedRoot $environment
+    if (-not (Test-Path -LiteralPath $preparedRoot -PathType Container)) {
+        throw "prepared vcpkg scripts root is missing: $preparedRoot"
+    }
+    $actualToolchain = Get-EasyConPhysicalFile -Path $Vcpkg.Toolchain `
+        -TrustedRoot $preparedRoot
+    $expectedToolchain = Resolve-EasyConFullPath `
+        -Path (Join-Path $preparedRoot "scripts/buildsystems/vcpkg.cmake")
+    if (-not $actualToolchain.Equals(
+        $expectedToolchain,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw "prepared vcpkg toolchain path does not match its fixed scripts checkout"
+    }
+    $actualMarker = Get-EasyConPhysicalFile -Path $Vcpkg.Marker -TrustedRoot $preparedRoot
+    $expectedMarker = Resolve-EasyConFullPath -Path (Join-Path $preparedRoot ".vcpkg-root")
+    if (-not $actualMarker.Equals($expectedMarker, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "prepared vcpkg root marker path does not match its fixed scripts checkout"
+    }
+    $actualExecutable = Get-EasyConPhysicalFile -Path $Vcpkg.Executable `
+        -TrustedRoot $environment
+    if (Test-EasyConPathWithin -Path $actualExecutable -Root $preparedRoot) {
+        throw "vcpkg executable must remain outside the immutable scripts checkout"
+    }
+
+    $sourceManifest = Get-EasyConPhysicalFile -Path (Join-Path $repository "vcpkg.json") `
+        -TrustedRoot $repository
+    $manifestBytes = [long](Get-Item -Force -LiteralPath $sourceManifest).Length
+    $manifestHash = Get-EasyConFileHash -Path $sourceManifest -Algorithm SHA256
+    $toolchainBytes = [long](Get-Item -Force -LiteralPath $actualToolchain).Length
+    $toolchainHash = Get-EasyConFileHash -Path $actualToolchain -Algorithm SHA256
+    Assert-EasyConContentFile -Path $actualExecutable -Algorithm SHA256 `
+        -Hash ([string]$Vcpkg.ExecutableSha256) -Bytes ([long]$Vcpkg.ExecutableBytes) `
+        -TrustedRoot $environment -Description "verified workspace vcpkg.exe source" | Out-Null
+    Assert-EasyConContentFile -Path $actualMarker -Algorithm SHA256 `
+        -Hash ([string]$Vcpkg.MarkerSha256) -Bytes ([long]$Vcpkg.MarkerBytes) `
+        -TrustedRoot $preparedRoot -Description "verified workspace .vcpkg-root source" | Out-Null
+
     $executionManifest = Join-Path $manifestRoot "vcpkg.json"
-    Assert-EasyConPhysicalPath -Path $sourceManifest -TrustedRoot $repository | Out-Null
-    Assert-EasyConPhysicalPath -Path $executionManifest -TrustedRoot $workspace | Out-Null
-    $manifestHash = Get-EasyConFileSha256 -Path $sourceManifest
-    Copy-Item -Force -LiteralPath $sourceManifest -Destination $executionManifest
-    Assert-EasyConPhysicalPath -Path $executionManifest -TrustedRoot $workspace | Out-Null
-    if ((Get-EasyConFileSha256 -Path $executionManifest) -cne $manifestHash) {
-        throw "generated workspace vcpkg manifest does not match the tracked manifest"
+    $workspaceExecutable = Join-Path $executionRoot "vcpkg.exe"
+    $workspaceMarker = Join-Path $executionRoot ".vcpkg-root"
+    $wrapper = Join-Path $buildsystems "vcpkg.cmake"
+    foreach ($destination in @(
+        [pscustomobject]@{ Path = $executionManifest; Description = "workspace vcpkg manifest" },
+        [pscustomobject]@{ Path = $workspaceExecutable; Description = "workspace vcpkg executable" },
+        [pscustomobject]@{ Path = $workspaceMarker; Description = "workspace vcpkg root marker" },
+        [pscustomobject]@{ Path = $wrapper; Description = "workspace vcpkg toolchain wrapper" }
+    )) {
+        Assert-EasyConAtomicFileDestination -Path $destination.Path -TrustedRoot $workspace `
+            -Description $destination.Description | Out-Null
     }
 
-    $actualToolchain = Assert-EasyConPhysicalPath -Path $Vcpkg.Toolchain `
-        -TrustedRoot $Vcpkg.Root
-    $wrapper = Join-Path $buildsystems "vcpkg.cmake"
-    Assert-EasyConPhysicalPath -Path $wrapper -TrustedRoot $workspace | Out-Null
+    Copy-EasyConContentFileAtomically -Source $actualExecutable `
+        -Destination $workspaceExecutable -Algorithm SHA256 `
+        -Hash ([string]$Vcpkg.ExecutableSha256) -Bytes ([long]$Vcpkg.ExecutableBytes) `
+        -SourceTrustedRoot $environment -DestinationTrustedRoot $workspace `
+        -Description "workspace vcpkg executable" -ReplaceExisting | Out-Null
+    Copy-EasyConContentFileAtomically -Source $actualMarker `
+        -Destination $workspaceMarker -Algorithm SHA256 `
+        -Hash ([string]$Vcpkg.MarkerSha256) -Bytes ([long]$Vcpkg.MarkerBytes) `
+        -SourceTrustedRoot $preparedRoot -DestinationTrustedRoot $workspace `
+        -Description "workspace vcpkg root marker" -ReplaceExisting | Out-Null
+    Copy-EasyConContentFileAtomically -Source $sourceManifest `
+        -Destination $executionManifest -Algorithm SHA256 -Hash $manifestHash `
+        -Bytes $manifestBytes -SourceTrustedRoot $repository `
+        -DestinationTrustedRoot $workspace -Description "workspace vcpkg manifest" `
+        -ReplaceExisting | Out-Null
+
     $wrapperText = @(
         "# Generated by tools/windows_workspace.psm1; do not edit.",
+        "set(Z_VCPKG_ROOT_DIR `"$(ConvertTo-EasyConCMakePathLiteral -Path $executionRoot)`" CACHE INTERNAL `"EasyCon workspace-local vcpkg applocal root`" FORCE)",
         "set(VCPKG_MANIFEST_DIR `"$(ConvertTo-EasyConCMakePathLiteral -Path $manifestRoot)`" CACHE PATH `"EasyCon verified local manifest`" FORCE)",
         "set(VCPKG_MANIFEST_INSTALL OFF CACHE BOOL `"EasyCon Setup owns vcpkg installation`" FORCE)",
         "set(VCPKG_INSTALLED_DIR `"$(ConvertTo-EasyConCMakePathLiteral -Path $installed)`" CACHE PATH `"EasyCon external vcpkg install tree`" FORCE)",
         "include(`"$(ConvertTo-EasyConCMakePathLiteral -Path $actualToolchain)`")",
         ""
     ) -join "`n"
-    [System.IO.File]::WriteAllText($wrapper, $wrapperText, [System.Text.UTF8Encoding]::new($false))
-    Assert-EasyConPhysicalPath -Path $wrapper -TrustedRoot $workspace | Out-Null
+    Write-EasyConUtf8FileAtomically -Path $wrapper -Text $wrapperText `
+        -TrustedRoot $workspace -Description "workspace vcpkg toolchain wrapper" | Out-Null
     if ([System.IO.File]::ReadAllText($wrapper, [System.Text.Encoding]::UTF8) -cne $wrapperText) {
         throw "generated workspace vcpkg toolchain wrapper changed during creation"
     }
+
+    Assert-EasyConPhysicalTree -Path $manifestRoot -TrustedRoot $workspace | Out-Null
+    Assert-EasyConPhysicalTree -Path $executionRoot -TrustedRoot $workspace | Out-Null
+    foreach ($shape in @(
+        [pscustomobject]@{ Path = $manifestRoot; Expected = @("vcpkg.json") },
+        [pscustomobject]@{ Path = $executionRoot; Expected = @(".vcpkg-root", "scripts", "vcpkg.exe") },
+        [pscustomobject]@{ Path = $scripts; Expected = @("buildsystems") },
+        [pscustomobject]@{ Path = $buildsystems; Expected = @("vcpkg.cmake") }
+    )) {
+        $actualEntries = @(Get-ChildItem -Force -LiteralPath $shape.Path -ErrorAction Stop |
+            Select-Object -ExpandProperty Name | Sort-Object)
+        $expectedEntries = @($shape.Expected | Sort-Object)
+        if (($actualEntries -join "`n") -cne ($expectedEntries -join "`n")) {
+            throw "generated workspace vcpkg layout is incomplete or contains unexpected entries: $($shape.Path)"
+        }
+    }
+
+    Assert-EasyConContentFile -Path $actualExecutable -Algorithm SHA256 `
+        -Hash ([string]$Vcpkg.ExecutableSha256) -Bytes ([long]$Vcpkg.ExecutableBytes) `
+        -TrustedRoot $environment -Description "verified workspace vcpkg.exe source" | Out-Null
+    Assert-EasyConContentFile -Path $actualMarker -Algorithm SHA256 `
+        -Hash ([string]$Vcpkg.MarkerSha256) -Bytes ([long]$Vcpkg.MarkerBytes) `
+        -TrustedRoot $preparedRoot -Description "verified workspace .vcpkg-root source" | Out-Null
+    Assert-EasyConContentFile -Path $sourceManifest -Algorithm SHA256 -Hash $manifestHash `
+        -Bytes $manifestBytes -TrustedRoot $repository `
+        -Description "tracked workspace vcpkg manifest source" | Out-Null
+    Assert-EasyConContentFile -Path $actualToolchain -Algorithm SHA256 -Hash $toolchainHash `
+        -Bytes $toolchainBytes -TrustedRoot $preparedRoot `
+        -Description "prepared workspace vcpkg toolchain source" | Out-Null
 
     return [pscustomobject]@{
         Root = Assert-EasyConPhysicalPath -Path $executionRoot -TrustedRoot $workspace
@@ -4190,10 +6249,12 @@ function Install-EasyConCargoSources {
         }
     }
 
-    $vendor = Assert-EasyConPhysicalTree -Path $vendorRoot -TrustedRoot $environment
+    $vendor = Assert-EasyConPhysicalPath -Path $vendorRoot -TrustedRoot $environment
+    if (-not (Test-Path -LiteralPath $vendor -PathType Container)) {
+        throw "required environment tree is missing: $vendor"
+    }
     return [pscustomobject]@{
         VendorRoot = $vendor
-        VendorTree = Get-EasyConTreeFingerprint -Path $vendor -TrustedRoot $environment
     }
 }
 
@@ -4484,11 +6545,10 @@ function Install-EasyConWindowsEnvironment {
         -DownloadsRoot $setupVcpkgDownloads -DownloadsTrustedRoot $cacheStorage `
         -CacheRoot $cache -WorkspaceLayout $vcpkgLayout
 
-    $nativeTree = Get-EasyConTreeFingerprint -Path $vcpkgLayout.Installed -TrustedRoot $cache
-    Assert-EasyConPreparedTreeDoesNotReferenceRepository -Path $cargoSources.VendorRoot `
+    $cargoVendorTree = Get-EasyConPreparedTreeVerification -Path $cargoSources.VendorRoot `
         -TrustedRoot $cache -RepositoryRoot $repository -WritableRoot $WritableRoot `
         -Description "prepared Cargo vendor tree"
-    Assert-EasyConPreparedTreeDoesNotReferenceRepository -Path $vcpkgLayout.Installed `
+    $nativeTree = Get-EasyConPreparedTreeVerification -Path $vcpkgLayout.Installed `
         -TrustedRoot $cache -RepositoryRoot $repository -WritableRoot $WritableRoot `
         -Description "prepared vcpkg installed tree"
     Remove-EasyConSafeTree -Path $setupTemporary -TrustedRoot $WritableRoot
@@ -4515,8 +6575,8 @@ function Install-EasyConWindowsEnvironment {
         cargoPath = $rust.CargoPath
         cargo = $cargoVersion
         cargoVendor = $cargoSources.VendorRoot
-        cargoVendorFiles = $cargoSources.VendorTree.Files
-        cargoVendorSha256 = $cargoSources.VendorTree.Sha256
+        cargoVendorFiles = $cargoVendorTree.TreeFiles
+        cargoVendorSha256 = $cargoVendorTree.TreeSha256
         pythonPath = $python.Path
         python = $python.Version.ToString()
         gitPath = $git
@@ -4529,8 +6589,8 @@ function Install-EasyConWindowsEnvironment {
         vcpkgInstalled = $vcpkgLayout.Installed
         vcpkgBinaryCache = $binaryCache
         ocrModel = $vision.Root
-        nativeTreeFiles = $nativeTree.Files
-        nativeTreeSha256 = $nativeTree.Sha256
+        nativeTreeFiles = $nativeTree.TreeFiles
+        nativeTreeSha256 = $nativeTree.TreeSha256
     }
     Write-EasyConStructuredRecord -Kind "setup" -Value $summary
     return [pscustomobject]$summary
@@ -5115,27 +7175,40 @@ function Invoke-EasyConWindowsVerifyCore {
 
     $preparedPaths = @{}
     try {
-        $sharedCacheRoot = Assert-EasyConPhysicalTree `
+        $sharedCacheRoot = Assert-EasyConPreparedPhysicalTree `
             -Path (Join-Path $location.CacheRoot "caches") -TrustedRoot $location.CacheRoot
-        $preparedPaths.rustupHome = Assert-EasyConPhysicalTree `
+        $preparedPaths.rustupHome = Assert-EasyConPreparedPhysicalTree `
             -Path (Join-Path $sharedCacheRoot "rustup-home") -TrustedRoot $sharedCacheRoot
-        foreach ($name in @(
-            "cargoVendor", "vcpkgScriptsRoot", "vcpkgInstalled", "ocrModel"
-        )) {
-            $preparedPaths[$name] = Assert-EasyConPhysicalTree `
+        $preparedPaths.vcpkgScriptsRoot = [string]$stamp.paths.vcpkgScriptsRoot
+        $preparedPaths.ocrModel = Assert-EasyConPreparedPhysicalTree `
+            -Path ([string]$stamp.paths.ocrModel) -TrustedRoot $location.EnvironmentRoot
+        foreach ($name in @("cargoVendor", "vcpkgInstalled")) {
+            $preparedPaths[$name] = Assert-EasyConPhysicalPath `
                 -Path ([string]$stamp.paths.$name) -TrustedRoot $location.EnvironmentRoot
         }
     }
     catch {
         throw "Windows build environment contains a missing or unsafe prepared path. Rerun Setup: $($_.Exception.Message)"
     }
-    $cargoVendorTree = Get-EasyConTreeFingerprint -Path $preparedPaths.cargoVendor `
-        -TrustedRoot $location.EnvironmentRoot
+    $cargoVendorTree = Get-EasyConPreparedTreeVerification -Path $preparedPaths.cargoVendor `
+        -TrustedRoot $location.EnvironmentRoot -RepositoryRoot $repository `
+        -WritableRoot $location.WritableRoot `
+        -Description "prepared Cargo vendor tree"
     if (
-        $cargoVendorTree.Files -ne [int]$stamp.cargoSources.files -or
-        $cargoVendorTree.Sha256 -cne [string]$stamp.cargoSources.sha256
+        $cargoVendorTree.TreeFiles -ne [int]$stamp.cargoSources.files -or
+        $cargoVendorTree.TreeSha256 -cne [string]$stamp.cargoSources.sha256
     ) {
         throw "prepared Cargo vendor tree is missing or damaged. Rerun Setup."
+    }
+    $nativeTree = Get-EasyConPreparedTreeVerification -Path $preparedPaths.vcpkgInstalled `
+        -TrustedRoot $location.EnvironmentRoot -RepositoryRoot $repository `
+        -WritableRoot $location.WritableRoot `
+        -Description "prepared vcpkg installed tree"
+    if (
+        $nativeTree.TreeFiles -ne [int]$stamp.nativeTree.files -or
+        $nativeTree.TreeSha256 -cne [string]$stamp.nativeTree.sha256
+    ) {
+        throw "prepared native dependency tree is missing or damaged. Rerun Setup."
     }
 
     $msvc = Initialize-EasyConMsvcEnvironment -VsWherePath $VsWherePath `
@@ -5240,30 +7313,14 @@ function Invoke-EasyConWindowsVerifyCore {
         -MinimumVersion $pythonMinimumVersion | Out-Null
 
     $vcpkg = Assert-EasyConVcpkgCheckout -VcpkgRoot $preparedPaths.vcpkgScriptsRoot `
-        -Configuration $configuration -VcpkgExecutable $tools.vcpkg
+        -Configuration $configuration -VcpkgExecutable $tools.vcpkg `
+        -TrustedRoot $location.EnvironmentRoot
     Assert-EasyConVcpkgAuditPins -VcpkgRoot $vcpkg.Root -Configuration $configuration
     $allowedModelRoot = Join-Path $location.EnvironmentRoot "vision-models"
     $vision = Assert-EasyConVisionModel `
         -ManifestPath (Join-Path $repository "spec/fixtures/vision/ocr-model.json") `
         -ModelRoot $preparedPaths.ocrModel -RepositoryRoot $repository `
         -AllowedModelRoot $allowedModelRoot
-    $nativeTree = Get-EasyConTreeFingerprint -Path $preparedPaths.vcpkgInstalled `
-        -TrustedRoot $location.EnvironmentRoot
-    if (
-        $nativeTree.Files -ne [int]$stamp.nativeTree.files -or
-        $nativeTree.Sha256 -cne [string]$stamp.nativeTree.sha256
-    ) {
-        throw "prepared native dependency tree is missing or damaged. Rerun Setup."
-    }
-    Assert-EasyConPreparedTreeDoesNotReferenceRepository -Path $preparedPaths.cargoVendor `
-        -TrustedRoot $location.EnvironmentRoot -RepositoryRoot $repository `
-        -WritableRoot $location.WritableRoot `
-        -Description "prepared Cargo vendor tree"
-    Assert-EasyConPreparedTreeDoesNotReferenceRepository -Path $preparedPaths.vcpkgInstalled `
-        -TrustedRoot $location.EnvironmentRoot -RepositoryRoot $repository `
-        -WritableRoot $location.WritableRoot `
-        -Description "prepared vcpkg installed tree"
-
     $workspaceCargo = New-EasyConCargoWorkspaceLayout `
         -WorkspaceRoot $location.WorkspaceRoot -CacheRoot $location.CacheRoot `
         -VendorRoot $preparedPaths.cargoVendor -EnvironmentRoot $location.EnvironmentRoot
@@ -5306,7 +7363,7 @@ function Invoke-EasyConWindowsVerifyCore {
         cargo = $cargoVersion
         vcpkgScripts = [string]$configuration.vcpkg.scriptsCommit
         vcpkgTool = [string]$configuration.vcpkg.toolRelease
-        nativeTreeSha256 = $nativeTree.Sha256
+        nativeTreeSha256 = $nativeTree.TreeSha256
         ocrModel = $vision.Root
         workspaceRoot = $location.WorkspaceRoot
         cargoTarget = $workspaceTarget

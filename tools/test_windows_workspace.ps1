@@ -174,11 +174,42 @@ function Set-ContractUtf8Text {
     )
 }
 
+function Get-ContractFileIdentity {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    $fsutil = Join-Path $env:SystemRoot "System32/fsutil.exe"
+    $identity = @(& $fsutil file queryfileid $Path)
+    Assert-Contract (
+        $LASTEXITCODE -eq 0 -and
+        $identity.Count -eq 1 -and
+        -not [string]::IsNullOrWhiteSpace($identity[0])
+    ) "contract file identity query must return one NTFS file ID for $Path"
+    return $identity[0].Trim()
+}
+
+function Get-ContractFileSnapshot {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    $item = Get-Item -Force -LiteralPath $Path -ErrorAction Stop
+    return [pscustomobject]@{
+        Bytes = [long]$item.Length
+        Hash = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+        Identity = Get-ContractFileIdentity -Path $Path
+        LastWriteTicks = $item.LastWriteTimeUtc.Ticks
+    }
+}
+
 $modulePath = Join-Path $PSScriptRoot "windows_workspace.psm1"
 $repository = Resolve-Path (Join-Path $PSScriptRoot "..")
 $configurationPath = Join-Path $PSScriptRoot "windows_build_environment.json"
 $temporaryRoot = Join-Path ([System.IO.Path]::GetTempPath()) (
-    "easycon environment contract {0}" -f [guid]::NewGuid().ToString("N")
+    "ecw-{0}" -f [guid]::NewGuid().ToString("N").Substring(0, 12)
 )
 New-Item -ItemType Directory -Path $temporaryRoot | Out-Null
 Import-Module -Name $modulePath -Force
@@ -1867,6 +1898,10 @@ try {
                         ) | Out-Null
                         [System.IO.File]::WriteAllText($path, "contract")
                     }
+                    $fixtureGit = (Get-Command git.exe -ErrorAction Stop).Source
+                    & $fixtureGit init --quiet $root
+                    Assert-Contract ($LASTEXITCODE -eq 0) `
+                        "the mocked pinned checkout must materialize its physical .git directory"
                     return @()
                 }
                 "vcpkg scripts commit check" { return $commit }
@@ -1950,6 +1985,630 @@ try {
             $afterWrite -eq $beforeWrite -and
             -not (Test-Path -LiteralPath (Join-Path $checkoutRoot ".git/index.lock"))
         ) "Verify must not refresh the prepared vcpkg index or create an optional lock"
+
+        $newPreGitCheckout = {
+            param([Parameter(Mandatory)][string]$Label)
+
+            $caseRoot = Join-Path $temporaryRoot (
+                "vcpkg pre-git binding {0}-{1}" -f $Label, [guid]::NewGuid().ToString("N").Substring(0, 8)
+            )
+            $root = Join-Path $caseRoot "checkout"
+            foreach ($relative in @(
+                ".vcpkg-root",
+                "bootstrap-vcpkg.bat",
+                "bootstrap-vcpkg.sh",
+                "scripts/buildsystems/vcpkg.cmake",
+                "scripts/ordinary-tracked.txt"
+            )) {
+                Set-ContractFile -Path (Join-Path $root $relative) -Value "contract"
+            }
+            & $git init --quiet $root
+            Assert-Contract ($LASTEXITCODE -eq 0) "pre-Git vcpkg fixture must initialize Git"
+            & $git -C $root add -- .
+            Assert-Contract ($LASTEXITCODE -eq 0) "pre-Git vcpkg fixture must stage required files"
+            & $git -c user.name=EasyConContract -c user.email=contract@example.invalid `
+                -C $root commit --quiet -m "pre-Git binding fixture"
+            Assert-Contract ($LASTEXITCODE -eq 0) "pre-Git vcpkg fixture must commit required files"
+            return [pscustomobject]@{
+                CaseRoot = $caseRoot
+                Root = $root
+                Commit = @(& $git -C $root rev-parse HEAD)[0].Trim()
+            }
+        }.GetNewClosure()
+
+        $readShareLockBehavior = @(& $workspaceModule {
+            param([Parameter(Mandatory)][string]$Root)
+
+            Initialize-EasyConPreparedTreeAuditor
+            $flags = [System.Reflection.BindingFlags]::NonPublic -bor
+                [System.Reflection.BindingFlags]::Static
+            $create = [EasyCon.WindowsWorkspace.PreparedTreeAuditor].GetMethod(
+                "CreateFile",
+                $flags
+            )
+            if ($null -eq $create) {
+                throw "prepared tree auditor is missing its private CreateFile binding probe"
+            }
+            $probeRoot = Join-Path $Root "read-share-lock-behavior"
+            [System.IO.Directory]::CreateDirectory($probeRoot) | Out-Null
+            $open = {
+                param(
+                    [Parameter(Mandatory)][string]$Path,
+                    [Parameter(Mandatory)][uint32]$Access,
+                    [Parameter(Mandatory)][bool]$IsDirectory
+                )
+
+                [uint32]$flags = 0x00200000
+                if ($IsDirectory) {
+                    $flags = $flags -bor 0x02000000
+                }
+                [object[]]$arguments = @(
+                    $Path,
+                    $Access,
+                    [uint32]1,
+                    [IntPtr]::Zero,
+                    [uint32]3,
+                    $flags,
+                    [IntPtr]::Zero
+                )
+                $handle = [Microsoft.Win32.SafeHandles.SafeFileHandle]$create.Invoke(
+                    $null,
+                    $arguments
+                )
+                if ($null -eq $handle -or $handle.IsInvalid) {
+                    throw "prepared tree auditor read-share lock probe could not open $Path"
+                }
+                return $handle
+            }.GetNewClosure()
+            $results = [System.Collections.Generic.List[object]]::new()
+            foreach ($probe in @(
+                [pscustomobject]@{ Name = "zero"; Access = [uint32]0 },
+                [pscustomobject]@{ Name = "attributes"; Access = [uint32]0x80 },
+                [pscustomobject]@{ Name = "read-data"; Access = [uint32]1 }
+            )) {
+                $path = Join-Path $probeRoot "$($probe.Name).txt"
+                [System.IO.File]::WriteAllText($path, "contract")
+                $handle = & $open $path ([uint32]$probe.Access) $false
+                $moveAllowed = $false
+                try {
+                    Move-Item -LiteralPath $path -Destination "$path.moved" -ErrorAction Stop
+                    $moveAllowed = $true
+                }
+                catch {
+                }
+                finally {
+                    $handle.Dispose()
+                }
+                $results.Add([pscustomobject]@{
+                    Name = $probe.Name
+                    MoveAllowed = $moveAllowed
+                }) | Out-Null
+            }
+            $directory = Join-Path $probeRoot "list-directory"
+            [System.IO.Directory]::CreateDirectory($directory) | Out-Null
+            $directoryHandle = & $open $directory ([uint32]1) $true
+            $directoryMoveAllowed = $false
+            try {
+                Move-Item -LiteralPath $directory -Destination "$directory.moved" -ErrorAction Stop
+                $directoryMoveAllowed = $true
+            }
+            catch {
+            }
+            finally {
+                $directoryHandle.Dispose()
+            }
+            $results.Add([pscustomobject]@{
+                Name = "list-directory"
+                MoveAllowed = $directoryMoveAllowed
+            }) | Out-Null
+            return $results.ToArray()
+        } $temporaryRoot)
+        $readShareMoves = @{}
+        foreach ($probe in $readShareLockBehavior) {
+            $readShareMoves[[string]$probe.Name] = [bool]$probe.MoveAllowed
+        }
+        Assert-Contract (
+            $readShareMoves.zero -and
+            $readShareMoves.attributes -and
+            -not $readShareMoves.'read-data' -and
+            -not $readShareMoves.'list-directory'
+        ) "zero/attributes handles must allow replacement while read-data/list-directory read-share locks reject it"
+
+        $longPathFixture = & $newPreGitCheckout "extended-path"
+        try {
+            $longAuditedDirectory = $longPathFixture.Root
+            while ($longAuditedDirectory.Length -le 280) {
+                $longAuditedDirectory = Join-Path $longAuditedDirectory "audit-path-segment-0123456789"
+            }
+            $longAuditedFile = Join-Path $longAuditedDirectory "critical-vcpkg-entry.txt"
+            Set-ContractFile -Path $longAuditedFile -Value "long physical binding fixture"
+            Assert-Contract (
+                $longAuditedDirectory.Length -gt 260 -and
+                $longAuditedFile.Length -gt 260
+            ) "the vcpkg physical-binding fixture must contain local audited directory and file paths longer than MAX_PATH"
+            $longRelative = [System.IO.Path]::GetRelativePath(
+                $longPathFixture.Root,
+                $longAuditedFile
+            )
+            $longPathProbe = & $workspaceModule {
+                param($Root, $TrustedRoot, $LongRelative)
+
+                Initialize-EasyConPreparedTreeAuditor
+                $binding = [EasyCon.WindowsWorkspace.PreparedTreeAuditor]::BindVcpkgCheckout(
+                    $Root,
+                    $TrustedRoot,
+                    [string[]]@(".vcpkg-root", $LongRelative)
+                )
+                try {
+                    $audit = $binding.Audit
+                    if (-not [string]::IsNullOrWhiteSpace([string]$audit.FailureCategory)) {
+                        return [pscustomobject]@{
+                            Failure = [string]$audit.FailureMessage
+                            RootPath = [string]$audit.RootPath
+                            Audit = $audit
+                        }
+                    }
+                    try {
+                        $binding.AssertCurrent()
+                        return [pscustomobject]@{
+                            Failure = $null
+                            RootPath = [string]$audit.RootPath
+                            Audit = $audit
+                        }
+                    }
+                    catch {
+                        return [pscustomobject]@{
+                            Failure = $_.Exception.Message
+                            RootPath = [string]$audit.RootPath
+                            Audit = $audit
+                        }
+                    }
+                }
+                finally {
+                    $binding.Dispose()
+                }
+            } $longPathFixture.Root $longPathFixture.CaseRoot $longRelative
+            Assert-Contract (
+                [string]::IsNullOrWhiteSpace([string]$longPathProbe.Failure) -and
+                $longPathProbe.RootPath -ceq $longPathFixture.Root -and
+                -not $longPathProbe.RootPath.StartsWith('\\?\') -and
+                $longPathProbe.Audit.PhysicalEntriesBound -eq (
+                    $longPathProbe.Audit.PhysicalEntriesChecked + 1
+                )
+            ) (
+                "vcpkg full-tree binding must bind and reopen local audited paths longer than MAX_PATH " +
+                "without leaking an extended path; failure=$($longPathProbe.Failure)"
+            )
+            $extendedPathProbe = & $workspaceModule {
+                param([Parameter(Mandatory)][string]$LocalPath)
+
+                Initialize-EasyConPreparedTreeAuditor
+                $flags = [System.Reflection.BindingFlags]::NonPublic -bor
+                    [System.Reflection.BindingFlags]::Static
+                $convert = [EasyCon.WindowsWorkspace.PreparedTreeAuditor].GetMethod(
+                    "GetWin32ExtendedPath",
+                    $flags
+                )
+                if ($null -eq $convert) {
+                    throw "prepared tree auditor is missing its private Win32 extended-path converter"
+                }
+                $uncPath = '\\server\share\vcpkg\scripts\entry.txt'
+                $extendedUncPath = '\\?\UNC\server\share\vcpkg\scripts\entry.txt'
+                [object[]]$localArguments = @([string]$LocalPath)
+                [object[]]$extendedLocalArguments = @("\\?\$LocalPath")
+                [object[]]$uncArguments = @($uncPath)
+                [object[]]$extendedUncArguments = @($extendedUncPath)
+                $malformedFailure = $null
+                try {
+                    [void]$convert.Invoke(
+                        $null,
+                        [object[]]@('\\?\Volume{contract}\vcpkg\entry.txt')
+                    )
+                }
+                catch {
+                    $malformedFailure = if ($null -ne $_.Exception.InnerException) {
+                        $_.Exception.InnerException.Message
+                    }
+                    else {
+                        $_.Exception.Message
+                    }
+                }
+                return [pscustomobject]@{
+                    Local = [string]$convert.Invoke($null, $localArguments)
+                    ExtendedLocal = [string]$convert.Invoke($null, $extendedLocalArguments)
+                    Unc = [string]$convert.Invoke($null, $uncArguments)
+                    ExtendedUnc = [string]$convert.Invoke($null, $extendedUncArguments)
+                    MalformedFailure = $malformedFailure
+                }
+            } $longAuditedFile
+            Assert-Contract (
+                $extendedPathProbe.Local -ceq "\\?\$longAuditedFile" -and
+                $extendedPathProbe.ExtendedLocal -ceq "\\?\$longAuditedFile" -and
+                $extendedPathProbe.Unc -ceq '\\?\UNC\server\share\vcpkg\scripts\entry.txt' -and
+                $extendedPathProbe.ExtendedUnc -ceq '\\?\UNC\server\share\vcpkg\scripts\entry.txt' -and
+                -not [string]::IsNullOrWhiteSpace([string]$extendedPathProbe.MalformedFailure) -and
+                -not $extendedPathProbe.MalformedFailure.Contains('\\?\')
+            ) "Win32 extended-path conversion must preserve local and UNC logical path semantics"
+        }
+        finally {
+            Remove-Item -LiteralPath $longPathFixture.CaseRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        $bindingMetricsFixture = & $newPreGitCheckout "binding-metrics"
+        try {
+            $bindingMetricsRoot = Join-Path $bindingMetricsFixture.Root "bulk-audited-entries"
+            for ($directoryIndex = 0; $directoryIndex -lt 32; $directoryIndex++) {
+                $directory = Join-Path $bindingMetricsRoot ("{0:d2}" -f $directoryIndex)
+                for ($fileIndex = 0; $fileIndex -lt 32; $fileIndex++) {
+                    Set-ContractFile -Path (Join-Path $directory ("entry-{0:d2}.txt" -f $fileIndex)) `
+                        -Value "bulk physical binding fixture"
+                }
+            }
+            $bindingMetricsTimer = [System.Diagnostics.Stopwatch]::StartNew()
+            $bindingMetricsProbe = & $workspaceModule {
+                param($Root, $TrustedRoot)
+
+                Initialize-EasyConPreparedTreeAuditor
+                $binding = [EasyCon.WindowsWorkspace.PreparedTreeAuditor]::BindVcpkgCheckout(
+                    $Root,
+                    $TrustedRoot,
+                    [string[]]@(
+                        ".vcpkg-root",
+                        "bootstrap-vcpkg.bat",
+                        "bootstrap-vcpkg.sh",
+                        "scripts/buildsystems/vcpkg.cmake"
+                    )
+                )
+                try {
+                    return $binding.Audit
+                }
+                finally {
+                    $binding.Dispose()
+                }
+            } $bindingMetricsFixture.Root $bindingMetricsFixture.CaseRoot
+            $bindingMetricsTimer.Stop()
+            Assert-Contract (
+                [string]::IsNullOrWhiteSpace([string]$bindingMetricsProbe.FailureCategory) -and
+                $bindingMetricsProbe.ControlledEnumerationPasses -eq 1 -and
+                $bindingMetricsProbe.PhysicalEntriesBound -eq (
+                    $bindingMetricsProbe.PhysicalEntriesChecked + 1
+                ) -and
+                $bindingMetricsProbe.PhysicalEntriesBound -ge 1024 -and
+                $bindingMetricsProbe.PhysicalCreateFileCalls -eq (
+                    $bindingMetricsProbe.PhysicalEntriesBound + 6
+                ) -and
+                $bindingMetricsProbe.PhysicalBasicInformationQueries -eq (
+                    $bindingMetricsProbe.PhysicalCreateFileCalls
+                ) -and
+                $bindingMetricsProbe.PhysicalBasicInformationQueries -eq (
+                    $bindingMetricsProbe.PhysicalEntriesBound + 6
+                ) -and
+                $bindingMetricsProbe.PhysicalReadDataLockCalls -eq (
+                    $bindingMetricsProbe.PhysicalCreateFileCalls
+                ) -and
+                $bindingMetricsProbe.PhysicalIdentityQueries -eq 18 -and
+                $bindingMetricsProbe.PhysicalFinalPathQueries -eq 12 -and
+                $bindingMetricsProbe.PhysicalIdentityQueries -lt (
+                    $bindingMetricsProbe.PhysicalEntriesBound / 8
+                ) -and
+                $bindingMetricsProbe.PhysicalFinalPathQueries -lt (
+                    $bindingMetricsProbe.PhysicalEntriesBound / 8
+                )
+            ) "vcpkg full-tree binding must retain every entry with one minimal read-data/list lock and basic query while limiting FileId/final-path work to critical paths and reopens"
+            Write-Output (
+                "CONTRACT_METRIC name=vcpkg-binding-operations entries={0} create={1} lock={2} basic={3} identity={4} final={5} durationMs={6}" -f
+                $bindingMetricsProbe.PhysicalEntriesBound,
+                $bindingMetricsProbe.PhysicalCreateFileCalls,
+                $bindingMetricsProbe.PhysicalReadDataLockCalls,
+                $bindingMetricsProbe.PhysicalBasicInformationQueries,
+                $bindingMetricsProbe.PhysicalIdentityQueries,
+                $bindingMetricsProbe.PhysicalFinalPathQueries,
+                $bindingMetricsTimer.ElapsedMilliseconds
+            )
+        }
+        finally {
+            Remove-Item -LiteralPath $bindingMetricsFixture.CaseRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        $preGitAttacks = @(
+            [pscustomobject]@{
+                Label = "checkout root"
+                Replace = {
+                    param($Root, $External)
+
+                    $saved = "$Root.pre-git-original"
+                    Move-Item -LiteralPath $Root -Destination $saved
+                    New-Item -ItemType Junction -Path $Root -Target $External | Out-Null
+                    return $saved
+                }
+                Restore = {
+                    param($Root, $Saved)
+
+                    if (Test-Path -LiteralPath $Root) {
+                        $item = Get-Item -Force -LiteralPath $Root
+                        if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                            Remove-Item -LiteralPath $Root -Force
+                        }
+                    }
+                    if (-not [string]::IsNullOrWhiteSpace($Saved) -and
+                        (Test-Path -LiteralPath $Saved)) {
+                        Move-Item -LiteralPath $Saved -Destination $Root
+                    }
+                }
+            },
+            [pscustomobject]@{
+                Label = "checkout .git"
+                Replace = {
+                    param($Root, $External)
+
+                    $entry = Join-Path $Root ".git"
+                    $saved = "$entry.pre-git-original"
+                    Move-Item -LiteralPath $entry -Destination $saved
+                    New-Item -ItemType Junction -Path $entry -Target $External | Out-Null
+                    return $saved
+                }
+                Restore = {
+                    param($Root, $Saved)
+
+                    $entry = Join-Path $Root ".git"
+                    if (Test-Path -LiteralPath $entry) {
+                        $item = Get-Item -Force -LiteralPath $entry
+                        if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                            Remove-Item -LiteralPath $entry -Force
+                        }
+                    }
+                    if (-not [string]::IsNullOrWhiteSpace($Saved) -and
+                        (Test-Path -LiteralPath $Saved)) {
+                        Move-Item -LiteralPath $Saved -Destination $entry
+                    }
+                }
+            },
+            [pscustomobject]@{
+                Label = "required entry"
+                Replace = {
+                    param($Root, $External)
+
+                    $entry = Join-Path $Root "scripts/buildsystems/vcpkg.cmake"
+                    $saved = "$entry.pre-git-original"
+                    Move-Item -LiteralPath $entry -Destination $saved
+                    New-Item -ItemType Junction -Path $entry -Target $External | Out-Null
+                    return $saved
+                }
+                Restore = {
+                    param($Root, $Saved)
+
+                    $entry = Join-Path $Root "scripts/buildsystems/vcpkg.cmake"
+                    if (Test-Path -LiteralPath $entry) {
+                        $item = Get-Item -Force -LiteralPath $entry
+                        if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                            Remove-Item -LiteralPath $entry -Force
+                        }
+                    }
+                    if (-not [string]::IsNullOrWhiteSpace($Saved) -and
+                        (Test-Path -LiteralPath $Saved)) {
+                        Move-Item -LiteralPath $Saved -Destination $entry
+                    }
+                }
+            },
+            [pscustomobject]@{
+                Label = "noncritical entry"
+                Replace = {
+                    param($Root, $External)
+
+                    $entry = Join-Path $Root "scripts/ordinary-tracked.txt"
+                    $saved = "$entry.pre-git-original"
+                    Move-Item -LiteralPath $entry -Destination $saved
+                    New-Item -ItemType Junction -Path $entry -Target $External | Out-Null
+                    return $saved
+                }
+                Restore = {
+                    param($Root, $Saved)
+
+                    $entry = Join-Path $Root "scripts/ordinary-tracked.txt"
+                    if (Test-Path -LiteralPath $entry) {
+                        $item = Get-Item -Force -LiteralPath $entry
+                        if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                            Remove-Item -LiteralPath $entry -Force
+                        }
+                    }
+                    if (-not [string]::IsNullOrWhiteSpace($Saved) -and
+                        (Test-Path -LiteralPath $Saved)) {
+                        Move-Item -LiteralPath $Saved -Destination $entry
+                    }
+                }
+            }
+        )
+        $invokePreGitBindingProbe = {
+            param(
+                [Parameter(Mandatory)][ValidateSet("Direct", "Verify", "Workspace")][string]$Mode,
+                [Parameter(Mandatory)][object]$Attack
+            )
+
+            $fixture = & $newPreGitCheckout $Attack.Label.Replace(" ", "-")
+            $external = Join-Path $fixture.CaseRoot "reparse-target"
+            New-Item -ItemType Directory -Force -Path $external | Out-Null
+            $state = [pscustomobject]@{
+                ReplacementApplied = $false
+                FirstGitCaptureReached = $false
+                Saved = $null
+                WorkspaceGateActions = 0
+                GatesStarted = 0
+            }
+            $replace = $Attack.Replace
+            $restore = $Attack.Restore
+            $caseConfiguration = [pscustomobject]@{
+                vcpkg = [pscustomobject]@{
+                    scriptsCommit = $fixture.Commit
+                    toolRelease = $toolRelease
+                    toolCommit = $toolCommit
+                    windowsAsset = [pscustomobject]@{
+                        bytes = [long]$asset.Length
+                        sha256 = $assetHash
+                    }
+                }
+            }
+            $capture = {
+                param($Program, $Arguments, $Description, $WorkingDirectory, $StreamOutput)
+
+                $null = $Program, $WorkingDirectory, $StreamOutput
+                switch ($Description) {
+                    "vcpkg scripts commit check" {
+                        try {
+                            $state.Saved = & $replace $fixture.Root $external
+                        }
+                        catch {
+                            throw "pre-Git vcpkg physical binding rejected $($Attack.Label) reparse substitution: $($_.Exception.Message)"
+                        }
+                        $state.ReplacementApplied = $true
+                        $state.FirstGitCaptureReached = $true
+                        return $fixture.Commit
+                    }
+                    "vcpkg required tracked file check" { return [string]$Arguments[-1] }
+                    "vcpkg scripts cleanliness check" { return @() }
+                    "vcpkg tool version check" {
+                        return "vcpkg package management program version $toolRelease-$toolCommit"
+                    }
+                    default { return @() }
+                }
+            }.GetNewClosure()
+            try {
+                $failure = $null
+                try {
+                    if ($Mode -ceq "Direct") {
+                        Invoke-PrivateCommandWithNativeCapture `
+                            -CommandName "Assert-EasyConVcpkgCheckout" -Parameters @{
+                                VcpkgRoot = $fixture.Root
+                                Configuration = $caseConfiguration
+                                VcpkgExecutable = $vcpkgExecutable
+                            } -NativeCapture $capture | Out-Null
+                    }
+                    else {
+                        & $workspaceModule {
+                            param($RequestedMode, $Root, $Configuration, $Executable, $Capture, $ProbeState)
+
+                            $originalContext = ${function:Get-EasyConWindowsEnvironmentContext}
+                            $originalVerifyCore = ${function:Invoke-EasyConWindowsVerifyCore}
+                            $originalWorkspaceGates = ${function:Invoke-EasyConWindowsWorkspaceGates}
+                            $originalLifecycle = ${function:Invoke-EasyConEnvironmentLifecycle}
+                            $checkoutModule = $ExecutionContext.SessionState.Module
+                            $context = [pscustomobject]@{
+                                Repository = "contract-repository"
+                                ConfigurationPath = "contract-configuration"
+                                Location = [pscustomobject]@{
+                                    CacheRoot = "contract-cache"
+                                    EnvironmentRoot = "contract-environment"
+                                    IdentityKey = "contract-identity"
+                                }
+                            }
+                            $contextProbe = { param($RepositoryRoot, $ConfigurationPath, $CacheRoot) return $context }.GetNewClosure()
+                            $verifyProbe = {
+                                param($RepositoryRoot, $ConfigurationPath, $CacheRoot, $VsWherePath, $Context)
+
+                                $null = $RepositoryRoot, $ConfigurationPath, $CacheRoot, $VsWherePath, $Context
+                                & $checkoutModule {
+                                    param($CheckoutRoot, $CheckoutConfiguration, $CheckoutExecutable, $NativeCapture)
+
+                                    $originalNative = ${function:Invoke-EasyConNativeCapture}
+                                    try {
+                                        Set-Item -LiteralPath Function:script:Invoke-EasyConNativeCapture `
+                                            -Value $NativeCapture
+                                        Assert-EasyConVcpkgCheckout -VcpkgRoot $CheckoutRoot `
+                                            -Configuration $CheckoutConfiguration `
+                                            -VcpkgExecutable $CheckoutExecutable | Out-Null
+                                    }
+                                    finally {
+                                        Set-Item -LiteralPath Function:script:Invoke-EasyConNativeCapture `
+                                            -Value $originalNative
+                                    }
+                                } $Root $Configuration $Executable $Capture
+                                return [pscustomobject]@{ Status = "ready" }
+                            }.GetNewClosure()
+                            $workspaceProbe = {
+                                param($RepositoryRoot, $BaseSha, [switch]$RequireCleanTree, $GateInvoker)
+
+                                $null = $RepositoryRoot, $BaseSha, $RequireCleanTree
+                                $ProbeState.WorkspaceGateActions++
+                                & $GateInvoker "contract gate" "unused" @() "unused"
+                            }.GetNewClosure()
+                            $lifecycleProbe = {
+                                param($Mode, $Location, $SetupAction, $VerifyAction, $WorkspaceAction, $LeaseTimeoutMilliseconds)
+
+                                $null = $Location, $SetupAction, $LeaseTimeoutMilliseconds
+                                $summary = & $VerifyAction
+                                if ($Mode -ceq "Workspace") {
+                                    & $WorkspaceAction $summary | Out-Null
+                                }
+                                return $summary
+                            }.GetNewClosure()
+                            $gateInvoker = {
+                                param($Name, $Program, $Arguments, $RepositoryRoot)
+
+                                $null = $Name, $Program, $Arguments, $RepositoryRoot
+                                $ProbeState.GatesStarted++
+                            }.GetNewClosure()
+                            try {
+                                Set-Item -LiteralPath Function:script:Get-EasyConWindowsEnvironmentContext -Value $contextProbe
+                                Set-Item -LiteralPath Function:script:Invoke-EasyConWindowsVerifyCore -Value $verifyProbe
+                                Set-Item -LiteralPath Function:script:Invoke-EasyConWindowsWorkspaceGates -Value $workspaceProbe
+                                Set-Item -LiteralPath Function:script:Invoke-EasyConEnvironmentLifecycle -Value $lifecycleProbe
+                                if ($RequestedMode -ceq "Verify") {
+                                    Invoke-EasyConWindowsVerify -RepositoryRoot "input-repository" `
+                                        -ConfigurationPath "input-configuration" -CacheRoot "input-cache" | Out-Null
+                                }
+                                else {
+                                    Invoke-EasyConWindowsWorkspace -RepositoryRoot "input-repository" `
+                                        -ConfigurationPath "input-configuration" -CacheRoot "input-cache" `
+                                        -GateInvoker $gateInvoker | Out-Null
+                                }
+                            }
+                            finally {
+                                Set-Item -LiteralPath Function:script:Get-EasyConWindowsEnvironmentContext -Value $originalContext
+                                Set-Item -LiteralPath Function:script:Invoke-EasyConWindowsVerifyCore -Value $originalVerifyCore
+                                Set-Item -LiteralPath Function:script:Invoke-EasyConWindowsWorkspaceGates -Value $originalWorkspaceGates
+                                Set-Item -LiteralPath Function:script:Invoke-EasyConEnvironmentLifecycle -Value $originalLifecycle
+                            }
+                        } $Mode $fixture.Root $caseConfiguration $vcpkgExecutable $capture $state
+                    }
+                }
+                catch {
+                    $failure = ($_ | Out-String).Trim()
+                }
+                return [pscustomobject]@{
+                    Failure = $failure
+                    ReplacementApplied = $state.ReplacementApplied
+                    FirstGitCaptureReached = $state.FirstGitCaptureReached
+                    WorkspaceGateActions = $state.WorkspaceGateActions
+                    GatesStarted = $state.GatesStarted
+                }
+            }
+            finally {
+                & $restore $fixture.Root $state.Saved
+                Remove-Item -LiteralPath $fixture.CaseRoot -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }.GetNewClosure()
+        foreach ($attack in $preGitAttacks) {
+            $probe = & $invokePreGitBindingProbe "Direct" $attack
+            Assert-Contract (
+                $probe.Failure -match "pre-Git vcpkg physical binding rejected" -and
+                -not $probe.ReplacementApplied -and
+                -not $probe.FirstGitCaptureReached
+            ) "physical vcpkg binding must reject audit-after $($attack.Label) reparse substitution before Git"
+        }
+        foreach ($mode in @("Verify", "Workspace")) {
+            foreach ($attack in $preGitAttacks) {
+                $probe = & $invokePreGitBindingProbe $mode $attack
+                Assert-Contract (
+                    $probe.Failure -match "pre-Git vcpkg physical binding rejected" -and
+                    -not $probe.ReplacementApplied -and
+                    -not $probe.FirstGitCaptureReached -and
+                    $probe.WorkspaceGateActions -eq 0 -and
+                    $probe.GatesStarted -eq 0
+                ) (
+                    "$mode must fail closed before a pre-Git $($attack.Label) reparse defect can start a gate; " +
+                    "failure=$($probe.Failure); replacement=$($probe.ReplacementApplied); " +
+                    "capture=$($probe.FirstGitCaptureReached); workspace=$($probe.WorkspaceGateActions); " +
+                    "gates=$($probe.GatesStarted)"
+                )
+            }
+        }
     }
 
     Invoke-ContractCase -Name "pinned-cargo-source-rejects-ambient-path-contamination" -Action {
@@ -2450,6 +3109,10 @@ try {
             $head[0] -cmatch '^[0-9a-f]{40}$'
         ) "the real worktree contract must resolve one fixed Git SHA"
         $fixedSha = $head[0]
+        $fixedTree = @(& $git -C $repository.Path rev-parse "$fixedSha`^{tree}")[0]
+        Assert-Contract (
+            $LASTEXITCODE -eq 0 -and $fixedTree -cmatch '^[0-9a-f]{40}$'
+        ) "the real worktree contract must resolve the fixed source tree"
         $createdWorktrees = [System.Collections.Generic.List[string]]::new()
         try {
             New-Item -ItemType Directory -Force -Path $checkoutRoot | Out-Null
@@ -2518,6 +3181,8 @@ try {
             $preparedVcpkgRelease = "2026-01-01"
             $preparedVcpkgToolCommit = "2" * 40
             $preparedVcpkgTool = Join-Path $firstLocation.EnvironmentRoot "tools/vcpkg.cmd"
+            $preparedVcpkgInstalled = Join-Path $firstLocation.EnvironmentRoot `
+                "setup/vcpkg/installed"
             $state = [pscustomobject]@{
                 Provisions = 0
                 Downloads = 0
@@ -2571,6 +3236,7 @@ try {
                 )
                 $preparedTrackedFile.LastWriteTimeUtc = `
                     $preparedTrackedFile.LastWriteTimeUtc.AddMinutes(-10)
+                New-Item -ItemType Directory -Force -Path $preparedVcpkgInstalled | Out-Null
                 Set-ContractFile -Path $readyMarker -Value $fixedSha
             }.GetNewClosure()
             $newVerify = {
@@ -2675,6 +3341,23 @@ try {
             foreach ($name in $indexPaths.Keys) {
                 $beforeIndexes[$name] = & $getIndexSnapshot $indexPaths[$name]
             }
+            $immutablePaths = [ordered]@{
+                PreparedMarker = Join-Path $preparedVcpkgRoot ".vcpkg-root"
+                PreparedToolchain = Join-Path $preparedVcpkgRoot `
+                    "scripts/buildsystems/vcpkg.cmake"
+                PreparedExecutable = $preparedVcpkgTool
+                FirstManifest = Join-Path $firstWorktree "vcpkg.json"
+                SecondManifest = Join-Path $secondWorktree "vcpkg.json"
+            }
+            $beforeImmutableFiles = [ordered]@{}
+            foreach ($name in $immutablePaths.Keys) {
+                $beforeImmutableFiles[$name] = Get-ContractFileSnapshot `
+                    -Path $immutablePaths[$name]
+            }
+            $preparedTree = @(& $git -C $preparedVcpkgRoot rev-parse 'HEAD^{tree}')[0]
+            Assert-Contract (
+                $LASTEXITCODE -eq 0 -and $preparedTree -cmatch '^[0-9a-f]{40}$'
+            ) "the prepared vcpkg fixture must resolve its immutable Git tree"
 
             $verifyProbeRoot = Join-Path $temporaryRoot "real concurrent verify probes"
             $verifyProbeScript = Join-Path $verifyProbeRoot "verify-probe.ps1"
@@ -2695,6 +3378,7 @@ param(
     [Parameter(Mandatory)][string]$ResultPath,
     [Parameter(Mandatory)][string]$VcpkgRoot,
     [Parameter(Mandatory)][string]$VcpkgExecutable,
+    [Parameter(Mandatory)][string]$VcpkgInstalledRoot,
     [Parameter(Mandatory)][string]$VcpkgCommit,
     [Parameter(Mandatory)][string]$VcpkgToolRelease,
     [Parameter(Mandatory)][string]$VcpkgToolCommit,
@@ -2775,28 +3459,33 @@ $verify = {
     ) {
         throw "real concurrent Verify environment is not ready"
     }
+    $vcpkg = & $module {
+        param($Root, $Configuration, $Executable)
+        Assert-EasyConVcpkgCheckout -VcpkgRoot $Root `
+            -Configuration $Configuration -VcpkgExecutable $Executable
+    } $VcpkgRoot $vcpkgConfiguration $VcpkgExecutable
     [System.IO.File]::WriteAllText(
         $ReadyMarker,
         "ready",
         [System.Text.UTF8Encoding]::new($false)
     )
-    Wait-ProbeMarker -Path $ReleaseMarker -Description "release" `
+    Wait-ProbeMarker -Path $ReleaseMarker -Description "layout release" `
         -TimeoutMilliseconds $ReleaseTimeoutMilliseconds
-    & $module {
-        param($Root, $Configuration, $Executable)
-        Assert-EasyConVcpkgCheckout -VcpkgRoot $Root `
-            -Configuration $Configuration -VcpkgExecutable $Executable
-    } $VcpkgRoot $vcpkgConfiguration $VcpkgExecutable | Out-Null
-    [System.IO.Directory]::CreateDirectory($location.WorkspaceRoot) | Out-Null
-    [System.IO.File]::WriteAllText(
-        (Join-Path $location.WorkspaceRoot "concurrent-verify.txt"),
-        $location.WorkspaceKey,
-        [System.Text.UTF8Encoding]::new($false)
-    )
+    $layout = & $module {
+        param($VerifiedVcpkg, $Root, $Workspace, $Cache, $Environment, $Installed)
+        New-EasyConVcpkgWorkspaceLayout -Vcpkg $VerifiedVcpkg `
+            -RepositoryRoot $Root -WorkspaceRoot $Workspace -CacheRoot $Cache `
+            -EnvironmentRoot $Environment -InstalledRoot $Installed
+    } $vcpkg $RepositoryRoot $location.WorkspaceRoot $CacheRoot `
+        $location.EnvironmentRoot $VcpkgInstalledRoot
     return [pscustomobject]@{
         status = "ready"
         environmentRoot = $location.EnvironmentRoot
         workspaceRoot = $location.WorkspaceRoot
+        vcpkgRoot = $layout.Root
+        vcpkgExecutable = Join-Path $layout.Root "vcpkg.exe"
+        vcpkgMarker = Join-Path $layout.Root ".vcpkg-root"
+        vcpkgWrapper = $layout.Toolchain
     }
 }.GetNewClosure()
 
@@ -2813,6 +3502,10 @@ $result = [ordered]@{
     status = $summary.status
     environmentRoot = $summary.environmentRoot
     workspaceRoot = $location.WorkspaceRoot
+    vcpkgRoot = $summary.vcpkgRoot
+    vcpkgExecutable = $summary.vcpkgExecutable
+    vcpkgMarker = $summary.vcpkgMarker
+    vcpkgWrapper = $summary.vcpkgWrapper
 }
 [System.IO.File]::WriteAllText(
     $ResultPath,
@@ -2835,6 +3528,7 @@ $result = [ordered]@{
             )
 
             $verifyProcesses = [System.Collections.Generic.List[object]]::new()
+            $layoutRelease = Join-Path $verifyProbeRoot "layout-release.txt"
             try {
                 foreach ($entry in @(
                     [pscustomobject]@{
@@ -2850,7 +3544,6 @@ $result = [ordered]@{
                 )) {
                     $start = Join-Path $verifyProbeRoot "$($entry.Name)-start.txt"
                     $ready = Join-Path $verifyProbeRoot "$($entry.Name)-ready.txt"
-                    $release = Join-Path $verifyProbeRoot "$($entry.Name)-release.txt"
                     $result = Join-Path $verifyProbeRoot "$($entry.Name)-result.json"
                     $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
                     $startInfo.FileName = Join-Path $PSHOME "pwsh.exe"
@@ -2869,11 +3562,12 @@ $result = [ordered]@{
                         "-EnvironmentReadyValue", $fixedSha,
                         "-StartMarker", $start,
                         "-ReadyMarker", $ready,
-                        "-ReleaseMarker", $release,
+                        "-ReleaseMarker", $layoutRelease,
                         "-ReleaseTimeoutMilliseconds", $probeReleaseTimeoutMilliseconds,
                         "-ResultPath", $result,
                         "-VcpkgRoot", $preparedVcpkgRoot,
                         "-VcpkgExecutable", $preparedVcpkgTool,
+                        "-VcpkgInstalledRoot", $preparedVcpkgInstalled,
                         "-VcpkgCommit", $state.PreparedVcpkgCommit,
                         "-VcpkgToolRelease", $preparedVcpkgRelease,
                         "-VcpkgToolCommit", $preparedVcpkgToolCommit,
@@ -2887,7 +3581,7 @@ $result = [ordered]@{
                         Process = [System.Diagnostics.Process]::Start($startInfo)
                         Start = $start
                         Ready = $ready
-                        Release = $release
+                        Release = $layoutRelease
                         Result = $result
                         Location = $entry.Location
                     }) | Out-Null
@@ -2981,13 +3675,11 @@ $result = [ordered]@{
                         $workspaceLeaseFailure.Exception.Message -match 'busy|ownership'
                     ) "ready probe $($probe.Name) must hold its distinct w/<key> lease"
                 }
-                foreach ($probe in $verifyProcesses) {
-                    [System.IO.File]::WriteAllText(
-                        $probe.Release,
-                        "release",
-                        [System.Text.UTF8Encoding]::new($false)
-                    )
-                }
+                [System.IO.File]::WriteAllText(
+                    $layoutRelease,
+                    "release both workspace layouts",
+                    [System.Text.UTF8Encoding]::new($false)
+                )
                 foreach ($probe in $verifyProcesses) {
                     Assert-Contract ($probe.Process.WaitForExit(30000)) `
                         "real Verify probe $($probe.Name) must finish after release"
@@ -3002,7 +3694,12 @@ $result = [ordered]@{
                     Assert-Contract (
                         $probe.Result.status -ceq "ready" -and
                         $probe.Result.environmentRoot -ceq $firstLocation.EnvironmentRoot -and
-                        $probe.Result.workspaceRoot -ceq $probe.Location.WorkspaceRoot
+                        $probe.Result.workspaceRoot -ceq $probe.Location.WorkspaceRoot -and
+                        $probe.Result.vcpkgRoot -ceq
+                            (Join-Path $probe.Location.WorkspaceRoot "vcpkg/root") -and
+                        (Test-Path -LiteralPath $probe.Result.vcpkgExecutable -PathType Leaf) -and
+                        (Test-Path -LiteralPath $probe.Result.vcpkgMarker -PathType Leaf) -and
+                        (Test-Path -LiteralPath $probe.Result.vcpkgWrapper -PathType Leaf)
                     ) "real concurrent Verify must report shared e/ and its own w/<key>"
                 }
             }
@@ -3022,6 +3719,57 @@ $result = [ordered]@{
                 $verifyProcesses[0].Result.workspaceRoot -cne `
                     $verifyProcesses[1].Result.workspaceRoot
             ) "concurrent real Verify must use one e/ and distinct w/<key> roots"
+            for ($index = 0; $index -lt $verifyProcesses.Count; $index++) {
+                $probe = $verifyProcesses[$index]
+                $sourceManifestName = if ($index -eq 0) { "FirstManifest" } else { "SecondManifest" }
+                $workspaceManifest = Join-Path $probe.Result.workspaceRoot `
+                    "vcpkg/manifest/vcpkg.json"
+                $wrapperText = Get-Content -Raw -LiteralPath $probe.Result.vcpkgWrapper
+                $rootBinding = "set(Z_VCPKG_ROOT_DIR `"$($probe.Result.vcpkgRoot.Replace('\', '/'))`""
+                Assert-Contract (
+                    (Get-FileHash -LiteralPath $probe.Result.vcpkgExecutable `
+                        -Algorithm SHA256).Hash.ToLowerInvariant() -ceq
+                        $state.PreparedVcpkgToolHash -and
+                    (Get-FileHash -LiteralPath $probe.Result.vcpkgMarker `
+                        -Algorithm SHA256).Hash.ToLowerInvariant() -ceq
+                        $beforeImmutableFiles.PreparedMarker.Hash -and
+                    (Get-FileHash -LiteralPath $workspaceManifest `
+                        -Algorithm SHA256).Hash.ToLowerInvariant() -ceq
+                        $beforeImmutableFiles[$sourceManifestName].Hash -and
+                    (Get-ContractFileIdentity -Path $probe.Result.vcpkgExecutable) -cne
+                        $beforeImmutableFiles.PreparedExecutable.Identity -and
+                    (Get-ContractFileIdentity -Path $probe.Result.vcpkgMarker) -cne
+                        $beforeImmutableFiles.PreparedMarker.Identity -and
+                    (Get-ContractFileIdentity -Path $probe.Result.vcpkgWrapper) -cne
+                        $beforeImmutableFiles.PreparedToolchain.Identity -and
+                    (Get-ContractFileIdentity -Path $workspaceManifest) -cne
+                        $beforeImmutableFiles[$sourceManifestName].Identity -and
+                    $wrapperText.IndexOf($rootBinding, [System.StringComparison]::Ordinal) -ge 0 -and
+                    $wrapperText.IndexOf($rootBinding, [System.StringComparison]::Ordinal) -lt
+                        $wrapperText.IndexOf("include(`"", [System.StringComparison]::Ordinal)
+                ) "real concurrent layout $($probe.Name) must publish detached exact files and bind root before include"
+                $rootEntries = @(Get-ChildItem -Force -LiteralPath $probe.Result.vcpkgRoot |
+                    Select-Object -ExpandProperty Name | Sort-Object)
+                Assert-Contract (
+                    ($rootEntries -join ',') -ceq '.vcpkg-root,scripts,vcpkg.exe'
+                ) "real concurrent layout $($probe.Name) must retain the exact applocal root"
+            }
+            foreach ($property in @(
+                "vcpkgExecutable", "vcpkgMarker", "vcpkgWrapper"
+            )) {
+                Assert-Contract (
+                    (Get-ContractFileIdentity -Path $verifyProcesses[0].Result.$property) -cne
+                        (Get-ContractFileIdentity -Path $verifyProcesses[1].Result.$property)
+                ) "concurrent real layouts must use independent $property file identities"
+            }
+            Assert-Contract (
+                (Get-ContractFileIdentity -Path (
+                    Join-Path $verifyProcesses[0].Result.workspaceRoot "vcpkg/manifest/vcpkg.json"
+                )) -cne
+                (Get-ContractFileIdentity -Path (
+                    Join-Path $verifyProcesses[1].Result.workspaceRoot "vcpkg/manifest/vcpkg.json"
+                ))
+            ) "concurrent real layouts must use independent manifest file identities"
             $finalEnvironmentDirectories = @(
                 Get-ChildItem -LiteralPath (Join-Path $cache "e") -Directory -Force
             )
@@ -3041,9 +3789,33 @@ $result = [ordered]@{
                     -not (Test-Path -LiteralPath "$($indexPaths[$name]).lock")
                 ) "concurrent real Verify must preserve $name index hash/mtime and avoid index.lock"
             }
+            foreach ($name in $immutablePaths.Keys) {
+                $afterImmutable = Get-ContractFileSnapshot -Path $immutablePaths[$name]
+                Assert-Contract (
+                    $afterImmutable.Hash -ceq $beforeImmutableFiles[$name].Hash -and
+                    $afterImmutable.Identity -ceq $beforeImmutableFiles[$name].Identity -and
+                    $afterImmutable.LastWriteTicks -eq
+                        $beforeImmutableFiles[$name].LastWriteTicks
+                ) "concurrent real layouts must preserve immutable $name hash, identity, and mtime"
+            }
+            $preparedHeadAfter = @(& $git -C $preparedVcpkgRoot rev-parse HEAD)[0]
+            $preparedTreeAfter = @(& $git -C $preparedVcpkgRoot rev-parse 'HEAD^{tree}')[0]
+            $preparedStatusAfter = @(
+                & $git --no-optional-locks -c core.fsmonitor=false `
+                    -c core.untrackedCache=false -C $preparedVcpkgRoot status `
+                    --porcelain=v1 --untracked-files=all --ignored=matching
+            )
+            Assert-Contract (
+                $LASTEXITCODE -eq 0 -and
+                $preparedHeadAfter -ceq $state.PreparedVcpkgCommit -and
+                $preparedTreeAfter -ceq $preparedTree -and
+                $preparedStatusAfter.Count -eq 0 -and
+                -not (Test-Path -LiteralPath (Join-Path $preparedVcpkgRoot ".git/index.lock"))
+            ) "concurrent real layouts must leave the prepared vcpkg HEAD/tree/status immutable"
 
             foreach ($worktree in @($firstWorktree, $secondWorktree)) {
                 $finalHead = @(& $git -C $worktree rev-parse --verify HEAD)
+                $finalTree = @(& $git -C $worktree rev-parse 'HEAD^{tree}')[0]
                 $finalStatus = @(
                     & $git --no-optional-locks -c core.fsmonitor=false `
                         -c core.untrackedCache=false -C $worktree status `
@@ -3053,15 +3825,24 @@ $result = [ordered]@{
                     $LASTEXITCODE -eq 0 -and
                     $finalHead.Count -eq 1 -and
                     $finalHead[0] -ceq $fixedSha -and
+                    $finalTree -ceq $fixedTree -and
                     $finalStatus.Count -eq 0
                 ) "Setup and concurrent Verify must leave each fixed-SHA checkout clean"
+                & $git --no-optional-locks -c core.fsmonitor=false `
+                    -c core.untrackedCache=false -C $worktree diff --quiet --exit-code
+                $worktreeDiffExit = $LASTEXITCODE
+                & $git --no-optional-locks -c core.fsmonitor=false `
+                    -c core.untrackedCache=false -C $worktree diff --cached --quiet --exit-code
+                Assert-Contract (
+                    $worktreeDiffExit -eq 0 -and $LASTEXITCODE -eq 0
+                ) "Setup and concurrent Verify must leave source index and worktree diffs empty"
             }
-            foreach ($name in @("FirstSource", "SecondSource")) {
+            foreach ($name in $indexPaths.Keys) {
                 $afterCleanCheck = & $getIndexSnapshot $indexPaths[$name]
                 Assert-Contract (
                     $afterCleanCheck.Hash -ceq $beforeIndexes[$name].Hash -and
                     $afterCleanCheck.LastWriteTicks -eq $beforeIndexes[$name].LastWriteTicks
-                ) "the read-only clean check must also preserve the $name index"
+                ) "the read-only status/diff checks must also preserve the $name index"
             }
         }
         finally {
@@ -3076,6 +3857,122 @@ $result = [ordered]@{
         }
     }
 
+    Invoke-ContractCase -Name "workspace-file-publication-failures-are-atomic" -Action {
+        $publicationRoot = Join-Path $temporaryRoot "workspace file atomic publication"
+        $destination = Join-Path $publicationRoot "vcpkg.exe"
+        Set-ContractFile -Path $destination -Value "complete original final"
+        $original = Get-ContractFileSnapshot -Path $destination
+        $content = [System.Text.Encoding]::UTF8.GetBytes("verified replacement content")
+        $contentHash = [Convert]::ToHexString(
+            [System.Security.Cryptography.SHA256]::HashData($content)
+        ).ToLowerInvariant()
+        $materialize = {
+            param($Temporary)
+            $stream = [System.IO.FileStream]::new(
+                $Temporary,
+                [System.IO.FileMode]::CreateNew,
+                [System.IO.FileAccess]::Write,
+                [System.IO.FileShare]::None
+            )
+            try {
+                $stream.Write($content, 0, $content.Length)
+                $stream.Flush($true)
+            }
+            finally {
+                $stream.Dispose()
+            }
+        }.GetNewClosure()
+        $publicationParameters = @{
+            Destination = $destination
+            Algorithm = "SHA256"
+            Hash = $contentHash
+            Bytes = [long]$content.Length
+            TrustedRoot = $publicationRoot
+            Description = "contract workspace file"
+            MaterializeAction = $materialize
+            CleanupMaxAttempts = 1
+            CleanupRetryMilliseconds = 0
+        }
+
+        $publishFailureParameters = $publicationParameters.Clone()
+        $publishFailureParameters.MoveAction = {
+            param($Temporary, $Final)
+            $null = $Temporary, $Final
+            throw [System.IO.IOException]::new("synthetic atomic file publish failure")
+        }
+        Assert-Throws -Pattern "synthetic atomic file publish failure" -Action {
+            Invoke-PrivateCommand -CommandName "Publish-EasyConContentFileAtomically" `
+                -Parameters $publishFailureParameters
+        }
+        $afterPublishFailure = Get-ContractFileSnapshot -Path $destination
+        Assert-Contract (
+            $afterPublishFailure.Hash -ceq $original.Hash -and
+            $afterPublishFailure.Identity -ceq $original.Identity -and
+            @(Get-ChildItem -Force -LiteralPath $publicationRoot |
+                Where-Object { $_.Name -like '*.publish-*' }).Count -eq 0
+        ) "a move failure must preserve the complete final and remove its verified temporary"
+
+        $cleanupState = [pscustomobject]@{ Handle = $null; Temporary = $null }
+        $cleanupFailureParameters = $publicationParameters.Clone()
+        $cleanupFailureParameters.MoveAction = {
+            param($Temporary, $Final)
+            $null = $Final
+            $cleanupState.Temporary = $Temporary
+            $cleanupState.Handle = [System.IO.File]::Open(
+                $Temporary,
+                [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::Read,
+                [System.IO.FileShare]::None
+            )
+            throw [System.IO.IOException]::new("synthetic atomic file primary failure")
+        }.GetNewClosure()
+        $cleanupFailure = $null
+        try {
+            try {
+                Invoke-PrivateCommand -CommandName "Publish-EasyConContentFileAtomically" `
+                    -Parameters $cleanupFailureParameters | Out-Null
+            }
+            catch {
+                $cleanupFailure = $_
+            }
+            Assert-Contract (
+                $null -ne $cleanupFailure -and
+                $cleanupFailure.Exception.Message -match "synthetic atomic file primary failure" -and
+                $cleanupFailure.Exception.Message -match "cleanup" -and
+                $cleanupFailure.Exception.Data.Contains("EasyConTemporaryCleanupFailure") -and
+                $cleanupFailure.Exception.Data["EasyConResidualTemporary"] -ceq
+                    $cleanupState.Temporary -and
+                (Test-Path -LiteralPath $cleanupState.Temporary -PathType Leaf)
+            ) "temporary cleanup failure must retain the publish primary and residual diagnostic"
+            $afterCleanupFailure = Get-ContractFileSnapshot -Path $destination
+            Assert-Contract (
+                $afterCleanupFailure.Hash -ceq $original.Hash -and
+                $afterCleanupFailure.Identity -ceq $original.Identity
+            ) "temporary cleanup failure must not replace or truncate the complete final"
+        }
+        finally {
+            if ($null -ne $cleanupState.Handle) {
+                $cleanupState.Handle.Dispose()
+            }
+            if (
+                -not [string]::IsNullOrWhiteSpace($cleanupState.Temporary) -and
+                (Test-Path -LiteralPath $cleanupState.Temporary -PathType Leaf)
+            ) {
+                Remove-Item -LiteralPath $cleanupState.Temporary -Force
+            }
+        }
+
+        Invoke-PrivateCommand -CommandName "Publish-EasyConContentFileAtomically" `
+            -Parameters $publicationParameters | Out-Null
+        Assert-Contract (
+            (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant() -ceq
+                $contentHash -and
+            (Get-ContractFileIdentity -Path $destination) -cne $original.Identity -and
+            @(Get-ChildItem -Force -LiteralPath $publicationRoot |
+                Where-Object { $_.Name -like '*.publish-*' }).Count -eq 0
+        ) "a later atomic publication must replace the final completely after failures clear"
+    }
+
     Invoke-ContractCase -Name "prepared-and-workspace-path-boundary" -Action {
         $cache = Join-Path $temporaryRoot "prepared workspace boundary cache"
         $repositoryRoot = Join-Path $temporaryRoot "prepared workspace boundary source"
@@ -3087,11 +3984,23 @@ $result = [ordered]@{
         $installed = Join-Path $location.EnvironmentRoot "setup/vcpkg/installed"
         $vcpkgRoot = Join-Path $location.EnvironmentRoot "vcpkg/scripts"
         $toolchain = Join-Path $vcpkgRoot "scripts/buildsystems/vcpkg.cmake"
+        $vcpkgExecutable = Join-Path $location.EnvironmentRoot "downloads/vcpkg.exe"
         Set-ContractFile -Path (Join-Path $vendor "contract-crate/Cargo.toml") `
             -Value "[package]`nname='contract-crate'`nversion='1.0.0'"
         Set-ContractFile -Path (Join-Path $installed "x64-windows-static-md/lib/contract.lib") `
             -Value "native"
         Set-ContractFile -Path $toolchain -Value "# shared vcpkg toolchain"
+        [System.IO.File]::WriteAllBytes((Join-Path $vcpkgRoot ".vcpkg-root"), [byte[]]@())
+        Set-ContractFile -Path $vcpkgExecutable -Value "verified vcpkg executable"
+        $vcpkgExecutableItem = Get-Item -Force -LiteralPath $vcpkgExecutable
+        $vcpkgExecutableHash = (
+            Get-FileHash -LiteralPath $vcpkgExecutable -Algorithm SHA256
+        ).Hash.ToLowerInvariant()
+        $vcpkgMarker = Join-Path $vcpkgRoot ".vcpkg-root"
+        $vcpkgMarkerItem = Get-Item -Force -LiteralPath $vcpkgMarker
+        $vcpkgMarkerHash = (
+            Get-FileHash -LiteralPath $vcpkgMarker -Algorithm SHA256
+        ).Hash.ToLowerInvariant()
 
         $cargoLayout = Invoke-PrivateCommand -CommandName "New-EasyConCargoWorkspaceLayout" `
             -Parameters @{
@@ -3100,17 +4009,67 @@ $result = [ordered]@{
                 VendorRoot = $vendor
                 EnvironmentRoot = $location.EnvironmentRoot
             }
-        $vcpkgLayout = Invoke-PrivateCommand -CommandName "New-EasyConVcpkgWorkspaceLayout" `
-            -Parameters @{
-                Vcpkg = [pscustomobject]@{ Root = $vcpkgRoot; Toolchain = $toolchain }
-                RepositoryRoot = $repositoryRoot
-                WorkspaceRoot = $location.WorkspaceRoot
-                CacheRoot = $location.CacheRoot
-                EnvironmentRoot = $location.EnvironmentRoot
-                InstalledRoot = $installed
+        $expectedManifest = Join-Path $location.WorkspaceRoot "vcpkg/manifest/vcpkg.json"
+        $expectedRoot = Join-Path $location.WorkspaceRoot "vcpkg/root"
+        $expectedExecutable = Join-Path $expectedRoot "vcpkg.exe"
+        $expectedMarker = Join-Path $expectedRoot ".vcpkg-root"
+        $expectedWrapper = Join-Path $expectedRoot "scripts/buildsystems/vcpkg.cmake"
+        foreach ($parent in @(
+            (Split-Path -Parent $expectedManifest),
+            (Split-Path -Parent $expectedWrapper)
+        )) {
+            New-Item -ItemType Directory -Force -Path $parent | Out-Null
+        }
+        $hardlinkSources = [ordered]@{
+            Manifest = Join-Path $repositoryRoot "vcpkg.json"
+            Executable = $vcpkgExecutable
+            Marker = $vcpkgMarker
+            Wrapper = $toolchain
+        }
+        $hardlinkDestinations = [ordered]@{
+            Manifest = $expectedManifest
+            Executable = $expectedExecutable
+            Marker = $expectedMarker
+            Wrapper = $expectedWrapper
+        }
+        $sourceSnapshots = [ordered]@{}
+        foreach ($name in $hardlinkSources.Keys) {
+            New-Item -ItemType HardLink -Path $hardlinkDestinations[$name] `
+                -Target $hardlinkSources[$name] | Out-Null
+            $sourceSnapshots[$name] = Get-ContractFileSnapshot -Path $hardlinkSources[$name]
+            Assert-Contract (
+                (Get-ContractFileIdentity -Path $hardlinkDestinations[$name]) -ceq
+                    $sourceSnapshots[$name].Identity
+            ) "preseeded workspace $name must begin as a real hardlink to its source"
+        }
+
+        $vcpkgLayoutParameters = @{
+            Vcpkg = [pscustomobject]@{
+                Root = $vcpkgRoot
+                Toolchain = $toolchain
+                Executable = $vcpkgExecutable
+                ExecutableBytes = [long]$vcpkgExecutableItem.Length
+                ExecutableSha256 = $vcpkgExecutableHash
+                Marker = $vcpkgMarker
+                MarkerBytes = [long]$vcpkgMarkerItem.Length
+                MarkerSha256 = $vcpkgMarkerHash
             }
+            RepositoryRoot = $repositoryRoot
+            WorkspaceRoot = $location.WorkspaceRoot
+            CacheRoot = $location.CacheRoot
+            EnvironmentRoot = $location.EnvironmentRoot
+            InstalledRoot = $installed
+        }
+        $vcpkgLayout = Invoke-PrivateCommand -CommandName "New-EasyConVcpkgWorkspaceLayout" `
+            -Parameters $vcpkgLayoutParameters
         $cargoConfig = Get-Content -Raw -LiteralPath $cargoLayout.Configuration
         $vcpkgWrapper = Get-Content -Raw -LiteralPath $vcpkgLayout.Toolchain
+        $workspaceVcpkgExecutable = Join-Path $vcpkgLayout.Root "vcpkg.exe"
+        $workspaceVcpkgMarker = Join-Path $vcpkgLayout.Root ".vcpkg-root"
+        Assert-Contract (
+            (Test-Path -LiteralPath $workspaceVcpkgExecutable -PathType Leaf) -and
+            (Test-Path -LiteralPath $workspaceVcpkgMarker -PathType Leaf)
+        ) "workspace vcpkg projection must provide an executable applocal root"
         Assert-Contract ($cargoLayout.CargoHome.StartsWith(
             $location.WorkspaceRoot, [System.StringComparison]::OrdinalIgnoreCase
         )) "Cargo home must be per-worktree writable state"
@@ -3125,8 +4084,172 @@ $result = [ordered]@{
             "workspace vcpkg wrapper must reference the shared installed tree"
         Assert-Contract ($vcpkgWrapper.Contains($toolchain.Replace("\", "/"))) `
             "workspace vcpkg wrapper must include the shared scripts checkout"
+        $workspaceRootBinding = "set(Z_VCPKG_ROOT_DIR `"$($vcpkgLayout.Root.Replace("\", "/"))`""
+        Assert-Contract (
+            $vcpkgWrapper.IndexOf($workspaceRootBinding, [System.StringComparison]::Ordinal) -ge 0 -and
+            $vcpkgWrapper.IndexOf($workspaceRootBinding, [System.StringComparison]::Ordinal) -lt
+                $vcpkgWrapper.IndexOf("include(`"", [System.StringComparison]::Ordinal)
+        ) "workspace vcpkg wrapper must bind its applocal root before including prepared scripts"
         Assert-Contract (-not $vcpkgWrapper.Contains($repositoryRoot)) `
             "workspace vcpkg wrapper must not bind to the source worktree"
+        foreach ($name in $hardlinkSources.Keys) {
+            $sourceAfter = Get-ContractFileSnapshot -Path $hardlinkSources[$name]
+            Assert-Contract (
+                $sourceAfter.Hash -ceq $sourceSnapshots[$name].Hash -and
+                $sourceAfter.Bytes -eq $sourceSnapshots[$name].Bytes -and
+                $sourceAfter.Identity -ceq $sourceSnapshots[$name].Identity -and
+                (Get-ContractFileIdentity -Path $hardlinkDestinations[$name]) -cne
+                    $sourceSnapshots[$name].Identity
+            ) "workspace $name publication must detach a hardlink without changing its source"
+        }
+        Assert-Contract (
+            (Get-FileHash -LiteralPath $workspaceVcpkgExecutable -Algorithm SHA256).Hash.ToLowerInvariant() -ceq
+                $vcpkgExecutableHash -and
+            (Get-Item -Force -LiteralPath $workspaceVcpkgMarker).Length -eq 0 -and
+            (Get-FileHash -LiteralPath $workspaceVcpkgMarker -Algorithm SHA256).Hash.ToLowerInvariant() -ceq
+                $vcpkgMarkerHash
+        ) "workspace vcpkg executable and root marker must exactly match verified sources"
+        $rootEntries = @(Get-ChildItem -Force -LiteralPath $vcpkgLayout.Root |
+            Select-Object -ExpandProperty Name | Sort-Object)
+        $scriptsEntries = @(Get-ChildItem -Force -LiteralPath (Join-Path $vcpkgLayout.Root "scripts") |
+            Select-Object -ExpandProperty Name | Sort-Object)
+        $buildsystemEntries = @(Get-ChildItem -Force -LiteralPath (
+            Join-Path $vcpkgLayout.Root "scripts/buildsystems"
+        ) | Select-Object -ExpandProperty Name | Sort-Object)
+        Assert-Contract (
+            ($rootEntries -join ',') -ceq '.vcpkg-root,scripts,vcpkg.exe' -and
+            ($scriptsEntries -join ',') -ceq 'buildsystems' -and
+            ($buildsystemEntries -join ',') -ceq 'vcpkg.cmake'
+        ) "workspace vcpkg applocal root must contain only its exact controlled layout"
+
+        Set-ContractFile -Path $workspaceVcpkgExecutable -Value "damaged workspace tool"
+        $vcpkgLayout = Invoke-PrivateCommand -CommandName "New-EasyConVcpkgWorkspaceLayout" `
+            -Parameters $vcpkgLayoutParameters
+        Assert-Contract (
+            (Get-FileHash -LiteralPath $workspaceVcpkgExecutable -Algorithm SHA256).Hash.ToLowerInvariant() -ceq
+                $vcpkgExecutableHash
+        ) "a damaged workspace vcpkg executable must recover from the verified source"
+
+        $ordinaryIdentity = Get-ContractFileIdentity -Path $workspaceVcpkgExecutable
+        $lockedSnapshot = Get-ContractFileSnapshot -Path $workspaceVcpkgExecutable
+        $lockedHandle = [System.IO.File]::Open(
+            $workspaceVcpkgExecutable,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::Read
+        )
+        $lockedFailure = $null
+        try {
+            try {
+                Invoke-PrivateCommand -CommandName "New-EasyConVcpkgWorkspaceLayout" `
+                    -Parameters $vcpkgLayoutParameters | Out-Null
+            }
+            catch {
+                $lockedFailure = $_
+            }
+            Assert-Contract ($null -ne $lockedFailure) `
+                "a same-hash locked workspace vcpkg executable must not use a reuse fast path"
+            $lockedAfter = Get-ContractFileSnapshot -Path $workspaceVcpkgExecutable
+            Assert-Contract (
+                $lockedAfter.Hash -ceq $lockedSnapshot.Hash -and
+                $lockedAfter.Identity -ceq $lockedSnapshot.Identity -and
+                @(Get-ChildItem -Force -Recurse -LiteralPath $vcpkgLayout.Root |
+                    Where-Object { $_.Name -like '*.publish-*' }).Count -eq 0
+            ) "locked atomic replacement must preserve the complete final and clean its temporary"
+        }
+        finally {
+            $lockedHandle.Dispose()
+        }
+        $vcpkgLayout = Invoke-PrivateCommand -CommandName "New-EasyConVcpkgWorkspaceLayout" `
+            -Parameters $vcpkgLayoutParameters
+        Assert-Contract (
+            (Get-ContractFileIdentity -Path $workspaceVcpkgExecutable) -cne $ordinaryIdentity -and
+            (Get-FileHash -LiteralPath $workspaceVcpkgExecutable -Algorithm SHA256).Hash.ToLowerInvariant() -ceq
+                $vcpkgExecutableHash
+        ) "an unlocked same-hash ordinary destination must be replaced by a fresh byte copy"
+
+        $beforeWrongKind = [ordered]@{}
+        foreach ($name in $hardlinkDestinations.Keys) {
+            $beforeWrongKind[$name] = Get-ContractFileSnapshot -Path $hardlinkDestinations[$name]
+        }
+        Remove-Item -LiteralPath $workspaceVcpkgMarker -Force
+        New-Item -ItemType Directory -Path $workspaceVcpkgMarker | Out-Null
+        Assert-Throws -Pattern "regular file" -Action {
+            Invoke-PrivateCommand -CommandName "New-EasyConVcpkgWorkspaceLayout" `
+                -Parameters $vcpkgLayoutParameters
+        }
+        foreach ($name in @("Manifest", "Executable", "Wrapper")) {
+            $afterWrongKind = Get-ContractFileSnapshot -Path $hardlinkDestinations[$name]
+            Assert-Contract (
+                $afterWrongKind.Hash -ceq $beforeWrongKind[$name].Hash -and
+                $afterWrongKind.Identity -ceq $beforeWrongKind[$name].Identity
+            ) "wrong-kind preflight must not publish a new $name file"
+        }
+        Remove-Item -LiteralPath $workspaceVcpkgMarker -Force
+        Invoke-PrivateCommand -CommandName "New-EasyConVcpkgWorkspaceLayout" `
+            -Parameters $vcpkgLayoutParameters | Out-Null
+        Assert-Contract (
+            (Test-Path -LiteralPath $workspaceVcpkgMarker -PathType Leaf) -and
+            (Get-Item -Force -LiteralPath $workspaceVcpkgMarker).Length -eq 0
+        ) "wrong-kind workspace marker must recover after the blocking directory is removed"
+
+        $unexpectedWorkspace = Join-Path $location.WritableRoot "unexpected-vcpkg-layout"
+        $unexpectedRoot = Join-Path $unexpectedWorkspace "vcpkg/root"
+        Set-ContractFile -Path (Join-Path $unexpectedRoot "unexpected.txt") -Value "blocked"
+        $unexpectedParameters = $vcpkgLayoutParameters.Clone()
+        $unexpectedParameters.WorkspaceRoot = $unexpectedWorkspace
+        Assert-Throws -Pattern "unexpected input" -Action {
+            Invoke-PrivateCommand -CommandName "New-EasyConVcpkgWorkspaceLayout" `
+                -Parameters $unexpectedParameters
+        }
+        Assert-Contract (
+            -not (Test-Path -LiteralPath (Join-Path $unexpectedRoot "vcpkg.exe")) -and
+            -not (Test-Path -LiteralPath (Join-Path $unexpectedRoot ".vcpkg-root")) -and
+            -not (Test-Path -LiteralPath (
+                Join-Path $unexpectedRoot "scripts/buildsystems/vcpkg.cmake"
+            )) -and
+            -not (Test-Path -LiteralPath (
+                Join-Path $unexpectedWorkspace "vcpkg/manifest/vcpkg.json"
+            ))
+        ) "unexpected workspace root input must fail before publishing any controlled file"
+        Remove-Item -LiteralPath (Join-Path $unexpectedRoot "unexpected.txt") -Force
+        Invoke-PrivateCommand -CommandName "New-EasyConVcpkgWorkspaceLayout" `
+            -Parameters $unexpectedParameters | Out-Null
+
+        $reparseWorkspace = Join-Path $location.WritableRoot "reparse-vcpkg-layout"
+        $reparseRoot = Join-Path $reparseWorkspace "vcpkg/root"
+        $reparseExternal = Join-Path $temporaryRoot "vcpkg layout reparse external"
+        $reparseSentinel = Join-Path $reparseExternal "sentinel.txt"
+        Set-ContractFile -Path $reparseSentinel -Value "external must remain unchanged"
+        $reparseSentinelHash = (
+            Get-FileHash -LiteralPath $reparseSentinel -Algorithm SHA256
+        ).Hash
+        New-Item -ItemType Directory -Force -Path $reparseRoot | Out-Null
+        New-Item -ItemType Junction -Path (Join-Path $reparseRoot ".vcpkg-root") `
+            -Target $reparseExternal | Out-Null
+        $reparseParameters = $vcpkgLayoutParameters.Clone()
+        $reparseParameters.WorkspaceRoot = $reparseWorkspace
+        Assert-Throws -Pattern "reparse point" -Action {
+            Invoke-PrivateCommand -CommandName "New-EasyConVcpkgWorkspaceLayout" `
+                -Parameters $reparseParameters
+        }
+        Assert-Contract (
+            (Get-FileHash -LiteralPath $reparseSentinel -Algorithm SHA256).Hash -ceq
+                $reparseSentinelHash -and
+            -not (Test-Path -LiteralPath (Join-Path $reparseExternal "vcpkg.exe")) -and
+            -not (Test-Path -LiteralPath (Join-Path $reparseRoot "vcpkg.exe"))
+        ) "reparse workspace layout must fail closed without following or partially publishing"
+        Remove-Item -LiteralPath (Join-Path $reparseRoot ".vcpkg-root") -Force
+        Invoke-PrivateCommand -CommandName "New-EasyConVcpkgWorkspaceLayout" `
+            -Parameters $reparseParameters | Out-Null
+
+        foreach ($name in $hardlinkSources.Keys) {
+            $sourceAfterRecovery = Get-ContractFileSnapshot -Path $hardlinkSources[$name]
+            Assert-Contract (
+                $sourceAfterRecovery.Hash -ceq $sourceSnapshots[$name].Hash -and
+                $sourceAfterRecovery.Identity -ceq $sourceSnapshots[$name].Identity
+            ) "all workspace recovery paths must preserve the $name source file"
+        }
 
         $leak = Join-Path $installed "contract-leak.cmake"
         Set-ContractFile -Path $leak -Value "set(CONTRACT_SOURCE `"$repositoryRoot`")"
@@ -3600,6 +4723,228 @@ $result = [ordered]@{
             $audit.TotalBytesRead -gt (8 * $audit.JsonWindowLimitBytes) -and
             $audit.MaximumJsonWindowBytes -le $audit.JsonWindowLimitBytes
         ) "large JSON must use the declared bounded incremental reader window"
+
+        $singleScanRoot = Join-Path $location.EnvironmentRoot "contract-single-scan"
+        Set-ContractUtf8Text -Path (Join-Path $singleScanRoot "a.txt") -Value "a"
+        Set-ContractUtf8Text -Path (Join-Path $singleScanRoot "nested/b.txt") -Value "b"
+        $singleScan = Invoke-PrivateCommand `
+            -CommandName "Get-EasyConPreparedTreeVerification" `
+            -Parameters @{
+                Path = $singleScanRoot
+                TrustedRoot = $location.EnvironmentRoot
+                RepositoryRoot = $repositoryRoot
+                WritableRoot = $location.WritableRoot
+                Description = "contract single scan prepared tree"
+            }
+        Assert-Contract (
+            $singleScan.ControlledEnumerationPasses -eq 1 -and
+            $singleScan.FilesScanned -eq 2 -and
+            $singleScan.FileContentReads -eq $singleScan.FilesScanned -and
+            $singleScan.FileHashesComputed -eq $singleScan.FilesScanned -and
+            $singleScan.PhysicalEntriesChecked -ge $singleScan.FilesScanned
+        ) "prepared tree verification must enumerate once and combine every file read, hash, and physical boundary check"
+        Assert-Contract (
+            $singleScan.TreeFiles -eq 2 -and
+            $singleScan.TreeSha256 -ceq
+                "ea515f52b71f9c89f77908efa68aed580cf901fedd831fcbdcd1c42ce216efa2"
+        ) "prepared tree verification must preserve the stamp v2 sorted digest format"
+        $legacyDigestBuilder = [System.Text.StringBuilder]::new()
+        $legacyFiles = @(Get-ChildItem -LiteralPath $singleScanRoot -Recurse -Force -File |
+            Sort-Object FullName)
+        foreach ($legacyFile in $legacyFiles) {
+            $legacyRelative = [System.IO.Path]::GetRelativePath(
+                $singleScanRoot, $legacyFile.FullName
+            ).Replace('\', '/')
+            $legacyHash = (
+                Get-FileHash -LiteralPath $legacyFile.FullName -Algorithm SHA256
+            ).Hash.ToLowerInvariant()
+            [void]$legacyDigestBuilder.Append($legacyRelative).Append("`0").Append(
+                $legacyFile.Length
+            ).Append("`0").Append($legacyHash).Append("`n")
+        }
+        $legacyTreeSha256 = [System.Convert]::ToHexString(
+            [System.Security.Cryptography.SHA256]::HashData(
+                [System.Text.Encoding]::UTF8.GetBytes($legacyDigestBuilder.ToString())
+            )
+        ).ToLowerInvariant()
+        Assert-Contract (
+            $singleScan.TreeFiles -eq $legacyFiles.Count -and
+            $singleScan.TreeSha256 -ceq $legacyTreeSha256
+        ) "prepared tree verification must remain byte-compatible with the prior stamp v2 fingerprint"
+
+        $legacyCultureRoot = Join-Path $location.EnvironmentRoot "contract-legacy-culture-digest"
+        $legacyCultureNames = @(
+            ".cargo_vcs_info.json",
+            ".cargo-checksum.json",
+            ("z-{0}.json" -f [char]0x4e2d),
+            ("z_{0}.json" -f [char]0x6587),
+            ("z.{0}.json" -f [char]0x6587),
+            "Z-Alpha.json"
+        )
+        foreach ($name in $legacyCultureNames) {
+            Set-ContractUtf8Text -Path (Join-Path $legacyCultureRoot $name) `
+                -Value '{"mode":"portable"}'
+        }
+        $previousCulture = [System.Threading.Thread]::CurrentThread.CurrentCulture
+        $previousUiCulture = [System.Threading.Thread]::CurrentThread.CurrentUICulture
+        try {
+            $zhCn = [System.Globalization.CultureInfo]::GetCultureInfo("zh-CN")
+            [System.Threading.Thread]::CurrentThread.CurrentCulture = $zhCn
+            [System.Threading.Thread]::CurrentThread.CurrentUICulture = $zhCn
+            $legacyCultureScan = Invoke-PrivateCommand `
+                -CommandName "Get-EasyConPreparedTreeVerification" `
+                -Parameters @{
+                    Path = $legacyCultureRoot
+                    TrustedRoot = $location.EnvironmentRoot
+                    RepositoryRoot = $repositoryRoot
+                    WritableRoot = $location.WritableRoot
+                    Description = "contract legacy current-culture prepared tree"
+                }
+            $legacyCultureFiles = @(Get-ChildItem -LiteralPath $legacyCultureRoot -Recurse -Force -File |
+                Sort-Object FullName)
+            $legacyCultureOrder = @($legacyCultureFiles | Select-Object -ExpandProperty FullName)
+            $ordinalCultureOrder = [System.Collections.Generic.List[string]]::new(
+                [string[]]$legacyCultureOrder
+            )
+            $ordinalCultureOrder.Sort([System.StringComparer]::OrdinalIgnoreCase)
+            Assert-Contract (
+                ($legacyCultureOrder -join "`n") -cne ($ordinalCultureOrder -join "`n") -and
+                [array]::IndexOf(
+                    [string[]]$legacyCultureOrder,
+                    (Join-Path $legacyCultureRoot ".cargo_vcs_info.json")
+                ) -lt [array]::IndexOf(
+                    [string[]]$legacyCultureOrder,
+                    (Join-Path $legacyCultureRoot ".cargo-checksum.json")
+                )
+            ) "zh-CN punctuation and Unicode fixture must distinguish the legacy Sort-Object FullName order"
+            $legacyCultureBuilder = [System.Text.StringBuilder]::new()
+            foreach ($legacyCultureFile in $legacyCultureFiles) {
+                $legacyCultureRelative = [System.IO.Path]::GetRelativePath(
+                    $legacyCultureRoot, $legacyCultureFile.FullName
+                ).Replace('\', '/')
+                $legacyCultureHash = (
+                    Get-FileHash -LiteralPath $legacyCultureFile.FullName -Algorithm SHA256
+                ).Hash.ToLowerInvariant()
+                [void]$legacyCultureBuilder.Append($legacyCultureRelative).Append("`0").Append(
+                    $legacyCultureFile.Length
+                ).Append("`0").Append($legacyCultureHash).Append("`n")
+            }
+            $legacyCultureDigest = [System.Convert]::ToHexString(
+                [System.Security.Cryptography.SHA256]::HashData(
+                    [System.Text.Encoding]::UTF8.GetBytes($legacyCultureBuilder.ToString())
+                )
+            ).ToLowerInvariant()
+            Assert-Contract (
+                $legacyCultureScan.TreeFiles -eq $legacyCultureFiles.Count -and
+                $legacyCultureScan.TreeSha256 -ceq $legacyCultureDigest
+            ) "prepared tree verification must preserve the prior current-culture Sort-Object FullName stamp v2 digest"
+        }
+        finally {
+            [System.Threading.Thread]::CurrentThread.CurrentCulture = $previousCulture
+            [System.Threading.Thread]::CurrentThread.CurrentUICulture = $previousUiCulture
+        }
+
+        $legacyCaseRoot = Join-Path $location.EnvironmentRoot "contract-legacy-case-digest"
+        [System.IO.Directory]::CreateDirectory($legacyCaseRoot) | Out-Null
+        $fsutil = Join-Path $env:SystemRoot "System32/fsutil.exe"
+        & $fsutil file SetCaseSensitiveInfo $legacyCaseRoot enable | Out-Null
+        Assert-Contract ($LASTEXITCODE -eq 0) `
+            "legacy digest fixture must enable Windows case-sensitive directory semantics"
+        $legacyCaseBase = "abcdef"
+        foreach ($bits in 0..39) {
+            $characters = $legacyCaseBase.ToCharArray()
+            for ($index = 0; $index -lt $characters.Length; $index++) {
+                if (($bits -band (1 -shl $index)) -ne 0) {
+                    $characters[$index] = [char]::ToUpperInvariant($characters[$index])
+                }
+            }
+            Set-ContractUtf8Text -Path (
+                Join-Path $legacyCaseRoot ((-join $characters) + ".txt")
+            ) -Value ("payload-{0:d2}" -f $bits)
+        }
+        $legacyCaseScan = Invoke-PrivateCommand `
+            -CommandName "Get-EasyConPreparedTreeVerification" `
+            -Parameters @{
+                Path = $legacyCaseRoot
+                TrustedRoot = $location.EnvironmentRoot
+                RepositoryRoot = $repositoryRoot
+                WritableRoot = $location.WritableRoot
+                Description = "contract legacy case-sensitive prepared tree"
+            }
+        $legacyCaseFiles = @(
+            Get-ChildItem -LiteralPath $legacyCaseRoot -Recurse -Force -File |
+                Sort-Object FullName
+        )
+        $legacyCaseCompare = [System.Globalization.CultureInfo]::CurrentCulture.CompareInfo
+        $legacyCaseFirstPath = $legacyCaseFiles[0].FullName
+        Assert-Contract (
+            $legacyCaseFiles.Count -eq 40 -and
+            @($legacyCaseFiles | Where-Object {
+                $legacyCaseCompare.Compare(
+                    $legacyCaseFirstPath,
+                    $_.FullName,
+                    [System.Globalization.CompareOptions]::IgnoreCase
+                ) -ne 0
+            }).Count -eq 0
+        ) "case-sensitive digest fixture must contain 40 distinct comparer-equal paths"
+        $legacyCaseBuilder = [System.Text.StringBuilder]::new()
+        foreach ($legacyCaseFile in $legacyCaseFiles) {
+            $legacyCaseRelative = [System.IO.Path]::GetRelativePath(
+                $legacyCaseRoot, $legacyCaseFile.FullName
+            ).Replace('\', '/')
+            $legacyCaseHash = (
+                Get-FileHash -LiteralPath $legacyCaseFile.FullName -Algorithm SHA256
+            ).Hash.ToLowerInvariant()
+            [void]$legacyCaseBuilder.Append($legacyCaseRelative).Append("`0").Append(
+                $legacyCaseFile.Length
+            ).Append("`0").Append($legacyCaseHash).Append("`n")
+        }
+        $legacyCaseDigest = [System.Convert]::ToHexString(
+            [System.Security.Cryptography.SHA256]::HashData(
+                [System.Text.Encoding]::UTF8.GetBytes($legacyCaseBuilder.ToString())
+            )
+        ).ToLowerInvariant()
+        Assert-Contract (
+            $legacyCaseScan.TreeFiles -eq $legacyCaseFiles.Count -and
+            $legacyCaseScan.TreeSha256 -ceq $legacyCaseDigest
+        ) "prepared tree verification must preserve single-pass legacy sorting for comparer-equal paths"
+
+        $singlePhysicalPath = Invoke-PrivateCommand `
+            -CommandName "Assert-EasyConPreparedPhysicalTree" `
+            -Parameters @{
+                Path = $singleScanRoot
+                TrustedRoot = $location.EnvironmentRoot
+            }
+        Assert-Contract ($singlePhysicalPath -ceq $singleScanRoot) `
+            "physical-only prepared tree traversal must preserve its resolved root"
+        $singlePhysicalAudit = Invoke-PrivateCommand `
+            -CommandName "Assert-EasyConPreparedPhysicalTree" `
+            -Parameters @{
+                Path = $singleScanRoot
+                TrustedRoot = $location.EnvironmentRoot
+                PassThru = $true
+            }
+        Assert-Contract (
+            $singlePhysicalAudit.ControlledEnumerationPasses -eq 1 -and
+            $singlePhysicalAudit.FilesScanned -eq $singleScan.FilesScanned -and
+            $singlePhysicalAudit.PhysicalEntriesChecked -ge $singlePhysicalAudit.FilesScanned
+        ) "physical-only prepared tree traversal must return a concrete single-pass audit only when requested internally"
+        $physicalReparseExternal = Join-Path $temporaryRoot "single physical reparse external"
+        $physicalReparse = Join-Path $singleScanRoot "blocked-reparse"
+        New-Item -ItemType Directory -Force -Path $physicalReparseExternal | Out-Null
+        New-Item -ItemType Junction -Path $physicalReparse -Target $physicalReparseExternal | Out-Null
+        try {
+            Assert-Throws -Pattern "reparse point" -Action {
+                Invoke-PrivateCommand -CommandName "Assert-EasyConPreparedPhysicalTree" `
+                    -Parameters @{
+                        Path = $singleScanRoot
+                        TrustedRoot = $location.EnvironmentRoot
+                    }
+            }
+        }
+        finally {
+            Remove-Item -LiteralPath $physicalReparse -Force
+        }
 
         $preparedAuditSource = & $workspaceModule {
             @(
@@ -4511,4 +5856,4 @@ finally {
     }
 }
 
-Write-Output "Windows workspace contracts passed: 41 cases"
+Write-Output "Windows workspace contracts passed: 42 cases"

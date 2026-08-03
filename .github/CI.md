@@ -106,7 +106,9 @@ pwsh -NoProfile -File tools/run_windows_workspace.ps1 -Mode Workspace
 
 Verify 与 Workspace 都不 provision、install 或 download。Verify 重新计算 fingerprint，验证 stamp、所有显式工具
 路径/hash、MSVC/SDK、Rust、vcpkg checkout/tool/audit pins、OCR 与完整 native install tree，并只为当前 worktree 创建
-Cargo source replacement、vcpkg wrapper、target 与临时目录。Workspace 必须先通过同一 Verify，再执行 Cargo、Loom、规范、
+Cargo source replacement、vcpkg applocal root、target 与临时目录。applocal root 只含独立 byte-copy 的 `vcpkg.exe`、精确
+`.vcpkg-root` 和先绑定该 local root 再 include prepared toolchain 的 wrapper；每次发布都会替换目标目录项，不复用可能与
+source/prepared 文件共享 identity 的同 hash 文件。Workspace 必须先通过同一 Verify，再执行 Cargo、Loom、规范、
 链接、repository contracts 与 diff 门禁。缺失、损坏、环境 schema/host-target/fingerprint 失配都在第一个 build gate 前失败，
 并明确要求重新运行 Setup；worktree 切换本身只改变隔离的可写输出。
 
@@ -116,6 +118,21 @@ source worktree 或整个 `CacheRoot/w`，工具记录也不得位于 source rep
 及全部 nested object 严格拒绝 duplicate key、错误 JSON type、字符串/小数/exponent 数值、缺失和未知字段。任何旧 schema、
 损坏或 identity 不匹配的 stamp 都 fail closed；Verify/Workspace 对 `e/` 只读，prepared vcpkg Git 检查禁止 optional lock 和
 index refresh，全部可写状态必须留在当前 `w/`。
+
+Cargo vendor 与 vcpkg installed 每棵 prepared tree 在 Setup 的最终核验及日常 Verify 中各只走一次受控 C# 扫描：根与祖先
+物理边界只检查一次且不跟随 reparse point；physical-only 与 vcpkg binding 的目录 entry 按固定 ordinal 顺序枚举，content
+scan 按文件系统枚举顺序收集 record，不在最终 digest sort 前预排。每个文件只打开一个 `FileShare.Read` 的顺序流，同时完成
+SHA-256、stamp v2 digest record、text/escaped JSON source/writable path 审计。digest 只执行一次旧
+`Sort-Object FullName` 当前文化、大小写不敏感排序，并保持 `relative-path NUL decimal-bytes NUL lowercase-sha256 LF` 格式；
+读失败、reparse、损坏受保护文本/JSON、路径泄漏和 files/hash 不匹配仍在第一个 build gate 前 fail closed，绝不以跳过
+内容 hash 或 audit 换取速度。Verify 的 pinned vcpkg scripts 在首次 Git 前完成一次 physical C# traversal，对 file 用
+`FILE_READ_DATA`、directory 用 `FILE_LIST_DIRECTORY`（同一 access bit）绑定 root 及每个已枚举 entry 的 `FileShare.Read`
+句柄；ordinary entry 以 `FILE_FLAG_BACKUP_SEMANTICS` 未知类型打开，只从 bound handle 的一次 basic query 完成 reparse/type
+分类。zero access/`FILE_READ_ATTRIBUTES` 不构成 delete/rename lock。root、`.git`
+与 required paths 才在 Git 前复核 FileId/final-path identity，全部句柄保持到最后
+一次 Git cleanliness 查询完成。绑定对本地与 UNC 长路径只在 Win32 handle/final-path API 边界使用 private extended-length
+形式，立即归一回逻辑路径；stamp、digest、诊断和公开环境变量不得出现 `\\?\`。单 root handle 不能保护子项，任意
+替换/reparse/读取失败在 Git 和 gate 前 fail closed。
 
 每个 fingerprint/schema/host-target identity 在环境根外有一个 ownership lock。Setup 从检查 stamp、删除旧树、安装到
 发布并复验 stamp 全程持有独占 lease；Verify 持共享 lease；Workspace 的同一个共享 lease 覆盖 Verify 和全部 gates，

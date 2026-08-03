@@ -336,5 +336,165 @@ class WindowsBuildEnvironmentContracts(unittest.TestCase):
         )
 
 
+class WindowsWorkspaceModuleContracts(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.module = (ROOT / "tools/windows_workspace.psm1").read_text(
+            encoding="utf-8"
+        )
+
+    def assert_rejected(self, module, label):
+        self.assertTrue(
+            GUARD.windows_workspace_module_failures(module),
+            "{} mutation must be rejected".format(label),
+        )
+
+    def test_current_workspace_vcpkg_projection_is_guarded(self):
+        self.assertEqual(GUARD.windows_workspace_module_failures(self.module), [])
+
+    def test_workspace_vcpkg_projection_mutations_are_rejected(self):
+        mutations = {
+            "missing root binding": (
+                '"set(Z_VCPKG_ROOT_DIR',
+                '"set(EASYCON_UNUSED_ROOT',
+            ),
+            "non-internal root binding": (
+                'CACHE INTERNAL `"EasyCon workspace-local vcpkg applocal root',
+                'CACHE PATH `"EasyCon workspace-local vcpkg applocal root',
+            ),
+            "same-hash reuse": ("-ReplaceExisting", ""),
+            "in-place wrapper write": (
+                "Write-EasyConUtf8FileAtomically -Path $wrapper",
+                "[System.IO.File]::WriteAllText($wrapper",
+            ),
+            "non-overwrite publish": (
+                "[System.IO.File]::Move($temporary, $destinationPath, $true)",
+                "[System.IO.File]::Move($temporary, $destinationPath, $false)",
+            ),
+            "non-unique temporary": (
+                "[System.IO.FileMode]::CreateNew",
+                "[System.IO.FileMode]::OpenOrCreate",
+            ),
+            "broadened root": (
+                'Allowed = @(".vcpkg-root", "scripts", "vcpkg.exe")',
+                'Allowed = @(".vcpkg-root", "scripts", "vcpkg.exe", "other")',
+            ),
+        }
+        for label, (original, replacement) in mutations.items():
+            with self.subTest(label=label):
+                self.assertIn(original, self.module)
+                mutated = self.module.replace(original, replacement, 1)
+                self.assertNotEqual(mutated, self.module)
+                self.assert_rejected(mutated, label)
+        self.assert_rejected(
+            self.module + "\n$env:VCPKG_APPLOCAL_DEPS = '0'\n",
+            "disabled applocal",
+        )
+
+    def test_prepared_tree_single_scan_mutations_are_rejected(self):
+        mutations = {
+            "missing controlled enumeration": (
+                "Directory.EnumerateFileSystemEntries",
+                "Directory.GetFiles",
+            ),
+            "nonincremental hash": (
+                "IncrementalHash.CreateHash",
+                "SHA256.Create",
+            ),
+            "Verify Cargo fallback fingerprint": (
+                "Get-EasyConPreparedTreeVerification -Path $preparedPaths.cargoVendor",
+                "Get-EasyConTreeFingerprint -Path $preparedPaths.cargoVendor",
+            ),
+            "assertion bypass": (
+                "Get-EasyConPreparedTreeVerification -Path $Path",
+                "Get-EasyConLegacyPreparedTreeVerification -Path $Path",
+            ),
+            "physical boundary bypass": (
+                "PreparedTreeAuditor]::ValidatePhysicalTree",
+                "PreparedTreeAuditor]::LegacyPhysicalTree",
+            ),
+            "Verify vcpkg full-tree binding root": (
+                "-VcpkgExecutable $tools.vcpkg `\n        -TrustedRoot $location.EnvironmentRoot",
+                "-VcpkgExecutable $tools.vcpkg `\n        -TrustedRoot $location.CacheRoot",
+            ),
+            "vcpkg full-tree binding": (
+                "PreparedTreeAuditor]::BindVcpkgCheckout(",
+                "PreparedTreeAuditor]::AuditTree(",
+            ),
+            "vcpkg binding lifetime": (
+                "$binding.Dispose()",
+                "$binding.ReleaseBeforeGit()",
+            ),
+            "vcpkg critical path identity revalidation": (
+                "vcpkg checkout binding path",
+                "vcpkg checkout held handle only",
+            ),
+            "vcpkg extended Win32 CreateFile path": (
+                "GetWin32ExtendedPath(logicalPath)",
+                "logicalPath",
+            ),
+            "vcpkg minimal read-share entry binding": (
+                "uint desiredAccess = FileReadData | FileListDirectory;",
+                "uint desiredAccess = 0;",
+            ),
+            "content digest ordinal pre-sort": (
+                "private static bool ScanDirectory(\n"
+                "            string directory,\n"
+                "            string tree,\n"
+                "            string[] labels,\n"
+                "            string[] references,\n"
+                "            bool auditContent,\n"
+                "            PreparedTreeAuditResult result,\n"
+                "            List<TreeFileRecord> files)\n"
+                "        {\n"
+                "            List<string> entries = new List<string>();",
+                "private static bool ScanDirectory(\n"
+                "            string directory,\n"
+                "            string tree,\n"
+                "            string[] labels,\n"
+                "            string[] references,\n"
+                "            bool auditContent,\n"
+                "            PreparedTreeAuditResult result,\n"
+                "            List<TreeFileRecord> files)\n"
+                "        {\n"
+                "            List<string> entries = new List<string>();\n"
+                "            entries.Sort(StringComparer.OrdinalIgnoreCase);",
+            ),
+            "vcpkg binding pre-handle attributes": (
+                "PreparedVcpkgBoundPhysicalEntry bound = OpenBoundPhysicalEntry(\n"
+                "                    entry,\n"
+                "                    null,",
+                "File.GetAttributes(entry);\n"
+                "                PreparedVcpkgBoundPhysicalEntry bound = "
+                "OpenBoundPhysicalEntry(\n"
+                "                    entry,\n"
+                "                    null,",
+            ),
+            "vcpkg basic entry audit": (
+                "GetBoundBasicInformation(",
+                "GetBoundFileInformation(",
+            ),
+            "vcpkg basic metric detached from OS query": (
+                "result.PhysicalBasicInformationQueries++;\n"
+                "            if (!GetFileInformationByHandleEx(",
+                "if (!GetFileInformationByHandleEx(",
+            ),
+            "vcpkg extended UNC normalization": (
+                'return @"\\\\?\\UNC\\" + logicalPath.Substring(2);',
+                'return logicalPath;',
+            ),
+            "vcpkg final path logical normalization": (
+                "return NormalizeFullPath(buffer.ToString());",
+                "return buffer.ToString();",
+            ),
+        }
+        for label, (original, replacement) in mutations.items():
+            with self.subTest(label=label):
+                self.assertIn(original, self.module)
+                mutated = self.module.replace(original, replacement)
+                self.assertNotEqual(mutated, self.module)
+                self.assert_rejected(mutated, label)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

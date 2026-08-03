@@ -77,8 +77,11 @@ immutable prepared tree。Setup 使用 `cargo vendor --locked` 把 lockfile 与�
 安装进环境。Cargo 不从 ambient PATH 解析；rustup 必须先为固定 channel 返回受控 Rust home 精确 toolchain 目录中的
 `cargo.exe`，Setup 在首次 Cargo 执行前核对该路径、release 与 host。`Verify` 与 `Workspace` 不安装或下载；两者只接受
 当前 shared identity 对应且未损坏的 stamp，缺失或失配时要求重新运行 Setup。新建或切换 worktree 不构成 Setup 理由，
-必须先 Verify。canonical worktree key 仅选择 `CARGO_TARGET_DIR`、CMake cache、Cargo home/config、vcpkg wrapper/downloads
-和测试临时目录等可写/source-bound 输出。`Workspace` 在 Verify 后运行完整仓库门禁。
+必须先 Verify。canonical worktree key 仅选择 `CARGO_TARGET_DIR`、CMake cache、Cargo home/config、vcpkg applocal
+root/downloads 和测试临时目录等可写/source-bound 输出。local root 严格只含 `.vcpkg-root`、独立 byte-copy 的
+`vcpkg.exe` 与 `scripts/buildsystems/vcpkg.cmake` wrapper；wrapper 在 include immutable prepared toolchain 前绑定该 root，
+使 CMake 的 z-applocal 后处理只执行当前 worktree 拥有的工具副本。tool、marker、manifest 与 wrapper 都经同目录临时文件
+完整校验后原子替换 final，不沿预置 hardlink 覆写 shared environment 或 source。`Workspace` 在 Verify 后运行完整仓库门禁。
 
 环境目录之外有跨 fingerprint/worktree 的共享资产层。直接固定资产以 SHA-256/SHA-512 内容寻址，命中时每次重验
 hash/bytes，损坏项在逐资产锁内隔离，唯一同卷 temporary 通过验证后才原子发布。CMake、Ninja、vcpkg.exe、7-Zip/7zr
@@ -139,6 +142,22 @@ stamp v2 用结构化 JSON parser 对每层 required key、JSON kind 和十进�
 field 与字符串、小数或 exponent 数值都 fail closed。工具路径同时排除 source repository 与整个 `CacheRoot/w`；prepared
 JSON 先解码 escaped string 再审计 source/writable reference。Verify 的 prepared vcpkg Git 查询禁止 optional lock/index refresh，
 因此共享 `e/` 在 Verify 与 Workspace 中保持只读。
+
+Cargo vendor 与 vcpkg installed 是完整内容核验而非 cache hint：每棵 tree 在 Setup 最终检查和 Verify 中各做一次有界 C#
+traversal。scanner 对 root/ancestor 做一次 physical boundary 检查、遇到任意 reparse 即拒绝；physical-only 与 vcpkg binding
+逐目录固定排序，content scan 则按文件系统枚举顺序收集 record，不在最终 digest sort 前预排序。每个 regular file 只使用一个
+顺序读取流，同步计算 SHA-256、v2 digest 行、raw text 与 escaped JSON 的 source/writable reference 审计。v2 digest 只执行
+一次既有 `Sort-Object FullName` 的当前文化、大小写不敏感排序，并继续使用 NUL 分隔十进制
+长度/lowercase hash 和 LF 行终止格式；不得改成 ordinal 排序，因此既有 stamp 语义不变。任何读取、解码、JSON、边界或
+digest/count 异常都在 gate 启动前 fail closed；不引入按组件 fingerprint、Preflight mode 或 GC 路径。pinned vcpkg scripts
+在 Verify 的首次 Git 查询前完成一轮 physical C# traversal，并为 file 使用 `FILE_READ_DATA`、directory 使用同一 access bit
+语义的 `FILE_LIST_DIRECTORY`，均以 `FileShare.Read` 持有到最后一次 Git cleanliness 查询结束；ordinary entry 使用
+`FILE_FLAG_BACKUP_SEMANTICS` 以未知类型打开，并只从 bound handle 的一次 basic query 完成 reparse/type 分类，只有 root、
+`.git` 和 required paths 才作 FileId/final-path 绑定并在 Git 前复核 identity。zero
+access 与 `FILE_READ_ATTRIBUTES` 不能作为 delete/rename lock，单独持有
+root 句柄不足以保护子项；本地/UNC 超过 `MAX_PATH` 的 entry 仅在 private Win32 handle/final-path conversion 中使用
+extended-length 表示，随即恢复逻辑路径，绝不进入 stamp、digest、诊断或公开环境变量；任意 reparse、替换、身份变化或
+绑定读取失败都在 Git/gate 前 fail closed。
 
 ## 3. 单一原生构建
 

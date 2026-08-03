@@ -1152,6 +1152,390 @@ def windows_build_environment_failures(configuration, native_quality):
     return failures
 
 
+def _powershell_function_text(module_text, name):
+    marker = re.search(
+        r"(?m)^function\s+{}\s*\{{".format(re.escape(name)), module_text
+    )
+    if marker is None:
+        return None
+    following = re.search(r"(?m)^function\s+[A-Za-z0-9-]+\s*\{", module_text[marker.end() :])
+    end = len(module_text) if following is None else marker.end() + following.start()
+    return module_text[marker.start() : end]
+
+
+def windows_workspace_module_failures(module_text):
+    failures = []
+    layout = _powershell_function_text(
+        module_text, "New-EasyConVcpkgWorkspaceLayout"
+    )
+    publisher = _powershell_function_text(
+        module_text, "Publish-EasyConContentFileAtomically"
+    )
+    copier = _powershell_function_text(
+        module_text, "Copy-EasyConContentFileAtomically"
+    )
+    writer = _powershell_function_text(module_text, "Write-EasyConUtf8FileAtomically")
+    prepared_tree = _powershell_function_text(
+        module_text, "Get-EasyConPreparedTreeVerification"
+    )
+    prepared_tree_assert = _powershell_function_text(
+        module_text, "Assert-EasyConPreparedTreeDoesNotReferenceRepository"
+    )
+    prepared_physical_tree = _powershell_function_text(
+        module_text, "Assert-EasyConPreparedPhysicalTree"
+    )
+    prepared_tree_auditor = _powershell_function_text(
+        module_text, "Initialize-EasyConPreparedTreeAuditor"
+    )
+    vcpkg_checkout = _powershell_function_text(
+        module_text, "Assert-EasyConVcpkgCheckout"
+    )
+    fingerprint = _powershell_function_text(module_text, "Get-EasyConTreeFingerprint")
+    verify_core = _powershell_function_text(
+        module_text, "Invoke-EasyConWindowsVerifyCore"
+    )
+    setup_install = _powershell_function_text(
+        module_text, "Install-EasyConWindowsEnvironment"
+    )
+    for name, body in (
+        ("workspace vcpkg layout", layout),
+        ("atomic file publisher", publisher),
+        ("atomic content copier", copier),
+        ("atomic UTF-8 writer", writer),
+        ("prepared tree verification", prepared_tree),
+        ("prepared tree assertion", prepared_tree_assert),
+        ("prepared physical tree assertion", prepared_physical_tree),
+        ("prepared tree auditor", prepared_tree_auditor),
+        ("vcpkg checkout assertion", vcpkg_checkout),
+        ("prepared tree fingerprint", fingerprint),
+        ("Windows Verify core", verify_core),
+        ("Windows Setup install", setup_install),
+    ):
+        if body is None:
+            failures.append("Windows workspace module is missing {}".format(name))
+    if failures:
+        return failures
+
+    root_binding = layout.find('"set(Z_VCPKG_ROOT_DIR')
+    prepared_include = layout.find('"include(`"')
+    if (
+        root_binding < 0
+        or prepared_include < 0
+        or root_binding >= prepared_include
+        or "CACHE INTERNAL" not in layout[root_binding:prepared_include]
+    ):
+        failures.append(
+            "workspace vcpkg wrapper must bind Z_VCPKG_ROOT_DIR as CACHE INTERNAL "
+            "before including prepared scripts"
+        )
+    if layout.count("-ReplaceExisting") != 3:
+        failures.append(
+            "workspace vcpkg tool, marker, and manifest must each use fresh replacement"
+        )
+    if "Write-EasyConUtf8FileAtomically -Path $wrapper" not in layout:
+        failures.append("workspace vcpkg wrapper must use atomic UTF-8 publication")
+    if "Copy-Item -Force" in layout or "WriteAllText($wrapper" in layout:
+        failures.append(
+            "workspace vcpkg final files must not be opened or overwritten in place"
+        )
+    for exact_shape in (
+        'Allowed = @(".vcpkg-root", "scripts", "vcpkg.exe")',
+        'Expected = @(".vcpkg-root", "scripts", "vcpkg.exe")',
+        'Allowed = @("buildsystems")',
+        'Expected = @("buildsystems")',
+    ):
+        if exact_shape not in layout:
+            failures.append(
+                "workspace vcpkg applocal root exact-shape guard is missing: {}".format(
+                    exact_shape
+                )
+            )
+    if "[System.IO.File]::Move($temporary, $destinationPath, $true)" not in publisher:
+        failures.append(
+            "workspace atomic file publication must replace the final with one overwrite move"
+        )
+    if "[switch]$ReplaceExisting" not in copier or "-not $ReplaceExisting" not in copier:
+        failures.append(
+            "atomic content copy must expose a private fresh-replacement mode"
+        )
+    if "[System.IO.FileMode]::CreateNew" not in copier:
+        failures.append("fresh content copies must create a unique new temporary file")
+    if "[System.IO.FileMode]::CreateNew" not in writer:
+        failures.append("generated UTF-8 files must create a unique new temporary file")
+    for forbidden in ("VCPKG_APPLOCAL_DEPS", "X_VCPKG_APPLOCAL_DEPS_INSTALL"):
+        if forbidden in module_text:
+            failures.append(
+                "Windows workspace module must not disable or switch applocal mode: {}".format(
+                    forbidden
+                )
+            )
+
+    if "PreparedTreeAuditor]::AuditTree(" not in prepared_tree:
+        failures.append(
+            "prepared tree verification must delegate to the unified C# tree auditor"
+        )
+    if "Get-EasyConPreparedTreeVerification -Path $Path" not in prepared_tree_assert:
+        failures.append(
+            "prepared tree assertion must delegate to the unified tree verification"
+        )
+    if "PreparedTreeAuditor]::ValidatePhysicalTree(" not in prepared_physical_tree:
+        failures.append(
+            "prepared physical tree assertion must use the controlled C# traversal"
+        )
+    if "PreparedTreeAuditor]::FingerprintTree(" not in fingerprint:
+        failures.append(
+            "prepared tree fingerprint must use the controlled C# tree scanner"
+        )
+    for required in (
+        "PreparedTreeAuditor]::BindVcpkgCheckout(",
+        "$binding.AssertCurrent()",
+        "PhysicalEntriesBound",
+        "$binding.Dispose()",
+        "ControlledEnumerationPasses",
+    ):
+        if required not in vcpkg_checkout:
+            failures.append(
+                "vcpkg checkout assertion is missing its full-tree physical binding: {}".format(
+                    required
+                )
+            )
+    binding_start = vcpkg_checkout.find("PreparedTreeAuditor]::BindVcpkgCheckout(")
+    binding_current = vcpkg_checkout.find("$binding.AssertCurrent()")
+    first_git = vcpkg_checkout.find('"vcpkg scripts commit check"')
+    final_git = vcpkg_checkout.find('"vcpkg scripts cleanliness check"')
+    binding_dispose = vcpkg_checkout.find("$binding.Dispose()")
+    if not (
+        0 <= binding_start < binding_current < first_git < final_git < binding_dispose
+    ):
+        failures.append(
+            "vcpkg full-tree binding must cover every Git validation from audit through status"
+        )
+    for required in (
+        "Directory.EnumerateFileSystemEntries",
+        "File.GetAttributes",
+        "FileOptions.SequentialScan",
+        "IncrementalHash.CreateHash",
+        "StringComparer.OrdinalIgnoreCase",
+        "ValidatePhysicalTree",
+        "BindVcpkgCheckout",
+        "ScanAndBindPhysicalDirectory",
+        "CreateFile",
+        "FileReadData",
+        "FileListDirectory",
+        "FileShareRead",
+        "GetFileInformationByHandleEx",
+        "GetFinalPathNameByHandle",
+        "GetFileInformationByHandle",
+        "GetBoundBasicInformation",
+        "PhysicalReadDataLockCalls",
+        "PhysicalBasicInformationQueries",
+        "PhysicalIdentityQueries",
+        "PhysicalFinalPathQueries",
+        "GetWin32ExtendedPath",
+        "GetLogicalPathInput",
+        "GetBoundLogicalFinalPath",
+        "ComparePowerShellFullName",
+        "vcpkg checkout binding path",
+        "current.Handle.Dispose()",
+    ):
+        if required not in prepared_tree_auditor:
+            failures.append(
+                "prepared tree auditor is missing its single-scan primitive: {}".format(
+                    required
+                )
+            )
+
+    def csharp_region(start_marker, end_marker, description):
+        start = prepared_tree_auditor.find(start_marker)
+        end = prepared_tree_auditor.find(end_marker, start + len(start_marker))
+        if start < 0 or end < 0:
+            failures.append(
+                "prepared tree auditor is missing its {} region".format(description)
+            )
+            return ""
+        return prepared_tree_auditor[start:end]
+
+    audit_tree = csharp_region(
+        "public static PreparedTreeAuditResult AuditTree(",
+        "private static void ScanPhysicalDirectory(",
+        "content audit",
+    )
+    physical_scan = csharp_region(
+        "private static void ScanPhysicalDirectory(",
+        "private static void ScanAndBindPhysicalDirectory(",
+        "physical-only scan",
+    )
+    binding_scan = csharp_region(
+        "private static void ScanAndBindPhysicalDirectory(",
+        "private static void AssertVcpkgCriticalEntriesBound(",
+        "vcpkg binding scan",
+    )
+    open_bound_entry = csharp_region(
+        "private static PreparedVcpkgBoundPhysicalEntry OpenBoundPhysicalEntry(",
+        "private static string GetBoundLogicalFinalPath(",
+        "bound entry open",
+    )
+    basic_query = csharp_region(
+        "private static FileBasicInformation GetBoundBasicInformation(",
+        "private static void AssertBoundPhysicalEntryState(",
+        "bound basic information query",
+    )
+    content_scan = csharp_region(
+        "private static bool ScanDirectory(",
+        "private static FileAuditResult ScanFile(",
+        "content scan",
+    )
+    ordinal_entry_sort = "entries.Sort(StringComparer.OrdinalIgnoreCase);"
+    if content_scan and ordinal_entry_sort in content_scan:
+        failures.append(
+            "prepared content scan must not pre-sort entries before the legacy digest sort"
+        )
+    if audit_tree and audit_tree.count(
+        "files.Sort(TreeFileRecordComparer.Instance);"
+    ) != 1:
+        failures.append(
+            "prepared content digest must perform exactly one legacy-compatible final sort"
+        )
+    for description, region in (
+        ("physical-only scan", physical_scan),
+        ("vcpkg binding scan", binding_scan),
+    ):
+        if region and region.count(ordinal_entry_sort) != 1:
+            failures.append(
+                "prepared {} must retain exactly one deterministic ordinal entry sort".format(
+                    description
+                )
+            )
+    if binding_scan:
+        if "File.GetAttributes(" in binding_scan:
+            failures.append(
+                "vcpkg binding scan must classify each entry only from its bound handle"
+            )
+        for required in (
+            "OpenBoundPhysicalEntry(\n                    entry,\n                    null,",
+            "if (bound.IsDirectory)",
+        ):
+            if required not in binding_scan:
+                failures.append(
+                    "vcpkg binding scan is missing handle-first classification: {}".format(
+                        required
+                    )
+                )
+    if open_bound_entry:
+        for required in (
+            "bool? expectedDirectory",
+            "uint flags = FileFlagOpenReparsePoint | FileFlagBackupSemantics;",
+            "uint desiredAccess = FileReadData | FileListDirectory;",
+            "FileBasicInformation basicInformation = GetBoundBasicInformation(",
+            "IsDirectory = isDirectory,",
+        ):
+            if required not in open_bound_entry:
+                failures.append(
+                    "bound entry open is missing single-query type binding: {}".format(
+                        required
+                    )
+                )
+        if open_bound_entry.count("GetBoundBasicInformation(") != 1:
+            failures.append(
+                "bound entry open must issue exactly one basic information query"
+            )
+    if basic_query and (
+        "result.PhysicalBasicInformationQueries++;\n"
+        "            if (!GetFileInformationByHandleEx(" not in basic_query
+    ):
+        failures.append(
+            "vcpkg basic-query metric must increment immediately before the real OS query"
+        )
+    for required in (
+        "CreateFile(\n                GetWin32ExtendedPath(logicalPath),",
+        'return @"\\\\?\\UNC\\" + logicalPath.Substring(2);',
+        "return NormalizeFullPath(buffer.ToString());",
+    ):
+        if required not in prepared_tree_auditor:
+            failures.append(
+                "prepared tree auditor is missing extended Win32 path normalization: {}".format(
+                    required
+                )
+            )
+    if "NoDesiredAccess" in prepared_tree_auditor:
+        failures.append(
+            "prepared vcpkg binding must not use a zero-access handle as its delete/rename lock"
+        )
+    if (
+        "uint desiredAccess = FileReadData | FileListDirectory;"
+        not in prepared_tree_auditor
+        or "GetWin32ExtendedPath(logicalPath),\n                desiredAccess,\n                FileShareRead,"
+        not in prepared_tree_auditor
+    ):
+        failures.append(
+            "prepared vcpkg binding must retain each audited entry with its minimal read-data/list read-share lock"
+        )
+    if "Get-ChildItem" in prepared_tree or "Assert-EasyConPhysicalPath" in prepared_tree:
+        failures.append(
+            "prepared tree verification must not reintroduce PowerShell per-entry traversal"
+        )
+
+    verify_calls = re.findall(
+        r"Get-EasyConPreparedTreeVerification\s+-Path\s+"
+        r"\$preparedPaths\.(cargoVendor|vcpkgInstalled)",
+        verify_core,
+    )
+    if sorted(verify_calls) != ["cargoVendor", "vcpkgInstalled"]:
+        failures.append(
+            "Windows Verify must scan each prepared Cargo/native tree exactly once"
+        )
+    if verify_core.count("Assert-EasyConPreparedPhysicalTree") != 3:
+        failures.append(
+            "Windows Verify must reserve the physical-only scanner for shared cache, Rust home, and OCR"
+        )
+    if "vcpkgScriptsAudit" in verify_core:
+        failures.append(
+            "Windows Verify must not leave a pre-Git vcpkg physical audit window"
+        )
+    if not re.search(
+        r"Assert-EasyConVcpkgCheckout\s+-VcpkgRoot "
+        r"\$preparedPaths\.vcpkgScriptsRoot\s+`\s*\r?\n\s*"
+        r"-Configuration \$configuration -VcpkgExecutable \$tools\.vcpkg\s+`\s*\r?\n\s*"
+        r"-TrustedRoot \$location\.EnvironmentRoot",
+        verify_core,
+    ):
+        failures.append(
+            "Windows Verify must create the vcpkg full-tree binding at the prepared root"
+        )
+    for legacy in (
+        "Get-EasyConTreeFingerprint -Path $preparedPaths.",
+        "Assert-EasyConPreparedTreeDoesNotReferenceRepository -Path $preparedPaths.",
+    ):
+        if legacy in verify_core:
+            failures.append(
+                "Windows Verify must not reintroduce a duplicate prepared-tree scan: {}".format(
+                    legacy
+                )
+            )
+    for name in ("cargoVendor", "vcpkgInstalled"):
+        if re.search(
+            r"Assert-EasyConPhysicalTree\s+`\s*\r?\n\s*"
+            r"-Path \(\[string\]\$stamp\.paths\.{}\)".format(name),
+            verify_core,
+        ):
+            failures.append(
+                "Windows Verify must leave {} physical-tree traversal to the unified scanner".format(
+                    name
+                )
+            )
+
+    setup_calls = re.findall(
+        r"Get-EasyConPreparedTreeVerification\s+-Path\s+"
+        r"(\$cargoSources\.VendorRoot|\$vcpkgLayout\.Installed)",
+        setup_install,
+    )
+    if sorted(setup_calls) != ["$cargoSources.VendorRoot", "$vcpkgLayout.Installed"]:
+        failures.append(
+            "Windows Setup must produce each prepared tree digest and audit from one scan"
+        )
+    return failures
+
+
 def main():
     failures = repository_guard_regression_failures()
     windows_build_configuration_text = (
@@ -1293,6 +1677,7 @@ def main():
     windows_module = (ROOT / "tools/windows_workspace.psm1").read_text(
         encoding="utf-8"
     )
+    failures.extend(windows_workspace_module_failures(windows_module))
     for forbidden in (
         r"C:\\Users\\",
         r"D:\\project",

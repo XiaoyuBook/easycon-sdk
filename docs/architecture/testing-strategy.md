@@ -437,6 +437,12 @@ Windows 环境生命周期另有无网络轻量合同：两个不同物理 workt
 必须解析同一个 prepared `EnvironmentRoot` 和 environment lease，首个 Setup 后第二个 Setup 必须 `already-ready` 且零 provision/
 download；Cargo target、CMake cache、Cargo home/config、vcpkg wrapper/downloads 和测试临时目录必须不同。prepared tree、stamp、
 Cargo vendor/config、vcpkg installed tree 和工具记录必须审计 worktree absolute path 与潜在写入边界，泄漏 fixture 必须 fail closed。
+prepared Cargo/native tree 的性能回归还必须用确定性合同证明每棵 tree 只受控枚举一次、`FilesScanned` 等于内容读取和 SHA
+计算次数，并以 `zh-CN` 的标点/Unicode fixture 及 case-sensitive 目录中的 40 个 comparer-equal casing variants 比较旧
+`Sort-Object FullName` 单次当前文化排序产生的 stamp v2 digest；content traversal 不得在该最终排序前预排 entry，wall-clock
+仅可输出诊断，不能作为安全或正确性唯一断言。
+同一合同继续注入 reparse、锁定读失败、损坏 BOM text/strict JSON、raw/escaped source 或任意 writable path 及
+files/hash mismatch，并要求 Verify/Workspace 在任一环境缺陷下零 gate 启动。
 两个 fixture 都必须是同一 fixed SHA 的独立 clean checkout，禁止复制 fingerprint inputs；合同必须真实走首次 Setup 与第二次
 already-ready Setup，证明单一 `e/`、不同 `w/` 及 provision/download 计数不增加。prepared JSON 的 escaped source/任意
 `CacheRoot/w` path、source/writable tool record、stamp 每层 duplicate/unknown/type/integer mutation 都要独立 fail closed。
@@ -462,6 +468,17 @@ parser 只接受恰好一行完整输出，且测试不依赖机器当前 Python
 prepared vcpkg checkout 的真实 Git fixture 必须在改变 tracked file stat 后记录 `.git/index` hash/mtime，Verify 后保持二者
 不变且不产生 `index.lock`。Python 合同核对 `TEMP`/`TMP`/`TMPDIR`、pycache/bytecode 全部落到当前 `w/`，并让
 `RequireCleanTree` 对 gate 新增的 ignored pyc 仍然失败。
+vcpkg checkout 还必须在 audit 后、首次 Git 前确定性尝试把 checkout root、`.git`、非 root required entry 与 ordinary tracked
+entry 分别替换为 junction/reparse；全树以 file `FILE_READ_DATA`、directory `FILE_LIST_DIRECTORY` 的 `FileShare.Read`
+binding 必须拒绝每种替换、持续到全部 Git commit/tracked-file/cleanliness 查询结束。行为 fixture 还必须证明 zero access
+与 `FILE_READ_ATTRIBUTES` 允许 replacement，而最小 read-data/list lock 拒绝它。bulk fixture 的确定性 call counters 必须
+结合 guard 证明 ordinary entry 不先调用 `File.GetAttributes`，而是只由 bound handle 的一次真实 basic query 完成
+reparse/type 分类；FileId/final-path 仅用于 critical path 和其重开，且让 Direct、Verify 与 Workspace
+均在零 gate 前 fail closed。该 fixture
+还必须覆盖本地盘超过 `MAX_PATH` 的 audited
+directory/file、critical-path reopen，以及 ordinary/already-extended local 和 UNC path 的 private Win32 conversion；extended
+prefix 不得泄漏到 audit/stamp/digest diagnostics 或公开环境变量。单 root handle 不能作为该合同的替代，测试使用同步 native
+capture 而非随机 sleep。
 Visual Studio discovery 合同通过 native capture 注入 `vswhere` 的空输出、仅空白、多条、畸形、有效单路径与非零失败；
 空/空白成功输出必须给出 x64 C++ toolchain 未找到诊断，不能泄漏数组索引异常，其他既有边界保持不变。
 
