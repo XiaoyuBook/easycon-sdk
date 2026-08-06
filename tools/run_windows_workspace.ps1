@@ -23,6 +23,18 @@ $ErrorActionPreference = "Stop"
 $PSNativeCommandUseErrorActionPreference = $false
 Set-StrictMode -Version Latest
 
+$runnerSourcePath = [string]$PSCommandPath
+$runnerScriptBlock = $MyInvocation.MyCommand.ScriptBlock
+if (
+    [string]::IsNullOrWhiteSpace($runnerSourcePath) -or
+    $null -eq $runnerScriptBlock -or
+    $null -eq $runnerScriptBlock.Ast -or
+    [string]::IsNullOrWhiteSpace([string]$runnerScriptBlock.Ast.Extent.Text)
+) {
+    throw "run_windows_workspace.ps1 cannot capture its parsed source snapshot"
+}
+$runnerSourceText = [string]$runnerScriptBlock.Ast.Extent.Text
+
 if (-not $IsWindows) {
     throw "run_windows_workspace.ps1 supports Windows only"
 }
@@ -50,7 +62,15 @@ if ($Mode -cne "Workspace" -and $RequireStagedCandidate) {
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
 $configurationPath = Join-Path $PSScriptRoot "windows_build_environment.json"
 $modulePath = Join-Path $PSScriptRoot "windows_workspace.psm1"
-Import-Module -Name $modulePath -Force
+$workspaceModule = @(Import-Module -Name $modulePath -Force -PassThru)
+if ($workspaceModule.Count -ne 1) {
+    throw "run_windows_workspace.ps1 must import exactly one workspace module"
+}
+& $workspaceModule[0] {
+    param($SourcePath, $SourceText)
+
+    Set-EasyConGatePolicyRunnerSnapshot -Path $SourcePath -Text $SourceText
+} $runnerSourcePath $runnerSourceText
 
 $commonParameters = @{
     RepositoryRoot = $repositoryRoot

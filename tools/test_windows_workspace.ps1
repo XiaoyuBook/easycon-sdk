@@ -730,11 +730,14 @@ function Invoke-PrivateWorkspaceEvidenceProbe {
         [string]$ResolvedBaseCommit = ("c" * 40),
 
         [ValidateSet("None", "Verify", "Gates", IgnoreCase = $false)]
-        [string]$PolicyMutationPhase = "None"
+        [string]$PolicyMutationPhase = "None",
+
+        [ValidateSet("None", "Json", "PolicyScript", "RunnerSource", IgnoreCase = $false)]
+        [string]$CaptureMutationInput = "None"
     )
 
     $policyRepository = $repository.Path
-    if ($PolicyMutationPhase -cne "None") {
+    if ($PolicyMutationPhase -cne "None" -or $CaptureMutationInput -cne "None") {
         $policyRepository = Join-Path $ProbeRoot "policy-source"
         foreach ($name in @(
             "windows_gate_policy.json",
@@ -755,7 +758,8 @@ function Invoke-PrivateWorkspaceEvidenceProbe {
             $RequestedBaseSha,
             $ResolvedBase,
             $PolicyRepository,
-            $MutationPhase
+            $MutationPhase,
+            $CaptureMutation
         )
 
         $originalContext = ${function:Get-EasyConWindowsEnvironmentContext}
@@ -763,7 +767,22 @@ function Invoke-PrivateWorkspaceEvidenceProbe {
         $originalWorkspaceGates = ${function:Invoke-EasyConWindowsWorkspaceGates}
         $originalLifecycle = ${function:Invoke-EasyConEnvironmentLifecycle}
         $originalStructuredRecord = ${function:Write-EasyConStructuredRecord}
+        $originalPolicyHash = ${function:Get-EasyConGatePolicyHash}
         $originalPolicyScriptPath = $script:EasyConGatePolicyScriptPath
+        $hadPolicyScriptSnapshot = Test-Path -LiteralPath Variable:script:EasyConGatePolicyScriptSnapshot
+        $originalPolicyScriptSnapshot = if ($hadPolicyScriptSnapshot) {
+            $script:EasyConGatePolicyScriptSnapshot
+        }
+        else {
+            $null
+        }
+        $hadRunnerSnapshot = Test-Path -LiteralPath Variable:script:EasyConGatePolicyRunnerSnapshot
+        $originalRunnerSnapshot = if ($hadRunnerSnapshot) {
+            $script:EasyConGatePolicyRunnerSnapshot
+        }
+        else {
+            $null
+        }
         $workspaceRoot = Join-Path $Root "workspace"
         New-Item -ItemType Directory -Force -Path $workspaceRoot | Out-Null
         $location = [pscustomobject]@{
@@ -781,6 +800,7 @@ function Invoke-PrivateWorkspaceEvidenceProbe {
             Location = $location
         }
         $state = [pscustomobject]@{
+            VerifyCalls = 0
             GateCalls = 0
             GateCall = $null
             Records = [System.Collections.Generic.List[object]]::new()
@@ -793,16 +813,48 @@ function Invoke-PrivateWorkspaceEvidenceProbe {
             PolicyHashBefore = $null
             PolicyHashAfter = $null
         }
-        $policyPath = Join-Path $PolicyRepository "tools/windows_gate_policy.json"
+        $policyInputPaths = [ordered]@{
+            Json = Join-Path $PolicyRepository "tools/windows_gate_policy.json"
+            PolicyScript = Join-Path $PolicyRepository "tools/windows_gate_policy.ps1"
+            RunnerSource = Join-Path $PolicyRepository "tools/run_windows_workspace.ps1"
+        }
+        $policyPath = $policyInputPaths.Json
         if ($MutationPhase -cne "None") {
-            $script:EasyConGatePolicyScriptPath = Join-Path $PolicyRepository `
-                "tools/windows_gate_policy.ps1"
+            $script:EasyConGatePolicyScriptPath = $policyInputPaths.PolicyScript
+        }
+        if ($MutationPhase -cne "None" -or $CaptureMutation -cne "None") {
+            $strictUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
+            $newSnapshot = {
+                param($Path, $RelativePath)
+
+                $bytes = [System.IO.File]::ReadAllBytes($Path)
+                return [pscustomobject]@{
+                    Path = $Path
+                    RelativePath = $RelativePath
+                    Text = $strictUtf8.GetString($bytes)
+                    Bytes = $bytes
+                    Sha256 = [System.Convert]::ToHexString(
+                        [System.Security.Cryptography.SHA256]::HashData($bytes)
+                    ).ToLowerInvariant()
+                }
+            }.GetNewClosure()
+            $script:EasyConGatePolicyScriptPath = $policyInputPaths.PolicyScript
+            $script:EasyConGatePolicyScriptSnapshot = & $newSnapshot `
+                $policyInputPaths.PolicyScript "tools/windows_gate_policy.ps1"
+            $script:EasyConGatePolicyRunnerSnapshot = & $newSnapshot `
+                $policyInputPaths.RunnerSource "tools/run_windows_workspace.ps1"
         }
         $state.PolicyHashBefore = (Get-EasyConGatePolicyHash -RepositoryRoot $PolicyRepository).Value
         $mutatePolicy = {
             if (-not $state.PolicyMutated) {
+                $target = if ($CaptureMutation -ceq "None") {
+                    $policyPath
+                }
+                else {
+                    [string]$policyInputPaths[$CaptureMutation]
+                }
                 [System.IO.File]::AppendAllText(
-                    $policyPath,
+                    $target,
                     " ",
                     [System.Text.UTF8Encoding]::new($false, $true)
                 )
@@ -817,6 +869,7 @@ function Invoke-PrivateWorkspaceEvidenceProbe {
         $verifyProbe = {
             param($RepositoryRoot, $ConfigurationPath, $CacheRoot, $VsWherePath, $Context)
             $null = $RepositoryRoot, $ConfigurationPath, $CacheRoot, $VsWherePath
+            $state.VerifyCalls++
             Assert-Contract ([object]::ReferenceEquals($Context, $context)) `
                 "evidence probe must keep the resolved context"
             if ($MutationPhase -ceq "Verify") {
@@ -893,6 +946,20 @@ function Invoke-PrivateWorkspaceEvidenceProbe {
                 Value = $Value
             }) | Out-Null
         }.GetNewClosure()
+        $policyHashProbe = {
+            param(
+                [string]$RepositoryRoot,
+                [object[]]$Snapshots
+            )
+
+            if ($CaptureMutation -cne "None") {
+                & $mutatePolicy
+            }
+            if ($PSBoundParameters.ContainsKey("Snapshots")) {
+                return & $originalPolicyHash -RepositoryRoot $RepositoryRoot -Snapshots $Snapshots
+            }
+            return & $originalPolicyHash -RepositoryRoot $RepositoryRoot
+        }.GetNewClosure()
 
         try {
             Set-Item -LiteralPath Function:script:Get-EasyConWindowsEnvironmentContext `
@@ -905,6 +972,10 @@ function Invoke-PrivateWorkspaceEvidenceProbe {
                 -Value $lifecycleProbe
             Set-Item -LiteralPath Function:script:Write-EasyConStructuredRecord `
                 -Value $recordProbe
+            if ($CaptureMutation -cne "None") {
+                Set-Item -LiteralPath Function:script:Get-EasyConGatePolicyHash `
+                    -Value $policyHashProbe
+            }
             try {
                 Invoke-EasyConWindowsWorkspace -RepositoryRoot "input-repository" `
                     -ConfigurationPath "input-configuration" -CacheRoot "input-cache" `
@@ -928,10 +999,55 @@ function Invoke-PrivateWorkspaceEvidenceProbe {
                 -Value $originalLifecycle
             Set-Item -LiteralPath Function:script:Write-EasyConStructuredRecord `
                 -Value $originalStructuredRecord
+            Set-Item -LiteralPath Function:script:Get-EasyConGatePolicyHash `
+                -Value $originalPolicyHash
             $script:EasyConGatePolicyScriptPath = $originalPolicyScriptPath
+            if ($hadPolicyScriptSnapshot) {
+                Set-Variable -Scope Script -Name EasyConGatePolicyScriptSnapshot `
+                    -Value $originalPolicyScriptSnapshot
+            }
+            else {
+                Remove-Variable -Scope Script -Name EasyConGatePolicyScriptSnapshot `
+                    -ErrorAction SilentlyContinue
+            }
+            if ($hadRunnerSnapshot) {
+                Set-Variable -Scope Script -Name EasyConGatePolicyRunnerSnapshot `
+                    -Value $originalRunnerSnapshot
+            }
+            else {
+                Remove-Variable -Scope Script -Name EasyConGatePolicyRunnerSnapshot `
+                    -ErrorAction SilentlyContinue
+            }
         }
     } $ProbeRoot $RequireCleanTree.IsPresent $RequireStagedCandidate.IsPresent $FailGate.IsPresent `
-        $BaseSha $ResolvedBaseCommit $policyRepository $PolicyMutationPhase
+        $BaseSha $ResolvedBaseCommit $policyRepository $PolicyMutationPhase $CaptureMutationInput
+}
+
+function Assert-WorkspacePolicySnapshotCaptureFailsClosed {
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet("Json", "PolicyScript", "RunnerSource", IgnoreCase = $false)]
+        [string]$MutationTarget
+    )
+
+    $captured = Invoke-PrivateWorkspaceEvidenceProbe -ProbeRoot (
+        Join-Path $temporaryRoot ("workspace policy snapshot capture {0}" -f $MutationTarget)
+    ) -RequireStagedCandidate -CaptureMutationInput $MutationTarget
+    Assert-Contract (
+        $null -ne $captured.Failure -and
+        $captured.Failure.Exception.Message -match
+            "policy inputs changed during snapshot capture"
+    ) "$MutationTarget mutation must fail while capturing the policy snapshot"
+    Assert-Contract (
+        $captured.PolicyMutated -and
+        $captured.PolicyHashBefore -cne $captured.PolicyHashAfter
+    ) "$MutationTarget mutation must change the temporary policy input hash"
+    Assert-Contract ($captured.VerifyCalls -eq 0 -and $captured.GateCalls -eq 0) `
+        "$MutationTarget mutation must enter neither Verify nor a gate"
+    Assert-Contract (
+        -not (Test-Path -LiteralPath (Join-Path $captured.WorkspaceRoot "evidence")) -and
+        @($captured.Records | Where-Object { $_.Kind -ceq "workspace" }).Count -eq 0
+    ) "$MutationTarget mutation must publish neither evidence nor a passed record"
 }
 
 function Invoke-RunnerContractProcess {
@@ -1294,6 +1410,21 @@ try {
     }
 
     Invoke-ContractCase -Name "public-module-surface-hides-lifecycle-bypasses" -Action {
+        $policyImportState = & $script:workspaceModule {
+            [pscustomobject]@{
+                PolicyScriptPath = $script:EasyConGatePolicyScriptPath
+                PolicySnapshot = $script:EasyConGatePolicyScriptSnapshot
+                RunnerSnapshot = $script:EasyConGatePolicyRunnerSnapshot
+            }
+        }
+        Assert-Contract (
+            $policyImportState.PolicyScriptPath -ceq (Join-Path $PSScriptRoot "windows_gate_policy.ps1") -and
+            $null -ne $policyImportState.PolicySnapshot -and
+            $null -ne $policyImportState.RunnerSnapshot -and
+            $policyImportState.PolicySnapshot.RelativePath -ceq "tools/windows_gate_policy.ps1" -and
+            $policyImportState.RunnerSnapshot.RelativePath -ceq "tools/run_windows_workspace.ps1"
+        ) "direct module import must retain policy file scope and initialize both private source snapshots"
+
         foreach ($name in @(
             "Enter-EasyConEnvironmentLease",
             "Invoke-EasyConEnvironmentLifecycle",
@@ -1351,6 +1482,43 @@ try {
         }
         Assert-Contract ($targetedStarted.Gates -eq 0) `
             "a rejected external Targeted GateInvoker must start zero Verify or gate work"
+    }
+
+    Invoke-ContractCase -Name "runner-ast-source-handoff-remains-private-and-byte-bound" -Action {
+        $runnerPath = Join-Path $PSScriptRoot "run_windows_workspace.ps1"
+        $runnerCommand = Get-Command -Name $runnerPath -ErrorAction Stop
+        $runnerText = [string]$runnerCommand.ScriptBlock.Ast.Extent.Text
+        Assert-Contract (
+            $runnerCommand.ScriptBlock.Ast.Extent.StartOffset -eq 0 -and
+            $runnerCommand.ScriptBlock.Ast.Extent.EndOffset -eq $runnerText.Length
+        ) "real runner AST must expose its complete parsed source"
+        $handoff = & $script:workspaceModule {
+            param($Path, $Text)
+
+            $defaultSnapshot = $script:EasyConGatePolicyRunnerSnapshot
+            try {
+                Set-EasyConGatePolicyRunnerSnapshot -Path $Path -Text $Text
+                return [pscustomobject]@{
+                    DefaultSnapshot = $defaultSnapshot
+                    OverlaySnapshot = $script:EasyConGatePolicyRunnerSnapshot
+                }
+            }
+            finally {
+                $script:EasyConGatePolicyRunnerSnapshot = $defaultSnapshot
+            }
+        } $runnerPath $runnerText
+        $rawRunnerHash = [System.Convert]::ToHexString(
+            [System.Security.Cryptography.SHA256]::HashData(
+                [System.IO.File]::ReadAllBytes($runnerPath)
+            )
+        ).ToLowerInvariant()
+        Assert-Contract (
+            -not [object]::ReferenceEquals($handoff.DefaultSnapshot, $handoff.OverlaySnapshot) -and
+            $handoff.OverlaySnapshot.Path -ceq $runnerPath -and
+            $handoff.OverlaySnapshot.RelativePath -ceq "tools/run_windows_workspace.ps1" -and
+            $handoff.OverlaySnapshot.Text -ceq $runnerText -and
+            $handoff.OverlaySnapshot.Sha256 -ceq $rawRunnerHash
+        ) "real runner AST handoff must privately replace the default with byte-bound source identity"
     }
 
     Invoke-ContractCase -Name "public-wrappers-forward-controlled-lifecycle" -Action {
@@ -6203,6 +6371,51 @@ $result = [ordered]@{
         ) "Workspace gate output must not corrupt ordered evidence timing records"
     }
 
+    Invoke-ContractCase -Name "workspace-policy-snapshots-are-strict-byte-bound" -Action {
+        $policyRepository = Join-Path $temporaryRoot "workspace policy strict byte snapshots"
+        foreach ($name in @(
+            "windows_gate_policy.json",
+            "windows_gate_policy.ps1",
+            "run_windows_workspace.ps1"
+        )) {
+            Set-ContractUtf8Text -Path (Join-Path $policyRepository "tools/$name") `
+                -Value (Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot $name))
+        }
+        $moduleForHash = $script:workspaceModule
+        $getHash = {
+            param($Repository)
+
+            return (& $moduleForHash {
+                param($Root)
+
+                return (Get-EasyConGatePolicyHash -RepositoryRoot $Root).Value
+            } $Repository)
+        }.GetNewClosure()
+        $policyPath = Join-Path $policyRepository "tools/windows_gate_policy.json"
+        $strictUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
+        $policyText = [System.IO.File]::ReadAllText($policyPath, $strictUtf8)
+        $lfText = $policyText.Replace("`r`n", "`n").Replace("`r", "`n")
+        Assert-Contract ($lfText.Contains("`n")) `
+            "strict byte snapshot fixture must contain a newline"
+        [System.IO.File]::WriteAllText($policyPath, $lfText, $strictUtf8)
+        $lfHash = & $getHash $policyRepository
+        [System.IO.File]::WriteAllText($policyPath, $lfText.Replace("`n", "`r`n"), $strictUtf8)
+        $crlfHash = & $getHash $policyRepository
+        Assert-Contract ($lfHash -cne $crlfHash) `
+            "policy source hash must bind exact newline bytes without normalization"
+
+        $textBytes = $strictUtf8.GetBytes($lfText)
+        $bomBytes = [byte[]]::new($textBytes.Length + 3)
+        $bomBytes[0] = 0xef
+        $bomBytes[1] = 0xbb
+        $bomBytes[2] = 0xbf
+        [System.Array]::Copy($textBytes, 0, $bomBytes, 3, $textBytes.Length)
+        [System.IO.File]::WriteAllBytes($policyPath, $bomBytes)
+        Assert-Throws -Pattern "strict UTF-8 without BOM" -Action {
+            & $getHash $policyRepository
+        }
+    }
+
     Invoke-ContractCase -Name "workspace-policy-revalidation-fails-closed" -Action {
         $changedDuringVerify = Invoke-PrivateWorkspaceEvidenceProbe -ProbeRoot (
             Join-Path $temporaryRoot "workspace policy changed during verify"
@@ -6241,6 +6454,18 @@ $result = [ordered]@{
             -not (Test-Path -LiteralPath (Join-Path $changedDuringGates.WorkspaceRoot "evidence")) -and
             @($changedDuringGates.Records | Where-Object { $_.Kind -ceq "workspace" }).Count -eq 0
         ) "a rejected gate policy change must publish neither evidence nor a passed record"
+    }
+
+    Invoke-ContractCase -Name "workspace-policy-json-snapshot-capture-fails-closed" -Action {
+        Assert-WorkspacePolicySnapshotCaptureFailsClosed -MutationTarget Json
+    }
+
+    Invoke-ContractCase -Name "workspace-policy-script-snapshot-capture-fails-closed" -Action {
+        Assert-WorkspacePolicySnapshotCaptureFailsClosed -MutationTarget PolicyScript
+    }
+
+    Invoke-ContractCase -Name "workspace-runner-snapshot-capture-fails-closed" -Action {
+        Assert-WorkspacePolicySnapshotCaptureFailsClosed -MutationTarget RunnerSource
     }
 
     Invoke-ContractCase -Name "require-clean-tree-detects-ignored-python-bytecode" -Action {

@@ -1,5 +1,125 @@
 # Gate and candidate policy is loaded into the private module scope.
 $script:EasyConGatePolicyScriptPath = $PSCommandPath
+$gatePolicyScriptBlock = $MyInvocation.MyCommand.ScriptBlock
+$gatePolicyAst = if ($null -eq $gatePolicyScriptBlock) {
+    $null
+}
+else {
+    $gatePolicyScriptBlock.Ast
+}
+if (
+    $null -eq $gatePolicyAst -or
+    $null -eq $gatePolicyAst.Extent -or
+    [string]::IsNullOrWhiteSpace([string]$gatePolicyAst.Extent.Text) -or
+    $gatePolicyAst.Extent.StartOffset -ne 0 -or
+    $gatePolicyAst.Extent.EndOffset -ne $gatePolicyAst.Extent.Text.Length
+) {
+    throw "Windows gate policy cannot capture its complete parsed source snapshot"
+}
+$script:EasyConGatePolicyScriptSourceText = [string]$gatePolicyAst.Extent.Text
+
+function New-EasyConGatePolicyStrictUtf8TextSnapshot {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [string]$RelativePath,
+
+        [string]$TrustedRoot,
+
+        [Parameter(Mandatory)]
+        [string]$Description
+    )
+
+    $arguments = @{ Path = $Path }
+    if (-not [string]::IsNullOrWhiteSpace($TrustedRoot)) {
+        $arguments.TrustedRoot = $TrustedRoot
+    }
+    $resolved = Get-EasyConPhysicalFile @arguments
+    $strictUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes($resolved)
+        if (
+            $bytes.Length -ge 3 -and
+            $bytes[0] -eq 0xef -and
+            $bytes[1] -eq 0xbb -and
+            $bytes[2] -eq 0xbf
+        ) {
+            throw "UTF-8 BOM is not permitted"
+        }
+        $text = $strictUtf8.GetString($bytes)
+    }
+    catch {
+        throw "$Description must be strict UTF-8 without BOM: $resolved ($($_.Exception.Message))"
+    }
+    Assert-EasyConPhysicalPath @arguments | Out-Null
+    $digest = [System.Security.Cryptography.SHA256]::HashData($bytes)
+    return [pscustomobject]@{
+        Path = $resolved
+        RelativePath = $RelativePath
+        Text = $text
+        Bytes = $bytes
+        Sha256 = [System.Convert]::ToHexString($digest).ToLowerInvariant()
+    }
+}
+
+function New-EasyConGatePolicyStrictUtf8TextSnapshotFromText {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [string]$RelativePath,
+
+        [Parameter(Mandatory)]
+        [string]$Text,
+
+        [string]$TrustedRoot,
+
+        [Parameter(Mandatory)]
+        [string]$Description
+    )
+
+    $arguments = @{ Path = $Path }
+    if (-not [string]::IsNullOrWhiteSpace($TrustedRoot)) {
+        $arguments.TrustedRoot = $TrustedRoot
+    }
+    $resolved = Get-EasyConPhysicalFile @arguments
+    if ($Text.Length -gt 0 -and [int][char]$Text[0] -eq 0xfeff) {
+        throw "$Description must be strict UTF-8 without BOM: $resolved"
+    }
+    $strictUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
+    try {
+        $bytes = $strictUtf8.GetBytes($Text)
+    }
+    catch {
+        throw "$Description must be strict UTF-8: $resolved ($($_.Exception.Message))"
+    }
+    Assert-EasyConPhysicalPath @arguments | Out-Null
+    $digest = [System.Security.Cryptography.SHA256]::HashData($bytes)
+    return [pscustomobject]@{
+        Path = $resolved
+        RelativePath = $RelativePath
+        Text = $Text
+        Bytes = $bytes
+        Sha256 = [System.Convert]::ToHexString($digest).ToLowerInvariant()
+    }
+}
+
+$gatePolicyRepositoryRoot = Assert-EasyConPhysicalPath -Path (Split-Path -Parent $PSScriptRoot)
+$script:EasyConGatePolicyScriptSnapshot = New-EasyConGatePolicyStrictUtf8TextSnapshotFromText `
+    -Path $script:EasyConGatePolicyScriptPath -RelativePath "tools/windows_gate_policy.ps1" `
+    -Text $script:EasyConGatePolicyScriptSourceText -TrustedRoot $gatePolicyRepositoryRoot `
+    -Description "Windows gate policy script"
+$gatePolicyRunnerScript = Get-EasyConPhysicalFile -Path (
+    Join-Path $gatePolicyRepositoryRoot "tools/run_windows_workspace.ps1"
+) -TrustedRoot $gatePolicyRepositoryRoot
+$script:EasyConGatePolicyRunnerSnapshot = New-EasyConGatePolicyStrictUtf8TextSnapshot `
+    -Path $gatePolicyRunnerScript -RelativePath "tools/run_windows_workspace.ps1" `
+    -TrustedRoot $gatePolicyRepositoryRoot -Description "Windows gate runner script"
 
 function Get-EasyConExpectedWindowsGatePolicy {
     return @(
@@ -64,18 +184,146 @@ function Get-EasyConGatePolicyStrictString {
     return $Element.GetString()
 }
 
+function Get-EasyConGatePolicyInputDefinitions {
+    return @(
+        [pscustomobject]@{
+            RelativePath = "tools/windows_gate_policy.json"
+            Description = "Windows gate policy JSON"
+        },
+        [pscustomobject]@{
+            RelativePath = "tools/windows_gate_policy.ps1"
+            Description = "Windows gate policy script"
+        },
+        [pscustomobject]@{
+            RelativePath = "tools/run_windows_workspace.ps1"
+            Description = "Windows gate runner script"
+        }
+    )
+}
+
+function Get-EasyConGatePolicyPhysicalSnapshot {
+    param(
+        [Parameter(Mandatory)]
+        [string]$RepositoryRoot,
+
+        [Parameter(Mandatory)]
+        [string]$RelativePath,
+
+        [Parameter(Mandatory)]
+        [string]$Description
+    )
+
+    $repository = Assert-EasyConPhysicalPath -Path $RepositoryRoot
+    $path = Get-EasyConPhysicalFile -Path (Join-Path $repository $RelativePath) `
+        -TrustedRoot $repository
+    return New-EasyConGatePolicyStrictUtf8TextSnapshot -Path $path -RelativePath $RelativePath `
+        -TrustedRoot $repository -Description $Description
+}
+
+function Assert-EasyConGatePolicySnapshot {
+    param(
+        [Parameter(Mandatory)]
+        [string]$RepositoryRoot,
+
+        [Parameter(Mandatory)]
+        [object]$Snapshot,
+
+        [Parameter(Mandatory)]
+        [string]$RelativePath,
+
+        [Parameter(Mandatory)]
+        [string]$Description
+    )
+
+    $repository = Assert-EasyConPhysicalPath -Path $RepositoryRoot
+    $expectedPath = Get-EasyConPhysicalFile -Path (Join-Path $repository $RelativePath) `
+        -TrustedRoot $repository
+    try {
+        $snapshotPath = [string]$Snapshot.Path
+        $snapshotRelativePath = [string]$Snapshot.RelativePath
+        $snapshotText = [string]$Snapshot.Text
+        $snapshotBytes = [byte[]]$Snapshot.Bytes
+        $snapshotHash = [string]$Snapshot.Sha256
+    }
+    catch {
+        throw "$Description snapshot is malformed: $($_.Exception.Message)"
+    }
+    if ($snapshotPath -cne $expectedPath -or $snapshotRelativePath -cne $RelativePath) {
+        throw "$Description snapshot is not bound to its repository input"
+    }
+    $strictUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
+    try {
+        if (
+            $snapshotBytes.Length -ge 3 -and
+            $snapshotBytes[0] -eq 0xef -and
+            $snapshotBytes[1] -eq 0xbb -and
+            $snapshotBytes[2] -eq 0xbf
+        ) {
+            throw "UTF-8 BOM is not permitted"
+        }
+        $decoded = $strictUtf8.GetString($snapshotBytes)
+        if ($decoded -cne $snapshotText) {
+            throw "snapshot text does not match its captured bytes"
+        }
+    }
+    catch {
+        throw "$Description snapshot is not strict UTF-8: $($_.Exception.Message)"
+    }
+    $digest = [System.Convert]::ToHexString(
+        [System.Security.Cryptography.SHA256]::HashData($snapshotBytes)
+    ).ToLowerInvariant()
+    if ($snapshotHash -cne $digest) {
+        throw "$Description snapshot hash does not match its captured bytes"
+    }
+    return $Snapshot
+}
+
+function Set-EasyConGatePolicyRunnerSnapshot {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [string]$Text
+    )
+
+    $repository = Assert-EasyConPhysicalPath -Path (Split-Path -Parent $PSScriptRoot)
+    $expectedPath = Get-EasyConPhysicalFile -Path (Join-Path $repository "tools/run_windows_workspace.ps1") `
+        -TrustedRoot $repository
+    $providedPath = Get-EasyConPhysicalFile -Path $Path -TrustedRoot $repository
+    if ($providedPath -cne $expectedPath) {
+        throw "Windows gate runner snapshot must be loaded from the repository runner path"
+    }
+    $snapshot = New-EasyConGatePolicyStrictUtf8TextSnapshotFromText -Path $expectedPath `
+        -RelativePath "tools/run_windows_workspace.ps1" -Text $Text `
+        -Description "Windows gate runner script"
+    $script:EasyConGatePolicyRunnerSnapshot = Assert-EasyConGatePolicySnapshot `
+        -RepositoryRoot $repository -Snapshot $snapshot `
+        -RelativePath "tools/run_windows_workspace.ps1" `
+        -Description "Windows gate runner script"
+}
+
 function Get-EasyConWindowsGatePolicy {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
-        [string]$RepositoryRoot
+        [string]$RepositoryRoot,
+
+        [object]$PolicySnapshot
     )
 
     $repository = Assert-EasyConPhysicalPath -Path $RepositoryRoot
-    $policyPath = Get-EasyConPhysicalFile -Path (Join-Path $repository "tools/windows_gate_policy.json") `
-        -TrustedRoot $repository
+    $capturedPolicySnapshot = if ($PSBoundParameters.ContainsKey("PolicySnapshot")) {
+        Assert-EasyConGatePolicySnapshot -RepositoryRoot $repository `
+            -Snapshot $PolicySnapshot -RelativePath "tools/windows_gate_policy.json" `
+            -Description "Windows gate policy JSON"
+    }
+    else {
+        Get-EasyConGatePolicyPhysicalSnapshot -RepositoryRoot $repository `
+            -RelativePath "tools/windows_gate_policy.json" -Description "Windows gate policy JSON"
+    }
     try {
-        $json = Read-EasyConPhysicalText -Path $policyPath -TrustedRoot $repository
+        $json = [string]$capturedPolicySnapshot.Text
         $options = [System.Text.Json.JsonDocumentOptions]::new()
         $options.AllowTrailingCommas = $false
         $options.CommentHandling = [System.Text.Json.JsonCommentHandling]::Disallow
@@ -156,7 +404,7 @@ function Get-EasyConWindowsGatePolicy {
             Version = $version
             CargoJobs = $cargoJobs
             Gates = $parsed.ToArray()
-            PolicyPath = $policyPath
+            PolicyPath = [string]$capturedPolicySnapshot.Path
         }
     }
     catch {
@@ -182,20 +430,36 @@ function Get-EasyConGatePolicyHash {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
-        [string]$RepositoryRoot
+        [string]$RepositoryRoot,
+
+        [object[]]$Snapshots
     )
 
     $repository = Assert-EasyConPhysicalPath -Path $RepositoryRoot
+    $definitions = @(Get-EasyConGatePolicyInputDefinitions)
+    $inputs = [System.Collections.Generic.List[object]]::new()
+    if ($PSBoundParameters.ContainsKey("Snapshots")) {
+        if (@($Snapshots).Count -ne $definitions.Count) {
+            throw "Windows gate policy snapshot set is incomplete"
+        }
+        for ($index = 0; $index -lt $definitions.Count; $index++) {
+            $definition = $definitions[$index]
+            $inputs.Add((Assert-EasyConGatePolicySnapshot -RepositoryRoot $repository `
+                -Snapshot $Snapshots[$index] -RelativePath $definition.RelativePath `
+                -Description $definition.Description)) | Out-Null
+        }
+    }
+    else {
+        foreach ($definition in $definitions) {
+            $inputs.Add((Get-EasyConGatePolicyPhysicalSnapshot -RepositoryRoot $repository `
+                -RelativePath $definition.RelativePath -Description $definition.Description)) | Out-Null
+        }
+    }
     $records = [System.Collections.Generic.List[object]]::new()
     $builder = [System.Text.StringBuilder]::new()
-    foreach ($relative in @(
-        "tools/windows_gate_policy.json",
-        "tools/windows_gate_policy.ps1",
-        "tools/run_windows_workspace.ps1"
-    )) {
-        $path = Get-EasyConPhysicalFile -Path (Join-Path $repository $relative) `
-            -TrustedRoot $repository
-        $hash = Get-EasyConFingerprintInputHash -Path $path -Kind "text"
+    foreach ($snapshot in $inputs) {
+        $relative = [string]$snapshot.RelativePath
+        $hash = [string]$snapshot.Sha256
         $records.Add([ordered]@{ path = $relative; sha256 = $hash }) | Out-Null
         [void]$builder.Append($relative).Append("`0").Append($hash).Append("`n")
     }
@@ -223,9 +487,31 @@ function Get-EasyConGatePolicyContext {
     if ($loadedScript -cne $expectedScript) {
         throw "Windows gate policy script must be loaded from the repository policy path"
     }
+    if ($null -eq $script:EasyConGatePolicyScriptSnapshot) {
+        throw "Windows gate policy script snapshot is unavailable"
+    }
+    if ($null -eq $script:EasyConGatePolicyRunnerSnapshot) {
+        throw "Windows gate runner snapshot is unavailable"
+    }
+    $jsonSnapshot = Get-EasyConGatePolicyPhysicalSnapshot -RepositoryRoot $repository `
+        -RelativePath "tools/windows_gate_policy.json" -Description "Windows gate policy JSON"
+    $policyScriptSnapshot = Assert-EasyConGatePolicySnapshot -RepositoryRoot $repository `
+        -Snapshot $script:EasyConGatePolicyScriptSnapshot `
+        -RelativePath "tools/windows_gate_policy.ps1" -Description "Windows gate policy script"
+    $runnerSnapshot = Assert-EasyConGatePolicySnapshot -RepositoryRoot $repository `
+        -Snapshot $script:EasyConGatePolicyRunnerSnapshot `
+        -RelativePath "tools/run_windows_workspace.ps1" -Description "Windows gate runner script"
+    $policy = Get-EasyConWindowsGatePolicy -RepositoryRoot $repository `
+        -PolicySnapshot $jsonSnapshot
+    $capturedHash = Get-EasyConGatePolicyHash -RepositoryRoot $repository `
+        -Snapshots @($jsonSnapshot, $policyScriptSnapshot, $runnerSnapshot)
+    $currentHash = Get-EasyConGatePolicyHash -RepositoryRoot $repository
+    if ($currentHash.Value -cne $capturedHash.Value) {
+        throw "Windows gate policy inputs changed during snapshot capture; rerun the command"
+    }
     return [pscustomobject]@{
-        Policy = Get-EasyConWindowsGatePolicy -RepositoryRoot $repository
-        Hash = Get-EasyConGatePolicyHash -RepositoryRoot $repository
+        Policy = $policy
+        Hash = $capturedHash
     }
 }
 

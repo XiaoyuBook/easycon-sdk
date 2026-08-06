@@ -2882,6 +2882,15 @@ def windows_gate_policy_failures(environment_module, policy_module, runner):
         policy_module, "Get-EasyConWindowsGatePolicy"
     )
     policy_hash = _powershell_function_text(policy_module, "Get-EasyConGatePolicyHash")
+    policy_inputs = _powershell_function_text(
+        policy_module, "Get-EasyConGatePolicyInputDefinitions"
+    )
+    policy_context = _powershell_function_text(
+        policy_module, "Get-EasyConGatePolicyContext"
+    )
+    runner_snapshot_setter = _powershell_function_text(
+        policy_module, "Set-EasyConGatePolicyRunnerSnapshot"
+    )
     evidence_writer = _powershell_function_text(
         policy_module, "Publish-EasyConWorkspaceEvidenceNoReplace"
     )
@@ -2896,6 +2905,9 @@ def windows_gate_policy_failures(environment_module, policy_module, runner):
         ("Targeted Cargo policy", targeted),
         ("strict gate policy parser", policy_parser),
         ("gate policy hash", policy_hash),
+        ("gate policy input definitions", policy_inputs),
+        ("gate policy snapshot context", policy_context),
+        ("runner snapshot handoff", runner_snapshot_setter),
         ("no-replace evidence publisher", evidence_writer),
         ("v2 evidence record", evidence_record),
         ("Workspace gate runner", gate_runner),
@@ -2909,6 +2921,18 @@ def windows_gate_policy_failures(environment_module, policy_module, runner):
         failures.append("environment module must not retain the public Workspace gate policy")
     if "windows_gate_policy.ps1" not in environment_module:
         failures.append("environment module must dot-source the gate policy module")
+    for forbidden in (
+        "EasyConGatePolicyScriptSnapshot",
+        "EasyConGatePolicyRunnerSnapshot",
+        "New-EasyConGatePolicyStrictUtf8TextSnapshot",
+        "System.Management.Automation.Language.Parser",
+    ):
+        if forbidden in environment_module:
+            failures.append(
+                "prepared-environment module must not own Workspace policy snapshots: {}".format(
+                    forbidden
+                )
+            )
     if "GateInvoker" in public_workspace:
         failures.append("public Workspace must not expose a GateInvoker bypass")
     if "IgnoreCase = $false" not in public_workspace or "-cnotin" not in public_workspace:
@@ -2939,10 +2963,51 @@ def windows_gate_policy_failures(environment_module, policy_module, runner):
         '"tools/windows_gate_policy.json"',
         '"tools/windows_gate_policy.ps1"',
         '"tools/run_windows_workspace.ps1"',
-        "Get-EasyConFingerprintInputHash",
+    ):
+        if required not in policy_inputs:
+            failures.append("gate policy input definitions miss required input: {}".format(required))
+    for required in (
+        "Snapshots",
+        "Sha256",
+        "Get-EasyConGatePolicyPhysicalSnapshot",
+        "Assert-EasyConGatePolicySnapshot",
     ):
         if required not in policy_hash:
             failures.append("gate policy hash misses required input: {}".format(required))
+    if "Get-EasyConFingerprintInputHash" in policy_hash:
+        failures.append(
+            "gate policy hash must use captured strict UTF-8 source bytes, not normalized fingerprints"
+        )
+    for required in (
+        "-PolicySnapshot $jsonSnapshot",
+        "-Snapshots @($jsonSnapshot, $policyScriptSnapshot, $runnerSnapshot)",
+        "$currentHash = Get-EasyConGatePolicyHash",
+        "changed during snapshot capture",
+        "EasyConGatePolicyScriptSnapshot",
+        "EasyConGatePolicyRunnerSnapshot",
+    ):
+        if required not in policy_context:
+            failures.append("gate policy snapshot context is missing: {}".format(required))
+    for required in (
+        "New-EasyConGatePolicyStrictUtf8TextSnapshotFromText",
+        "Assert-EasyConGatePolicySnapshot",
+        "must be loaded from the repository runner path",
+    ):
+        if required not in runner_snapshot_setter:
+            failures.append("runner snapshot handoff is missing: {}".format(required))
+    for required in (
+        "New-EasyConGatePolicyStrictUtf8TextSnapshot",
+        "New-EasyConGatePolicyStrictUtf8TextSnapshotFromText",
+        "UTF-8 BOM is not permitted",
+        "EasyConGatePolicyScriptSnapshot",
+        "EasyConGatePolicyRunnerSnapshot",
+        "$MyInvocation.MyCommand.ScriptBlock",
+        "EasyConGatePolicyScriptSourceText",
+        "StartOffset -ne 0",
+        "EndOffset -ne $gatePolicyAst.Extent.Text.Length",
+    ):
+        if required not in policy_module:
+            failures.append("policy source snapshot import is missing: {}".format(required))
     for required in (
         "Get-EasyConGatePolicyStrictObject",
         "Get-EasyConGatePolicyStrictString",
@@ -3000,6 +3065,10 @@ def windows_gate_policy_failures(environment_module, policy_module, runner):
         "IgnoreCase = $false",
         "-Mode must use one exact supported case",
         "switch -CaseSensitive ($Mode)",
+        "$MyInvocation.MyCommand.ScriptBlock",
+        "$runnerSourceText",
+        "Import-Module -Name $modulePath -Force -PassThru",
+        "Set-EasyConGatePolicyRunnerSnapshot",
     ):
         if required not in runner:
             failures.append("runner Mode case handling is missing: {}".format(required))

@@ -115,8 +115,11 @@ source/prepared 文件共享 identity 的同 hash 文件。Workspace 必须先�
 链接、repository contracts 与 diff 门禁。缺失、损坏、环境 schema/host-target/fingerprint 失配都在第一个 build gate 前失败，
 并明确要求重新运行 Setup；worktree 切换本身只改变隔离的可写输出。
 
-Workspace 在 lifecycle 前解析固定 policy，并在 Verify 后、首个 gate 前和最后一个 gate 后复核 policy hash。hash 改变时
-fail closed：前一边界零 gate，后一边界零 passed evidence/record。candidate 成功的 evidence 只在当前
+Workspace 在 lifecycle 前以 strict UTF-8、无 BOM、无换行归一化的 JSON/policy script/runner 内存快照解析固定 policy
+并计算 hash；capture 后立即重读三个物理输入，任何不匹配均在进入 Verify 前 fail closed。policy script 自身在最早执行
+阶段保留完整 AST 的文件作用域和文本，direct import 有 runner 物理快照默认值，runner 运行时以前置 AST 文本经私有 scope 交接其
+实际 source identity。Verify 后、首个 gate 前和最后一个 gate 后仍复核当前物理 hash。hash 改变时 fail closed：前一
+边界零 gate，后一边界零 passed evidence/record。candidate 成功的 evidence 只在当前
 `w/<workspace-key>/evidence/v2/` 以 no-replace 的 schema v2 record 发布；普通 Workspace 不写 tree credential。
 
 prepared tree、stamp、Cargo vendor/config、vcpkg installed tree 和工具记录都必须审计绝对路径与写入边界：stamp 不得含

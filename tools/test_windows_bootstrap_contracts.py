@@ -610,6 +610,45 @@ class WindowsGatePolicyContracts(unittest.TestCase):
             with self.subTest(label=label):
                 self.assert_module_rejected(policy_module, runner, label)
 
+    def test_policy_snapshot_import_handoff_and_capture_recheck_are_required(self):
+        mutations = {
+            "policy source earliest AST capture": (
+                self.environment_module,
+                self.policy_module.replace(
+                    "$MyInvocation.MyCommand.ScriptBlock",
+                    "$null",
+                    1,
+                ),
+                self.runner,
+            ),
+            "capture-time physical recheck": (
+                self.environment_module,
+                self.policy_module.replace(
+                    "changed during snapshot capture",
+                    "changed after a later boundary",
+                    1,
+                ),
+                self.runner,
+            ),
+            "runner private snapshot handoff": (
+                self.environment_module,
+                self.policy_module,
+                self.runner.replace(
+                    "Set-EasyConGatePolicyRunnerSnapshot",
+                    "Apply-EasyConGateRunnerSource",
+                    1,
+                ),
+            ),
+        }
+        for label, (environment_module, policy_module, runner) in mutations.items():
+            with self.subTest(label=label):
+                self.assertTrue(
+                    GUARD.windows_gate_policy_failures(
+                        environment_module, policy_module, runner
+                    ),
+                    "{} mutation must be rejected".format(label),
+                )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

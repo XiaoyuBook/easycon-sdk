@@ -476,8 +476,11 @@ source/output/config/target bypass 参数和 `--name=value` 形式的零启动�
 负责、public export set 不扩张。
 candidate contract 使用真实 Git fixture 覆盖 staged success、unstaged/untracked 拒绝及 gate 内 index tree 改变；成功 binding
 必须同时固定 HEAD 与 `git write-tree`，clean-tree 继续覆盖 ignored pyc。任何 `BaseSha` branch/ref/`HEAD`/abbrev 都必须在 gate
-前由一次受控 Git 解析为 40 位 immutable commit，非法 ref 零 gate 拒绝，diff/evidence 均使用同一解析值。policy hash 必须在 Verify 后和
-最后一个 gate 后复核；两个 deterministic mutation fixture 分别证明前者零 gate，后者零 passed record/evidence。evidence contract 必须覆盖普通 Workspace 只输出
+前由一次受控 Git 解析为 40 位 immutable commit，非法 ref 零 gate 拒绝，diff/evidence 均使用同一解析值。policy 的 JSON、private
+script 和 runner 必须作为 strict UTF-8、无 BOM、无换行归一化的同批 source-byte snapshot 解析和 hash；三个 capture-time
+deterministic mutation fixture 分别证明零 Verify/零 gate，LF/CRLF 与 BOM fixture 证明 byte identity 不会隐式归一化或放宽。
+policy hash 还必须在 Verify 后和最后一个 gate 后复核；两个 deterministic mutation fixture 分别证明前者零 gate，后者零 passed
+record/evidence。evidence contract 必须覆盖普通 Workspace 只输出
 `credential=none` summary、staged/clean credential 成功后才在当前 `w/<workspace-key>` 原子 no-replace 发布
 `evidence/v2/workspace-<candidate-mode>-<tree>-<run-id>.json`、final `EASYCON_WORKSPACE` 与 JSON 的
 tree/environment fingerprint/policy hash/identity/timing 一致、没有残留 temporary，以及 gate 失败时零 passed record 和零 evidence。所有这些 fixture 以同步 marker、真实 Git 状态或真实原子 writer 判断，不用随机 sleep。

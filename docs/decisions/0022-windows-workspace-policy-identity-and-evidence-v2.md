@@ -30,9 +30,12 @@ v5 清单。旧 schema stamp 不迁移为命中；Verify 发现 identity 不兼�
 调用方不能通过 Cargo 参数覆盖该预算。公开模块仍只导出 Setup、Verify 与 Workspace，不接收外部 `GateInvoker`。
 
 policy hash 使用 `tools/windows_gate_policy.json`、`tools/windows_gate_policy.ps1` 与
-`tools/run_windows_workspace.ps1` 的规范 text hash。Workspace 在进入 lifecycle 前捕获 policy 和 hash，随后在
-Verify 后、首个 gate 前复核一次，并在最后一个 gate 后、candidate rebind/evidence 之前再复核一次。任一次复核
-发现变化均 fail closed：前一边界启动零 gate，后一边界不发布 passed evidence 或 passed workspace record。
+`tools/run_windows_workspace.ps1` 的 strict UTF-8、无 BOM、无换行归一化的 source-byte hash。policy script 在自身最早
+执行阶段从已解析的完整 PowerShell AST 捕获文本和文件作用域，再由私有 helper 固化该 script snapshot；direct module import
+同时捕获 runner 物理输入作为 fail-closed 默认值。runner 则在 import 前从其已解析 AST 捕获自身文本，并只通过 module private
+scope 替换该默认快照。Workspace 解析 JSON、计算 policy hash 都只能使用同一组三输入快照；随后在进入 lifecycle 前立即重读
+三个物理输入并比较 hash。捕获期间或此后任一次复核发现变化均 fail closed：capture-time 与 Verify 后边界启动零 gate，
+最后一个 gate 后边界不发布 passed evidence 或 passed workspace record。
 runner 的 `-Mode`、内部 `-GateMode` 均只接受精确大小写的允许值，不能以 PowerShell 的大小写宽容绕过该 policy。
 
 ### Candidate 与 evidence
@@ -55,9 +58,10 @@ evidence。
 ## 测试与门禁
 
 Windows contract tests 必须覆盖 v5 清单缺少 file-identity manifest 的 provision 前拒绝、lowercase mode 拒绝、两个
-clean fixed-SHA worktree 使用同一 v5 配置得到同一 prepared identity、policy hash 在 Verify/gate window 中变化的
-fail-closed 行为，以及 v2 evidence 的 path、字段、no-replace collision 和失败零发布。并发 fixture 使用 lease、真实
-Git 状态和同步 marker；不以随机 sleep 或放宽 timeout 证明正确性。
+clean fixed-SHA worktree 使用同一 v5 配置得到同一 prepared identity、JSON/policy script/runner 三个输入分别在快照
+捕获时变化的零 Verify/零 gate fail-closed 行为、strict UTF-8 BOM 拒绝和 LF/CRLF byte identity，以及 policy hash 在
+Verify/gate window 中变化的 fail-closed 行为，还要覆盖 v2 evidence 的 path、字段、no-replace collision 和失败零发布。
+并发 fixture 使用 lease、真实 Git 状态和同步 marker；不以随机 sleep 或放宽 timeout 证明正确性。
 
 这些定向回归不替代最终受控 Workspace。可执行候选仍必须在 staged tree 上经官方入口完成完整 workspace gate。
 

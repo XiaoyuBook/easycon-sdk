@@ -118,7 +118,10 @@ candidate requirement。它仍通过同一个 Workspace lifecycle 获取 environ
 staged，不能有 unstaged 或 untracked 内容；gate 前使用当前 index 的 `git write-tree` 得到 candidate tree，并额外运行
 `git diff --cached --check`。两种 credential 模式在 gate 后都重新核对 HEAD、source/index 状态与 tree；任一变化都 fail
 closed，两个开关不可同时使用。Workspace 还在 Verify 后、首个 gate 前以及最后一个 gate 后、candidate rebind/evidence
-前复核 captured policy hash；任何 policy input 改变都 fail closed。
+前复核 captured policy hash；该 hash 来自 JSON、private policy script 与 runner 的 strict UTF-8、无 BOM、无换行归一化
+source-byte snapshot。policy script 在自身最早执行阶段捕获完整且保留文件作用域的 AST 文本，direct import 由其提供 runner 的物理
+默认 snapshot；runner 在 import 前捕获其已解析 AST 文本后只通过 private module scope 覆盖默认值。policy 解析和初始 hash
+都绑定同一批快照，进入 lifecycle 前立即重读三个物理输入；任一变化均 fail closed。
 
 credential 成功时才会在当前 canonical worktree 的 writable root
 `CacheRoot/w/<workspace-key>/evidence/v2/workspace-<candidate-mode>-<tree>-<lowercase-run-id>.json` 写入 UTF-8 无 BOM
