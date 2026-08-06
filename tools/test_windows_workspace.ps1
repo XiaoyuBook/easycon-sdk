@@ -220,6 +220,8 @@ function Invoke-PrivateWorkspaceGates {
         [Parameter(Mandatory)]
         [string]$RepositoryRoot,
 
+        [string]$BaseSha,
+
         [scriptblock]$GateInvoker,
 
         [switch]$RequireCleanTree,
@@ -228,10 +230,10 @@ function Invoke-PrivateWorkspaceGates {
     )
 
     & $script:workspaceModule {
-        param($Root, $Invoker, $RequireClean, $RequireStaged)
+        param($Root, $Base, $Invoker, $RequireClean, $RequireStaged)
         Invoke-EasyConWindowsWorkspaceGates -RepositoryRoot $Root -GateInvoker $Invoker `
-            -RequireCleanTree:$RequireClean -RequireStagedCandidate:$RequireStaged
-    } $RepositoryRoot $GateInvoker $RequireCleanTree.IsPresent $RequireStagedCandidate.IsPresent
+            -BaseSha $Base -RequireCleanTree:$RequireClean -RequireStagedCandidate:$RequireStaged
+    } $RepositoryRoot $BaseSha $GateInvoker $RequireCleanTree.IsPresent $RequireStagedCandidate.IsPresent
 }
 
 function Invoke-PrivateTargetedCargoGate {
@@ -673,11 +675,15 @@ function Invoke-PrivateWorkspaceEvidenceProbe {
 
         [switch]$RequireStagedCandidate,
 
-        [switch]$FailGate
+        [switch]$FailGate,
+
+        [string]$BaseSha = ("c" * 40),
+
+        [string]$ResolvedBaseCommit = ("c" * 40)
     )
 
     & $script:workspaceModule {
-        param($Root, $RequireClean, $RequireStaged, $ShouldFail)
+        param($Root, $RequireClean, $RequireStaged, $ShouldFail, $RequestedBaseSha, $ResolvedBase)
 
         $originalContext = ${function:Get-EasyConWindowsEnvironmentContext}
         $originalVerifyCore = ${function:Invoke-EasyConWindowsVerifyCore}
@@ -707,6 +713,8 @@ function Invoke-PrivateWorkspaceEvidenceProbe {
             Failure = $null
             WorkspaceRoot = $workspaceRoot
             Tree = ("b" * 40)
+            RequestedBaseSha = $RequestedBaseSha
+            ResolvedBaseCommit = $ResolvedBase
         }
         $contextProbe = {
             param($RepositoryRoot, $ConfigurationPath, $CacheRoot)
@@ -751,6 +759,7 @@ function Invoke-PrivateWorkspaceEvidenceProbe {
                 }
                 HeadCommit = ("a" * 40)
                 Tree = $state.Tree
+                BaseCommit = $state.ResolvedBaseCommit
             }
         }.GetNewClosure()
         $lifecycleProbe = {
@@ -791,7 +800,7 @@ function Invoke-PrivateWorkspaceEvidenceProbe {
             try {
                 Invoke-EasyConWindowsWorkspace -RepositoryRoot "input-repository" `
                     -ConfigurationPath "input-configuration" -CacheRoot "input-cache" `
-                    -BaseSha ("c" * 40) -RequireCleanTree:$RequireClean `
+                    -BaseSha $RequestedBaseSha -RequireCleanTree:$RequireClean `
                     -RequireStagedCandidate:$RequireStaged | Out-Null
             }
             catch {
@@ -811,7 +820,8 @@ function Invoke-PrivateWorkspaceEvidenceProbe {
             Set-Item -LiteralPath Function:script:Write-EasyConStructuredRecord `
                 -Value $originalStructuredRecord
         }
-    } $ProbeRoot $RequireCleanTree.IsPresent $RequireStagedCandidate.IsPresent $FailGate.IsPresent
+    } $ProbeRoot $RequireCleanTree.IsPresent $RequireStagedCandidate.IsPresent $FailGate.IsPresent `
+        $BaseSha $ResolvedBaseCommit
 }
 
 function Invoke-RunnerContractProcess {
@@ -5637,6 +5647,59 @@ $result = [ordered]@{
                 "targeted Cargo must reject $argument before starting a gate"
         }
 
+        $manifestAliases = @(
+            [pscustomobject]@{
+                Name = "manifest short alias"
+                Arguments = @("-p", "easycon-ecs", "-m", "other/Cargo.toml")
+            },
+            [pscustomobject]@{
+                Name = "compact manifest short alias"
+                Arguments = @("-p", "easycon-ecs", "-mother/Cargo.toml")
+            }
+        )
+        foreach ($case in $manifestAliases) {
+            $started = 0
+            Assert-Throws -Pattern "manifest|not permitted" -Action {
+                Invoke-PrivateTargetedCargoGate -RepositoryRoot $repository `
+                    -CargoCommand test -CargoArguments $case.Arguments -GateInvoker {
+                        param($Name, $Program, $Arguments, $Root)
+                        $null = $Name, $Program, $Arguments, $Root
+                        $started++
+                    }.GetNewClosure()
+            }
+            Assert-Contract ($started -eq 0) `
+                "targeted Cargo must reject $($case.Name) before starting a gate"
+        }
+
+        $sourceWritingVariants = @("--fix", "--fix=true")
+        foreach ($argument in $sourceWritingVariants) {
+            $started = 0
+            Assert-Throws -Pattern "fix|not permitted" -Action {
+                Invoke-PrivateTargetedCargoGate -RepositoryRoot $repository `
+                    -CargoCommand clippy -CargoArguments @(
+                        "-p", "easycon-ecs", $argument
+                    ) -GateInvoker {
+                        param($Name, $Program, $Arguments, $Root)
+                        $null = $Name, $Program, $Arguments, $Root
+                        $started++
+                    }.GetNewClosure()
+            }
+            Assert-Contract ($started -eq 0) `
+                "targeted Cargo must reject source-writing $argument before starting a gate"
+        }
+
+        $postDelimiter = [System.Collections.Generic.List[object]]::new()
+        Invoke-PrivateTargetedCargoGate -RepositoryRoot $repository -CargoCommand test `
+            -CargoArguments @("-p", "easycon-ecs", "--", "-m", "other/Cargo.toml") -GateInvoker {
+                param($Name, $Program, $Arguments, $Root)
+                $postDelimiter.Add([pscustomobject]@{
+                    Name = $Name
+                    Arguments = @($Arguments)
+                }) | Out-Null
+            }.GetNewClosure()
+        Assert-Contract ($postDelimiter.Count -eq 1) `
+            "test-binary -m argument after -- must not be parsed as a Cargo manifest option"
+
         Assert-Throws -Pattern "ValidateSet|only supports" -Action {
             Invoke-PrivateTargetedCargoGate -RepositoryRoot $repository `
                 -CargoCommand build -CargoArguments @("-p", "easycon-ecs")
@@ -5673,6 +5736,46 @@ $result = [ordered]@{
             $binding.Tree -ceq $candidateTree -and
             $binding.HeadCommit -match "^[0-9a-f]{40}$"
         ) "staged Workspace must bind the candidate tree created from the current index"
+
+        $headCommit = @(& $git -C $stagedRepository rev-parse HEAD)[0].Trim()
+        $branchRef = @(& $git -C $stagedRepository symbolic-ref HEAD)[0].Trim()
+        Assert-Contract (
+            $LASTEXITCODE -eq 0 -and
+            $headCommit -match "^[0-9a-f]{40}$" -and
+            $branchRef -match "^refs/heads/"
+        ) "candidate fixture must expose an immutable HEAD and branch ref"
+        $baseAliases = @(
+            [pscustomobject]@{ Name = "HEAD"; Value = "HEAD" },
+            [pscustomobject]@{ Name = "branch ref"; Value = $branchRef },
+            [pscustomobject]@{ Name = "abbreviated commit"; Value = $headCommit.Substring(0, 12) }
+        )
+        foreach ($baseAlias in $baseAliases) {
+            $gateState = [pscustomobject]@{ Starts = 0 }
+            $baseBinding = Invoke-PrivateWorkspaceGates -RepositoryRoot $stagedRepository `
+                -BaseSha $baseAlias.Value -RequireStagedCandidate -GateInvoker {
+                    param($Name, $Program, $Arguments, $Root)
+                    $null = $Name, $Program, $Arguments, $Root
+                    $gateState.Starts++
+                }.GetNewClosure()
+            Assert-Contract (
+                $gateState.Starts -gt 0 -and
+                $baseBinding.PSObject.Properties.Name -ccontains "BaseCommit" -and
+                [string]$baseBinding.BaseCommit -ceq $headCommit -and
+                [string]$baseBinding.BaseCommit -match "^[0-9a-f]{40}$"
+            ) "workspace BaseSha $($baseAlias.Name) must bind one immutable full commit before gates"
+        }
+
+        $invalidBaseState = [pscustomobject]@{ Starts = 0 }
+        Assert-Throws -Pattern "workspace base commit|base commit" -Action {
+            Invoke-PrivateWorkspaceGates -RepositoryRoot $stagedRepository `
+                -BaseSha "refs/heads/not-a-workspace-base" -RequireStagedCandidate -GateInvoker {
+                    param($Name, $Program, $Arguments, $Root)
+                    $null = $Name, $Program, $Arguments, $Root
+                    $invalidBaseState.Starts++
+                }.GetNewClosure()
+        }
+        Assert-Contract ($invalidBaseState.Starts -eq 0) `
+            "invalid BaseSha must fail before any workspace gate starts"
 
         $diagnosticBindings = @(Invoke-PrivateWorkspaceGates -RepositoryRoot $stagedRepository `
             -RequireStagedCandidate -GateInvoker {
@@ -5812,6 +5915,21 @@ $result = [ordered]@{
                 "evidence/workspace-{0}.json" -f $success.Tree
             )
         ) "final EASYCON_WORKSPACE record must follow the published tree-bound evidence"
+
+        $aliasEvidence = Invoke-PrivateWorkspaceEvidenceProbe -ProbeRoot (
+            Join-Path $temporaryRoot "resolved base workspace evidence"
+        ) -RequireStagedCandidate -BaseSha "HEAD" -ResolvedBaseCommit ("d" * 40)
+        Assert-Contract ($null -eq $aliasEvidence.Failure -and $aliasEvidence.GateCalls -eq 1) `
+            "resolved BaseSha evidence probe must complete"
+        $aliasEvidencePath = Join-Path $aliasEvidence.WorkspaceRoot (
+            "evidence/workspace-{0}.json" -f $aliasEvidence.Tree
+        )
+        $aliasEvidenceRecord = Get-Content -Raw -LiteralPath $aliasEvidencePath | ConvertFrom-Json -Depth 16
+        Assert-Contract (
+            $aliasEvidence.GateCall.BaseSha -ceq "HEAD" -and
+            $aliasEvidenceRecord.baseCommit -ceq ("d" * 40) -and
+            $aliasEvidenceRecord.baseCommit -match "^[0-9a-f]{40}$"
+        ) "workspace evidence must publish the resolved immutable BaseSha rather than its input ref"
 
         $failed = Invoke-PrivateWorkspaceEvidenceProbe -ProbeRoot (
             Join-Path $temporaryRoot "failed workspace evidence"

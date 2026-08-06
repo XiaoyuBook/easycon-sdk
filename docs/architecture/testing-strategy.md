@@ -470,10 +470,13 @@ prepared vcpkg checkout 的真实 Git fixture 必须在改变 tracked file stat 
 `RequireCleanTree` 对 gate 新增的 ignored pyc 仍然失败。
 Windows targeted Cargo 合同还必须用 child runner 证明非 `Targeted` mode 携带 targeted 参数在 Verify 前失败；私有 gate
 contract 必须逐 token 核对自动插入的 `--locked`、显式 package、仅允许的 command，以及 `--workspace`/`--all`、所有
-source/output/config/target bypass 参数和 `--name=value` 形式的零启动拒绝。公开 Targeted wrapper 必须继续走 Workspace
-lifecycle，证明 Verify 失败时零 targeted gate、lease/环境恢复仍由既有 lifecycle 负责、public export set 不扩张。
+source/output/config/target bypass 参数和 `--name=value` 形式的零启动拒绝。它还必须在 Cargo `--` 前分别覆盖 `-m <path>`、
+紧凑 `-m<path>` 与 `clippy --fix`/equals 形式的零启动拒绝，同时保留 `--` 后 test-binary 参数不按 Cargo option 解析。
+公开 Targeted wrapper 必须继续走 Workspace lifecycle，证明 Verify 失败时零 targeted gate、lease/环境恢复仍由既有 lifecycle
+负责、public export set 不扩张。
 candidate contract 使用真实 Git fixture 覆盖 staged success、unstaged/untracked 拒绝及 gate 内 index tree 改变；成功 binding
-必须同时固定 HEAD 与 `git write-tree`，clean-tree 继续覆盖 ignored pyc。evidence contract 必须覆盖普通 Workspace 只输出
+必须同时固定 HEAD 与 `git write-tree`，clean-tree 继续覆盖 ignored pyc。任何 `BaseSha` branch/ref/`HEAD`/abbrev 都必须在 gate
+前由一次受控 Git 解析为 40 位 immutable commit，非法 ref 零 gate 拒绝，diff/evidence 均使用同一解析值。evidence contract 必须覆盖普通 Workspace 只输出
 `credential=none` summary、staged/clean credential 成功后才在当前 `w/<workspace-key>` 原子发布 schema v1 JSON、final
 `EASYCON_WORKSPACE` 与 JSON 的 tree/fingerprint/identity/timing 一致、没有残留 publish temporary，以及 gate 失败时零 passed
 record 和零 evidence。所有这些 fixture 以同步 marker、真实 Git 状态或真实原子 writer 判断，不用随机 sleep。

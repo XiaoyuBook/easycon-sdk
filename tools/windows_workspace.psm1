@@ -7750,7 +7750,8 @@ function Invoke-EasyConWindowsWorkspace {
         $completedUtc = [DateTimeOffset]::UtcNow
         if ($null -ne $candidate) {
             & $publishWorkspaceEvidence -Context $context -Candidate $candidate `
-                -BaseSha $BaseSha -StartedUtc $workspaceStartedUtc -CompletedUtc $completedUtc `
+                -BaseCommit ([string]$candidate.BaseCommit) `
+                -StartedUtc $workspaceStartedUtc -CompletedUtc $completedUtc `
                 -DurationMilliseconds ([long]$workspaceTimer.ElapsedMilliseconds) | Out-Null
             return
         }
@@ -7856,6 +7857,7 @@ function Get-EasyConTargetedCargoArguments {
         "--offline",
         "--frozen"
     )
+    $clippySourceWriting = @("--fix")
     $hasPackage = $false
     $cargoOptionSection = $true
     for ($index = 0; $index -lt $arguments.Count; $index++) {
@@ -7874,6 +7876,16 @@ function Get-EasyConTargetedCargoArguments {
         }
         if (-not $cargoOptionSection) {
             continue
+        }
+        if ($argument -ceq "-m" -or ($argument.StartsWith("-m") -and $argument.Length -gt 2)) {
+            throw "Targeted Cargo manifest-path argument is not permitted: $argument"
+        }
+        if ($CargoCommand -ieq "clippy") {
+            foreach ($blocked in $clippySourceWriting) {
+                if ($argument -ieq $blocked -or $argument.StartsWith("$blocked=")) {
+                    throw "Targeted Cargo argument is not permitted: $argument"
+                }
+            }
         }
         if ($argument -ceq "-p" -or $argument -ceq "--package") {
             if ($index + 1 -ge $arguments.Count) {
@@ -8013,6 +8025,26 @@ function Get-EasyConGitObjectId {
         throw "$Description returned an invalid Git object ID"
     }
     return $value
+}
+
+function Resolve-EasyConWorkspaceBaseCommit {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Git,
+
+        [Parameter(Mandatory)]
+        [string]$RepositoryRoot,
+
+        [string]$BaseSha
+    )
+
+    if ([string]::IsNullOrWhiteSpace($BaseSha) -or $BaseSha -match '^0+$') {
+        return $null
+    }
+    return Get-EasyConGitObjectId -Git $Git -RepositoryRoot $RepositoryRoot `
+        -Arguments @("--no-optional-locks", "rev-parse", "--verify", "--end-of-options", "$BaseSha^{commit}") `
+        -Description "workspace base commit"
 }
 
 function Get-EasyConGitWorkingTreeStatus {
@@ -8176,7 +8208,7 @@ function Publish-EasyConWorkspaceEvidence {
         [Parameter(Mandatory)]
         [object]$Candidate,
 
-        [string]$BaseSha,
+        [string]$BaseCommit,
 
         [Parameter(Mandatory)]
         [DateTimeOffset]$StartedUtc,
@@ -8199,13 +8231,14 @@ function Publish-EasyConWorkspaceEvidence {
     }
     $workspaceRoot = Assert-EasyConPhysicalPath -Path ([string]$Context.Location.WorkspaceRoot)
     $evidenceFile = "evidence/workspace-$tree.json"
-    $baseCommit = if (
-        [string]::IsNullOrWhiteSpace($BaseSha) -or $BaseSha -match '^0+$'
-    ) {
+    $baseCommit = if ([string]::IsNullOrWhiteSpace($BaseCommit)) {
         $null
     }
     else {
-        [string]$BaseSha
+        if ($BaseCommit -cnotmatch '^[0-9a-f]{40}$' -or $BaseCommit -match '^0+$') {
+            throw "workspace evidence requires an immutable full base commit"
+        }
+        [string]$BaseCommit
     }
     $record = [ordered]@{
         schemaVersion = 1
@@ -8256,6 +8289,8 @@ function Invoke-EasyConWindowsWorkspaceGates {
     $python = Get-EasyConCommandPath -Name "python.exe"
     $pwsh = Get-EasyConCommandPath -Name "pwsh.exe"
     $git = Get-EasyConCommandPath -Name "git.exe"
+    $baseCommit = Resolve-EasyConWorkspaceBaseCommit -Git $git -RepositoryRoot $repository `
+        -BaseSha $BaseSha
     $cargoResolution = @("--locked")
     $checkArguments = @("check") + $cargoResolution + @("--workspace", "--all-targets")
     $clippyArguments = @("clippy") + $cargoResolution + @(
@@ -8265,6 +8300,10 @@ function Invoke-EasyConWindowsWorkspaceGates {
     $candidate = New-EasyConWorkspaceCandidateBinding -RepositoryRoot $repository `
         -Git $git -RequireCleanTree:$RequireCleanTree `
         -RequireStagedCandidate:$RequireStagedCandidate
+    if ($null -ne $candidate) {
+        Add-Member -InputObject $candidate -NotePropertyName "BaseCommit" `
+            -NotePropertyValue $baseCommit
+    }
     $gates = @(
         @("cargo fmt --all --check", $cargo, @("fmt", "--all", "--check")),
         @(
@@ -8315,11 +8354,9 @@ function Invoke-EasyConWindowsWorkspaceGates {
             & $GateInvoker $gate[0] $gate[1] $gate[2] $repository | Out-Host
         }
     }
-    if (-not [string]::IsNullOrWhiteSpace($BaseSha) -and $BaseSha -notmatch '^0+$') {
-        Invoke-EasyConGate -Name "git cat-file base commit" -Program $git `
-            -Arguments @("cat-file", "-e", "$BaseSha^{commit}") -RepositoryRoot $repository
+    if ($null -ne $baseCommit) {
         Invoke-EasyConGate -Name "git diff base...HEAD --check" -Program $git `
-            -Arguments @("diff", "--check", "$BaseSha...HEAD") -RepositoryRoot $repository
+            -Arguments @("diff", "--check", "$baseCommit...HEAD") -RepositoryRoot $repository
     }
     if ($null -ne $candidate) {
         return Assert-EasyConWorkspaceCandidateBindingCurrent -RepositoryRoot $repository `
