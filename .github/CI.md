@@ -52,6 +52,9 @@ configuration、triplet、CMake preset、OCR manifest/provisioner 共同组成 f
 配置及独立 native-quality pins 交叉核对。PowerShell Setup parser 在 provision 前强制 exact schema 键、固定
 path/kind/顺序、无 `.`/`..` component 的规范相对路径和 Windows 大小写不敏感 path identity；任一偏差直接拒绝，
 不能等到后置 repository gate 才发现。Python guard 独立执行同一严格合同，防止清单与 Setup parser 漂移。
+当前环境清单为 v5，并精确包含 `crates/easycon-file-identity/Cargo.toml`；runner 文本不进入 prepared identity。
+`windows_gate_policy.json`、`windows_gate_policy.ps1` 与 runner 则组成独立 Workspace policy hash，见
+[ADR-0022](../docs/decisions/0022-windows-workspace-policy-identity-and-evidence-v2.md)。
 
 ## Windows Setup、Verify 与 Workspace
 
@@ -111,6 +114,10 @@ Cargo source replacement、vcpkg applocal root、target 与临时目录。apploc
 source/prepared 文件共享 identity 的同 hash 文件。Workspace 必须先通过同一 Verify，再执行 Cargo、Loom、规范、
 链接、repository contracts 与 diff 门禁。缺失、损坏、环境 schema/host-target/fingerprint 失配都在第一个 build gate 前失败，
 并明确要求重新运行 Setup；worktree 切换本身只改变隔离的可写输出。
+
+Workspace 在 lifecycle 前解析固定 policy，并在 Verify 后、首个 gate 前和最后一个 gate 后复核 policy hash。hash 改变时
+fail closed：前一边界零 gate，后一边界零 passed evidence/record。candidate 成功的 evidence 只在当前
+`w/<workspace-key>/evidence/v2/` 以 no-replace 的 schema v2 record 发布；普通 Workspace 不写 tree credential。
 
 prepared tree、stamp、Cargo vendor/config、vcpkg installed tree 和工具记录都必须审计绝对路径与写入边界：stamp 不得含
 workspace key 或 writable path，vendor/installed structured JSON 必须先解码 escaped string，所有 text artifact 不得引用

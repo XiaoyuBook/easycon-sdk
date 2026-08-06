@@ -4033,6 +4033,12 @@ mod tests {
         let cancellation = runtime.child_cancellation_token();
         let operation = runtime.create_operation(None).expect("operation");
         operation.start();
+        let (operation_cancelled, observed_operation_cancelled) = mpsc::channel();
+        operation.on_cancel(move || {
+            operation_cancelled
+                .send(())
+                .expect("operation cancellation observer");
+        });
         let (wake, woken) = mpsc::channel();
         cancellation.on_cancel(move || {
             let _ = wake.send(());
@@ -4055,6 +4061,14 @@ mod tests {
             closed.send(()).expect("close observer");
         });
 
+        observed_operation_cancelled
+            .recv_timeout(Duration::from_secs(2))
+            .expect("close requested operation cancellation");
+        assert_eq!(operation.snapshot().state, OperationState::Cancelling);
+        assert!(matches!(
+            observed_close.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
         observed_cleanup
             .recv_timeout(Duration::from_secs(2))
             .expect("task began cancellation cleanup");

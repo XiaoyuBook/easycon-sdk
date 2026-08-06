@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet("Setup", "Verify", "Workspace", "Targeted")]
+    [ValidateSet("Setup", "Verify", "Workspace", "Targeted", IgnoreCase = $false)]
     [string]$Mode = "Workspace",
 
     [string]$CacheRoot,
@@ -25,6 +25,9 @@ Set-StrictMode -Version Latest
 
 if (-not $IsWindows) {
     throw "run_windows_workspace.ps1 supports Windows only"
+}
+if ($Mode -cnotin @("Setup", "Verify", "Workspace", "Targeted")) {
+    throw "-Mode must use one exact supported case: Setup, Verify, Workspace, or Targeted"
 }
 
 $targetedParametersProvided = (
@@ -62,7 +65,7 @@ foreach ($entry in @(
     }
 }
 
-switch ($Mode) {
+switch -CaseSensitive ($Mode) {
     "Setup" {
         Invoke-EasyConWindowsSetup @commonParameters | Out-Null
     }

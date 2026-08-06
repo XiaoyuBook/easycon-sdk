@@ -1,0 +1,66 @@
+{
+  "version": 1,
+  "cargoJobs": 4,
+  "gates": [
+    {
+      "name": "cargo fmt --all --check",
+      "tool": "cargo",
+      "arguments": ["fmt", "--all", "--check"]
+    },
+    {
+      "name": "cargo check --locked --jobs 4 --workspace --all-targets",
+      "tool": "cargo",
+      "arguments": ["check", "--locked", "--workspace", "--all-targets"]
+    },
+    {
+      "name": "cargo clippy --locked --jobs 4 --workspace --all-targets --all-features -- -D warnings",
+      "tool": "cargo",
+      "arguments": ["clippy", "--locked", "--workspace", "--all-targets", "--all-features", "--", "-D", "warnings"]
+    },
+    {
+      "name": "cargo test --locked --jobs 4 --workspace --all-features",
+      "tool": "cargo",
+      "arguments": ["test", "--locked", "--workspace", "--all-features"]
+    },
+    {
+      "name": "python tools/run_runtime_models.py",
+      "tool": "python",
+      "arguments": ["tools/run_runtime_models.py"]
+    },
+    {
+      "name": "python tools/validate_specs.py",
+      "tool": "python",
+      "arguments": ["tools/validate_specs.py"]
+    },
+    {
+      "name": "python tools/check_markdown_links.py",
+      "tool": "python",
+      "arguments": ["tools/check_markdown_links.py"]
+    },
+    {
+      "name": "python tools/check_repository_guards.py",
+      "tool": "python",
+      "arguments": ["tools/check_repository_guards.py"]
+    },
+    {
+      "name": "python tools/test_windows_bootstrap_contracts.py",
+      "tool": "python",
+      "arguments": ["tools/test_windows_bootstrap_contracts.py"]
+    },
+    {
+      "name": "pwsh tools/test_windows_workspace.ps1",
+      "tool": "pwsh",
+      "arguments": ["-NoLogo", "-NoProfile", "-File", "tools/test_windows_workspace.ps1"]
+    },
+    {
+      "name": "pwsh tools/test_windows_environment_lifecycle.ps1",
+      "tool": "pwsh",
+      "arguments": ["-NoLogo", "-NoProfile", "-File", "tools/test_windows_environment_lifecycle.ps1"]
+    },
+    {
+      "name": "git diff --check",
+      "tool": "git",
+      "arguments": ["diff", "--check"]
+    }
+  ]
+}

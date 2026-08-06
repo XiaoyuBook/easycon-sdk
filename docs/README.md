@@ -72,6 +72,7 @@
 - [ADR-0019：冻结 Phase 4 C1 lexer 合同（Accepted / Frozen）](decisions/0019-phase-4-c1-lexer-contract.md)
 - [ADR-0020：冻结 Controller 结算的 Runtime 前置合同（Accepted / Effective）](decisions/0020-controller-settlement-runtime-prerequisites.md)
 - [ADR-0021：冻结 Phase 4 C1 Windows high-resolution file-identity foundation 前置合同（Accepted / Effective）](decisions/0021-phase-4-c1-windows-loader-handle-identity-dependency.md)
+- [ADR-0022：Windows Workspace policy identity 与 evidence v2 合同（Accepted / Effective）](decisions/0022-windows-workspace-policy-identity-and-evidence-v2.md)
 
 ## v1 固定范围
 

@@ -1,9 +1,17 @@
 [CmdletBinding()]
-param()
+param(
+    [string]$ExactCase
+)
 
 $ErrorActionPreference = "Stop"
 $PSNativeCommandUseErrorActionPreference = $false
 Set-StrictMode -Version Latest
+
+$script:contractCases = [System.Collections.Generic.List[object]]::new()
+$script:contractCaseNames = [System.Collections.Generic.HashSet[string]]::new(
+    [System.StringComparer]::Ordinal
+)
+$script:exactCaseRequested = $PSBoundParameters.ContainsKey("ExactCase")
 
 function Assert-Contract {
     param(
@@ -48,10 +56,39 @@ function Invoke-ContractCase {
         [scriptblock]$Action
     )
 
-    $timer = [System.Diagnostics.Stopwatch]::StartNew()
-    & $Action
-    $timer.Stop()
-    Write-Output ("CONTRACT_PASS name={0} durationMs={1}" -f $Name, $timer.ElapsedMilliseconds)
+    if (-not $script:contractCaseNames.Add($Name)) {
+        throw "contract case registry contains duplicate exact name '$Name'"
+    }
+    $script:contractCases.Add([pscustomobject]@{
+        Name = $Name
+        Action = $Action
+    }) | Out-Null
+}
+
+function Invoke-SelectedContractCases {
+    if ($script:exactCaseRequested) {
+        if ([string]::IsNullOrWhiteSpace($ExactCase)) {
+            throw "-ExactCase requires one complete exact case name"
+        }
+        if (-not $script:contractCaseNames.Contains($ExactCase)) {
+            throw "unknown exact contract case '$ExactCase'"
+        }
+        $selected = @($script:contractCases | Where-Object { $_.Name -ceq $ExactCase })
+        Assert-Contract ($selected.Count -eq 1) `
+            "exact contract case selection must resolve one case"
+        $timer = [System.Diagnostics.Stopwatch]::StartNew()
+        & $selected[0].Action
+        $timer.Stop()
+        Write-Output ("CONTRACT_PASS name={0} durationMs={1}" -f $ExactCase, $timer.ElapsedMilliseconds)
+        return
+    }
+
+    foreach ($case in $script:contractCases) {
+        $timer = [System.Diagnostics.Stopwatch]::StartNew()
+        & $case.Action
+        $timer.Stop()
+        Write-Output ("CONTRACT_PASS name={0} durationMs={1}" -f $case.Name, $timer.ElapsedMilliseconds)
+    }
 }
 
 function Wait-ContractFileCreated {
@@ -231,8 +268,18 @@ function Invoke-PrivateWorkspaceGates {
 
     & $script:workspaceModule {
         param($Root, $Base, $Invoker, $RequireClean, $RequireStaged)
-        Invoke-EasyConWindowsWorkspaceGates -RepositoryRoot $Root -GateInvoker $Invoker `
-            -BaseSha $Base -RequireCleanTree:$RequireClean -RequireStagedCandidate:$RequireStaged
+        $policy = Get-EasyConWindowsGatePolicy -RepositoryRoot $Root
+        $outcome = Invoke-EasyConWindowsWorkspaceGates -RepositoryRoot $Root `
+            -GateInvoker $Invoker -Policy $policy -BaseSha $Base `
+            -RequireCleanTree:$RequireClean -RequireStagedCandidate:$RequireStaged
+        if ($null -eq $outcome.Candidate) {
+            return
+        }
+        Add-Member -InputObject $outcome.Candidate -NotePropertyName "BaseCommit" `
+            -NotePropertyValue $outcome.BaseCommit -Force
+        Add-Member -InputObject $outcome.Candidate -NotePropertyName "GateRecords" `
+            -NotePropertyValue @($outcome.Gates) -Force
+        return $outcome.Candidate
     } $RepositoryRoot $BaseSha $GateInvoker $RequireCleanTree.IsPresent $RequireStagedCandidate.IsPresent
 }
 
@@ -246,14 +293,17 @@ function Invoke-PrivateTargetedCargoGate {
 
         [string[]]$CargoArguments = @(),
 
+        [int]$CargoJobs = 4,
+
         [scriptblock]$GateInvoker
     )
 
     & $script:workspaceModule {
-        param($Root, $Command, $Arguments, $Invoker)
+        param($Root, $Command, $Arguments, $Jobs, $Invoker)
         Invoke-EasyConWindowsTargetedCargoGate -RepositoryRoot $Root `
-            -CargoCommand $Command -CargoArguments $Arguments -GateInvoker $Invoker
-    } $RepositoryRoot $CargoCommand $CargoArguments $GateInvoker
+            -CargoCommand $Command -CargoJobs $Jobs -CargoArguments $Arguments `
+            -GateInvoker $Invoker
+    } $RepositoryRoot $CargoCommand $CargoArguments $CargoJobs $GateInvoker
 }
 
 function Set-PrivateVerifiedProcessEnvironment {
@@ -481,7 +531,7 @@ function Invoke-PrivatePublicWrapperProbe {
     )
 
     & $script:workspaceModule {
-        param($WrapperMode, $FailLifecycle)
+        param($WrapperMode, $FailLifecycle, $ResolvedRepository)
 
         $originalContext = ${function:Get-EasyConWindowsEnvironmentContext}
         $originalSetupCore = ${function:Invoke-EasyConWindowsSetupCore}
@@ -496,7 +546,7 @@ function Invoke-PrivatePublicWrapperProbe {
             WorkspaceKey = "resolved-workspace"
         }
         $context = [pscustomobject]@{
-            Repository = "resolved-repository"
+            Repository = $ResolvedRepository
             ConfigurationPath = "resolved-configuration"
             Configuration = [pscustomobject]@{ target = "x86_64-pc-windows-msvc" }
             Fingerprint = [pscustomobject]@{ Value = ("f" * 64) }
@@ -510,7 +560,6 @@ function Invoke-PrivatePublicWrapperProbe {
             VerifyCalls = [System.Collections.Generic.List[object]]::new()
             WorkspaceCalls = [System.Collections.Generic.List[object]]::new()
             TargetedCalls = [System.Collections.Generic.List[object]]::new()
-            InputGateInvoker = { param($Name, $Program, $Arguments, $Root) }
         }
 
         $contextProbe = {
@@ -557,23 +606,23 @@ function Invoke-PrivatePublicWrapperProbe {
                 $BaseSha,
                 [switch]$RequireCleanTree,
                 [switch]$RequireStagedCandidate,
-                $GateInvoker
+                $Policy
             )
             $state.WorkspaceCalls.Add([pscustomobject]@{
                 RepositoryRoot = $RepositoryRoot
                 BaseSha = $BaseSha
                 RequireCleanTree = $RequireCleanTree.IsPresent
                 RequireStagedCandidate = $RequireStagedCandidate.IsPresent
-                GateInvoker = $GateInvoker
+                Policy = $Policy
             }) | Out-Null
         }.GetNewClosure()
         $targetedProbe = {
-            param($RepositoryRoot, $CargoCommand, $CargoArguments, $GateInvoker)
+            param($RepositoryRoot, $CargoCommand, $CargoArguments, $CargoJobs)
             $state.TargetedCalls.Add([pscustomobject]@{
                 RepositoryRoot = $RepositoryRoot
                 CargoCommand = $CargoCommand
                 CargoArguments = @($CargoArguments)
-                GateInvoker = $GateInvoker
+                CargoJobs = $CargoJobs
             }) | Out-Null
         }.GetNewClosure()
         $lifecycleProbe = {
@@ -638,13 +687,12 @@ function Invoke-PrivatePublicWrapperProbe {
                 }
                 "Workspace" {
                     Invoke-EasyConWindowsWorkspace @parameters -BaseSha ("a" * 40) `
-                        -RequireCleanTree -GateInvoker $state.InputGateInvoker | Out-Null
+                        -RequireCleanTree | Out-Null
                 }
                 "Targeted" {
                     Invoke-EasyConWindowsWorkspace @parameters -GateMode Targeted `
                         -TargetedCargoCommand test `
-                        -TargetedCargoArguments @("-p", "easycon-ecs", "--lib") `
-                        -GateInvoker $state.InputGateInvoker | Out-Null
+                        -TargetedCargoArguments @("-p", "easycon-ecs", "--lib") | Out-Null
                 }
             }
             return $state
@@ -663,7 +711,7 @@ function Invoke-PrivatePublicWrapperProbe {
             Set-Item -LiteralPath Function:script:Invoke-EasyConEnvironmentLifecycle `
                 -Value $originalLifecycle
         }
-    } $Mode $LifecycleFailure.IsPresent
+    } $Mode $LifecycleFailure.IsPresent $repository
 }
 
 function Invoke-PrivateWorkspaceEvidenceProbe {
@@ -679,17 +727,43 @@ function Invoke-PrivateWorkspaceEvidenceProbe {
 
         [string]$BaseSha = ("c" * 40),
 
-        [string]$ResolvedBaseCommit = ("c" * 40)
+        [string]$ResolvedBaseCommit = ("c" * 40),
+
+        [ValidateSet("None", "Verify", "Gates", IgnoreCase = $false)]
+        [string]$PolicyMutationPhase = "None"
     )
 
+    $policyRepository = $repository.Path
+    if ($PolicyMutationPhase -cne "None") {
+        $policyRepository = Join-Path $ProbeRoot "policy-source"
+        foreach ($name in @(
+            "windows_gate_policy.json",
+            "windows_gate_policy.ps1",
+            "run_windows_workspace.ps1"
+        )) {
+            Set-ContractUtf8Text -Path (Join-Path $policyRepository "tools/$name") `
+                -Value (Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot $name))
+        }
+    }
+
     & $script:workspaceModule {
-        param($Root, $RequireClean, $RequireStaged, $ShouldFail, $RequestedBaseSha, $ResolvedBase)
+        param(
+            $Root,
+            $RequireClean,
+            $RequireStaged,
+            $ShouldFail,
+            $RequestedBaseSha,
+            $ResolvedBase,
+            $PolicyRepository,
+            $MutationPhase
+        )
 
         $originalContext = ${function:Get-EasyConWindowsEnvironmentContext}
         $originalVerifyCore = ${function:Invoke-EasyConWindowsVerifyCore}
         $originalWorkspaceGates = ${function:Invoke-EasyConWindowsWorkspaceGates}
         $originalLifecycle = ${function:Invoke-EasyConEnvironmentLifecycle}
         $originalStructuredRecord = ${function:Write-EasyConStructuredRecord}
+        $originalPolicyScriptPath = $script:EasyConGatePolicyScriptPath
         $workspaceRoot = Join-Path $Root "workspace"
         New-Item -ItemType Directory -Force -Path $workspaceRoot | Out-Null
         $location = [pscustomobject]@{
@@ -700,7 +774,7 @@ function Invoke-PrivateWorkspaceEvidenceProbe {
             WorkspaceRoot = $workspaceRoot
         }
         $context = [pscustomobject]@{
-            Repository = "resolved-repository"
+            Repository = $PolicyRepository
             ConfigurationPath = "resolved-configuration"
             Configuration = [pscustomobject]@{ target = "x86_64-pc-windows-msvc" }
             Fingerprint = [pscustomobject]@{ Value = ("f" * 64) }
@@ -715,7 +789,26 @@ function Invoke-PrivateWorkspaceEvidenceProbe {
             Tree = ("b" * 40)
             RequestedBaseSha = $RequestedBaseSha
             ResolvedBaseCommit = $ResolvedBase
+            PolicyMutated = $false
+            PolicyHashBefore = $null
+            PolicyHashAfter = $null
         }
+        $policyPath = Join-Path $PolicyRepository "tools/windows_gate_policy.json"
+        if ($MutationPhase -cne "None") {
+            $script:EasyConGatePolicyScriptPath = Join-Path $PolicyRepository `
+                "tools/windows_gate_policy.ps1"
+        }
+        $state.PolicyHashBefore = (Get-EasyConGatePolicyHash -RepositoryRoot $PolicyRepository).Value
+        $mutatePolicy = {
+            if (-not $state.PolicyMutated) {
+                [System.IO.File]::AppendAllText(
+                    $policyPath,
+                    " ",
+                    [System.Text.UTF8Encoding]::new($false, $true)
+                )
+                $state.PolicyMutated = $true
+            }
+        }.GetNewClosure()
         $contextProbe = {
             param($RepositoryRoot, $ConfigurationPath, $CacheRoot)
             $null = $RepositoryRoot, $ConfigurationPath, $CacheRoot
@@ -726,6 +819,9 @@ function Invoke-PrivateWorkspaceEvidenceProbe {
             $null = $RepositoryRoot, $ConfigurationPath, $CacheRoot, $VsWherePath
             Assert-Contract ([object]::ReferenceEquals($Context, $context)) `
                 "evidence probe must keep the resolved context"
+            if ($MutationPhase -ceq "Verify") {
+                & $mutatePolicy
+            }
             return [pscustomobject]@{ Status = "ready" }
         }.GetNewClosure()
         $gatesProbe = {
@@ -734,7 +830,7 @@ function Invoke-PrivateWorkspaceEvidenceProbe {
                 $BaseSha,
                 [switch]$RequireCleanTree,
                 [switch]$RequireStagedCandidate,
-                $GateInvoker
+                $Policy
             )
             $state.GateCalls++
             $state.GateCall = [pscustomobject]@{
@@ -742,24 +838,36 @@ function Invoke-PrivateWorkspaceEvidenceProbe {
                 BaseSha = $BaseSha
                 RequireCleanTree = $RequireCleanTree.IsPresent
                 RequireStagedCandidate = $RequireStagedCandidate.IsPresent
-                GateInvoker = $GateInvoker
+                Policy = $Policy
             }
             if ($ShouldFail) {
                 throw "synthetic candidate gate failure"
             }
-            if (-not $RequireClean -and -not $RequireStaged) {
-                return
-            }
-            return [pscustomobject]@{
-                CandidateMode = if ($RequireStaged) {
-                    "staged-candidate"
+            $candidate = $null
+            if ($RequireClean -or $RequireStaged) {
+                $candidate = [pscustomobject]@{
+                    CandidateMode = if ($RequireStaged) {
+                        "staged-candidate"
                 }
                 else {
                     "clean-tree"
                 }
-                HeadCommit = ("a" * 40)
-                Tree = $state.Tree
-                BaseCommit = $state.ResolvedBaseCommit
+                    HeadCommit = ("a" * 40)
+                    Tree = $state.Tree
+                }
+            }
+            if ($MutationPhase -ceq "Gates") {
+                & $mutatePolicy
+            }
+            return [pscustomobject]@{
+                Candidate = $candidate
+                BaseCommit = if ($null -ne $candidate) { $state.ResolvedBaseCommit } else { $null }
+                Gates = @([pscustomobject]@{
+                    name = "synthetic contract gate"
+                    status = "passed"
+                    durationMs = 0L
+                })
+                Git = $null
             }
         }.GetNewClosure()
         $lifecycleProbe = {
@@ -806,6 +914,7 @@ function Invoke-PrivateWorkspaceEvidenceProbe {
             catch {
                 $state.Failure = $_
             }
+            $state.PolicyHashAfter = (Get-EasyConGatePolicyHash -RepositoryRoot $PolicyRepository).Value
             return $state
         }
         finally {
@@ -819,9 +928,10 @@ function Invoke-PrivateWorkspaceEvidenceProbe {
                 -Value $originalLifecycle
             Set-Item -LiteralPath Function:script:Write-EasyConStructuredRecord `
                 -Value $originalStructuredRecord
+            $script:EasyConGatePolicyScriptPath = $originalPolicyScriptPath
         }
     } $ProbeRoot $RequireCleanTree.IsPresent $RequireStagedCandidate.IsPresent $FailGate.IsPresent `
-        $BaseSha $ResolvedBaseCommit
+        $BaseSha $ResolvedBaseCommit $policyRepository $PolicyMutationPhase
 }
 
 function Invoke-RunnerContractProcess {
@@ -938,7 +1048,7 @@ try {
     Invoke-ContractCase -Name "strict-environment-configuration" -Action {
         $configurationText = Get-Content -Raw -LiteralPath $configurationPath
         $configuration = Get-PrivateWindowsBuildConfiguration -Path $configurationPath
-        Assert-Contract ($configuration.version -eq 4) "environment config schema must be v4"
+        Assert-Contract ($configuration.version -eq 5) "environment config schema must be v5"
         Assert-Contract ($configuration.vcpkg.internalTools.Count -eq 4) `
             "CMake, Ninja, 7-Zip, and its 7zr bootstrap must be audited"
         Assert-Contract ($configuration.vcpkg.nativeDependencies.Count -eq 3) `
@@ -947,16 +1057,26 @@ try {
             "Cargo.lock must invalidate the prepared dependency environment"
         Assert-Contract ($configuration.fingerprintInputs.path -ccontains "tools/windows_workspace.psm1") `
             "environment implementation changes must invalidate the prepared environment"
+        Assert-Contract (
+            $configuration.fingerprintInputs.path -ccontains "crates/easycon-file-identity/Cargo.toml"
+        ) "the file-identity manifest must invalidate the prepared environment"
 
         $reversedConfiguration = $configurationText | ConvertFrom-Json -Depth 32
         [array]::Reverse($reversedConfiguration.fingerprintInputs)
         $reversedFingerprintInputs = $reversedConfiguration | ConvertTo-Json -Depth 32
+        $withoutFileIdentityConfiguration = $configurationText | ConvertFrom-Json -Depth 32
+        $withoutFileIdentityConfiguration.fingerprintInputs = @(
+            $withoutFileIdentityConfiguration.fingerprintInputs | Where-Object {
+                $_.path -cne "crates/easycon-file-identity/Cargo.toml"
+            }
+        )
+        $withoutFileIdentityManifest = $withoutFileIdentityConfiguration | ConvertTo-Json -Depth 32
 
         $mutations = [ordered]@{
             "duplicate key" = $configurationText.Replace(
-                '"version": 4', '"version": 4, "version": 4'
+                '"version": 5', '"version": 5, "version": 5'
             )
-            "old schema" = $configurationText.Replace('"version": 4', '"version": 3')
+            "old schema" = $configurationText.Replace('"version": 5', '"version": 4')
             "unfrozen target" = $configurationText.Replace(
                 '"x86_64-pc-windows-msvc"', '"x86_64-unknown-linux-gnu"'
             )
@@ -968,6 +1088,7 @@ try {
                 '"path": "Cargo.lock", "kind": "text"',
                 '"path": "Cargo.lock", "kind": "auto"'
             )
+            "missing file identity manifest" = $withoutFileIdentityManifest
             "reversed fingerprint inputs" = $reversedFingerprintInputs
             "Windows case alias duplicate" = $configurationText.Replace(
                 '"path": "tools/provision_vision_test_model.py"',
@@ -1199,8 +1320,13 @@ try {
             ($expectedCommands -join "`n")
         ) "exported function set must contain exactly Setup, Verify, and Workspace; actual=$($publicCommands -join ',')"
 
+        $workspaceCommand = Get-Command -Name "Invoke-EasyConWindowsWorkspace" `
+            -Module windows_workspace -ErrorAction Stop
+        Assert-Contract (-not $workspaceCommand.Parameters.ContainsKey("GateInvoker")) `
+            "the public Workspace wrapper must not expose the test-only GateInvoker bypass"
+
         $started = [pscustomobject]@{ Gates = 0 }
-        Assert-Throws -Pattern "not prepared.*Mode Setup" -Action {
+        Assert-Throws -Pattern "parameter name 'GateInvoker'|cannot be found.*GateInvoker" -Action {
             Invoke-EasyConWindowsWorkspace -RepositoryRoot $repository `
                 -ConfigurationPath $configurationPath `
                 -CacheRoot (Join-Path $temporaryRoot "public workspace bypass cache") `
@@ -1210,10 +1336,10 @@ try {
                 }.GetNewClosure()
         }
         Assert-Contract ($started.Gates -eq 0) `
-            "public Workspace must start zero gates before Verify succeeds"
+            "a rejected external Workspace GateInvoker must start zero Verify or gate work"
 
         $targetedStarted = [pscustomobject]@{ Gates = 0 }
-        Assert-Throws -Pattern "not prepared.*Mode Setup" -Action {
+        Assert-Throws -Pattern "parameter name 'GateInvoker'|cannot be found.*GateInvoker" -Action {
             Invoke-EasyConWindowsWorkspace -RepositoryRoot $repository `
                 -ConfigurationPath $configurationPath `
                 -CacheRoot (Join-Path $temporaryRoot "public targeted bypass cache") `
@@ -1224,7 +1350,7 @@ try {
                 }.GetNewClosure()
         }
         Assert-Contract ($targetedStarted.Gates -eq 0) `
-            "public Targeted must start zero gates before Verify succeeds"
+            "a rejected external Targeted GateInvoker must start zero Verify or gate work"
     }
 
     Invoke-ContractCase -Name "public-wrappers-forward-controlled-lifecycle" -Action {
@@ -1245,7 +1371,7 @@ try {
                 "$mode must execute exactly one controlled Verify action"
             $verify = $state.VerifyCalls[0]
             Assert-Contract (
-                $verify.RepositoryRoot -ceq "resolved-repository" -and
+                $verify.RepositoryRoot -ceq $state.ResolvedContext.Repository -and
                 $verify.ConfigurationPath -ceq "resolved-configuration" -and
                 $verify.CacheRoot -ceq "resolved-cache" -and
                 $verify.VsWherePath -ceq "input-vswhere" -and
@@ -1259,7 +1385,7 @@ try {
                     "Setup must execute exactly one controlled Setup action"
                 $setup = $state.SetupCalls[0]
                 Assert-Contract (
-                    $setup.RepositoryRoot -ceq "resolved-repository" -and
+                    $setup.RepositoryRoot -ceq $state.ResolvedContext.Repository -and
                     $setup.ConfigurationPath -ceq "resolved-configuration" -and
                     $setup.CacheRoot -ceq "resolved-cache" -and
                     $setup.VsWherePath -ceq "input-vswhere" -and
@@ -1275,11 +1401,11 @@ try {
                     "Workspace must execute exactly one gate action after Verify"
                 $workspace = $state.WorkspaceCalls[0]
                 Assert-Contract (
-                    $workspace.RepositoryRoot -ceq "resolved-repository" -and
+                    $workspace.RepositoryRoot -ceq $state.ResolvedContext.Repository -and
                     $workspace.BaseSha -ceq ("a" * 40) -and
                     $workspace.RequireCleanTree -and
-                    [object]::ReferenceEquals($workspace.GateInvoker, $state.InputGateInvoker)
-                ) "Workspace must forward base, clean-tree, and gate invoker parameters"
+                    $workspace.Policy.CargoJobs -eq 4
+                ) "Workspace must forward base, clean-tree, and fixed policy parameters"
             }
             else {
                 Assert-Contract ($state.WorkspaceCalls.Count -eq 0) `
@@ -1290,12 +1416,12 @@ try {
                     "Targeted must execute exactly one Cargo gate action after Verify"
                 $targeted = $state.TargetedCalls[0]
                 Assert-Contract (
-                    $targeted.RepositoryRoot -ceq "resolved-repository" -and
+                    $targeted.RepositoryRoot -ceq $state.ResolvedContext.Repository -and
                     $targeted.CargoCommand -ceq "test" -and
                     ($targeted.CargoArguments -join "`0") -ceq
                         (@("-p", "easycon-ecs", "--lib") -join "`0") -and
-                    [object]::ReferenceEquals($targeted.GateInvoker, $state.InputGateInvoker)
-                ) "Targeted must preserve each controlled Cargo argument token"
+                    $targeted.CargoJobs -eq 4
+                ) "Targeted must preserve each controlled Cargo argument token and fixed jobs policy"
             }
             else {
                 Assert-Contract ($state.TargetedCalls.Count -eq 0) `
@@ -2764,7 +2890,15 @@ try {
                     }
                     else {
                         & $workspaceModule {
-                            param($RequestedMode, $Root, $Configuration, $Executable, $Capture, $ProbeState)
+                            param(
+                                $RequestedMode,
+                                $Root,
+                                $Configuration,
+                                $Executable,
+                                $Capture,
+                                $ProbeState,
+                                $PolicyRepository
+                            )
 
                             $originalContext = ${function:Get-EasyConWindowsEnvironmentContext}
                             $originalVerifyCore = ${function:Invoke-EasyConWindowsVerifyCore}
@@ -2772,7 +2906,7 @@ try {
                             $originalLifecycle = ${function:Invoke-EasyConEnvironmentLifecycle}
                             $checkoutModule = $ExecutionContext.SessionState.Module
                             $context = [pscustomobject]@{
-                                Repository = "contract-repository"
+                                Repository = $PolicyRepository
                                 ConfigurationPath = "contract-configuration"
                                 Configuration = [pscustomobject]@{
                                     target = "x86_64-pc-windows-msvc"
@@ -2814,12 +2948,12 @@ try {
                                     $BaseSha,
                                     [switch]$RequireCleanTree,
                                     [switch]$RequireStagedCandidate,
-                                    $GateInvoker
+                                    $Policy
                                 )
 
-                                $null = $RepositoryRoot, $BaseSha, $RequireCleanTree, $RequireStagedCandidate
+                                $null = $RepositoryRoot, $BaseSha, $RequireCleanTree, $RequireStagedCandidate, $Policy
                                 $ProbeState.WorkspaceGateActions++
-                                & $GateInvoker "contract gate" "unused" @() "unused"
+                                $ProbeState.GatesStarted++
                             }.GetNewClosure()
                             $lifecycleProbe = {
                                 param($Mode, $Location, $SetupAction, $VerifyAction, $WorkspaceAction, $LeaseTimeoutMilliseconds)
@@ -2830,12 +2964,6 @@ try {
                                     & $WorkspaceAction $summary | Out-Null
                                 }
                                 return $summary
-                            }.GetNewClosure()
-                            $gateInvoker = {
-                                param($Name, $Program, $Arguments, $RepositoryRoot)
-
-                                $null = $Name, $Program, $Arguments, $RepositoryRoot
-                                $ProbeState.GatesStarted++
                             }.GetNewClosure()
                             try {
                                 Set-Item -LiteralPath Function:script:Get-EasyConWindowsEnvironmentContext -Value $contextProbe
@@ -2848,8 +2976,7 @@ try {
                                 }
                                 else {
                                     Invoke-EasyConWindowsWorkspace -RepositoryRoot "input-repository" `
-                                        -ConfigurationPath "input-configuration" -CacheRoot "input-cache" `
-                                        -GateInvoker $gateInvoker | Out-Null
+                                        -ConfigurationPath "input-configuration" -CacheRoot "input-cache" | Out-Null
                                 }
                             }
                             finally {
@@ -2858,7 +2985,7 @@ try {
                                 Set-Item -LiteralPath Function:script:Invoke-EasyConWindowsWorkspaceGates -Value $originalWorkspaceGates
                                 Set-Item -LiteralPath Function:script:Invoke-EasyConEnvironmentLifecycle -Value $originalLifecycle
                             }
-                        } $Mode $fixture.Root $caseConfiguration $vcpkgExecutable $capture $state
+                        } $Mode $fixture.Root $caseConfiguration $vcpkgExecutable $capture $state $repository.Path
                     }
                 }
                 catch {
@@ -3425,20 +3552,23 @@ try {
                 ) "each real worktree fixture must be one unmodified fixed-SHA checkout"
             }
 
-            $firstConfiguration = Get-PrivateWindowsBuildConfiguration `
-                -Path (Join-Path $firstWorktree "tools/windows_build_environment.json")
-            $secondConfiguration = Get-PrivateWindowsBuildConfiguration `
-                -Path (Join-Path $secondWorktree "tools/windows_build_environment.json")
+            $contractConfiguration = Get-PrivateWindowsBuildConfiguration -Path $configurationPath
+            foreach ($input in @($contractConfiguration.fingerprintInputs)) {
+                Assert-Contract (
+                    (Test-Path -LiteralPath (Join-Path $firstWorktree $input.path) -PathType Leaf) -and
+                    (Test-Path -LiteralPath (Join-Path $secondWorktree $input.path) -PathType Leaf)
+                ) "each fixed-SHA worktree must contain the current fingerprint input $($input.path)"
+            }
             $firstFingerprint = Get-PrivateEnvironmentFingerprint -RepositoryRoot $firstWorktree `
-                -Configuration $firstConfiguration
+                -Configuration $contractConfiguration
             $secondFingerprint = Get-PrivateEnvironmentFingerprint -RepositoryRoot $secondWorktree `
-                -Configuration $secondConfiguration
+                -Configuration $contractConfiguration
             Assert-Contract ($firstFingerprint.Value -ceq $secondFingerprint.Value) `
                 "clean fixed-SHA worktrees must calculate one fingerprint without copied inputs"
             $firstLocation = Get-PrivateEnvironmentLocation -RepositoryRoot $firstWorktree `
-                -Fingerprint $firstFingerprint.Value -Configuration $firstConfiguration -CacheRoot $cache
+                -Fingerprint $firstFingerprint.Value -Configuration $contractConfiguration -CacheRoot $cache
             $secondLocation = Get-PrivateEnvironmentLocation -RepositoryRoot $secondWorktree `
-                -Fingerprint $secondFingerprint.Value -Configuration $secondConfiguration -CacheRoot $cache
+                -Fingerprint $secondFingerprint.Value -Configuration $contractConfiguration -CacheRoot $cache
             Assert-Contract ($firstLocation.EnvironmentRoot -ceq $secondLocation.EnvironmentRoot) `
                 "matching real worktrees must share one prepared EnvironmentRoot"
             Assert-Contract ($firstLocation.LockPath -ceq $secondLocation.LockPath) `
@@ -3658,6 +3788,7 @@ try {
             Set-ContractFile -Path $verifyProbeScript -Value @'
 param(
     [Parameter(Mandatory)][string]$ModulePath,
+    [Parameter(Mandatory)][string]$ConfigurationPath,
     [Parameter(Mandatory)][string]$RepositoryRoot,
     [Parameter(Mandatory)][string]$CacheRoot,
     [Parameter(Mandatory)][string]$ExpectedEnvironmentRoot,
@@ -3720,14 +3851,13 @@ Wait-ProbeMarker -Path $StartMarker -Description "parent start" `
 Import-Module -Name $ModulePath -Force
 $module = Get-Module windows_workspace
 $location = & $module {
-    param($Root, $Cache)
-    $configurationPath = Join-Path $Root "tools/windows_build_environment.json"
-    $configuration = Get-EasyConWindowsBuildConfiguration -Path $configurationPath
+    param($Root, $Cache, $Configuration)
+    $configuration = Get-EasyConWindowsBuildConfiguration -Path $Configuration
     $fingerprint = Get-EasyConEnvironmentFingerprint `
         -RepositoryRoot $Root -Configuration $configuration
     Get-EasyConEnvironmentLocation -RepositoryRoot $Root `
         -Fingerprint $fingerprint.Value -Configuration $configuration -CacheRoot $Cache
-} $RepositoryRoot $CacheRoot
+} $RepositoryRoot $CacheRoot $ConfigurationPath
 if (
     $location.EnvironmentRoot -cne $ExpectedEnvironmentRoot -or
     $location.WorkspaceRoot -cne $ExpectedWorkspaceRoot
@@ -3752,11 +3882,6 @@ $verify = {
     ) {
         throw "real concurrent Verify environment is not ready"
     }
-    $vcpkg = & $module {
-        param($Root, $Configuration, $Executable)
-        Assert-EasyConVcpkgCheckout -VcpkgRoot $Root `
-            -Configuration $Configuration -VcpkgExecutable $Executable
-    } $VcpkgRoot $vcpkgConfiguration $VcpkgExecutable
     [System.IO.File]::WriteAllText(
         $ReadyMarker,
         "ready",
@@ -3764,6 +3889,11 @@ $verify = {
     )
     Wait-ProbeMarker -Path $ReleaseMarker -Description "layout release" `
         -TimeoutMilliseconds $ReleaseTimeoutMilliseconds
+    $vcpkg = & $module {
+        param($Root, $Configuration, $Executable)
+        Assert-EasyConVcpkgCheckout -VcpkgRoot $Root `
+            -Configuration $Configuration -VcpkgExecutable $Executable
+    } $VcpkgRoot $vcpkgConfiguration $VcpkgExecutable
     $layout = & $module {
         param($VerifiedVcpkg, $Root, $Workspace, $Cache, $Environment, $Installed)
         New-EasyConVcpkgWorkspaceLayout -Vcpkg $VerifiedVcpkg `
@@ -3847,6 +3977,7 @@ $result = [ordered]@{
                     foreach ($argument in @(
                         "-NoLogo", "-NoProfile", "-File", $verifyProbeScript,
                         "-ModulePath", $modulePath,
+                        "-ConfigurationPath", $configurationPath,
                         "-RepositoryRoot", $entry.RepositoryRoot,
                         "-CacheRoot", $entry.Location.CacheRoot,
                         "-ExpectedEnvironmentRoot", $entry.Location.EnvironmentRoot,
@@ -5531,6 +5662,11 @@ $result = [ordered]@{
         foreach ($gate in $cargoGates | Where-Object { $_.Name -notlike "cargo fmt*" }) {
             Assert-Contract ($gate.Arguments -ccontains "--locked") `
                 "Cargo resolution must use the tracked lockfile"
+            $jobsIndex = [Array]::IndexOf([object[]]$gate.Arguments, "--jobs")
+            Assert-Contract (
+                $jobsIndex -ge 0 -and $jobsIndex + 1 -lt $gate.Arguments.Count -and
+                $gate.Arguments[$jobsIndex + 1] -ceq "4"
+            ) "Workspace Cargo build gates must use the fixed jobs budget"
             Assert-Contract ($gate.Arguments -cnotcontains "--offline") `
                 "Workspace duty separation must not be described as an offline contract"
         }
@@ -5549,6 +5685,14 @@ $result = [ordered]@{
             ($result.Output + "`n" + $result.Error) -match
                 "Targeted Cargo parameters require -Mode Targeted"
         ) "runner must reject targeted parameters before Verify; output=$($result.Output) error=$($result.Error)"
+
+        $lowercaseMode = Invoke-RunnerContractProcess -Arguments @("-Mode", "verify")
+        Assert-Contract ($lowercaseMode.ExitCode -ne 0) `
+            "runner must reject a lowercase mode before any lifecycle action starts"
+        Assert-Contract (
+            ($lowercaseMode.Output + "`n" + $lowercaseMode.Error) -match
+                "Mode.*(exact supported case|ValidateSet|cannot validate)"
+        ) "runner must require the exact supported mode case; output=$($lowercaseMode.Output) error=$($lowercaseMode.Error)"
     }
 
     Invoke-ContractCase -Name "targeted-cargo-gate-is-package-bound-and-tokenized" -Action {
@@ -5569,12 +5713,12 @@ $result = [ordered]@{
         Assert-Contract ($captured.Count -eq 1) `
             "a valid targeted command must invoke exactly one Cargo gate"
         $gate = $captured[0]
-        Assert-Contract ($gate.Name -ceq "cargo test --locked -p easycon-ecs --test world_contract -- --exact --nocapture") `
+        Assert-Contract ($gate.Name -ceq "cargo test --locked --jobs 4 -p easycon-ecs --test world_contract -- --exact --nocapture") `
             "targeted gate name must describe the controlled command"
         Assert-Contract (
             ($gate.Arguments -join "`0") -ceq
-                ((@("test", "--locked") + $requestedArguments) -join "`0")
-        ) "targeted Cargo arguments must remain distinct native tokens with --locked inserted"
+                ((@("test", "--locked", "--jobs", "4") + $requestedArguments) -join "`0")
+        ) "targeted Cargo arguments must remain distinct native tokens with --locked and --jobs inserted"
         Assert-Contract ($gate.Root -ceq $repository.Path) `
             "targeted Cargo gate must use the resolved repository root"
 
@@ -5590,7 +5734,7 @@ $result = [ordered]@{
         Assert-Contract (
             $packageEquals.Count -eq 1 -and
             ($packageEquals[0].Arguments -join "`0") -ceq
-                (@("check", "--locked", "--package=easycon-ecs") -join "`0")
+                (@("check", "--locked", "--jobs", "4", "--package=easycon-ecs") -join "`0")
         ) "--package=<name> must satisfy the explicit package requirement"
 
         $rejected = @(
@@ -5629,7 +5773,12 @@ $result = [ordered]@{
             "--offline",
             "--offline=true",
             "--frozen",
-            "--frozen=true"
+            "--frozen=true",
+            "--jobs",
+            "--jobs=1",
+            "-j",
+            "-j1",
+            "-j=1"
         )
         foreach ($argument in $blocked) {
             $started = 0
@@ -5690,7 +5839,7 @@ $result = [ordered]@{
 
         $postDelimiter = [System.Collections.Generic.List[object]]::new()
         Invoke-PrivateTargetedCargoGate -RepositoryRoot $repository -CargoCommand test `
-            -CargoArguments @("-p", "easycon-ecs", "--", "-m", "other/Cargo.toml") -GateInvoker {
+            -CargoArguments @("-p", "easycon-ecs", "--", "-m", "other/Cargo.toml", "--jobs", "1") -GateInvoker {
                 param($Name, $Program, $Arguments, $Root)
                 $postDelimiter.Add([pscustomobject]@{
                     Name = $Name
@@ -5698,7 +5847,7 @@ $result = [ordered]@{
                 }) | Out-Null
             }.GetNewClosure()
         Assert-Contract ($postDelimiter.Count -eq 1) `
-            "test-binary -m argument after -- must not be parsed as a Cargo manifest option"
+            "test-binary arguments after -- must not be parsed as Cargo option overrides"
 
         Assert-Throws -Pattern "ValidateSet|only supports" -Action {
             Invoke-PrivateTargetedCargoGate -RepositoryRoot $repository `
@@ -5712,6 +5861,8 @@ $result = [ordered]@{
             param($Name)
             $root = Join-Path $temporaryRoot ("candidate tree {0}" -f $Name)
             Set-ContractFile -Path (Join-Path $root "tracked.txt") -Value "base`n"
+            Set-ContractUtf8Text -Path (Join-Path $root "tools/windows_gate_policy.json") `
+                -Value (Get-Content -LiteralPath (Join-Path $PSScriptRoot "windows_gate_policy.json") -Raw)
             & $git init --quiet $root
             & $git -C $root add -- .
             & $git -c user.name=EasyConContract -c user.email=contract@example.invalid `
@@ -5849,82 +6000,121 @@ $result = [ordered]@{
         Assert-Contract ($null -eq $plain.Failure -and $plain.GateCalls -eq 1) `
             "ordinary Workspace must complete the controlled gate probe"
         Assert-Contract (-not (Test-Path -LiteralPath (Join-Path $plain.WorkspaceRoot "evidence"))) `
-            "ordinary Workspace must not publish a reusable tree credential"
+            "ordinary Workspace must not write a reusable tree credential"
         $plainRecords = @($plain.Records | Where-Object { $_.Kind -ceq "workspace" })
         Assert-Contract ($plainRecords.Count -eq 1) `
             "ordinary Workspace must still publish a final structured summary"
         Assert-Contract (
+            $plainRecords[0].Value.schemaVersion -eq 2 -and
             $plainRecords[0].Value.credential -ceq "none" -and
-            -not ($plainRecords[0].Value.PSObject.Properties.Name -ccontains "tree")
-        ) "ordinary Workspace summary must not claim a tree credential"
+            [string]::IsNullOrEmpty([string]$plainRecords[0].Value.candidateMode) -and
+            [string]::IsNullOrEmpty([string]$plainRecords[0].Value.tree) -and
+            [string]::IsNullOrEmpty([string]$plainRecords[0].Value.evidenceFile) -and
+            $plainRecords[0].Value.environmentFingerprint -ceq ("f" * 64) -and
+            $plainRecords[0].Value.gatePolicyHash -cmatch "^[0-9a-f]{64}$" -and
+            @($plainRecords[0].Value.gates).Count -eq 1 -and
+            $plain.GateCall.Policy.CargoJobs -eq 4
+        ) "ordinary Workspace summary must be v2, credential none, and policy-bound"
 
         $clean = Invoke-PrivateWorkspaceEvidenceProbe -ProbeRoot (
             Join-Path $temporaryRoot "clean workspace evidence"
         ) -RequireCleanTree
         Assert-Contract ($null -eq $clean.Failure -and $clean.GateCalls -eq 1) `
             "clean-tree Workspace must complete before evidence publication"
-        $cleanEvidencePath = Join-Path $clean.WorkspaceRoot (
-            "evidence/workspace-{0}.json" -f $clean.Tree
-        )
-        $cleanEvidence = Get-Content -Raw -LiteralPath $cleanEvidencePath | ConvertFrom-Json -Depth 16
+        $cleanEvidenceDirectory = Join-Path $clean.WorkspaceRoot "evidence/v2"
+        $cleanEvidenceFiles = @(Get-ChildItem -LiteralPath $cleanEvidenceDirectory -File)
+        Assert-Contract ($cleanEvidenceFiles.Count -eq 1 -and $cleanEvidenceFiles[0].Name -cmatch (
+            "^workspace-clean-tree-{0}-[0-9a-f]{{32}}\.json$" -f $clean.Tree
+        )) "clean-tree evidence must use the v2 candidate/tree/runId path"
+        $cleanEvidence = Get-Content -Raw -LiteralPath $cleanEvidenceFiles[0].FullName | ConvertFrom-Json -Depth 16
         Assert-Contract (
+            $cleanEvidence.schemaVersion -eq 2 -and
             $cleanEvidence.credential -ceq "tree" -and
             $cleanEvidence.candidateMode -ceq "clean-tree" -and
-            $cleanEvidence.tree -ceq $clean.Tree
-        ) "RequireCleanTree Workspace must publish a HEAD-tree credential"
+            $cleanEvidence.tree -ceq $clean.Tree -and
+            $cleanEvidence.runId -cmatch "^[0-9a-f]{32}$" -and
+            $cleanEvidence.evidenceFile -ceq ("evidence/v2/{0}" -f $cleanEvidenceFiles[0].Name)
+        ) "RequireCleanTree Workspace must publish a v2 tree credential"
 
         $success = Invoke-PrivateWorkspaceEvidenceProbe -ProbeRoot (
             Join-Path $temporaryRoot "staged workspace evidence"
         ) -RequireStagedCandidate
         Assert-Contract ($null -eq $success.Failure -and $success.GateCalls -eq 1) `
             "staged candidate Workspace must complete before evidence publication"
-        $evidencePath = Join-Path $success.WorkspaceRoot (
-            "evidence/workspace-{0}.json" -f $success.Tree
-        )
-        Assert-Contract (Test-Path -LiteralPath $evidencePath -PathType Leaf) `
-            "successful staged candidate Workspace must atomically publish its evidence"
+        $evidenceDirectory = Join-Path $success.WorkspaceRoot "evidence/v2"
+        $evidenceFiles = @(Get-ChildItem -LiteralPath $evidenceDirectory -File)
+        Assert-Contract ($evidenceFiles.Count -eq 1 -and $evidenceFiles[0].Name -cmatch (
+            "^workspace-staged-candidate-{0}-[0-9a-f]{{32}}\.json$" -f $success.Tree
+        )) "successful staged candidate Workspace must publish one v2 evidence file"
+        $evidencePath = $evidenceFiles[0].FullName
         $evidence = Get-Content -Raw -LiteralPath $evidencePath | ConvertFrom-Json -Depth 16
         Assert-Contract (
-            $evidence.schemaVersion -eq 1 -and
+            $evidence.schemaVersion -eq 2 -and
             $evidence.status -ceq "passed" -and
             $evidence.mode -ceq "workspace" -and
+            $evidence.runId -cmatch "^[0-9a-f]{32}$" -and
+            $evidence.credential -ceq "tree" -and
             $evidence.candidateMode -ceq "staged-candidate" -and
             $evidence.baseCommit -ceq ("c" * 40) -and
             $evidence.headCommit -ceq ("a" * 40) -and
             $evidence.tree -ceq $success.Tree -and
-            $evidence.fingerprint -ceq ("f" * 64) -and
+            $evidence.environmentFingerprint -ceq ("f" * 64) -and
+            $evidence.gatePolicyHash -cmatch "^[0-9a-f]{64}$" -and
+            $evidence.verifyDurationMs -ge 0 -and
+            @($evidence.gates).Count -eq 1 -and
+            $evidence.gates[0].name -ceq "synthetic contract gate" -and
+            $evidence.gates[0].status -ceq "passed" -and
+            $evidence.gates[0].durationMs -ge 0 -and
             $evidence.target -ceq "x86_64-pc-windows-msvc" -and
             $evidence.environmentIdentity -ceq "contract-environment" -and
             $evidence.workspaceIdentity -ceq "contract-workspace" -and
-            $evidence.durationMs -ge 0 -and
+            $evidence.totalDurationMs -ge 0 -and
+            $evidence.durationMs -eq $evidence.totalDurationMs -and
+            $evidence.evidenceFile -ceq ("evidence/v2/{0}" -f $evidenceFiles[0].Name) -and
             -not [string]::IsNullOrWhiteSpace([string]$evidence.startedUtc) -and
             -not [string]::IsNullOrWhiteSpace([string]$evidence.completedUtc)
-        ) "workspace evidence must bind schema, environment, candidate tree, and timing"
+        ) "workspace evidence must bind v2 policy, environment, candidate, timing, and publication path"
         Assert-Contract (
-            @(
-                Get-ChildItem -LiteralPath (Join-Path $success.WorkspaceRoot "evidence") `
-                    -Filter "*.publish-*" -File -ErrorAction SilentlyContinue
-            ).Count -eq 0
-        ) "successful evidence publication must leave no atomic temporary file"
+            @(Get-ChildItem -LiteralPath $evidenceDirectory -Filter "*.write-*" -File `
+                -ErrorAction SilentlyContinue).Count -eq 0
+        ) "successful evidence publication must leave no no-replace temporary file"
         $successRecords = @($success.Records | Where-Object { $_.Kind -ceq "workspace" })
         Assert-Contract (
             $successRecords.Count -eq 1 -and
             $successRecords[0].Value.credential -ceq "tree" -and
             $successRecords[0].Value.tree -ceq $success.Tree -and
-            $successRecords[0].Value.evidenceFile -ceq (
-                "evidence/workspace-{0}.json" -f $success.Tree
-            )
-        ) "final EASYCON_WORKSPACE record must follow the published tree-bound evidence"
+            $successRecords[0].Value.evidenceFile -ceq $evidence.evidenceFile
+        ) "final EASYCON_WORKSPACE record must follow successful no-replace publication"
+
+        $collisionRoot = Join-Path $temporaryRoot "workspace evidence no-replace collision"
+        $collisionDirectory = Join-Path $collisionRoot "evidence/v2"
+        New-Item -ItemType Directory -Force -Path $collisionDirectory | Out-Null
+        $collisionPath = Join-Path $collisionDirectory "workspace-staged-candidate-$(("b" * 40))-$("a" * 32).json"
+        $originalEvidence = "{`"status`":`"original`"}`n"
+        Set-ContractUtf8Text -Path $collisionPath -Value $originalEvidence
+        Assert-Throws -Pattern "already exists.*not be replaced" -Action {
+            Invoke-PrivateCommand -CommandName "Publish-EasyConWorkspaceEvidenceNoReplace" -Parameters @{
+                Path = $collisionPath
+                Text = "{`"status`":`"replacement`"}`n"
+                TrustedRoot = $collisionRoot
+            }
+        }
+        Assert-Contract ((Get-Content -Raw -LiteralPath $collisionPath) -ceq $originalEvidence) `
+            "evidence collision must preserve the original file"
+        Assert-Contract (
+            @(Get-ChildItem -LiteralPath $collisionDirectory -Filter "*.write-*" -File `
+                -ErrorAction SilentlyContinue).Count -eq 0
+        ) "failed no-replace publication must leave no temporary file"
 
         $aliasEvidence = Invoke-PrivateWorkspaceEvidenceProbe -ProbeRoot (
             Join-Path $temporaryRoot "resolved base workspace evidence"
         ) -RequireStagedCandidate -BaseSha "HEAD" -ResolvedBaseCommit ("d" * 40)
         Assert-Contract ($null -eq $aliasEvidence.Failure -and $aliasEvidence.GateCalls -eq 1) `
             "resolved BaseSha evidence probe must complete"
-        $aliasEvidencePath = Join-Path $aliasEvidence.WorkspaceRoot (
-            "evidence/workspace-{0}.json" -f $aliasEvidence.Tree
-        )
-        $aliasEvidenceRecord = Get-Content -Raw -LiteralPath $aliasEvidencePath | ConvertFrom-Json -Depth 16
+        $aliasEvidenceFiles = @(Get-ChildItem -LiteralPath (Join-Path $aliasEvidence.WorkspaceRoot "evidence/v2") -File)
+        Assert-Contract ($aliasEvidenceFiles.Count -eq 1) `
+            "resolved BaseSha probe must publish exactly one v2 evidence file"
+        $aliasEvidenceRecord = Get-Content -Raw -LiteralPath $aliasEvidenceFiles[0].FullName | ConvertFrom-Json -Depth 16
         Assert-Contract (
             $aliasEvidence.GateCall.BaseSha -ceq "HEAD" -and
             $aliasEvidenceRecord.baseCommit -ceq ("d" * 40) -and
@@ -5945,6 +6135,114 @@ $result = [ordered]@{
         ) "failed candidate Workspace must not emit a passed workspace record"
     }
 
+    Invoke-ContractCase -Name "workspace-gate-output-remains-structured-at-evidence-boundary" -Action {
+        $git = (Get-Command git.exe -ErrorAction Stop).Source
+        $repository = Join-Path $temporaryRoot "workspace gate output evidence boundary"
+        $workspace = Join-Path $temporaryRoot "workspace gate output evidence workspace"
+        Set-ContractFile -Path (Join-Path $repository "tracked.txt") -Value "base`n"
+        New-Item -ItemType Directory -Force -Path $workspace | Out-Null
+        & $git init --quiet $repository
+        & $git -C $repository add -- tracked.txt
+        & $git -c user.name=EasyConContract -c user.email=contract@example.invalid `
+            -C $repository commit --quiet -m "contract fixture"
+        Assert-Contract ($LASTEXITCODE -eq 0) `
+            "workspace gate output fixture must commit its clean baseline"
+
+        $policy = [pscustomobject]@{
+            CargoJobs = 4
+            Gates = @(
+                [pscustomobject]@{
+                    Name = "synthetic pwsh gate with stdout"
+                    Tool = "pwsh"
+                    Arguments = @(
+                        "-NoLogo",
+                        "-NoProfile",
+                        "-Command",
+                        "Write-Output 'synthetic gate diagnostics'"
+                    )
+                }
+            )
+        }
+        $outcome = Invoke-PrivateCommand -CommandName "Invoke-EasyConWindowsWorkspaceGates" `
+            -Parameters @{
+                RepositoryRoot = $repository
+                RequireCleanTree = $true
+                Policy = $policy
+            }
+        $context = [pscustomobject]@{
+            Fingerprint = [pscustomobject]@{ Value = ("f" * 64) }
+            Configuration = [pscustomobject]@{ target = "x86_64-pc-windows-msvc" }
+            Location = [pscustomobject]@{
+                WorkspaceRoot = $workspace
+                IdentityKey = "contract-environment"
+                WorkspaceKey = "contract-workspace"
+            }
+        }
+        $timestamp = [DateTimeOffset]::UtcNow
+        $record = Invoke-PrivateCommand -CommandName "New-EasyConWorkspaceEvidenceRecord" `
+            -Parameters @{
+                Context = $context
+                Candidate = $outcome.Candidate
+                BaseCommit = $outcome.BaseCommit
+                GatePolicyHash = ("a" * 64)
+                Gates = @($outcome.Gates)
+                VerifyDurationMilliseconds = 0L
+                RunId = ("b" * 32)
+                StartedUtc = $timestamp
+                CompletedUtc = $timestamp
+                TotalDurationMilliseconds = 1L
+                Credential = "tree"
+                EvidenceFile = "evidence/v2/collector-boundary.json"
+            }
+        Assert-Contract (
+            @($record.gates).Count -eq @($outcome.Gates).Count -and
+            $record.gates[0].name -ceq "synthetic pwsh gate with stdout" -and
+            -not (@($record.gates | Where-Object {
+                $_.name -ceq "synthetic gate diagnostics"
+            }).Count -gt 0)
+        ) "Workspace gate output must not corrupt ordered evidence timing records"
+    }
+
+    Invoke-ContractCase -Name "workspace-policy-revalidation-fails-closed" -Action {
+        $changedDuringVerify = Invoke-PrivateWorkspaceEvidenceProbe -ProbeRoot (
+            Join-Path $temporaryRoot "workspace policy changed during verify"
+        ) -RequireStagedCandidate -PolicyMutationPhase Verify
+        Assert-Contract (
+            $null -ne $changedDuringVerify.Failure -and
+            $changedDuringVerify.Failure.Exception.Message -match
+                "policy inputs changed after Verify and before the first gate"
+        ) "a policy hash change during Verify must fail before the first gate"
+        Assert-Contract (
+            $changedDuringVerify.PolicyMutated -and
+            $changedDuringVerify.PolicyHashBefore -cne $changedDuringVerify.PolicyHashAfter
+        ) "the Verify race fixture must change the real temporary policy hash"
+        Assert-Contract ($changedDuringVerify.GateCalls -eq 0) `
+            "a policy hash change during Verify must start zero gates"
+        Assert-Contract (
+            -not (Test-Path -LiteralPath (Join-Path $changedDuringVerify.WorkspaceRoot "evidence")) -and
+            @($changedDuringVerify.Records | Where-Object { $_.Kind -ceq "workspace" }).Count -eq 0
+        ) "a rejected Verify policy change must publish neither evidence nor a passed record"
+
+        $changedDuringGates = Invoke-PrivateWorkspaceEvidenceProbe -ProbeRoot (
+            Join-Path $temporaryRoot "workspace policy changed during gates"
+        ) -RequireStagedCandidate -PolicyMutationPhase Gates
+        Assert-Contract (
+            $null -ne $changedDuringGates.Failure -and
+            $changedDuringGates.Failure.Exception.Message -match
+                "policy inputs changed after the final gate"
+        ) "a policy hash change during gates must fail before evidence publication"
+        Assert-Contract (
+            $changedDuringGates.PolicyMutated -and
+            $changedDuringGates.PolicyHashBefore -cne $changedDuringGates.PolicyHashAfter
+        ) "the gate race fixture must change the real temporary policy hash"
+        Assert-Contract ($changedDuringGates.GateCalls -eq 1) `
+            "a policy hash change during gates must occur after the controlled gate"
+        Assert-Contract (
+            -not (Test-Path -LiteralPath (Join-Path $changedDuringGates.WorkspaceRoot "evidence")) -and
+            @($changedDuringGates.Records | Where-Object { $_.Kind -ceq "workspace" }).Count -eq 0
+        ) "a rejected gate policy change must publish neither evidence nor a passed record"
+    }
+
     Invoke-ContractCase -Name "require-clean-tree-detects-ignored-python-bytecode" -Action {
         $git = (Get-Command git.exe -ErrorAction Stop).Source
         $cleanRepository = Join-Path $temporaryRoot "ignored bytecode clean tree"
@@ -5952,6 +6250,8 @@ $result = [ordered]@{
             -Value "__pycache__/`n*.pyc`n"
         Set-ContractFile -Path (Join-Path $cleanRepository "tools/contract.py") `
             -Value "print('contract')`n"
+        Set-ContractUtf8Text -Path (Join-Path $cleanRepository "tools/windows_gate_policy.json") `
+            -Value (Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot "windows_gate_policy.json"))
         & $git init --quiet $cleanRepository
         & $git -C $cleanRepository add -- .
         & $git -c user.name=EasyConContract -c user.email=contract@example.invalid `
@@ -6525,6 +6825,8 @@ $result = [ordered]@{
         Assert-Contract (Test-Path -LiteralPath $externalMarker -PathType Leaf) `
             "transient cleanup must remove a junction without following its external target"
     }
+
+    Invoke-SelectedContractCases
 }
 catch {
     $contractFailure = $_
@@ -6555,4 +6857,4 @@ finally {
     }
 }
 
-Write-Output "Windows workspace contracts passed: 46 cases"
+Write-Output ("Windows workspace contracts passed: {0} cases" -f $script:contractCases.Count)

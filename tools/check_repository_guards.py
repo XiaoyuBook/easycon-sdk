@@ -106,6 +106,8 @@ WINDOWS_BUILD_FILES = {
     "tools/test_windows_workspace.ps1",
     "tools/test_windows_bootstrap_contracts.py",
     "tools/windows_build_environment.json",
+    "tools/windows_gate_policy.json",
+    "tools/windows_gate_policy.ps1",
     "tools/windows_workspace.psm1",
 }
 
@@ -179,6 +181,45 @@ HOST_TOOL_KEYS = {
 }
 INTERNAL_TOOL_KEYS = {"name", "version", "url", "archive", "executable", "sha512"}
 NATIVE_DEPENDENCY_KEYS = {"name", "version", "portVersion", "gitTree"}
+WINDOWS_GATE_POLICY_KEYS = {"version", "cargoJobs", "gates"}
+WINDOWS_GATE_POLICY_GATE_KEYS = {"name", "tool", "arguments"}
+
+
+def expected_windows_environment_fingerprint_paths():
+    member_manifests = sorted(
+        "{}/Cargo.toml".format(member) for member in EXPECTED_MEMBERS
+    )
+    return [
+        "tools/windows_build_environment.json",
+        "tools/windows_workspace.psm1",
+        "rust-toolchain.toml",
+        "Cargo.toml",
+        "Cargo.lock",
+        *member_manifests,
+        "vcpkg.json",
+        "vcpkg-configuration.json",
+        "cmake/triplets/x64-windows-static-md.cmake",
+        "CMakePresets.json",
+        "spec/fixtures/vision/ocr-model.json",
+        "tools/provision_vision_test_model.py",
+    ]
+
+
+def expected_windows_gate_policy_gates():
+    return [
+        ("cargo fmt --all --check", "cargo", ["fmt", "--all", "--check"]),
+        ("cargo check --locked --jobs 4 --workspace --all-targets", "cargo", ["check", "--locked", "--workspace", "--all-targets"]),
+        ("cargo clippy --locked --jobs 4 --workspace --all-targets --all-features -- -D warnings", "cargo", ["clippy", "--locked", "--workspace", "--all-targets", "--all-features", "--", "-D", "warnings"]),
+        ("cargo test --locked --jobs 4 --workspace --all-features", "cargo", ["test", "--locked", "--workspace", "--all-features"]),
+        ("python tools/run_runtime_models.py", "python", ["tools/run_runtime_models.py"]),
+        ("python tools/validate_specs.py", "python", ["tools/validate_specs.py"]),
+        ("python tools/check_markdown_links.py", "python", ["tools/check_markdown_links.py"]),
+        ("python tools/check_repository_guards.py", "python", ["tools/check_repository_guards.py"]),
+        ("python tools/test_windows_bootstrap_contracts.py", "python", ["tools/test_windows_bootstrap_contracts.py"]),
+        ("pwsh tools/test_windows_workspace.ps1", "pwsh", ["-NoLogo", "-NoProfile", "-File", "tools/test_windows_workspace.ps1"]),
+        ("pwsh tools/test_windows_environment_lifecycle.ps1", "pwsh", ["-NoLogo", "-NoProfile", "-File", "tools/test_windows_environment_lifecycle.ps1"]),
+        ("git diff --check", "git", ["diff", "--check"]),
+    ]
 
 
 def git_files():
@@ -2188,8 +2229,8 @@ def parse_windows_build_environment(text):
     _require_json_keys(
         configuration, WINDOWS_CONFIGURATION_KEYS, "Windows build environment root"
     )
-    if type(configuration["version"]) is not int or configuration["version"] != 4:
-        raise ValueError("Windows build environment version must be the JSON integer 4")
+    if type(configuration["version"]) is not int or configuration["version"] != 5:
+        raise ValueError("Windows build environment version must be the JSON integer 5")
     if configuration["target"] != "x86_64-pc-windows-msvc":
         raise ValueError("Windows build target must remain x86_64-pc-windows-msvc")
     fingerprint_inputs = configuration["fingerprintInputs"]
@@ -2218,28 +2259,7 @@ def parse_windows_build_environment(text):
     identities = [item["path"].casefold() for item in fingerprint_inputs]
     if len(identities) != len(set(identities)):
         raise ValueError("fingerprintInputs contains duplicate Windows path identity")
-    expected_fingerprint_paths = [
-        "tools/windows_build_environment.json",
-        "tools/windows_workspace.psm1",
-        "tools/run_windows_workspace.ps1",
-        "rust-toolchain.toml",
-        "Cargo.toml",
-        "Cargo.lock",
-        "crates/easycon-model/Cargo.toml",
-        "crates/easycon-runtime/Cargo.toml",
-        "crates/easycon-controller/Cargo.toml",
-        "crates/easycon-ecs/Cargo.toml",
-        "crates/easycon-serial/Cargo.toml",
-        "crates/easycon-native-sys/Cargo.toml",
-        "crates/easycon-vision/Cargo.toml",
-        "tests/support/Cargo.toml",
-        "vcpkg.json",
-        "vcpkg-configuration.json",
-        "cmake/triplets/x64-windows-static-md.cmake",
-        "CMakePresets.json",
-        "spec/fixtures/vision/ocr-model.json",
-        "tools/provision_vision_test_model.py",
-    ]
+    expected_fingerprint_paths = expected_windows_environment_fingerprint_paths()
     expected_fingerprint_inputs = [
         {"path": path, "kind": "text"} for path in expected_fingerprint_paths
     ]
@@ -2386,6 +2406,47 @@ def parse_windows_build_environment(text):
             "native dependencies must be exactly leptonica, opencv4, and tesseract"
         )
     return configuration
+
+
+def parse_windows_gate_policy(text):
+    try:
+        policy = json.loads(text, object_pairs_hook=_unique_json_object)
+    except (json.JSONDecodeError, ValueError) as error:
+        raise ValueError("invalid JSON: {}".format(error)) from error
+
+    _require_json_keys(policy, WINDOWS_GATE_POLICY_KEYS, "Windows gate policy root")
+    if type(policy["version"]) is not int or policy["version"] != 1:
+        raise ValueError("Windows gate policy version must be the JSON integer 1")
+    if type(policy["cargoJobs"]) is not int or policy["cargoJobs"] != 4:
+        raise ValueError("Windows gate policy cargoJobs must be the JSON integer 4")
+    gates = policy["gates"]
+    if type(gates) is not list:
+        raise ValueError("Windows gate policy gates must be a JSON array")
+
+    expected = expected_windows_gate_policy_gates()
+    if len(gates) != len(expected):
+        raise ValueError("Windows gate policy gate set or order changed")
+    identities = []
+    for index, gate in enumerate(gates):
+        _require_json_keys(
+            gate, WINDOWS_GATE_POLICY_GATE_KEYS, "Windows gate policy gate {}".format(index)
+        )
+        name = _require_string(gate["name"], "Windows gate policy gate name")
+        tool = _require_string(gate["tool"], "Windows gate policy gate tool")
+        arguments = gate["arguments"]
+        if type(arguments) is not list or any(type(value) is not str for value in arguments):
+            raise ValueError("Windows gate policy gate arguments must be a JSON string array")
+        identities.append(name.casefold())
+        expected_name, expected_tool, expected_arguments = expected[index]
+        if (
+            name != expected_name
+            or tool != expected_tool
+            or arguments != expected_arguments
+        ):
+            raise ValueError("Windows gate policy gate set, path, case, or order changed")
+    if len(identities) != len(set(identities)):
+        raise ValueError("Windows gate policy contains duplicate Windows gate identity")
+    return policy
 
 
 def windows_build_environment_failures(configuration, native_quality):
@@ -2809,6 +2870,142 @@ def windows_workspace_module_failures(module_text):
     return failures
 
 
+def windows_gate_policy_failures(environment_module, policy_module, runner):
+    failures = []
+    public_workspace = _powershell_function_text(
+        policy_module, "Invoke-EasyConWindowsWorkspace"
+    )
+    targeted = _powershell_function_text(
+        policy_module, "Get-EasyConTargetedCargoArguments"
+    )
+    policy_parser = _powershell_function_text(
+        policy_module, "Get-EasyConWindowsGatePolicy"
+    )
+    policy_hash = _powershell_function_text(policy_module, "Get-EasyConGatePolicyHash")
+    evidence_writer = _powershell_function_text(
+        policy_module, "Publish-EasyConWorkspaceEvidenceNoReplace"
+    )
+    evidence_record = _powershell_function_text(
+        policy_module, "New-EasyConWorkspaceEvidenceRecord"
+    )
+    gate_runner = _powershell_function_text(
+        policy_module, "Invoke-EasyConWindowsWorkspaceGates"
+    )
+    for name, body in (
+        ("public Workspace policy", public_workspace),
+        ("Targeted Cargo policy", targeted),
+        ("strict gate policy parser", policy_parser),
+        ("gate policy hash", policy_hash),
+        ("no-replace evidence publisher", evidence_writer),
+        ("v2 evidence record", evidence_record),
+        ("Workspace gate runner", gate_runner),
+    ):
+        if body is None:
+            failures.append("Windows gate policy is missing {}".format(name))
+    if failures:
+        return failures
+
+    if "function Invoke-EasyConWindowsWorkspace" in environment_module:
+        failures.append("environment module must not retain the public Workspace gate policy")
+    if "windows_gate_policy.ps1" not in environment_module:
+        failures.append("environment module must dot-source the gate policy module")
+    if "GateInvoker" in public_workspace:
+        failures.append("public Workspace must not expose a GateInvoker bypass")
+    if "IgnoreCase = $false" not in public_workspace or "-cnotin" not in public_workspace:
+        failures.append("public Workspace GateMode must be exact-case fail closed")
+    if (
+        "$assertGatePolicyContextCurrent = ${function:Assert-EasyConGatePolicyContextCurrent}"
+        not in public_workspace
+        or public_workspace.count("& $assertGatePolicyContextCurrent") != 4
+    ):
+        failures.append(
+            "Workspace must recheck the policy hash before and after each gate mode"
+        )
+    post_policy = public_workspace.find('"after the final gate"')
+    candidate_recheck = public_workspace.find(
+        "& $assertWorkspaceCandidateBindingCurrent"
+    )
+    publisher = public_workspace.find("& $publishWorkspaceEvidence", candidate_recheck)
+    if (
+        "$assertWorkspaceCandidateBindingCurrent = "
+        "${function:Assert-EasyConWorkspaceCandidateBindingCurrent}"
+        not in public_workspace
+        or not (0 <= post_policy < candidate_recheck < publisher)
+    ):
+        failures.append(
+            "Workspace publication order must be post-policy check, candidate recheck, publish, then record"
+        )
+    for required in (
+        '"tools/windows_gate_policy.json"',
+        '"tools/windows_gate_policy.ps1"',
+        '"tools/run_windows_workspace.ps1"',
+        "Get-EasyConFingerprintInputHash",
+    ):
+        if required not in policy_hash:
+            failures.append("gate policy hash misses required input: {}".format(required))
+    for required in (
+        "Get-EasyConGatePolicyStrictObject",
+        "Get-EasyConGatePolicyStrictString",
+        "TryGetInt32",
+        "cargoJobs must be the JSON integer 4",
+        "gate set, path, case, or order changed",
+        "OrdinalIgnoreCase",
+    ):
+        if required not in policy_parser:
+            failures.append("strict gate policy parser is missing: {}".format(required))
+    if "--jobs" not in targeted or "CargoJobs" not in targeted:
+        failures.append("Targeted Cargo must inject the fixed Cargo jobs budget")
+    for rejected in (
+        '"--jobs"',
+        'StartsWith("--jobs=")',
+        '"-j"',
+        'StartsWith("-j")',
+    ):
+        if rejected not in targeted:
+            failures.append("Targeted Cargo must reject jobs override form: {}".format(rejected))
+    if "if (-not $cargoOptionSection)" not in targeted:
+        failures.append("Targeted Cargo must leave test-binary arguments after -- untouched")
+    for required in (
+        "[System.IO.FileMode]::CreateNew",
+        "[System.IO.File]::Move($temporary, $destination)",
+        "already exists and will not be replaced",
+        "Complete-EasyConTemporaryFileCleanup",
+    ):
+        if required not in evidence_writer:
+            failures.append("v2 evidence no-replace publication is missing: {}".format(required))
+    if "Write-EasyConUtf8FileAtomically" in evidence_writer:
+        failures.append("v2 evidence must not use overwrite atomic publication")
+    for required in (
+        "schemaVersion = 2",
+        "runId = $RunId",
+        "environmentFingerprint",
+        "gatePolicyHash",
+        "verifyDurationMs",
+        "gates = $gateRecords.ToArray()",
+        "totalDurationMs",
+        "evidenceFile",
+    ):
+        if required not in evidence_record:
+            failures.append("v2 evidence record is missing: {}".format(required))
+    for required in (
+        '"--jobs"',
+        "Invoke-EasyConTimedPolicyGate",
+        '"git diff --cached --check"',
+        '"git diff base...HEAD --check"',
+        "Gates = $records.ToArray()",
+    ):
+        if required not in gate_runner:
+            failures.append("Workspace gate runner is missing: {}".format(required))
+    for required in (
+        "IgnoreCase = $false",
+        "-Mode must use one exact supported case",
+        "switch -CaseSensitive ($Mode)",
+    ):
+        if required not in runner:
+            failures.append("runner Mode case handling is missing: {}".format(required))
+    return failures
+
+
 def main():
     metadata = cargo_metadata()
     failures = repository_guard_regression_failures()
@@ -2822,6 +3019,13 @@ def main():
     except ValueError as error:
         failures.append("Windows build environment config is invalid: {}".format(error))
         windows_build_configuration = None
+    windows_gate_policy_text = (ROOT / "tools/windows_gate_policy.json").read_text(
+        encoding="utf-8"
+    )
+    try:
+        parse_windows_gate_policy(windows_gate_policy_text)
+    except ValueError as error:
+        failures.append("Windows gate policy is invalid: {}".format(error))
     required_ci = (ROOT / ".github/workflows/required-ci.yml").read_text(encoding="utf-8")
     failures.extend(required_ci_failures(required_ci))
     tracked = git_files()
@@ -2951,7 +3155,18 @@ def main():
     windows_module = (ROOT / "tools/windows_workspace.psm1").read_text(
         encoding="utf-8"
     )
+    windows_gate_policy_module = (ROOT / "tools/windows_gate_policy.ps1").read_text(
+        encoding="utf-8"
+    )
+    windows_runner = (ROOT / "tools/run_windows_workspace.ps1").read_text(
+        encoding="utf-8"
+    )
     failures.extend(windows_workspace_module_failures(windows_module))
+    failures.extend(
+        windows_gate_policy_failures(
+            windows_module, windows_gate_policy_module, windows_runner
+        )
+    )
     for forbidden in (
         r"C:\\Users\\",
         r"D:\\project",

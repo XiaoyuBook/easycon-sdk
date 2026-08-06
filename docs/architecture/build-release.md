@@ -56,8 +56,11 @@ OCR 分别由 fingerprint 中列出的 tracked 文件共同约束。清单显式
 exact path/kind/order、规范相对 path 和 Windows 大小写不敏感 identity；Python guard 独立执行同一严格合同，防止两者
 漂移。升级任一固定输入都必须经过显式变更并重新运行 Setup。
 
-当前受控环境清单 schema 为 v4，prepared stamp schema 为 v2；两者与固定 host/target identity 都进入 shared environment
-identity。旧 schema stamp 不迁移、不降级为 cache 命中，Verify 必须 fail closed 并要求 Setup 发布新树。
+当前受控环境清单 schema 为 v5，prepared stamp schema 为 v2；两者与固定 host/target identity 都进入 shared environment
+identity。v5 将 `crates/easycon-file-identity/Cargo.toml` 纳入 exact fingerprint inputs；runner 本身不再作为 prepared
+identity 输入，因为它不物化 prepared tree。旧 schema stamp 不迁移、不降级为 cache 命中，Verify 必须 fail closed 并要求
+Setup 发布新树。runner、gate policy JSON 与 private policy parser 另组成 Workspace policy identity，见
+[ADR-0022](../decisions/0022-windows-workspace-policy-identity-and-evidence-v2.md)。
 
 ### Windows 开发环境生命周期
 
@@ -69,6 +72,9 @@ pwsh -NoProfile -File tools/run_windows_workspace.ps1 -Mode Verify
 pwsh -NoProfile -File tools/run_windows_workspace.ps1 -Mode Workspace
 pwsh -NoProfile -File tools/run_windows_workspace.ps1 -Mode Workspace -RequireStagedCandidate
 ```
+
+`-Mode` 只接受 `Setup`、`Verify`、`Workspace` 或 `Targeted` 的精确大小写；lowercase 或 mixed-case 变体在任何
+lifecycle action 前拒绝。
 
 `Setup` 是可重跑的一次性在线准备步骤，安装并核验固定 Rust toolchain、受控 CMake/Ninja、vcpkg
 scripts/tool/registry/native install tree、7-Zip 与测试 OCR 模型，然后写入包含环境 schema、host/target identity、
@@ -97,7 +103,8 @@ $targetedCargoArguments = @("-p", "easycon-ecs", "--test", "world_contract", "--
 
 `TargetedCargoCommand` 只能是 `check`、`clippy` 或 `test`，参数必须在 Cargo option section 中显式给出
 `-p`/`--package`（也可用 `--package=<name>`）。runner 以数组逐 token 调用 native Cargo，并在 command 后自动插入
-`--locked`；它不拼接或 eval 命令字符串。为维持 source、Cargo home/config、target 和受控 target identity 的边界，
+`--locked` 与固定 `--jobs 4`；它不拼接或 eval 命令字符串。调用方不能在 Cargo option section 提供 `--jobs`/`-j`
+覆盖该预算。为维持 source、Cargo home/config、target 和受控 target identity 的边界，
 `--workspace`、`--all`、`--manifest-path`（包括 option section 中的 `-m <path>` 与紧凑 `-m<path>`）、`--target-dir`、`--config`、
 `--target`、`--offline` 与 `--frozen`，以及它们的 `--name=value` 形式，都在启动 Cargo 前 fail closed；`clippy` 的 option
 section 还拒绝会写回 source 的 `--fix` 与 `--fix=<value>`。`--` 后的 test-binary `-m` 参数不按 Cargo manifest option 解释。非 `Targeted` mode
@@ -110,14 +117,16 @@ candidate requirement。它仍通过同一个 Workspace lifecycle 获取 environ
 绑定 `HEAD^{tree}`，并保持既有 ignored pyc snapshot 保护。`-RequireStagedCandidate` 则允许候选差异，但所有候选变化必须
 staged，不能有 unstaged 或 untracked 内容；gate 前使用当前 index 的 `git write-tree` 得到 candidate tree，并额外运行
 `git diff --cached --check`。两种 credential 模式在 gate 后都重新核对 HEAD、source/index 状态与 tree；任一变化都 fail
-closed，两个开关不可同时使用。
+closed，两个开关不可同时使用。Workspace 还在 Verify 后、首个 gate 前以及最后一个 gate 后、candidate rebind/evidence
+前复核 captured policy hash；任何 policy input 改变都 fail closed。
 
 credential 成功时才会在当前 canonical worktree 的 writable root
-`CacheRoot/w/<workspace-key>/evidence/workspace-<tree>.json` 写入 UTF-8 无 BOM 的 schema v1 JSON。现有原子 writer 在同一
-writable root 临时物化、校验并替换 final；source tree 从不接收 evidence。记录和随后输出的最终 `EASYCON_WORKSPACE` 都包含
-`schemaVersion`、`status`、`mode`、`credential`、`candidateMode`、`baseCommit`、`headCommit`、`tree`、`fingerprint`、`target`、
-environment/workspace identity、UTC start/end、`durationMs` 与相对 `evidenceFile`。gate、后置 candidate 校验或原子发布失败时
-不会输出 passed workspace record，也不会为该次候选发布 passed evidence。
+`CacheRoot/w/<workspace-key>/evidence/v2/workspace-<candidate-mode>-<tree>-<lowercase-run-id>.json` 写入 UTF-8 无 BOM
+schema v2 JSON。普通 Workspace 只输出 `credential=none` summary，不写 tree evidence。candidate record 和随后输出的最终
+`EASYCON_WORKSPACE` 都包含 `environmentFingerprint`、`gatePolicyHash`、Verify duration、ordered passed gate timings、
+`baseCommit`、`headCommit`、`tree`、target、environment/workspace identity、UTC start/end、总 duration 与相对
+`evidenceFile`。writer 使用 no-replace publication，不能覆盖同路径旧 record；gate、后置 candidate/policy 校验或发布失败时
+不会输出 passed workspace record，也不会为该次候选发布 passed evidence 或 temporary。
 
 任何非空且非全零的 `BaseSha` 都会在任何 diff 或 evidence 使用前由受控 Git 解析一次为完整 commit ID。branch、ref、`HEAD`
 和 commit abbreviation 都只会以该 40 位 immutable commit 写入 `baseCommit`，diff 也使用同一 ID；不存在或非法的 ref 在启动

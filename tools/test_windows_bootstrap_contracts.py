@@ -229,6 +229,10 @@ class WindowsBuildEnvironmentContracts(unittest.TestCase):
             ROOT / "tools/windows_build_environment.json"
         ).read_text(encoding="utf-8")
         cls.configuration = json.loads(cls.configuration_text)
+        cls.policy_text = (ROOT / "tools/windows_gate_policy.json").read_text(
+            encoding="utf-8"
+        )
+        cls.policy = json.loads(cls.policy_text)
 
     def assert_rejected(self, value, label):
         text = value if isinstance(value, str) else json.dumps(value)
@@ -243,7 +247,7 @@ class WindowsBuildEnvironmentContracts(unittest.TestCase):
 
     def test_duplicate_json_keys_are_rejected(self):
         duplicate_root = self.configuration_text.replace(
-            '"version": 4', '"version": 4,\n  "version": 4', 1
+            '"version": 5', '"version": 5,\n  "version": 5', 1
         )
         self.assert_rejected(duplicate_root, "duplicate root key")
         duplicate_tool = self.configuration_text.replace(
@@ -294,6 +298,13 @@ class WindowsBuildEnvironmentContracts(unittest.TestCase):
             "unfrozen target": lambda value: value.update(target="x86_64-unknown-linux-gnu"),
             "fingerprint order": lambda value: value["fingerprintInputs"].reverse(),
             "fingerprint kind": lambda value: value["fingerprintInputs"][0].update(kind="auto"),
+            "missing file identity manifest": lambda value: value["fingerprintInputs"].remove(
+                next(
+                    item
+                    for item in value["fingerprintInputs"]
+                    if item["path"] == "crates/easycon-file-identity/Cargo.toml"
+                )
+            ),
             "fingerprint Windows case alias": lambda value: value["fingerprintInputs"][-1].update(path="TOOLS/WINDOWS_BUILD_ENVIRONMENT.JSON"),
             "fingerprint dot component": lambda value: value["fingerprintInputs"][-1].update(path="tools/./provision_vision_test_model.py"),
             "uppercase scripts commit": lambda value: value["vcpkg"].update(scriptsCommit="C" * 40),
@@ -494,6 +505,110 @@ class WindowsWorkspaceModuleContracts(unittest.TestCase):
                 mutated = self.module.replace(original, replacement)
                 self.assertNotEqual(mutated, self.module)
                 self.assert_rejected(mutated, label)
+
+
+class WindowsGatePolicyContracts(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.environment_module = (ROOT / "tools/windows_workspace.psm1").read_text(
+            encoding="utf-8"
+        )
+        cls.policy_module = (ROOT / "tools/windows_gate_policy.ps1").read_text(
+            encoding="utf-8"
+        )
+        cls.runner = (ROOT / "tools/run_windows_workspace.ps1").read_text(
+            encoding="utf-8"
+        )
+        cls.policy_text = (ROOT / "tools/windows_gate_policy.json").read_text(
+            encoding="utf-8"
+        )
+        cls.policy = json.loads(cls.policy_text)
+
+    def assert_policy_rejected(self, value, label):
+        text = value if isinstance(value, str) else json.dumps(value)
+        with self.assertRaises(ValueError, msg="{} must be rejected".format(label)):
+            GUARD.parse_windows_gate_policy(text)
+
+    def assert_module_rejected(self, policy_module, runner, label):
+        self.assertTrue(
+            GUARD.windows_gate_policy_failures(
+                self.environment_module, policy_module, runner
+            ),
+            "{} mutation must be rejected".format(label),
+        )
+
+    def test_current_policy_is_valid_and_environment_identity_is_separate(self):
+        self.assertEqual(GUARD.parse_windows_gate_policy(self.policy_text), self.policy)
+        self.assertEqual(
+            GUARD.windows_gate_policy_failures(
+                self.environment_module, self.policy_module, self.runner
+            ),
+            [],
+        )
+        self.assertNotIn(
+            "tools/run_windows_workspace.ps1",
+            GUARD.expected_windows_environment_fingerprint_paths(),
+        )
+        self.assertIn(
+            "crates/easycon-file-identity/Cargo.toml",
+            GUARD.expected_windows_environment_fingerprint_paths(),
+        )
+
+    def test_policy_schema_order_case_and_jobs_are_strict(self):
+        mutations = {
+            "duplicate root key": self.policy_text.replace(
+                '"version": 1', '"version": 1, "version": 1', 1
+            ),
+            "unknown root key": dict(self.policy, unknown=True),
+            "noninteger jobs": dict(self.policy, cargoJobs=True),
+            "wrong jobs": dict(self.policy, cargoJobs=3),
+            "reordered gates": dict(self.policy, gates=list(reversed(self.policy["gates"]))),
+            "path case alias": self.policy_text.replace(
+                "tools/validate_specs.py", "TOOLS/VALIDATE_SPECS.PY", 1
+            ),
+        }
+        for label, mutation in mutations.items():
+            with self.subTest(label=label):
+                self.assert_policy_rejected(mutation, label)
+
+    def test_gate_policy_bypass_jobs_and_evidence_mutations_are_rejected(self):
+        mutations = {
+            "public GateInvoker": (
+                self.policy_module.replace(
+                    "[ValidateRange(0, 7200000)]\n        [int]$LeaseTimeoutMilliseconds",
+                    "[scriptblock]$GateInvoker,\n\n        [ValidateRange(0, 7200000)]\n        [int]$LeaseTimeoutMilliseconds",
+                    1,
+                ),
+                self.runner,
+            ),
+            "Targeted jobs override": (
+                self.policy_module.replace(
+                    'StartsWith("--jobs=")', 'StartsWith("--worker-jobs=")', 1
+                ),
+                self.runner,
+            ),
+            "overwrite evidence": (
+                self.policy_module.replace(
+                    "[System.IO.File]::Move($temporary, $destination)",
+                    "[System.IO.File]::Move($temporary, $destination, $true)",
+                    1,
+                ),
+                self.runner,
+            ),
+            "missing post-policy timing check": (
+                self.policy_module.replace(
+                    '"after the final gate"', '"after an unrelated boundary"'
+                ),
+                self.runner,
+            ),
+            "case-insensitive runner": (
+                self.policy_module,
+                self.runner.replace("IgnoreCase = $false", "IgnoreCase = $true", 1),
+            ),
+        }
+        for label, (policy_module, runner) in mutations.items():
+            with self.subTest(label=label):
+                self.assert_module_rejected(policy_module, runner, label)
 
 
 if __name__ == "__main__":

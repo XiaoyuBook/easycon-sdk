@@ -443,8 +443,8 @@ prepared Cargo/native tree 的性能回归还必须用确定性合同证明每�
 仅可输出诊断，不能作为安全或正确性唯一断言。
 同一合同继续注入 reparse、锁定读失败、损坏 BOM text/strict JSON、raw/escaped source 或任意 writable path 及
 files/hash mismatch，并要求 Verify/Workspace 在任一环境缺陷下零 gate 启动。
-两个 fixture 都必须是同一 fixed SHA 的独立 clean checkout，禁止复制 fingerprint inputs；合同必须真实走首次 Setup 与第二次
-already-ready Setup，证明单一 `e/`、不同 `w/` 及 provision/download 计数不增加。prepared JSON 的 escaped source/任意
+两个 fixture 都必须是同一 fixed SHA 的独立 clean checkout，使用当前严格 v5 配置计算 fingerprint，禁止复制 fingerprint
+inputs；合同必须真实走首次 Setup 与第二次 already-ready Setup，证明单一 `e/`、不同 `w/` 及 provision/download 计数不增加。prepared JSON 的 escaped source/任意
 `CacheRoot/w` path、source/writable tool record、stamp 每层 duplicate/unknown/type/integer mutation 都要独立 fail closed。
 合同还覆盖首次 Setup、
 损坏重建、Setup 中断后恢复、跨 worktree 的 Setup-vs-Verify/Workspace ownership、Verify 失败时 gate 零启动，以及两个不同
@@ -456,8 +456,8 @@ CMake/package-root/vcpkg/proxy 未被继承；vcpkg publish 测试通过注入�
 可清理时的回滚，以及文件被独占句柄锁定时保留 publish 首错、附加 cleanup 状态并在句柄释放后恢复，不使用随机
 sleep。生命周期合同还必须证明普通 Import 后完整 exported function set exact 等于 Setup/Verify/Workspace，所有 helper
 只能通过模块作用域测试，并逐项覆盖三个 wrapper 参数转发以及 Setup/Verify/Workspace 成功与失败后完整恢复调用进程
-环境；Workspace gate 内仍只能看到受控环境。配置合同分别向 PowerShell parser 注入倒序 inputs、Windows 大小写
-alias duplicate 与 `.` component，并要求在 provision 前拒绝；Python guard 对同一 schema/path/kind/order/identity 规则
+环境；Workspace gate 内仍只能看到受控环境。配置合同分别向 PowerShell parser 注入倒序 inputs、遗漏
+`crates/easycon-file-identity/Cargo.toml`、Windows 大小写 alias duplicate 与 `.` component，并要求在 provision 前拒绝；Python guard 对同一 schema/path/kind/order/identity 规则
 给出独立回归。文件 cleanup 合同用真实 `FileShare.None` 覆盖通用 pinned download、vcpkg asset 和 stamp temporary，证明
 首错、cleanup/residual 诊断、最终 destination 不可见和句柄释放后的恢复。
 cwd cleanup 合同由真实子 `pwsh` 删除 caller 原目录后分别 exit 42/43，证明 native 输出/描述和 gate 名称/退出码保持主错误，
@@ -468,18 +468,19 @@ parser 只接受恰好一行完整输出，且测试不依赖机器当前 Python
 prepared vcpkg checkout 的真实 Git fixture 必须在改变 tracked file stat 后记录 `.git/index` hash/mtime，Verify 后保持二者
 不变且不产生 `index.lock`。Python 合同核对 `TEMP`/`TMP`/`TMPDIR`、pycache/bytecode 全部落到当前 `w/`，并让
 `RequireCleanTree` 对 gate 新增的 ignored pyc 仍然失败。
-Windows targeted Cargo 合同还必须用 child runner 证明非 `Targeted` mode 携带 targeted 参数在 Verify 前失败；私有 gate
-contract 必须逐 token 核对自动插入的 `--locked`、显式 package、仅允许的 command，以及 `--workspace`/`--all`、所有
+Windows targeted Cargo 合同还必须用 child runner 证明非 `Targeted` mode 携带 targeted 参数及 lowercase mode 都在 Verify 前失败；私有 gate
+contract 必须逐 token 核对自动插入的 `--locked` 与 `--jobs 4`、显式 package、仅允许的 command，以及 `--workspace`/`--all`、所有
 source/output/config/target bypass 参数和 `--name=value` 形式的零启动拒绝。它还必须在 Cargo `--` 前分别覆盖 `-m <path>`、
 紧凑 `-m<path>` 与 `clippy --fix`/equals 形式的零启动拒绝，同时保留 `--` 后 test-binary 参数不按 Cargo option 解析。
 公开 Targeted wrapper 必须继续走 Workspace lifecycle，证明 Verify 失败时零 targeted gate、lease/环境恢复仍由既有 lifecycle
 负责、public export set 不扩张。
 candidate contract 使用真实 Git fixture 覆盖 staged success、unstaged/untracked 拒绝及 gate 内 index tree 改变；成功 binding
 必须同时固定 HEAD 与 `git write-tree`，clean-tree 继续覆盖 ignored pyc。任何 `BaseSha` branch/ref/`HEAD`/abbrev 都必须在 gate
-前由一次受控 Git 解析为 40 位 immutable commit，非法 ref 零 gate 拒绝，diff/evidence 均使用同一解析值。evidence contract 必须覆盖普通 Workspace 只输出
-`credential=none` summary、staged/clean credential 成功后才在当前 `w/<workspace-key>` 原子发布 schema v1 JSON、final
-`EASYCON_WORKSPACE` 与 JSON 的 tree/fingerprint/identity/timing 一致、没有残留 publish temporary，以及 gate 失败时零 passed
-record 和零 evidence。所有这些 fixture 以同步 marker、真实 Git 状态或真实原子 writer 判断，不用随机 sleep。
+前由一次受控 Git 解析为 40 位 immutable commit，非法 ref 零 gate 拒绝，diff/evidence 均使用同一解析值。policy hash 必须在 Verify 后和
+最后一个 gate 后复核；两个 deterministic mutation fixture 分别证明前者零 gate，后者零 passed record/evidence。evidence contract 必须覆盖普通 Workspace 只输出
+`credential=none` summary、staged/clean credential 成功后才在当前 `w/<workspace-key>` 原子 no-replace 发布
+`evidence/v2/workspace-<candidate-mode>-<tree>-<run-id>.json`、final `EASYCON_WORKSPACE` 与 JSON 的
+tree/environment fingerprint/policy hash/identity/timing 一致、没有残留 temporary，以及 gate 失败时零 passed record 和零 evidence。所有这些 fixture 以同步 marker、真实 Git 状态或真实原子 writer 判断，不用随机 sleep。
 vcpkg checkout 还必须在 audit 后、首次 Git 前确定性尝试把 checkout root、`.git`、非 root required entry 与 ordinary tracked
 entry 分别替换为 junction/reparse；全树以 file `FILE_READ_DATA`、directory `FILE_LIST_DIRECTORY` 的 `FileShare.Read`
 binding 必须拒绝每种替换、持续到全部 Git commit/tracked-file/cleanliness 查询结束。行为 fixture 还必须证明 zero access
