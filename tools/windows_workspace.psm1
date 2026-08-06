@@ -7679,15 +7679,44 @@ function Invoke-EasyConWindowsWorkspace {
 
         [string]$VsWherePath,
 
+        [ValidateSet("Workspace", "Targeted")]
+        [string]$GateMode = "Workspace",
+
         [string]$BaseSha,
 
         [switch]$RequireCleanTree,
+
+        [switch]$RequireStagedCandidate,
+
+        [ValidateSet("check", "clippy", "test")]
+        [string]$TargetedCargoCommand,
+
+        [string[]]$TargetedCargoArguments = @(),
 
         [scriptblock]$GateInvoker,
 
         [ValidateRange(0, 7200000)]
         [int]$LeaseTimeoutMilliseconds = 1800000
     )
+
+    $targetedParametersProvided = (
+        $PSBoundParameters.ContainsKey("TargetedCargoCommand") -or
+        $PSBoundParameters.ContainsKey("TargetedCargoArguments")
+    )
+    if ($RequireCleanTree -and $RequireStagedCandidate) {
+        throw "-RequireCleanTree and -RequireStagedCandidate are mutually exclusive"
+    }
+    if ($GateMode -cne "Targeted" -and $targetedParametersProvided) {
+        throw "Targeted Cargo parameters require -GateMode Targeted"
+    }
+    if ($GateMode -ceq "Targeted") {
+        if ($RequireCleanTree -or $RequireStagedCandidate) {
+            throw "Targeted mode cannot use Workspace candidate requirements"
+        }
+        if ([string]::IsNullOrWhiteSpace($TargetedCargoCommand)) {
+            throw "Targeted Cargo command is required"
+        }
+    }
 
     $context = Get-EasyConWindowsEnvironmentContext -RepositoryRoot $RepositoryRoot `
         -ConfigurationPath $ConfigurationPath -CacheRoot $CacheRoot
@@ -7700,18 +7729,55 @@ function Invoke-EasyConWindowsWorkspace {
     }
     $verifyCore = ${function:Invoke-EasyConWindowsVerifyCore}
     $workspaceGates = ${function:Invoke-EasyConWindowsWorkspaceGates}
+    $targetedCargoGate = ${function:Invoke-EasyConWindowsTargetedCargoGate}
+    $publishWorkspaceEvidence = ${function:Publish-EasyConWorkspaceEvidence}
+    $writeStructuredRecord = ${function:Write-EasyConStructuredRecord}
+    $workspaceStartedUtc = [DateTimeOffset]::UtcNow
+    $workspaceTimer = [System.Diagnostics.Stopwatch]::StartNew()
     $verifyAction = { & $verifyCore @parameters }.GetNewClosure()
     $workspaceAction = {
         param($Summary)
-        $null = $Summary
-        & $workspaceGates -RepositoryRoot $context.Repository `
+        if ($GateMode -ceq "Targeted") {
+            & $targetedCargoGate -RepositoryRoot $context.Repository `
+                -CargoCommand $TargetedCargoCommand -CargoArguments $TargetedCargoArguments `
+                -GateInvoker $GateInvoker
+            return
+        }
+
+        $candidate = & $workspaceGates -RepositoryRoot $context.Repository `
             -BaseSha $BaseSha -RequireCleanTree:$RequireCleanTree `
-            -GateInvoker $GateInvoker
+            -RequireStagedCandidate:$RequireStagedCandidate -GateInvoker $GateInvoker
+        $completedUtc = [DateTimeOffset]::UtcNow
+        if ($null -ne $candidate) {
+            & $publishWorkspaceEvidence -Context $context -Candidate $candidate `
+                -BaseSha $BaseSha -StartedUtc $workspaceStartedUtc -CompletedUtc $completedUtc `
+                -DurationMilliseconds ([long]$workspaceTimer.ElapsedMilliseconds) | Out-Null
+            return
+        }
+
+        & $writeStructuredRecord -Kind "workspace" -Value ([ordered]@{
+            schemaVersion = 1
+            status = "passed"
+            mode = "workspace"
+            credential = "none"
+            fingerprint = [string]$context.Fingerprint.Value
+            target = [string]$context.Configuration.target
+            environmentIdentity = [string]$context.Location.IdentityKey
+            workspaceIdentity = [string]$context.Location.WorkspaceKey
+            startedUtc = $workspaceStartedUtc.ToString("O", [Globalization.CultureInfo]::InvariantCulture)
+            completedUtc = $completedUtc.ToString("O", [Globalization.CultureInfo]::InvariantCulture)
+            durationMs = [long]$workspaceTimer.ElapsedMilliseconds
+        })
     }.GetNewClosure()
-    return Invoke-EasyConEnvironmentLifecycle -Mode Workspace -Location $context.Location `
-        -SetupAction { throw "Workspace cannot prepare the Windows build environment" } `
-        -VerifyAction $verifyAction -WorkspaceAction $workspaceAction `
-        -LeaseTimeoutMilliseconds $LeaseTimeoutMilliseconds
+    try {
+        return Invoke-EasyConEnvironmentLifecycle -Mode Workspace -Location $context.Location `
+            -SetupAction { throw "Workspace cannot prepare the Windows build environment" } `
+            -VerifyAction $verifyAction -WorkspaceAction $workspaceAction `
+            -LeaseTimeoutMilliseconds $LeaseTimeoutMilliseconds
+    }
+    finally {
+        $workspaceTimer.Stop()
+    }
 }
 
 function Invoke-EasyConGate {
@@ -7769,6 +7835,109 @@ function Invoke-EasyConGate {
     })
 }
 
+function Get-EasyConTargetedCargoArguments {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet("check", "clippy", "test")]
+        [string]$CargoCommand,
+
+        [string[]]$CargoArguments = @()
+    )
+
+    $arguments = @($CargoArguments)
+    $forbidden = @(
+        "--workspace",
+        "--all",
+        "--manifest-path",
+        "--target-dir",
+        "--config",
+        "--target",
+        "--offline",
+        "--frozen"
+    )
+    $hasPackage = $false
+    $cargoOptionSection = $true
+    for ($index = 0; $index -lt $arguments.Count; $index++) {
+        $argument = [string]$arguments[$index]
+        if ([string]::IsNullOrWhiteSpace($argument)) {
+            throw "Targeted Cargo arguments must not contain empty tokens"
+        }
+        foreach ($blocked in $forbidden) {
+            if ($argument -ieq $blocked -or $argument.StartsWith("$blocked=")) {
+                throw "Targeted Cargo argument is not permitted: $argument"
+            }
+        }
+        if ($argument -ceq "--") {
+            $cargoOptionSection = $false
+            continue
+        }
+        if (-not $cargoOptionSection) {
+            continue
+        }
+        if ($argument -ceq "-p" -or $argument -ceq "--package") {
+            if ($index + 1 -ge $arguments.Count) {
+                throw "Targeted Cargo package selection requires a package value"
+            }
+            $package = [string]$arguments[$index + 1]
+            if ([string]::IsNullOrWhiteSpace($package) -or $package.StartsWith("-")) {
+                throw "Targeted Cargo package selection requires a package value"
+            }
+            $hasPackage = $true
+            $index++
+            continue
+        }
+        if ($argument.StartsWith("--package=")) {
+            $package = $argument.Substring("--package=".Length)
+            if ([string]::IsNullOrWhiteSpace($package)) {
+                throw "Targeted Cargo package selection requires a package value"
+            }
+            $hasPackage = $true
+            continue
+        }
+        if ($argument.StartsWith("-p") -and $argument.Length -gt 2) {
+            $package = $argument.Substring(2)
+            if ([string]::IsNullOrWhiteSpace($package) -or $package.StartsWith("=")) {
+                throw "Targeted Cargo package selection requires a package value"
+            }
+            $hasPackage = $true
+        }
+    }
+    if (-not $hasPackage) {
+        throw "Targeted Cargo command requires an explicit -p or --package selection"
+    }
+    return @($CargoCommand, "--locked") + $arguments
+}
+
+function Invoke-EasyConWindowsTargetedCargoGate {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$RepositoryRoot,
+
+        [Parameter(Mandatory)]
+        [ValidateSet("check", "clippy", "test")]
+        [string]$CargoCommand,
+
+        [string[]]$CargoArguments = @(),
+
+        [scriptblock]$GateInvoker
+    )
+
+    $repository = Assert-EasyConPhysicalPath -Path $RepositoryRoot
+    $cargo = Get-EasyConCommandPath -Name "cargo.exe"
+    $arguments = @(Get-EasyConTargetedCargoArguments -CargoCommand $CargoCommand `
+        -CargoArguments $CargoArguments)
+    $name = "cargo " + ($arguments -join " ")
+    if ($null -eq $GateInvoker) {
+        Invoke-EasyConGate -Name $name -Program $cargo -Arguments $arguments `
+            -RepositoryRoot $repository
+    }
+    else {
+        & $GateInvoker $name $cargo $arguments $repository
+    }
+}
+
 function Get-EasyConIgnoredPythonBytecodeSnapshot {
     [CmdletBinding()]
     param(
@@ -7818,6 +7987,252 @@ function Assert-EasyConGitWorkingTreeClean {
     }
 }
 
+function Get-EasyConGitObjectId {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Git,
+
+        [Parameter(Mandatory)]
+        [string]$RepositoryRoot,
+
+        [Parameter(Mandatory)]
+        [string[]]$Arguments,
+
+        [Parameter(Mandatory)]
+        [string]$Description
+    )
+
+    $output = @(Invoke-EasyConNativeCapture -Program $Git -Arguments $Arguments `
+        -Description $Description -WorkingDirectory $RepositoryRoot)
+    if ($output.Count -ne 1) {
+        throw "$Description did not return exactly one Git object ID"
+    }
+    $value = ([string]$output[0]).Trim()
+    if ($value -cnotmatch '^[0-9a-f]{40}$') {
+        throw "$Description returned an invalid Git object ID"
+    }
+    return $value
+}
+
+function Get-EasyConGitWorkingTreeStatus {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Git,
+
+        [Parameter(Mandatory)]
+        [string]$RepositoryRoot
+    )
+
+    return @(Invoke-EasyConNativeCapture -Program $Git -Arguments @(
+        "--no-optional-locks", "status", "--porcelain=v1", "--untracked-files=all"
+    ) -Description "workspace candidate status check" -WorkingDirectory $RepositoryRoot)
+}
+
+function Assert-EasyConGitStagedCandidate {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Git,
+
+        [Parameter(Mandatory)]
+        [string]$RepositoryRoot
+    )
+
+    $status = @(Get-EasyConGitWorkingTreeStatus -Git $Git -RepositoryRoot $RepositoryRoot)
+    foreach ($line in $status) {
+        $entry = [string]$line
+        if ($entry.Length -lt 2) {
+            throw "workspace candidate status is malformed"
+        }
+        $indexState = $entry[0]
+        $worktreeState = $entry[1]
+        if ($indexState -eq '?' -and $worktreeState -eq '?') {
+            throw "workspace candidate has untracked content"
+        }
+        if ($worktreeState -ne ' ') {
+            throw "workspace candidate has unstaged content"
+        }
+        if ($indexState -eq ' ') {
+            throw "workspace candidate status is malformed"
+        }
+    }
+    return [pscustomobject]@{
+        Snapshot = $status -join "`0"
+    }
+}
+
+function New-EasyConWorkspaceCandidateBinding {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$RepositoryRoot,
+
+        [Parameter(Mandatory)]
+        [string]$Git,
+
+        [switch]$RequireCleanTree,
+
+        [switch]$RequireStagedCandidate
+    )
+
+    if ($RequireCleanTree -and $RequireStagedCandidate) {
+        throw "-RequireCleanTree and -RequireStagedCandidate are mutually exclusive"
+    }
+    if (-not $RequireCleanTree -and -not $RequireStagedCandidate) {
+        return
+    }
+
+    $head = Get-EasyConGitObjectId -Git $Git -RepositoryRoot $RepositoryRoot `
+        -Arguments @("--no-optional-locks", "rev-parse", "--verify", "HEAD^{commit}") `
+        -Description "workspace candidate HEAD commit"
+    if ($RequireCleanTree) {
+        Assert-EasyConGitWorkingTreeClean -RepositoryRoot $RepositoryRoot
+        $tree = Get-EasyConGitObjectId -Git $Git -RepositoryRoot $RepositoryRoot `
+            -Arguments @("--no-optional-locks", "rev-parse", "--verify", "HEAD^{tree}") `
+            -Description "workspace clean-tree candidate"
+        return [pscustomobject]@{
+            CandidateMode = "clean-tree"
+            HeadCommit = $head
+            Tree = $tree
+            StatusSnapshot = $null
+            IgnoredPythonBytecodeSnapshot = Get-EasyConIgnoredPythonBytecodeSnapshot `
+                -RepositoryRoot $RepositoryRoot
+        }
+    }
+
+    $status = Assert-EasyConGitStagedCandidate -Git $Git -RepositoryRoot $RepositoryRoot
+    $tree = Get-EasyConGitObjectId -Git $Git -RepositoryRoot $RepositoryRoot `
+        -Arguments @("--no-optional-locks", "write-tree") `
+        -Description "workspace staged candidate tree"
+    return [pscustomobject]@{
+        CandidateMode = "staged-candidate"
+        HeadCommit = $head
+        Tree = $tree
+        StatusSnapshot = $status.Snapshot
+        IgnoredPythonBytecodeSnapshot = $null
+    }
+}
+
+function Assert-EasyConWorkspaceCandidateBindingCurrent {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$RepositoryRoot,
+
+        [Parameter(Mandatory)]
+        [string]$Git,
+
+        [Parameter(Mandatory)]
+        [object]$Candidate
+    )
+
+    $head = Get-EasyConGitObjectId -Git $Git -RepositoryRoot $RepositoryRoot `
+        -Arguments @("--no-optional-locks", "rev-parse", "--verify", "HEAD^{commit}") `
+        -Description "workspace candidate HEAD commit after gates"
+    if ($head -cne [string]$Candidate.HeadCommit) {
+        throw "workspace candidate HEAD changed during gates"
+    }
+
+    $tree = $null
+    switch ([string]$Candidate.CandidateMode) {
+        "clean-tree" {
+            Assert-EasyConGitWorkingTreeClean -RepositoryRoot $RepositoryRoot
+            $ignoredPythonBytecodeAfter = Get-EasyConIgnoredPythonBytecodeSnapshot `
+                -RepositoryRoot $RepositoryRoot
+            if ($ignoredPythonBytecodeAfter -cne [string]$Candidate.IgnoredPythonBytecodeSnapshot) {
+                throw "workspace gates changed ignored Python bytecode inside the source tree"
+            }
+            $tree = Get-EasyConGitObjectId -Git $Git -RepositoryRoot $RepositoryRoot `
+                -Arguments @("--no-optional-locks", "rev-parse", "--verify", "HEAD^{tree}") `
+                -Description "workspace clean-tree candidate after gates"
+        }
+        "staged-candidate" {
+            $status = Assert-EasyConGitStagedCandidate -Git $Git -RepositoryRoot $RepositoryRoot
+            if ($status.Snapshot -cne [string]$Candidate.StatusSnapshot) {
+                throw "workspace candidate source/index state changed during gates"
+            }
+            $tree = Get-EasyConGitObjectId -Git $Git -RepositoryRoot $RepositoryRoot `
+                -Arguments @("--no-optional-locks", "write-tree") `
+                -Description "workspace staged candidate tree after gates"
+        }
+        default {
+            throw "workspace candidate binding has an invalid mode"
+        }
+    }
+    if ($tree -cne [string]$Candidate.Tree) {
+        throw "workspace candidate tree changed during gates"
+    }
+    return $Candidate
+}
+
+function Publish-EasyConWorkspaceEvidence {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object]$Context,
+
+        [Parameter(Mandatory)]
+        [object]$Candidate,
+
+        [string]$BaseSha,
+
+        [Parameter(Mandatory)]
+        [DateTimeOffset]$StartedUtc,
+
+        [Parameter(Mandatory)]
+        [DateTimeOffset]$CompletedUtc,
+
+        [Parameter(Mandatory)]
+        [long]$DurationMilliseconds
+    )
+
+    $tree = [string]$Candidate.Tree
+    $head = [string]$Candidate.HeadCommit
+    if ($tree -cnotmatch '^[0-9a-f]{40}$' -or $head -cnotmatch '^[0-9a-f]{40}$') {
+        throw "workspace evidence requires a validated Git tree and HEAD commit"
+    }
+    $candidateMode = [string]$Candidate.CandidateMode
+    if ($candidateMode -cnotin @("clean-tree", "staged-candidate")) {
+        throw "workspace evidence requires a validated candidate mode"
+    }
+    $workspaceRoot = Assert-EasyConPhysicalPath -Path ([string]$Context.Location.WorkspaceRoot)
+    $evidenceFile = "evidence/workspace-$tree.json"
+    $baseCommit = if (
+        [string]::IsNullOrWhiteSpace($BaseSha) -or $BaseSha -match '^0+$'
+    ) {
+        $null
+    }
+    else {
+        [string]$BaseSha
+    }
+    $record = [ordered]@{
+        schemaVersion = 1
+        status = "passed"
+        mode = "workspace"
+        credential = "tree"
+        candidateMode = $candidateMode
+        baseCommit = $baseCommit
+        headCommit = $head
+        tree = $tree
+        fingerprint = [string]$Context.Fingerprint.Value
+        target = [string]$Context.Configuration.target
+        environmentIdentity = [string]$Context.Location.IdentityKey
+        workspaceIdentity = [string]$Context.Location.WorkspaceKey
+        startedUtc = $StartedUtc.ToString("O", [Globalization.CultureInfo]::InvariantCulture)
+        completedUtc = $CompletedUtc.ToString("O", [Globalization.CultureInfo]::InvariantCulture)
+        durationMs = $DurationMilliseconds
+        evidenceFile = $evidenceFile
+    }
+    $destination = Join-Path $workspaceRoot $evidenceFile
+    $text = ($record | ConvertTo-Json -Depth 12) + [Environment]::NewLine
+    Write-EasyConUtf8FileAtomically -Path $destination -Text $text -TrustedRoot $workspaceRoot `
+        -Description "workspace evidence" | Out-Null
+    Write-EasyConStructuredRecord -Kind "workspace" -Value $record
+    return [pscustomobject]$record
+}
+
 function Invoke-EasyConWindowsWorkspaceGates {
     [CmdletBinding()]
     param(
@@ -7828,10 +8243,15 @@ function Invoke-EasyConWindowsWorkspaceGates {
 
         [switch]$RequireCleanTree,
 
+        [switch]$RequireStagedCandidate,
+
         [scriptblock]$GateInvoker
     )
 
     $repository = Assert-EasyConPhysicalPath -Path $RepositoryRoot
+    if ($RequireCleanTree -and $RequireStagedCandidate) {
+        throw "-RequireCleanTree and -RequireStagedCandidate are mutually exclusive"
+    }
     $cargo = Get-EasyConCommandPath -Name "cargo.exe"
     $python = Get-EasyConCommandPath -Name "python.exe"
     $pwsh = Get-EasyConCommandPath -Name "pwsh.exe"
@@ -7842,6 +8262,9 @@ function Invoke-EasyConWindowsWorkspaceGates {
         "--workspace", "--all-targets", "--all-features", "--", "-D", "warnings"
     )
     $testArguments = @("test") + $cargoResolution + @("--workspace", "--all-features")
+    $candidate = New-EasyConWorkspaceCandidateBinding -RepositoryRoot $repository `
+        -Git $git -RequireCleanTree:$RequireCleanTree `
+        -RequireStagedCandidate:$RequireStagedCandidate
     $gates = @(
         @("cargo fmt --all --check", $cargo, @("fmt", "--all", "--check")),
         @(
@@ -7880,19 +8303,16 @@ function Invoke-EasyConWindowsWorkspaceGates {
         ),
         @("git diff --check", $git, @("diff", "--check"))
     )
-    $ignoredPythonBytecodeBefore = $null
-    if ($RequireCleanTree) {
-        Assert-EasyConGitWorkingTreeClean -RepositoryRoot $repository
-        $ignoredPythonBytecodeBefore = Get-EasyConIgnoredPythonBytecodeSnapshot `
-            -RepositoryRoot $repository
+    if ($RequireStagedCandidate) {
+        $gates += ,@("git diff --cached --check", $git, @("diff", "--cached", "--check"))
     }
     foreach ($gate in $gates) {
         if ($null -eq $GateInvoker) {
             Invoke-EasyConGate -Name $gate[0] -Program $gate[1] -Arguments $gate[2] `
-                -RepositoryRoot $repository
+                -RepositoryRoot $repository | Out-Host
         }
         else {
-            & $GateInvoker $gate[0] $gate[1] $gate[2] $repository
+            & $GateInvoker $gate[0] $gate[1] $gate[2] $repository | Out-Host
         }
     }
     if (-not [string]::IsNullOrWhiteSpace($BaseSha) -and $BaseSha -notmatch '^0+$') {
@@ -7901,13 +8321,9 @@ function Invoke-EasyConWindowsWorkspaceGates {
         Invoke-EasyConGate -Name "git diff base...HEAD --check" -Program $git `
             -Arguments @("diff", "--check", "$BaseSha...HEAD") -RepositoryRoot $repository
     }
-    if ($RequireCleanTree) {
-        Assert-EasyConGitWorkingTreeClean -RepositoryRoot $repository
-        $ignoredPythonBytecodeAfter = Get-EasyConIgnoredPythonBytecodeSnapshot `
-            -RepositoryRoot $repository
-        if ($ignoredPythonBytecodeAfter -cne $ignoredPythonBytecodeBefore) {
-            throw "workspace gates changed ignored Python bytecode inside the source tree"
-        }
+    if ($null -ne $candidate) {
+        return Assert-EasyConWorkspaceCandidateBindingCurrent -RepositoryRoot $repository `
+            -Git $git -Candidate $candidate
     }
 }
 

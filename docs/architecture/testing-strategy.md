@@ -468,6 +468,15 @@ parser 只接受恰好一行完整输出，且测试不依赖机器当前 Python
 prepared vcpkg checkout 的真实 Git fixture 必须在改变 tracked file stat 后记录 `.git/index` hash/mtime，Verify 后保持二者
 不变且不产生 `index.lock`。Python 合同核对 `TEMP`/`TMP`/`TMPDIR`、pycache/bytecode 全部落到当前 `w/`，并让
 `RequireCleanTree` 对 gate 新增的 ignored pyc 仍然失败。
+Windows targeted Cargo 合同还必须用 child runner 证明非 `Targeted` mode 携带 targeted 参数在 Verify 前失败；私有 gate
+contract 必须逐 token 核对自动插入的 `--locked`、显式 package、仅允许的 command，以及 `--workspace`/`--all`、所有
+source/output/config/target bypass 参数和 `--name=value` 形式的零启动拒绝。公开 Targeted wrapper 必须继续走 Workspace
+lifecycle，证明 Verify 失败时零 targeted gate、lease/环境恢复仍由既有 lifecycle 负责、public export set 不扩张。
+candidate contract 使用真实 Git fixture 覆盖 staged success、unstaged/untracked 拒绝及 gate 内 index tree 改变；成功 binding
+必须同时固定 HEAD 与 `git write-tree`，clean-tree 继续覆盖 ignored pyc。evidence contract 必须覆盖普通 Workspace 只输出
+`credential=none` summary、staged/clean credential 成功后才在当前 `w/<workspace-key>` 原子发布 schema v1 JSON、final
+`EASYCON_WORKSPACE` 与 JSON 的 tree/fingerprint/identity/timing 一致、没有残留 publish temporary，以及 gate 失败时零 passed
+record 和零 evidence。所有这些 fixture 以同步 marker、真实 Git 状态或真实原子 writer 判断，不用随机 sleep。
 vcpkg checkout 还必须在 audit 后、首次 Git 前确定性尝试把 checkout root、`.git`、非 root required entry 与 ordinary tracked
 entry 分别替换为 junction/reparse；全树以 file `FILE_READ_DATA`、directory `FILE_LIST_DIRECTORY` 的 `FileShare.Read`
 binding 必须拒绝每种替换、持续到全部 Git commit/tracked-file/cleanliness 查询结束。行为 fixture 还必须证明 zero access

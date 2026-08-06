@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet("Setup", "Verify", "Workspace")]
+    [ValidateSet("Setup", "Verify", "Workspace", "Targeted")]
     [string]$Mode = "Workspace",
 
     [string]$CacheRoot,
@@ -9,7 +9,14 @@ param(
 
     [string]$BaseSha = $env:BASE_SHA,
 
-    [switch]$RequireCleanTree
+    [switch]$RequireCleanTree,
+
+    [switch]$RequireStagedCandidate,
+
+    [ValidateSet("check", "clippy", "test")]
+    [string]$TargetedCargoCommand,
+
+    [string[]]$TargetedCargoArguments = @()
 )
 
 $ErrorActionPreference = "Stop"
@@ -18,6 +25,23 @@ Set-StrictMode -Version Latest
 
 if (-not $IsWindows) {
     throw "run_windows_workspace.ps1 supports Windows only"
+}
+
+$targetedParametersProvided = (
+    $PSBoundParameters.ContainsKey("TargetedCargoCommand") -or
+    $PSBoundParameters.ContainsKey("TargetedCargoArguments")
+)
+if ($Mode -cne "Targeted" -and $targetedParametersProvided) {
+    throw "Targeted Cargo parameters require -Mode Targeted"
+}
+if ($RequireCleanTree -and $RequireStagedCandidate) {
+    throw "-RequireCleanTree and -RequireStagedCandidate are mutually exclusive"
+}
+if ($Mode -ceq "Targeted" -and ($RequireCleanTree -or $RequireStagedCandidate)) {
+    throw "Targeted mode cannot use Workspace candidate requirements"
+}
+if ($Mode -cne "Workspace" -and $RequireStagedCandidate) {
+    throw "-RequireStagedCandidate requires -Mode Workspace"
 }
 
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
@@ -47,6 +71,12 @@ switch ($Mode) {
     }
     "Workspace" {
         Invoke-EasyConWindowsWorkspace @commonParameters -BaseSha $BaseSha `
-            -RequireCleanTree:$RequireCleanTree | Out-Null
+            -RequireCleanTree:$RequireCleanTree `
+            -RequireStagedCandidate:$RequireStagedCandidate | Out-Null
+    }
+    "Targeted" {
+        Invoke-EasyConWindowsWorkspace @commonParameters -GateMode Targeted `
+            -TargetedCargoCommand $TargetedCargoCommand `
+            -TargetedCargoArguments $TargetedCargoArguments | Out-Null
     }
 }

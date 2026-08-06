@@ -67,6 +67,7 @@ Windows 构建流程分为两个职责：
 pwsh -NoProfile -File tools/run_windows_workspace.ps1 -Mode Setup
 pwsh -NoProfile -File tools/run_windows_workspace.ps1 -Mode Verify
 pwsh -NoProfile -File tools/run_windows_workspace.ps1 -Mode Workspace
+pwsh -NoProfile -File tools/run_windows_workspace.ps1 -Mode Workspace -RequireStagedCandidate
 ```
 
 `Setup` 是可重跑的一次性在线准备步骤，安装并核验固定 Rust toolchain、受控 CMake/Ninja、vcpkg
@@ -82,6 +83,39 @@ root/downloads 和测试临时目录等可写/source-bound 输出。local root �
 `vcpkg.exe` 与 `scripts/buildsystems/vcpkg.cmake` wrapper；wrapper 在 include immutable prepared toolchain 前绑定该 root，
 使 CMake 的 z-applocal 后处理只执行当前 worktree 拥有的工具副本。tool、marker、manifest 与 wrapper 都经同目录临时文件
 完整校验后原子替换 final，不沿预置 hardlink 覆写 shared environment 或 source。`Workspace` 在 Verify 后运行完整仓库门禁。
+
+#### Targeted Cargo 与候选证据
+
+日常小范围反馈可通过同一受控入口使用 `Targeted`，而不是在 ambient shell 中重建一套 Cargo 环境。例如，在 PowerShell
+调用脚本时先把每个 Cargo token 放入数组：
+
+```powershell
+$targetedCargoArguments = @("-p", "easycon-ecs", "--test", "world_contract", "--", "--exact")
+.\tools\run_windows_workspace.ps1 -Mode Targeted -TargetedCargoCommand test `
+  -TargetedCargoArguments $targetedCargoArguments
+```
+
+`TargetedCargoCommand` 只能是 `check`、`clippy` 或 `test`，参数必须在 Cargo option section 中显式给出
+`-p`/`--package`（也可用 `--package=<name>`）。runner 以数组逐 token 调用 native Cargo，并在 command 后自动插入
+`--locked`；它不拼接或 eval 命令字符串。为维持 source、Cargo home/config、target 和受控 target identity 的边界，
+`--workspace`、`--all`、`--manifest-path`、`--target-dir`、`--config`、`--target`、`--offline` 与 `--frozen`，以及它们的
+`--name=value` 形式，都在启动 Cargo 前 fail closed。非 `Targeted` mode 传入 targeted 参数同样失败；`Targeted` 不接受
+candidate requirement。它仍通过同一个 Workspace lifecycle 获取 environment/shared-cache/workspace lease，先完成 Verify，
+失败时零 Cargo gate，并在成功或失败后完整恢复调用进程环境。模块 public export 继续只有 Setup、Verify 与 Workspace。
+
+完整 `Workspace` 有三种互斥的 credential 策略。普通 Workspace 输出成功 `EASYCON_WORKSPACE` summary，字段
+`credential` 为 `none`，不声明可复用 tree。`-RequireCleanTree` 要求 tracked、staged、unstaged 与 untracked 状态全空，
+绑定 `HEAD^{tree}`，并保持既有 ignored pyc snapshot 保护。`-RequireStagedCandidate` 则允许候选差异，但所有候选变化必须
+staged，不能有 unstaged 或 untracked 内容；gate 前使用当前 index 的 `git write-tree` 得到 candidate tree，并额外运行
+`git diff --cached --check`。两种 credential 模式在 gate 后都重新核对 HEAD、source/index 状态与 tree；任一变化都 fail
+closed，两个开关不可同时使用。
+
+credential 成功时才会在当前 canonical worktree 的 writable root
+`CacheRoot/w/<workspace-key>/evidence/workspace-<tree>.json` 写入 UTF-8 无 BOM 的 schema v1 JSON。现有原子 writer 在同一
+writable root 临时物化、校验并替换 final；source tree 从不接收 evidence。记录和随后输出的最终 `EASYCON_WORKSPACE` 都包含
+`schemaVersion`、`status`、`mode`、`credential`、`candidateMode`、`baseCommit`、`headCommit`、`tree`、`fingerprint`、`target`、
+environment/workspace identity、UTC start/end、`durationMs` 与相对 `evidenceFile`。gate、后置 candidate 校验或原子发布失败时
+不会输出 passed workspace record，也不会为该次候选发布 passed evidence。
 
 环境目录之外有跨 fingerprint/worktree 的共享资产层。直接固定资产以 SHA-256/SHA-512 内容寻址，命中时每次重验
 hash/bytes，损坏项在逐资产锁内隔离，唯一同卷 temporary 通过验证后才原子发布。CMake、Ninja、vcpkg.exe、7-Zip/7zr
