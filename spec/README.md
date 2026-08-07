@@ -1,9 +1,15 @@
-# EasyCon SDK v1 milestone specifications
+# EasyCon SDK product specifications and dormant ECS maintenance corpus
 
-This directory contains the machine-checkable behavior and conformance baseline for the Phase 1
-Runtime, the Phase 2A Controller/Serial Candidate, and the static Phase 4 S0 ECS provenance
-foundation. Phase 2A is `Hardware Unverified` and remains narrower than the complete v1
-architecture.
+This directory indexes two separately scoped sets of tracked machine-checkable assets.
+[ADR-0023](../docs/decisions/0023-v1-host-language-sdk-roadmap-and-ecs-deferral.md) defines the
+current SDK v1 product around Runtime, Controller, and Vision, and defers ECS/Automation.
+
+## Current v1 product specifications
+
+These behavior and conformance assets cover the current v1 Runtime/Controller product and any
+applicable Vision contracts. They are product specifications, not a claim that an incomplete
+product stage is complete. The retained Controller/Serial candidate is `Hardware Unverified` and
+remains narrower than the complete v1 product.
 
 - `behavior/runtime-controller-v1.json` fixes operation, timeout, event, shutdown, serial,
   Controller, Amiibo, sequence, timing, and Hardware Unverified behavior.
@@ -17,10 +23,25 @@ architecture.
   scenarios. Every step and assertion has a stable ID. Each scenario declares the exact executable
   Rust test suite covering its assertions, and every assertion maps through a matching
   `// conformance:` source marker.
+
+## Dormant ECS maintenance corpus
+
+The static Phase 4 S0 ECS provenance foundation remains tracked as dormant maintenance under its
+historical/future ECS contracts. It is not current v1 product scope or completion, and does not
+establish a public ABI, shared language acceptance, hardware/soak evidence, release evidence, or a
+v1 product prerequisite. The ECS fixtures, schemas, generator, validator, and their health checks
+remain maintained rather than deleted or downgraded.
+
 - `fixtures/ecs/manifest.json` separates Legacy Exact, Corrected, and v1-native provenance. Its 11
   records own 33 SDK-local input, observed, expected, source-snapshot, and profile artifacts. The
   Corrected records preserve every ADR-0017 PRINT and label production/test oracle independently;
   the v1-native records preserve the fixed heap-order pair without claiming legacy evidence.
+
+`v1-native` is an existing ECS provenance-class name. It does not describe a current
+ADR-0023 v1 product capability, support status, or release status.
+
+## Shared schemas and validation
+
 - `schemas/` contains JSON Schema Draft 2020-12 documents for every asset shape. The local validator
   applies the schema subset used here to each concrete instance rather than only parsing the schema
   documents.
@@ -30,11 +51,13 @@ is a dated local measurement with an explicit software-only scope. Controller go
 precise-sequence tests read their tracked files directly. Tests and validation do not open, build,
 download, or otherwise depend on `EasyCon/`.
 
-`tools/generate_ecs_provenance_fixtures.py --check` deterministically verifies the tracked ECS file
-set. Its legacy commit, full source blob identities, and exact source excerpts are fixed data; the
-generator performs no checkout discovery, network access, or external source read.
+`tools/generate_ecs_provenance_fixtures.py --check` deterministically verifies the tracked dormant
+ECS file set as a maintenance health check. Its legacy commit, full source blob identities, and
+exact source excerpts are fixed data; the generator performs no checkout discovery, network access,
+or external source read.
 
-`tools/validate_specs.py` compares the complete assertion and Rust marker sets, checks each scenario
+`tools/validate_specs.py` validates both the current product specifications and the dormant ECS
+maintenance corpus. It compares the complete assertion and Rust marker sets, checks each scenario
 suite for exact assertion coverage, resolves every mapped source through Cargo metadata to one
 workspace package and target, then executes each unique test against that exact target. A mapping is
 valid only when libtest reports exactly one passed and zero ignored tests. The validator rejects

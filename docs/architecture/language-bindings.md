@@ -9,7 +9,7 @@ Vision 的宿主语言适配层，不是另一套业务核心，也不提供 ECS
 - discover、connect、Controller direct call、`ActionSequence`、snapshot、template、OCR 和 color 使用宿主语言的异步惯用形态。
 - 调用方用普通函数、协程、Task 或 Promise 组合业务流程。普通业务计时由宿主语言负责；精确 press/release/delay 只交给
   核心校验并调度的 `ActionSequence`。
-- v1 不冻结公共 `wait()` API。异步对象的完成、取消、错误和事件观察由已冻结 C ABI 与各语言惯用机制表达。
+- v1 不冻结公共 `wait()` API。第二阶段完成公共 C ABI 冻结后，异步对象的完成、取消、错误和事件观察由该 ABI 与各语言惯用机制表达。
 - Error 由 stable domain/code 映射，保留 message、native code、operation/resource ID 和 cause。
 - Event 包含同一 sequence/kind/payload；语言层不得制造或吞掉核心状态事件。
 - Frame、Image、Label 和结果值是不可变对象；TypeScript 只支持 Node.js，不提供浏览器降级实现。
