@@ -117,7 +117,10 @@ Rust、Cargo、behavior 或 conformance 提交都必须在普通 workspace tests
 
 - 跨域依赖检查和资源 admission；
 - Runtime、Controller、Vision 的聚合不连接 ECS port；
-- Controller `ActionSequence` 的 success/failure/cancel 都先结算 stream 与中立化再终态；
+- Controller `ActionSequence` 成功时，最后一个 report/stream 已结算且 Controller write lease 已释放后才提交终态；最终
+  Controller 状态由序列的显式动作决定，成功路径不得额外中立化覆盖它，便捷 `press` step 自身包含 release 的语义不变；
+- Controller `ActionSequence` 失败、取消或 Controller/Runtime close 时，在终态前结算 stream、执行中立化并释放
+  Controller write lease；断线等使中立报告无法送达时，保留既有可观察 warning/失败边界；
 - Runtime close 按 Runtime-local `ResourceId` 顺序执行 resource callback，再 join task、收尾 operation、
   检查 registry 并发布最终事件；中立化和 lease 释放属于各 owner 的 cleanup，不依赖硬编码类型顺序。
 
@@ -238,12 +241,15 @@ ECS/Automation、Python/Lua Runner、字节码/固件、远端控制、配置/�
 2. 发现两个 fake device，连接 fallback、断线、重连由调用方发起。
 3. direct button/HAT/stick/reset 和 precise sequence trace。
 4. Amiibo save/select 的 success、ACK timeout、cancel。
-5. Controller `ActionSequence` 的 success/failure/cancel、精确时间线和中立化。
-6. synthetic capture、snapshot、Frame metadata/encode。
-7. `.IL` load、template、OCR、color 的共同 result。
-8. event read timeout 不取消；语言 cancel 映射到 native Cancelled。
-9. queue overflow gap 和状态恢复查询。
-10. 显式 dispose/context exit 后资源/task/handle 计数为零。
+5. Controller `ActionSequence` success 的精确时间线、最后 report/stream 结算、write lease 释放，以及由显式 step
+   保留的最终 Controller 状态；成功路径不额外中立化，便捷 `press` step 自身仍包含 release。
+6. Controller `ActionSequence` failure/cancel/Controller 或 Runtime close 的 stream 结算、中立化和 write lease
+   释放；中立报告无法送达时保留可观察 warning/失败边界。
+7. synthetic capture、snapshot、Frame metadata/encode。
+8. `.IL` load、template、OCR、color 的共同 result。
+9. event read timeout 不取消；语言 cancel 映射到 native Cancelled。
+10. queue overflow gap 和状态恢复查询。
+11. 显式 dispose/context exit 后资源/task/handle 计数为零。
 
 ### trace 比较
 
