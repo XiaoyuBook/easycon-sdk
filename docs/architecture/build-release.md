@@ -17,15 +17,16 @@
 
 **[已决定]** ARM64、x86、Linux 和 macOS 不属于 v1.0 支持面。代码必须保留 target module 和 native bridge 边界，但不得在没有硬件、打包、ABI 和四语言一致性测试时发布对应 binary。
 
-### Phase 3 平台候选
+### Vision 平台候选与证据
 
 | 平台 | 方向 | 当前允许的最高状态 | 发布边界 |
 | --- | --- | --- | --- |
-| Windows 10/11 x64 | v1 Tier 1 | Vision software/native `Passed` | `Hardware Unverified`；完整 Phase 3、ABI、四语言与 package 门禁前不发布 |
+| Windows 10/11 x64 | v1 Tier 1 | Vision software/native `Passed` | `Hardware Unverified`；完整 Vision 平台证据、ABI、四语言与 package 门禁前不发布 |
 | Linux x64 | v1 正式目标方向 | Vision Build Candidate；按实际 build 标记 Passed/Build Unverified | serial、硬件、四语言与 package 未完成，不是完整 Linux SDK |
 | macOS Apple Silicon arm64 | experimental source | Build/Hardware Unverified、Not Shipped | 无 binary/package；不承诺 Intel 或 universal |
 
-该表的目标由 [ADR-0012](../decisions/0012-phase-3-vision-native-target.md) 管理，第一次冻结历史见
+该表记录的是 Vision 平台候选与证据。相关 ADR 中的 “Phase 3” 是 ADR-0023 前的历史 Vision 平台标签，不是当前第三阶段的
+语言 SDK。该表的目标由 [ADR-0012](../decisions/0012-phase-3-vision-native-target.md) 管理，第一次冻结历史见
 [ADR-0013](../decisions/0013-phase-3-vision-cross-platform-source-candidate-freeze.md)，当前证据状态由 NativePool admission
 修复后的 [ADR-0014](../decisions/0014-phase-3-native-pool-admission-refreeze.md) 重新冻结，不改变 v1.0 只有
 Windows Tier 1 的发布承诺。macOS 至少一次真实 arm64 compile/software gate 通过前，不实现完整 AVFoundation

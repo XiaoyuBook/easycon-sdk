@@ -17,7 +17,9 @@
 
 v1 聚合 Runtime、Controller 与 Vision。调用方在 C++、.NET、Python 或 Node.js/TypeScript 中直接调用这些能力，以普通函数、协程、Task 或 Promise 组合自己的业务流程。
 
-- 普通长流程的等待、轮询和业务节拍由宿主语言负责；本决定不承诺公共 `wait()` API。
+- 普通长流程的等待、轮询和业务节拍由宿主语言负责；v1 不提供独立的工作流 `wait()`/delay/sleep API。第二阶段冻结的
+  通用 C ABI 保留 `operation_wait`，它只观察既有 operation；超时返回 `WAIT_TIMEOUT` 并不取消 operation。语言 binding
+  可以在内部把 `operation_wait`、`operation_status` 和 event 投影为 Task、Promise 或协程完成。
 - 精确的 press、release 和 delay 使用由核心校验并由 Controller lane 调度的 `ActionSequence`。它保持绝对时间线、取消、lease、中立化和 transport-acceptance 边界。
 - v1 不把 `.ecs` 文件、Program、Compilation、AutomationRun、Automation port 或 ECS diagnostic/source-limit 域暴露为产品能力。
 

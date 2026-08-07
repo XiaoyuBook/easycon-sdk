@@ -157,7 +157,8 @@ flowchart TB
 
 新增平台不得修改 Frame/Image/Label、Capture 五态、operation、latest slot、pool、cancel/deadline 或
 interrupt/handoff/join/handle-release 语义。完整约束见
-[Phase 3 跨平台边界设计](../development/phase3-cross-platform-design.md)。
+[历史 Vision Phase 3 跨平台边界设计](../development/phase3-cross-platform-design.md)；这里的 “Phase 3” 是 ADR-0023 前的
+Vision 平台候选记录，不是当前第三阶段的语言 SDK。
 
 ## 5. 公共 C ABI 与语言层
 

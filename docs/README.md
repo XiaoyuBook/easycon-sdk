@@ -50,6 +50,9 @@
 21. [Phase 2B faults 协议证据修订设计](development/phase2b-fault-protocol-evidence-remediation.md)：每个 faults
     role 的 baud/handshake ledger、qualification-only reply byte correlation、legacy 分类与 candidate refreeze 门槛。
 
+> **历史计划编号说明：** 上述 `Phase 2`、`Phase 2A`、`Phase 2B` 和 `Phase 3` 开发记录及历史 ADR 标题保留原名，
+> 只表示 ADR-0023 前的开发/证据语境；它们不表示 ADR-0023 所定义的当前四个产品阶段或其完成状态。
+
 ## 决策记录
 
 - [ADR-0001：外层 SDK 与 EasyCon 源码分离](decisions/0001-source-boundary.md)

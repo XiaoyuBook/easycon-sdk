@@ -9,7 +9,9 @@ Vision 的宿主语言适配层，不是另一套业务核心，也不提供 ECS
 - discover、connect、Controller direct call、`ActionSequence`、snapshot、template、OCR 和 color 使用宿主语言的异步惯用形态。
 - 调用方用普通函数、协程、Task 或 Promise 组合业务流程。普通业务计时由宿主语言负责；精确 press/release/delay 只交给
   核心校验并调度的 `ActionSequence`。
-- v1 不冻结公共 `wait()` API。第二阶段完成公共 C ABI 冻结后，异步对象的完成、取消、错误和事件观察由该 ABI 与各语言惯用机制表达。
+- v1 不提供独立的、用于编排业务流程的公共 `wait()`/delay/sleep API。第二阶段完成公共 C ABI 冻结后，通用
+  `operation_wait` 只观察既有 operation；超时返回 `WAIT_TIMEOUT` 并不取消它。binding 可以在内部把
+  `operation_wait`、`operation_status` 和 event 投影为 Task、Promise 或协程完成；异步对象的取消、错误和事件观察由该 ABI 与各语言惯用机制表达。
 - Error 由 stable domain/code 映射，保留 message、native code、operation/resource ID 和 cause。
 - Event 包含同一 sequence/kind/payload；语言层不得制造或吞掉核心状态事件。
 - Frame、Image、Label 和结果值是不可变对象；TypeScript 只支持 Node.js，不提供浏览器降级实现。
@@ -63,7 +65,9 @@ auto match = co_await runtime.vision().match_template(frame, label);
 
 - 正常路径是显式 close + release；析构不抛、不阻塞、不启动 finalizer。
 - `std::stop_token` overload 只注册取消请求；token 销毁不释放 native operation。
-- `EventSubscription` 是 move-only input range；明确标注的 `next(timeout)` 只读取事件，不定义通用 operation `wait()`。
+- `EventSubscription` 是 move-only input range；明确标注的 `next(timeout)` 只读取事件。它与 `operation_wait` 分别观察
+  event queue 和既有 operation；`Operation<T>` 可以在内部使用 `operation_wait`、`operation_status` 和 event 驱动协程，但这不定义
+  工作流 delay/sleep。
 
 ## 4. .NET SDK
 

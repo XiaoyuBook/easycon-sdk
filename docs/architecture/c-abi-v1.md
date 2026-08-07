@@ -12,7 +12,7 @@ Automation symbol、error、event 或 handle 都不属于此 ABI。
 核心规则：
 
 1. 每个函数都有明确 ownership、线程安全和阻塞属性。
-2. 每个耗时动作返回 operation；只有显式 event read、close 或以后明确冻结的观察函数可以阻塞。
+2. 每个耗时动作返回 operation；只有显式 `operation_wait`、event `read` 和 `close` 可以阻塞。
 3. 没有用户 callback。日志、状态和完成通知全部从 subscription 拉取。
 4. 所有文本是带长度 UTF-8；不把 NUL 终止当成边界。
 5. 所有跨边界分配都由分配它的一侧释放。
@@ -160,13 +160,16 @@ typedef struct easycon_utf8_view_t {
 
 ```c
 status controller_connect(controller, options, &operation, &error);
-status operation_state(operation, &state, &error);
+status operation_status(operation, &state, &error);
+status operation_wait(operation, timeout_ms, &state, &error);
 status operation_cancel(operation, &error);
 status controller_connect_result(operation, &info, &error);
 ```
 
-`operation_cancel` 幂等，只发请求。operation 的终态通过状态查询、结果 accessor 与 event subscription 观察；本路线没有
-冻结公共阻塞 `wait()` API，语言 SDK 以宿主语言的 Task、Promise、协程或等价机制表达完成。
+`operation_wait` 是观察既有 operation 的通用接口：ABI 调用成功表示获得一个状态；timeout 到期时返回 `WAIT_TIMEOUT`，
+operation 本身没有被取消。它不是用于组织业务流程的 `wait()`/delay/sleep API。`operation_cancel` 幂等，只发请求；必须等到
+terminal 后才完成语言级取消。语言 SDK 可以将 `operation_wait`、`operation_status` 与 event subscription 投影为宿主语言的 Task、
+Promise、协程或等价机制。
 
 ### 状态
 
@@ -212,6 +215,11 @@ Operation terminal event 便于 binding 完成 Task/Promise，但 operation quer
 
 本阶段只冻结类别，不冻结完整函数名：
 
+### Operation 观察
+
+- status/wait/cancel；
+- result/error accessor。
+
 ### Runtime
 
 - ABI/library/build info 查询；
@@ -242,7 +250,7 @@ API 不暴露 Python/Lua、固件写入、远端脚本、远程助手、UI 或�
 | 对象/调用 | 线程安全约束 |
 | --- | --- |
 | Runtime query/submit | 可从任意线程并发 |
-| Operation status/cancel/result accessor | 可并发；多个调用方可观察同一终态 |
+| Operation status/wait/cancel/result/error accessor | 可并发；多个 `operation_wait` 调用方可观察同一终态 |
 | Event subscription read | 每个 subscription 允许一个并发 reader；多个 reader 返回 `RESOURCE_BUSY` |
 | Controller submit/query | 可并发，内部序列化；release 需调用方同步 |
 | Capture/Frame/Vision | query/submit 可并发；配置通过 capture lane 串行 |
@@ -310,12 +318,15 @@ binding 初始化时检查：
 
 ## 14. ABI 冻结门槛
 
-正式 `easycon.h` 只有在以下条件同时满足后才能标记 v1：
+第二阶段的正式 `easycon.h` 只有在以下条件同时满足后才能标记 v1：
 
 - 资源、operation、错误和事件模型已有 Rust reference implementation；
 - C 与 C++ smoke client 覆盖所有 ownership 路径；
 - 旧头/新库和新头/旧库兼容矩阵通过；
-- 四语言原型从同一 manifest 生成并通过一致性场景；
+- 四语言对同一 manifest 的 representation/FFI 可表达性已由生成声明或等价检查验证；这不要求完整官方 SDK 或共同场景；
 - symbol/layout golden 已建立；
 - sanitizer/fuzz 未发现跨边界泄漏、越界或 unwind；
 - O-01/O-02 的硬件能力不会迫使改变现有字段，只需 capability/options 尾字段。
+
+完整官方 SDK、共同场景和四语言 conformance 属于第三阶段：C++、.NET、Python、Node.js/TypeScript 全部完成后才执行，
+随后才能进入第四阶段的发布资格，不是冻结 `easycon.h` 的前置。

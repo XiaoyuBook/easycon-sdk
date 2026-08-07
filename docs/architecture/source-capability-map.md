@@ -119,8 +119,9 @@ transport 结果不得替代这些证据。
 
 **[推导]** 公共 Vision API 不暴露 `Mat`、`Bitmap` 或 Tesseract 类型。帧、图像和标签都是核心拥有的不透明资源，跨 ABI 只给稳定元数据和显式复制/编码结果。
 
-**[已决定]** 上表的 DirectShow/Windows 枚举只是 EasyCon 源码事实，不是跨平台公共语义。Phase 3 保持
-Frame/Image/Label/Capture 状态机平台中立，Windows、Linux V4L2 和未来 AVFoundation 都只能作为 leaf adapter。
+**[已决定]** 上表的 DirectShow/Windows 枚举只是 EasyCon 源码事实，不是跨平台公共语义。Vision 平台候选与证据保持
+Frame/Image/Label/Capture 状态机平台中立，Windows、Linux V4L2 和未来 AVFoundation 都只能作为 leaf adapter。此前的
+“Phase 3” 是 ADR-0023 前的历史 Vision 平台标签，不是当前第三阶段的语言 SDK。
 Linux 在真实 build/native fixture 后仍是 Vision candidate，macOS 本轮只允许 Apple Silicon arm64
 fail-closed experimental source；两者都不得从现有 Windows 源码推导硬件或完整 SDK 支持。
 

@@ -148,7 +148,7 @@ Rust、Cargo、behavior 或 conformance 提交都必须在普通 workspace tests
 
 浮点结果比较由每个 fixture 声明容差；位置、错误和 event order 不使用模糊比较。
 
-### Phase 3 平台证据分级
+### Vision 平台证据分级
 
 - Windows 10/11 x64 是 Tier 1：MSVC Debug/Release、clang-cl ASan/UBSan、clang-tidy、MSVC analyze、fuzz、
   Rust/spec 全门禁必须在最终源码执行。
@@ -162,9 +162,10 @@ synthetic Capture、exception/ownership/resource count。平台 native adapter �
 BackendUnavailable，不能以空 discovery/profile/frame success 通过测试。
 
 平台结果的完整门槛和 macOS 两阶段 handoff 见
-[Phase 3 跨平台边界设计](../development/phase3-cross-platform-design.md) 与
+[历史 Vision Phase 3 跨平台边界设计](../development/phase3-cross-platform-design.md) 与
 [Linux/macOS 验证 handoff](../development/phase3-cross-platform-validation-handoff.md)；当前证据状态由
-[ADR-0014](../decisions/0014-phase-3-native-pool-admission-refreeze.md) 重新冻结；ADR-0013 仅保留旧候选的历史冻结记录。
+[ADR-0014](../decisions/0014-phase-3-native-pool-admission-refreeze.md) 重新冻结；这些历史 “Phase 3” 名称只标识 Vision
+平台证据，不是 ADR-0023 当前第三阶段的语言 SDK；ADR-0013 仅保留旧候选的历史冻结记录。
 
 ## 6. C ABI 测试
 

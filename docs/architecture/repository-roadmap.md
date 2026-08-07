@@ -82,7 +82,7 @@ easycon sdk/
 交付：
 
 - `easycon-sdk` 聚合 Runtime、Controller、Vision，`easycon-capi` 作为唯一 public native 链接根；
-- 机器可读 ABI manifest、生成 C header、symbol allowlist、C/C++ smoke 与 layout golden；
+- 机器可读 ABI manifest、reference C API、生成 C header、symbol allowlist、C/C++ low-level smoke 与 layout golden；
 - 一份带 build metadata 的 canonical native bundle，供全部语言 SDK 消费。
 
 退出门槛：ABI 的 ownership、错误、operation、事件、Controller 与 Vision 形态已冻结；同一 bundle 通过 ABI 与 native
@@ -108,8 +108,9 @@ language-sdk
 └── clean-environment install smoke
 ```
 
-退出门槛：每种 SDK 只适配 public C ABI，且与 canonical bundle 的 build ID 匹配。C++ 候选只证明该语言的阶段性可用性；
-四语言共同验收和 GA 仍属于第四阶段。
+退出门槛：每种 SDK 只适配 public C ABI，且与 canonical bundle 的 build ID 匹配。C++、.NET、Python、Node.js/TypeScript
+全部完成后，在 fake-enabled core 上执行四语言共同场景与 conformance；这是第三阶段的完成门槛，也是进入第四阶段发布资格的前置。
+C++ 候选只证明该语言的阶段性可用性，不等于四语言 GA。
 
 ### 打包、真实硬件、ABI、供应链与发布资格
 
@@ -147,20 +148,34 @@ flowchart LR
 Controller、Vision 和 Runtime 可在第一阶段的既有依赖边界内并行收口。后续语言顺序是实施优先级，不允许任何语言绕过
 canonical bundle 或在本地复制核心业务逻辑。
 
-## 5. 核心完成门槛
+## 5. 第一阶段退出、第二阶段工作与退出
 
-只有以下条件全部满足，才能开始 ABI 冻结和 canonical bundle 候选：
+### 第一阶段退出
+
+只有以下条件全部满足，才能开始第二阶段的 ABI 冻结和 canonical native bundle 工作：
 
 1. Runtime、Controller、Vision 的状态机、错误和关闭顺序由实现测试覆盖。
-2. fake serial/native 能运行共同场景，不需要物理硬件或 `EasyCon/`。
+2. fake serial/native 能运行核心共同场景，不需要物理硬件或 `EasyCon/`。
 3. Controller report、`ActionSequence` 和 Vision fixture 具有明确的 exact/corrected 分类。
 4. Controller lease、取消、中立化、stream settlement 与精确时序的成功/失败边界已覆盖。
 5. Capture read 可中断，Runtime close 后没有活动 task、resource 或 native handle。
 6. C++ exception 与 Rust panic 隔离通过，无跨 ABI unwind。
-7. ABI manifest 能生成 C header、声明和 symbol allowlist，并有 C/C++ smoke。
-8. status/error/event/struct/ownership/blocking 文档不依赖 binding 猜测，也不凭空承诺公共 `wait()` API。
-9. canonical native bundle 含 ABI/build metadata，binding 可在 fake 模式运行。
-10. GPL 来源、版权和 dependency license 初审完成。
+7. operation/status/error/event/struct/ownership/blocking 文档不依赖 binding 猜测，保留 `operation_wait` 的观察语义，且不把
+   独立工作流 `wait()`/delay/sleep 承诺为 v1 API。
+8. GPL 来源、版权和 dependency license 已完成初审。
+
+### 第二阶段工作
+
+- 从 ABI manifest 形成 reference C API、生成 `easycon.h`、语言低层声明和 symbol allowlist；
+- 建立 C 与 C++ low-level smoke、layout/symbol golden 与 ABI 兼容矩阵；
+- 构建带 ABI/build metadata 的 canonical native bundle；
+- 对四语言做 representation/FFI 可表达性或生成声明检查。该检查只证明 ABI 投影，不要求完整官方 SDK、共同场景或 conformance。
+
+### 第二阶段退出
+
+ABI 的 ownership、错误、operation、事件、Controller 与 Vision 形态冻结；同一 canonical bundle 通过 ABI、C/C++ low-level
+smoke、symbol/layout golden 与兼容矩阵，且四语言的低层 ABI 表达检查通过。此后才进入第三阶段，先实现 C++ SDK，再依次实现
+.NET、Python、Node.js/TypeScript SDK。
 
 ## 6. 阶段性禁止项
 

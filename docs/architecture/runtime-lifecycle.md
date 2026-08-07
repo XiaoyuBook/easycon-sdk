@@ -53,9 +53,9 @@ stateDiagram-v2
 | 状态 | 接受新资源 | 接受查询 | 事件 |
 | --- | --- | --- | --- |
 | Active | 是 | 是 | 正常发布 |
-| Closing | 否，返回 `RUNTIME_CLOSING` | 只允许状态、error 和 drain | 发布关闭进度及资源终态 |
+| Closing | 否，返回 `RUNTIME_CLOSING` | 只允许状态、`operation_wait`、error 和 drain | 发布关闭进度及资源终态 |
 | Closed | 否 | 只允许版本化 handle 销毁 | subscription 收到 closed 后结束 |
-| CloseFailed | 否，永久拒绝 | 允许状态、保存的 close report、operation query 和 drain | subscription 收到 close_failed 后结束 |
+| CloseFailed | 否，永久拒绝 | 允许状态、保存的 close report、`operation_wait`/query 和 drain | subscription 收到 close_failed 后结束 |
 
 `Closing` 只表示关闭事务正在执行或最后 owning handle 已请求非确定性取消，不能同时表示已经失败。
 显式 close 保存唯一 `CloseOutcome::Closed` 或 `CloseOutcome::Failed(CloseReport)`；并发和后续 close
@@ -73,7 +73,7 @@ Runtime 创建是同步的，只完成内存、executor、native context 和队�
 4. 一个有界 native compute pool，执行模板匹配、编码和 OCR；线程数由 Runtime options 限制。
 5. 一个事件分发器，把不可变事件复制到各 subscription 的有界队列。
 
-语言线程永远不会被用作核心 executor。除明确命名为 event `read`、`close` 或以后单独冻结的观察函数外，C ABI 调用只做有限验证和入队，不执行硬件 I/O 或长时间 native 计算。
+语言线程永远不会被用作核心 executor。除明确命名为 `operation_wait`、event `read` 或 `close` 的函数外，C ABI 调用只做有限验证和入队，不执行硬件 I/O 或长时间 native 计算。
 
 ## 4. Operation 模型
 
@@ -100,6 +100,7 @@ stateDiagram-v2
 - terminal event 与终态提交在同一有序临界区完成；查询一定能看到不早于事件的状态。
 - `cancel` 幂等。对终态 operation 调用 cancel 返回成功但不改变结果。
 - 释放 observation handle 不取消 operation。
+- `operation_wait` 超时只结束本次观察，返回 `WAIT_TIMEOUT`，不请求取消也不改变 operation 状态。
 - parent 开始终态事务时先封闭 cancellation node；在此之后 child admission 必须失败。已经在线性化点前
   admission 的 child 会被取消并继续由自己的 owner 清理。
 - 终态事务依次封闭 child admission、取消 subtree、执行 owner cleanup、提交 immutable 终态和 terminal
@@ -111,16 +112,17 @@ stateDiagram-v2
 - owner cleanup panic 转成可诊断 internal failure，不得留下不可观察的半终态；terminal event 仍不是
   waiter 正确性的唯一通道。
 
-### 完成观察、deadline 与 timeout
+### Operation 观察、deadline 与 timeout
 
 三个概念严格分开：
 
-- **观察超时**：调用方在 event read 或未来明确冻结的观察函数中愿意阻塞多久。超时只返回 `WAIT_TIMEOUT`，operation 继续。
+- **观察超时**：调用方在 `operation_wait` 或 event `read` 中愿意阻塞多久。超时只返回 `WAIT_TIMEOUT`；前者不会取消
+  operation，后者不会关闭 subscription。
 - **operation deadline**：请求 options 中的执行期限。到期后核心请求取消，最终通常为 `Cancelled`，error reason 为 deadline。
 - **协议 timeout**：握手、ACK、读帧等一次 I/O 的内部期限。耗尽重试后 operation 为 `Failed`，error domain 为 device/I/O。
 
-所有期限都从单调时钟计算。`0` 表示轮询，`UINT64_MAX` 表示无限观察；公共 API 不使用负数或壁钟时间。v1 路线不因本节
-冻结任何公共 operation `wait()` API。
+所有期限都从单调时钟计算。`0` 表示轮询，`UINT64_MAX` 表示无限观察；公共 API 不使用负数或壁钟时间。v1 不提供独立的
+工作流 `wait()`/delay/sleep API；`operation_wait` 仅用于观察既有 operation。
 
 ## 5. 取消树
 

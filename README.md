@@ -27,8 +27,9 @@ Vision 已有源码候选，但 capture hardware 仍未验证。前三个产品�
 - **Vision**：视频采集、截图、图像标签、模板匹配、OCR 和颜色检测。
 
 首批官方 SDK 为 C++、.NET、Python 和 Node.js/TypeScript。调用方直接用宿主语言的函数、协程、Task 或 Promise 组合
-Controller 与 Vision；普通业务计时由宿主语言负责，精确 press/release/delay 交给 `ActionSequence`。v1 不承诺公共
-`wait()` API，也不包含 Automation。
+Controller 与 Vision；普通业务计时由宿主语言负责，精确 press/release/delay 交给 `ActionSequence`。v1 不提供独立的、用于
+编排业务流程的公共 `wait()`/delay/sleep API；第二阶段冻结的 C ABI 保留通用 `operation_wait`，它只观察既有 operation，
+超时返回 `WAIT_TIMEOUT` 并不取消该 operation。v1 也不包含 Automation。
 
 ## 仓库边界
 
