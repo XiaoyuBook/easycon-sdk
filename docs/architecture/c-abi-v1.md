@@ -6,10 +6,13 @@
 
 **[已决定]** C ABI 是四语言唯一底层边界。ABI 只表达稳定标量、版本化结构体和不透明句柄，不暴露 Rust layout、C++ class、STL、OpenCV `Mat`、Tesseract 对象或平台 handle。
 
+v1 只覆盖 Runtime、Controller 与 Vision。Program、Compilation、AutomationRun、ECS diagnostics/source limits，以及任何
+Automation symbol、error、event 或 handle 都不属于此 ABI。
+
 核心规则：
 
 1. 每个函数都有明确 ownership、线程安全和阻塞属性。
-2. 每个耗时动作返回 operation；只有显式 wait/read/close 可以阻塞。
+2. 每个耗时动作返回 operation；只有显式 event read、close 或以后明确冻结的观察函数可以阻塞。
 3. 没有用户 callback。日志、状态和完成通知全部从 subscription 拉取。
 4. 所有文本是带长度 UTF-8；不把 NUL 终止当成边界。
 5. 所有跨边界分配都由分配它的一侧释放。
@@ -65,7 +68,6 @@ uint32_t version;
 | `easycon_runtime_t` | Runtime 根资源 |
 | `easycon_controller_t` | 一个 Controller session |
 | `easycon_capture_t` | 一个 Capture session |
-| `easycon_program_t` | 不可变 ECS Program |
 | `easycon_operation_t` | 异步 operation 观察句柄 |
 | `easycon_event_subscription_t` | 独立事件队列 |
 | `easycon_event_t` | 一条不可变事件 |
@@ -73,7 +75,7 @@ uint32_t version;
 | `easycon_label_t` | 不可变图像标签 |
 | `easycon_buffer_t` | 不可变 owned bytes/text |
 | `easycon_error_t` | 不可变错误链 |
-| typed list/result handles | 设备、诊断、匹配等复合结果 |
+| typed list/result handles | 设备、匹配等复合结果 |
 
 ABI 声明使用 incomplete struct pointer。内部 wrapper header 含 ABI/type magic、generation、runtime ID 和一个 Rust `Arc`，但这些字段不公开。
 
@@ -87,7 +89,7 @@ ABI 声明使用 incomplete struct pointer。内部 wrapper header 含 ABI/type 
   `RuntimeClosed`。
 - 同一非 NULL raw pointer 只能 release 一次。释放后使用或二次释放属于 C 调用方未定义行为，binding 必须把字段原子置 NULL。
 - 有效但类型错误、ABI magic 错误或跨 Runtime 的 handle 返回稳定错误；不能靠 C cast 绕过。
-- 关闭 Runtime 会使主动子资源停止，但 immutable Frame/Image/Program/Event/Error/Buffer 可读到其各自最后引用释放；它们不能再启动新 operation。
+- 关闭 Runtime 会使主动子资源停止，但 immutable Frame/Image/Label/Event/Error/Buffer 可读到其各自最后引用释放；它们不能再启动新 operation。
 - handle 存活不会允许动态库被 binding 主动卸载。官方 binding 在进程期内固定装载核心。
 
 ## 5. UTF-8 与内存
@@ -107,7 +109,7 @@ typedef struct easycon_utf8_view_t {
 - 输入只在函数返回前借用；需要异步使用的文本在创建 operation 时复制进核心。
 - 必须是严格 UTF-8。路径、端口名、label 名和标识符额外拒绝内嵌 NUL。
 - 文件路径按 Windows UTF-16 系统调用转换，错误位置仍以输入 UTF-8 byte offset 表达。
-- 不执行隐式本地代码页转换和 Unicode 大小写猜测；需要大小写不敏感的 ECS token 按语言规范处理。
+- 不执行隐式本地代码页转换和 Unicode 大小写猜测；标识符的匹配规则由各具体 v1 API 明确规定。
 
 ### 输出内存
 
@@ -130,9 +132,8 @@ typedef struct easycon_utf8_view_t {
 | --- | --- |
 | ABI | INVALID_ARGUMENT、INVALID_UTF8、ABI_MISMATCH、INVALID_HANDLE、WRONG_HANDLE_TYPE、WRONG_RUNTIME |
 | Runtime | RUNTIME_CLOSING、INVALID_STATE、RESOURCE_BUSY、RESOURCE_EXHAUSTED、UNSUPPORTED |
-| Wait/cancel | WAIT_TIMEOUT、CANCELLED、DEADLINE_EXCEEDED、QUEUE_CLOSED |
+| Observation/cancel | WAIT_TIMEOUT、CANCELLED、DEADLINE_EXCEEDED、QUEUE_CLOSED |
 | I/O/Controller | NOT_FOUND、ACCESS_DENIED、IO_ERROR、DEVICE_DISCONNECTED、PROTOCOL_ERROR、ACK_TIMEOUT |
-| Automation | COMPILE_FAILED、SCRIPT_RUNTIME_ERROR、MISSING_DEPENDENCY |
 | Vision | NO_FRAME、INVALID_IMAGE、MODEL_NOT_FOUND、VISION_ERROR |
 | Isolation | NATIVE_EXCEPTION、PANIC、INTERNAL |
 
@@ -147,9 +148,7 @@ typedef struct easycon_utf8_view_t {
 - 调用方可传 NULL，仍得到 status。
 - 不提供 thread-local last-error，避免异步和嵌套调用覆盖。
 
-异步失败存入 operation：先等待终态，再用 `operation_error_clone` 获取 error。`Succeeded` 无 error；`Failed` 必须有；`Cancelled` 可有 cancellation reason error；result 与 error 不能同时存在。
-
-诊断不是 exception：ECS compile operation 的 compile result 始终包含完整 diagnostic list，并且只有在不存在 error diagnostic 时才包含 optional Program；warning 可与该真实 Program 共存。只要存在任何 error diagnostic，就不创建或发布 partial/not-runnable Program。run 只接受 compile result 中实际存在的 Program，不存在“对失败 Program 运行后返回 `COMPILE_FAILED`”的路径。
+异步失败存入 operation：operation 达到终态后，再用 `operation_error_clone` 获取 error。`Succeeded` 无 error；`Failed` 必须有；`Cancelled` 可有 cancellation reason error；result 与 error 不能同时存在。
 
 ## 7. Operation handle
 
@@ -161,12 +160,13 @@ typedef struct easycon_utf8_view_t {
 
 ```c
 status controller_connect(controller, options, &operation, &error);
-status operation_wait(operation, timeout_ms, &state, &error);
+status operation_state(operation, &state, &error);
 status operation_cancel(operation, &error);
 status controller_connect_result(operation, &info, &error);
 ```
 
-`operation_wait` 的 ABI 调用成功表示得到了一个状态。若 timeout 到期，返回 `WAIT_TIMEOUT`；operation 本身没有被取消。`operation_cancel` 幂等，只发请求；必须 wait 到 terminal 才完成语言级取消。
+`operation_cancel` 幂等，只发请求。operation 的终态通过状态查询、结果 accessor 与 event subscription 观察；本路线没有
+冻结公共阻塞 `wait()` API，语言 SDK 以宿主语言的 Task、Promise、协程或等价机制表达完成。
 
 ### 状态
 
@@ -182,9 +182,9 @@ public state 是 `PENDING`、`RUNNING`、`CANCELLING`、`SUCCEEDED`、`FAILED`�
 ### 结果
 
 - 小型固定结果通过版本化 output struct 复制。
-- 设备列表、诊断列表、Frame、Buffer 等以新 owning handle 取出。
+- 设备列表、Frame、Buffer、Vision 匹配结果等以新 owning handle 取出。
 - `take_result` 只能成功一次时，函数名必须包含 `take`；可重复读取的结果使用 `clone_result`。
-- accessor 在 operation 未成功终态时返回 `INVALID_STATE`，不能隐式 wait。
+- accessor 在 operation 未成功终态时返回 `INVALID_STATE`，不能隐式阻塞等待。
 - release operation 不取消；语言 Task/Promise 仍由 binding 的内部 registry 保留观察引用直到完成。
 
 ## 8. 事件读取
@@ -227,14 +227,6 @@ Operation terminal event 便于 binding 完成 Task/Promise，但 operation quer
 - validated precise sequence operation；
 - Amiibo save/select operation。
 
-### Automation
-
-- compile source bundle/directory operation → compile result（optional Program + 完整 diagnostics）；
-- Program metadata/required labels/hash；
-- run Program operation，只接受 compile result 实际发布的 Program；
-- operation cancel 作为 stop；
-- run state/log/state events。
-
 ### Vision
 
 - discover/open/close capture；
@@ -250,11 +242,11 @@ API 不暴露 Python/Lua、固件写入、远端脚本、远程助手、UI 或�
 | 对象/调用 | 线程安全约束 |
 | --- | --- |
 | Runtime query/submit | 可从任意线程并发 |
-| Operation status/wait/cancel | 可并发；多个 wait 均可观察同一终态 |
+| Operation status/cancel/result accessor | 可并发；多个调用方可观察同一终态 |
 | Event subscription read | 每个 subscription 允许一个并发 reader；多个 reader 返回 `RESOURCE_BUSY` |
 | Controller submit/query | 可并发，内部序列化；release 需调用方同步 |
 | Capture/Frame/Vision | query/submit 可并发；配置通过 capture lane 串行 |
-| Program/Label/Frame/Buffer/Error/Event accessor | immutable，可并发读取 |
+| Label/Frame/Buffer/Error/Event accessor | immutable，可并发读取 |
 | close | 幂等，可与 operation 并发；close 获胜后新提交被拒绝 |
 | release | 不可与同一个 raw wrapper 的其他调用并发 |
 
@@ -308,14 +300,13 @@ binding 初始化时检查：
 
 实现前为以下内容定义 Runtime 可配置且有硬上限的 limit：
 
-- source 文件数、单文件字节、总 source bytes、诊断数；
 - action sequence step 数和总跨度；
 - image encoded bytes、解码像素数、width/height/stride；
 - label 数、名称长度、Base64 target bytes；
 - OCR 文本长度和 model 数；
 - event queue capacity、log payload 和 operation 数。
 
-所有乘法/offset 使用 checked arithmetic。ROI 必须在 Frame 边界内；图像解码在 native compute pool 受限执行；路径加载只允许显式 root，拒绝跳出 root 的规范化路径。
+所有乘法/offset 使用 checked arithmetic。ROI 必须在 Frame 边界内；图像、标签和模型等文件输入只允许显式 root，拒绝跳出 root 的规范化路径。
 
 ## 14. ABI 冻结门槛
 

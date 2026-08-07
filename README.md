@@ -4,77 +4,31 @@ EasyCon SDK 是基于 EasyCon 源码进行二次开发的多语言 SDK 项目，
 
 ## 当前状态
 
-仓库已经冻结 SDK v1 架构、[Phase 1 Runtime 基线](docs/decisions/0007-phase-1-freeze.md) 和
-[Phase 2A Controller/Serial Candidate](docs/decisions/0009-phase-2a-freeze.md)。Phase 2A 包含 Windows serial
-系统 backend、可注入 byte I/O、Controller 单写者 lane、Amiibo save/select、10,000-step fake 和软件路径
-latency harness。
+[ADR-0023](docs/decisions/0023-v1-host-language-sdk-roadmap-and-ecs-deferral.md) 将 SDK v1 重新冻结为四个产品阶段：
+Runtime、Controller、Vision 核心收口；公共 C ABI 与 canonical native bundle；各语言 SDK；以及打包、真实硬件、ABI、
+供应链与发布资格。
 
-[Phase 2 Controller/Serial 开发目标](docs/decisions/0008-phase-2-controller-target.md) 已冻结；Phase 2A 仍为
-`Hardware Unverified`：没有验证任何具体控制板、固件、VID/PID、Amiibo 容量或 UART/USB/Switch 时序，
-O-01、O-02、O-04 保持开放。当前也未发布稳定公共 API/ABI；Phase 3 只重新冻结私有 Vision 跨平台源码候选，
-不包含 ECS、语言绑定、固件或 UI；
-完整 Phase 2 必须在 CH32 可用后通过 Phase 2B 硬件资格验证。
+当前位于第一阶段的软件核心收口。Runtime 的通用修复候选仍需要独立的固定 SHA 审查；Controller settlement 尚未完成；
+Vision 已有源码候选，但 capture hardware 仍未验证。前三个产品阶段尚未全部完成，尚无稳定 public C ABI 或任一语言 SDK
+候选。C++ 会在第一、第二阶段完成后优先进入第三阶段；其可用候选也不等于四语言 v1 GA。
 
-[Phase 2B Qualification Software Candidate](docs/decisions/0011-phase-2b-qualification-software-candidate-freeze.md)
-已冻结并通过 fake/synthetic 门禁，但尚未在目标设备上执行资格命令，也没有创建支持矩阵或关闭任何硬件开放项。
+现有 `easycon-ecs`、ECS spec、fixture、conformance、validator 和 guards 保留为 dormant workspace maintenance 资产。
+它们继续参加仓库健康门禁，但不是 v1 public ABI、四语言共同验收、真实硬件、soak 或发布的前置。ADR-0017、ADR-0019
+和 ADR-0021 保留为历史/未来 ECS 合同，不自动恢复 v1 ECS 产品范围。
 
-Phase 3 私有 Vision 跨平台源码候选在旧候选因 NativePool admission P2 被重开后，已按
-[ADR-0014](docs/decisions/0014-phase-3-native-pool-admission-refreeze.md) 以 implementation `27444f16` 重新冻结；
-[ADR-0013](docs/decisions/0013-phase-3-vision-cross-platform-source-candidate-freeze.md) 仅保留第一次冻结的历史记录。Windows x64
-软件/native 门禁通过但 capture hardware 未验证；Linux x64 是 v1 正式目标方向的 `Candidate / Build Unverified`；
-macOS 只形成 Apple Silicon arm64 `Experimental Source Candidate / Build Unverified / Hardware Unverified /
-Not Shipped`。三者均不等于完整 SDK 发布，且未冻结 public C ABI、Phase 4、四语言或 package。
-
-[ADR-0016](docs/decisions/0016-phase-3-downstream-reopen-boundary.md) 已以 `Refrozen Governance Boundary` 接受：
-准备增加 Phase 4 按 ADR-0014 的现行字面规则确实触发治理 reopen，本次 refreeze 已闭合该治理 reopen。从本次
-refreeze 之后，纯下游 Phase 4/5/6 增加本身不再自动重开 Phase 3，只有实际改变其冻结面时才重开。Phase 3
-implementation、public-neutral contract 和平台/支持状态均未改变；该治理决定本身不授权 Phase 4 target 或实现。
-
-[ADR-0017](docs/decisions/0017-phase-4-ecs-automation-target.md) 现已作为
-`Accepted / Frozen Phase 4 ECS/Automation Target` 生效，固定接受候选为 `fa265dff`。它冻结 Phase 4
-`easycon-ecs` 的 compiler、不可变 Program、Automation Run、抽象 ports、确定性语义、limits、Runtime 窄重开边界
-与安全实施 DAG。
-
-治理链从 G0a/design base `38ef0dc` 依次经过初始 proposal `6468da5`、第一轮修订 `9983d42` 和第二轮修订
-`fa265dff`；最终独立 full review 任务 `019f9348-1fb0-7130-86b6-57d69a0db31c` 对固定接受候选给出
-`APPROVE`，P0/P1/P2=`0/0/0`。`main` 已在实现基线 `87544d9` 完成并合入 W0 与 S0：W0 只建立零依赖、可编译的
-`easycon-ecs` workspace 骨架，S0 只建立 11 条自包含 provenance records、33 个 SDK-local artifacts 及静态
-validator。[ADR-0018](docs/decisions/0018-phase-2a-controller-lease-reopen.md) 已接受 Phase 5 Controller D0
-窄重开合同，但 D1/D2 尚未形成已接受实现；[ADR-0019](docs/decisions/0019-phase-4-c1-lexer-contract.md) 已接受并冻结
-C1 lexer 合同，固定接受候选为 `e4b12b5`，独立 full review 任务
-`019fb40a-ef77-7f12-8075-885be6a0e917` 结论为 `APPROVE`、P0/P1/P2=`0/0/0`。C1 实现现已获授权但尚未形成
-implementation candidate。[ADR-0020](docs/decisions/0020-controller-settlement-runtime-prerequisites.md) 现已
-`Accepted / Effective`，固定接受候选为 `a617e084`；它冻结 Runtime-only R0-v2 对 D1 的前置合同，并只解锁 R0-v2
-作为下一独立实现节点。R0-v2 implementation candidate、Phase 1 refreeze、D1 Controller/serial 集成与 D2 均尚未完成；
-D1 保持暂停并保留现有四条 RED，C1 的独立授权不变。
-[ADR-0021](docs/decisions/0021-phase-4-c1-windows-loader-handle-identity-dependency.md) 现已
-`Accepted / Effective`，固定接受候选为 `ff109565`；独立 Sol Ultra review 任务
-`019fb4f5-362b-7003-8415-0eacd208341f` 结论为 `APPROVE`、P0/P1/P2=`0/0/0`。它冻结先把现有
-qualification-private `FILE_ID_INFO` leaf 迁移为唯一共享 root safe foundation 的前置合同，并只解锁 F0 作为下一
-独立实现节点。F0 stable assertions、dependency admission、扩展后的 guards、root/hardware 两套完整门禁、fixed-SHA
-review 与单独 refreeze 尚未完成；此前 C1 继续暂停，W0/root workspace guard 继续有效。这些进展不表示 Phase 4 实现、
-硬件、支持或发布已经完成。
-
-此前的实验性共享运行基线已经移除，不再作为本项目的产品架构或兼容性约束。后续 public C ABI 和各语言绑定
-将在当前 Rust 共享核心之上按 Phase 5/6 的独立门禁实现。
-
-完整架构固定在 [docs/README.md](docs/README.md)，包括源码能力映射、Rust/C++/C ABI
-边界、生命周期与并发、四语言绑定、构建发布、测试和实施路线。首个里程碑的实现范围、
-行为边界和验证命令见
-[Runtime + Controller/Serial Phase 2A Candidate](docs/development/runtime-controller-vertical-slice.md)。
+完整架构固定在 [docs/README.md](docs/README.md)，包括源码能力映射、Rust/C++/C ABI 边界、生命周期与并发、四语言绑定、
+构建发布、测试和四阶段路线。Controller 与 Vision 的现有软件候选边界仍可参考
+[Controller/Serial 现有软件候选](docs/development/runtime-controller-vertical-slice.md)。
 
 ## SDK v1 目标
 
-- **Controller**：设备发现与连接、按键、方向键、摇杆、Amiibo 和精确动作序列。
-- **Automation**：ECS 脚本的编译、执行、停止、状态查询和运行事件。
+- **Runtime 基础**：operation、事件、资源所有权、取消、deadline 与确定性 close。
+- **Controller**：设备发现与连接、按键、方向键、摇杆、Amiibo 和精确 `ActionSequence`。
 - **Vision**：视频采集、截图、图像标签、模板匹配、OCR 和颜色检测。
 
-首批官方 SDK：
-
-- C++
-- .NET
-- Python
-- Node.js/TypeScript
+首批官方 SDK 为 C++、.NET、Python 和 Node.js/TypeScript。调用方直接用宿主语言的函数、协程、Task 或 Promise 组合
+Controller 与 Vision；普通业务计时由宿主语言负责，精确 press/release/delay 交给 `ActionSequence`。v1 不承诺公共
+`wait()` API，也不包含 Automation。
 
 ## 仓库边界
 

@@ -96,7 +96,7 @@ root/downloads 和测试临时目录等可写/source-bound 输出。local root �
 调用脚本时先把每个 Cargo token 放入数组：
 
 ```powershell
-$targetedCargoArguments = @("-p", "easycon-ecs", "--test", "world_contract", "--", "--exact")
+$targetedCargoArguments = @("-p", "easycon-runtime", "--test", "runtime_contract", "--", "--exact")
 .\tools\run_windows_workspace.ps1 -Mode Targeted -TargetedCargoCommand test `
   -TargetedCargoArguments $targetedCargoArguments
 ```
@@ -234,6 +234,7 @@ runtime/win-x64/
 `easycon-native.json` 至少记录：SDK version、ABI major/minor、build ID、git source revision、target、compiler、features、public symbol hash、OpenCV/Tesseract/Leptonica/Rust dependency versions、各文件 SHA-256。
 
 四语言 packaging job 只能消费签名/校验后的 canonical bundle，不允许重新运行 Cargo/CMake。这样相同版本的 NuGet、wheel、npm platform package 和 CMake archive 必然携带相同 `easycon_core.dll`。
+该 bundle 只包含 Runtime、Controller、Vision 的 v1 ABI；不导出 ECS Program、compile/run、Automation domain 或相关 symbol。
 
 ## 4. 原生依赖布局
 
@@ -343,6 +344,7 @@ easycon_sdk-<version>.dist-info/
 - C++、NuGet、PyPI、npm 使用同一个 `MAJOR.MINOR.PATCH`。
 - 所有官方包同一 release train；缺任一语言验收则整个 release 不发布。
 - prerelease 使用 `-alpha.N`、`-beta.N`、`-rc.N`，四种 registry 做各自等价映射。
+- C++ 可先作为第三阶段的可用候选发布给受控预览流程；它不是四语言 v1 GA，也不改变同一 release train 的要求。
 
 ### ABI version
 
@@ -353,7 +355,7 @@ easycon_sdk-<version>.dist-info/
 
 ### 行为版本
 
-ECS grammar、Controller protocol normalization、Vision score 和 event schema 都有 conformance version。修复源码实现缺陷但改变可观察结果时，在 changelog 标注 compatibility note，并增加 fixture；不能只靠 SemVer 猜测。
+Runtime lifecycle、Controller protocol/`ActionSequence` normalization、Vision score 和 event schema 都有 conformance version。修复源码实现缺陷但改变可观察结果时，在 changelog 标注 compatibility note，并增加 fixture；不能只靠 SemVer 猜测。
 
 ## 10. 可重复构建与供应链
 

@@ -11,6 +11,7 @@
 - **保留**：用户可见语义或协议可作为 v1 兼容基线。
 - **迁移**：在 Rust 中重新实现，不复制原有线程、资源或错误处理方式。
 - **桥接**：由私有 C++ 层承载原生库调用，Rust 仍拥有状态和生命周期。
+- **延后**：保留为源码事实或 dormant workspace maintenance 的证据，不迁移为 v1 产品、公共 ABI 或语言 SDK。
 - **排除**：不进入 v1 产品、公共 ABI 或官方绑定。
 
 ## 2. 源码项目关系
@@ -51,7 +52,7 @@ flowchart LR
 | `ECKey.cs:12-19` + `NintendoSwitchPriv.cs:68-73` | `KeyStroke` 构造器接收 `time`，但字段总是 `DateTime.Now`，因此未来释放时间未保存 | 不作为兼容行为 | 修复。差分测试不能把此缺陷固化；序列时序以文档契约为准 |
 | `NintendoSwitchCmd.cs:83-107` | 同步命令通过临时接收处理器等待谓词匹配，默认 100 ms | Controller request/response lane | 迁移为每连接唯一的请求匹配器，禁止多个临时监听器争用相同字节流 |
 | `NintendoSwitchCmd.cs:232-271` | Amiibo 数据按 20 字节分包，ACK 失败时握手后重试；可切换索引 | Controller Amiibo operations | 保留分包/ACK 协议；长度、槽位由已验证设备能力约束 |
-| `GamePadAdapter.cs:13-68` | ECS 按键/摇杆动作映射到 `NintendoSwitch`；延时后再释放 | Automation Controller port | 迁移到 Rust 内部 trait，不形成跨 ABI 回调 |
+| `GamePadAdapter.cs:13-68` | ECS 按键/摇杆动作映射到 `NintendoSwitch`；延时后再释放 | ECS future evidence | 延后。v1 以直接 Controller 调用和 `ActionSequence` 替代，不形成跨 ABI 回调 |
 | `OperationRecords.cs` | 手工操作可转成 ECS 文本 | 无 | 排除 v1；不是 Controller 首批能力 |
 | `NintendoSwitchCmd.cs:130-230` 中固件、远端脚本、LED、配对和改色命令 | 与首批 Controller 能力无关 | 无 | 固件写入和远端脚本明确排除；其余不进入 v1 稳定 API |
 
@@ -75,34 +76,23 @@ Win32 或具体串口实现。
 Amiibo 物理容量以及 O-04 的 UART/USB/Switch 时序必须在 Phase 2B 用实物关闭；软件 fake 和内存
 transport 结果不得替代这些证据。
 
-## 4. Automation 映射
+## 4. `EasyCon.Script` 源码事实与延后处置
 
-| 源码组件与证据 | 已验证行为 | v1 归属 | 动作与约束 |
-| --- | --- | --- | --- |
-| `EasyCon.Script/Compilation.cs:22-60` | 创建编译时自动加载主文件旁 `lib/*.ecs`，解析并返回诊断；记录是否有按键和图像标签依赖 | `easycon-ecs::compiler` | 迁移。模块名排序后编译，消除目录枚举顺序的不确定性 |
-| `Syntax/Lexer.cs`、`Syntax/Parser*.cs`、`Binding/Binder.cs` | 完整管线为词法、语法、绑定、降低和解释执行 | `easycon-ecs` | 在 Rust 中重建，保留语言行为和诊断位置 |
-| `Binder.cs:44-119` | lib 与主脚本分阶段绑定；lib 函数对主脚本可见；lib 不能访问主脚本全局；全局语句最终组成 `$eval` | ECS 编译语义 | 保留并建立黄金测试 |
-| `Binder.cs:253-287` | `IMPORT` 被绑定为 NOP；实际可见库来自 `lib` 全量加载 | ECS 兼容加载器 | v1 保留这一现状，不擅自实现选择性导入 |
-| `Diagnostic.cs:6-29`、`Text/*` | 诊断区分 error/warning，携带文件、字符 span 和起止行 | `easycon-model::diagnostic` | 迁移并补齐起止列、稳定诊断码；中文消息不是机器判断依据 |
-| `Evaluator.cs:97-170` | 绑定树在单个执行流中解释；循环在每条已降低语句边界检查取消 | `easycon-ecs::evaluator` | 保留顺序语义；所有阻塞内建函数也必须可取消 |
-| `Evaluator.cs:328-359` | 按键和摇杆语句通过 `ICGamePad` 执行 | `AutomationPorts::Controller` | 迁移为内部 trait，由聚合核心实现 |
-| `Evaluator.cs:201-205` | `@标签` 在求值时调用外部 getter，得到整数 | `AutomationPorts::Vision` | 保留为 0..100 的整数匹配分；每次访问使用一个不可变帧快照 |
-| `BuiltInFuncs.cs` + `BuiltinCallable.cs` | WAIT/PRINT/ALERT/RAND/TIME/AMIIBO/BEEP/LEN/APPEND 为内建函数 | ECS runtime | 保留语法；PRINT/ALERT/BEEP 只生成事件，v1 不执行推送或 UI 副作用 |
-| `CustomSleep.cs:8-17` | 高精度 WAIT 先异步等待再自旋，并响应取消 | Runtime scheduler | 只保留精确且可取消的目标；统一使用 Rust 单调调度器 |
-| `GamePadAdapter.cs:13-25` | 点击等待被取消时，`Up` 不在 `finally` 中，可能留下按下状态 | Automation 清理协议 | 修复。运行终态必须在标记完成前发送中立报告并释放控制权 |
-| `Scripter.cs`、`EasyRunner.cs` | Core 只薄封装 ECS 编译和运行；`Assemble` 当前抛 `NotImplementedException` | `easycon-sdk` façade | 保留编译/运行编排；字节码接口排除 |
-| `Scripter.cs:17-26` | `Parse(code, fileName, ...)` 在 fileName 非空时重新从文件加载，忽略传入 code | ECS compile request | 不保留歧义；v1 明确区分 in-memory source bundle 与受限目录加载 |
-| Avalonia `ScriptService.cs:70-125` | 运行在后台任务，Stop 只请求取消，最终块调用设备 Reset | Automation operation | 将“取消后 Reset”提升为核心强制不变量，不依赖 UI 服务 |
-| CLI `Program.cs:102-199` | 命令行直接组合标签、采集、设备和 runner，说明这些能力可在无 UI 环境运行 | 共享核心用例 | 保留组合能力，不迁移 CLI 生命周期缺陷 |
-| `Runner/PyRunner.cs`、`Runner/LuaRunner.cs` | Python Runner 的键名未映射且取消未接通；Lua 仍为 TODO 示例 | 无 | 明确排除 v1 |
-| `Assembly/` 与固件服务 | 生成单片机字节码或固件 | 无 | 明确排除 v1 |
-| `ForeignFunction.cs` | 可注册调用方委托，但现有委托无取消和线程契约 | 无公共 v1 能力 | 不跨 C ABI 暴露自定义函数回调；以后单独设计 |
+`EasyCon.Script` 继续是本地只读源码事实：它包含 `.ecs` 的 source loading、lexer/parser/binder/evaluator、诊断、
+控制器/标签 adapter 和内建函数。该事实不等于 v1 迁移承诺。
 
-### ECS v1 语义边界
+| 源码组件与证据 | 已验证行为 | 当前处置 |
+| --- | --- | --- |
+| `EasyCon.Script/Compilation.cs:22-60`、`Syntax/*`、`Binding/*` | 加载 source 与 `lib/*.ecs`，编译、诊断并解释执行 | 延后为 `easycon-ecs` 及其现有 spec/fixture/conformance 的未来合同；不进入 v1 ABI 或语言 SDK |
+| `Binder.cs:44-119`、`Binder.cs:253-287` | lib/main 可见性和 `IMPORT` NOP | 延后为未来 ECS 语义证据，不迁移为 v1 行为 |
+| `Diagnostic.cs:6-29`、`Text/*` | 文件、span、行列与 error/warning | 延后为未来诊断合同；v1 不导出 ECS diagnostics |
+| `Evaluator.cs`、`GamePadAdapter.cs`、`CustomSleep.cs` | 解释器驱动控制器、标签、等待和取消清理 | 延后。v1 Controller 的中立化/取消和 `ActionSequence` 另由 Runtime/Controller 合同定义 |
+| `BuiltInFuncs.cs`、`BuiltinCallable.cs` | WAIT、PRINT、ALERT、RAND、TIME、AMIIBO、BEEP、LEN、APPEND | 仅作源码事实；不把该语言、其事件或等待模型公开为 v1 |
+| `Scripter.cs`、`EasyRunner.cs`、Avalonia `ScriptService.cs` | 应用层编译/执行封装和 stop/reset 路径 | 延后；`easycon-sdk` v1 只聚合 Runtime、Controller、Vision |
+| `Runner/PyRunner.cs`、`Runner/LuaRunner.cs`、`Assembly/`、`ForeignFunction.cs` | 语言 runner、字节码、固件和自定义回调 | 排除 v1 |
 
-**[已决定]** v1 支持当前源码已经进入编译/解释管线的 ECS 语言：变量/常量、整数/布尔/字符串/数组、表达式、IF、FOR、WHILE、BREAK/CONTINUE、函数、按键/摇杆、WAIT、Amiibo、标签读取和现有内建函数。
-
-**[推导]** `RAND` 接收可选 run seed；默认 seed 在运行开始事件中公开。`TIME` 使用运行开始后的单调毫秒数。这样既保留用途，又能重放测试。
+现有 ECS maintenance 资产继续参加仓库健康门禁，但不作为 v1 public ABI、共同语言 conformance、硬件/soak 或发布证据。
+未来恢复必须按 ADR-0023 重新决定产品范围、API/ABI、兼容性、资源/安全与测试成本。
 
 ## 5. Vision 映射
 
@@ -116,7 +106,7 @@ transport 结果不得替代这些证据。
 | `CVSearch.cs:21-88` | XY Sobel 平均和 Laplacian 预处理；Canny 有实现但没有进入启用列表及 Search 分支 | 私有桥接 | 迁移前两种；Canny 不进入 v1 稳定枚举 |
 | `OCRDetect.cs:5-30` | 默认 `chi_sim`、SingleLine；每次调用创建 TesseractEngine；数据路径固定为进程相对 `./Tessdata` | `easycon-vision::ocr` + 私有桥接 | 桥接；模型路径由 Runtime 配置，按语言缓存/池化引擎，不依赖当前工作目录 |
 | `ImgLabel.cs:10-129` | `.IL` 为 JSON，含算法、Base64 目标、搜索区和目标区；name/path 来自文件系统 | `easycon-vision::label` | 在 Rust 用结构化解析器迁移；标签不可变，名称和来源独立于当前目录 |
-| `ImgLabel.cs:159-202` | 标签搜索裁剪 ROI，图像模板匹配或 OCR，最终把分数乘 100 | Vision label evaluate | 保留 0..100 ECS 适配值；公共 Vision 结果使用 0.0..1.0 |
+| `ImgLabel.cs:159-202` | 标签搜索裁剪 ROI，图像模板匹配或 OCR，最终把分数乘 100 | Vision label evaluate | 公共 Vision 结果统一为 0.0..1.0；0..100 的 ECS adapter 仅保留为未来合同证据 |
 | `ECCore.cs:17-50` | 从多个 `ImgLabel` 目录加载 `.IL`，按名称去重并跳过后出现者 | label registry | 改为稳定排序和显式 duplicate diagnostic；默认重复名是编译/加载错误 |
 | `ImgLabelX.cs` | 对外只有名称可设置；核心字段私有；写入把 0xFF 当结束符，读取却先把下一字节当扩展标记 | 无 | `.ILX` 不具备可验证的稳定契约，v1 排除 |
 | `MatExtensions.cs` | 使用 ImageSharp 在 BGR/BGRA/Gray 与 PNG 间转换，失败时吞异常并返回空对象 | Vision image codec | OpenCV 编解码由桥接承担；错误必须显式传播，不允许空结果掩盖失败 |
@@ -125,7 +115,7 @@ transport 结果不得替代这些证据。
 
 ### Vision 兼容基线
 
-**[已决定]** `.IL`、三个归一化模板算法、XY/Laplacian 边缘模板、默认简体中文单行 OCR 和 ECS 的整数百分比分是 v1 基线。
+**[已决定]** `.IL`、三个归一化模板算法、XY/Laplacian 边缘模板、默认简体中文单行 OCR 和公共 Vision 的 0.0..1.0 归一化分数是 v1 基线。
 
 **[推导]** 公共 Vision API 不暴露 `Mat`、`Bitmap` 或 Tesseract 类型。帧、图像和标签都是核心拥有的不透明资源，跨 ABI 只给稳定元数据和显式复制/编码结果。
 
@@ -139,8 +129,8 @@ fail-closed experimental source；两者都不得从现有 Windows 源码推导�
 | 源码区域 | 事实 | v1 处理 |
 | --- | --- | --- |
 | `EasyCon.Core/ECCore.cs` | 静态便捷入口聚合设备、采集、算法和标签 | 由实例化 `Runtime` 取代，禁止进程全局可变状态 |
-| `EasyCon.Core/Scripter.cs` | 保存 runner 与外部 getter，未定义并发访问 | 由不可变 Program + 单次 Run operation 取代 |
-| `EasyCon.Core/ProjectManager.cs` | ZIP 工程编辑和文件写入职责 | 排除；v1 只接受显式源码 bundle 或受限目录加载 |
+| `EasyCon.Core/Scripter.cs` | 保存 runner 与外部 getter，未定义并发访问 | 延后为 ECS 未来证据；v1 不创建 Program 或 Run operation |
+| `EasyCon.Core/ProjectManager.cs` | ZIP 工程编辑和文件写入职责 | 排除；不进入 v1 产品 |
 | `EasyCon.Core/Config/*` | AppData 配置和网络推送 | 排除；SDK 只接受调用方传入的 options |
 | `EasyCon.Core/Assist/` (`AssistClient`) | 连接固定远程地址并发送消息 | 远程助手排除，不进入依赖图 |
 | `EasyCon2*` UI、WinInput | UI 状态、键盘映射、虚拟面板和对话框 | 全部排除；只能作为调用模式证据 |

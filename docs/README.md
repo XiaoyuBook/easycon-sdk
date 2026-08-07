@@ -22,7 +22,7 @@
 5. [语言绑定](architecture/language-bindings.md)：C++、.NET、Python、Node.js/TypeScript 的惯用接口与底层绑定。
 6. [构建、发布与合规](architecture/build-release.md)：首发平台、工具链、动态库布局、四类包和 GPL 边界。
 7. [测试策略](architecture/testing-strategy.md)：单元、ABI、一致性、差分、故障注入和硬件验收。
-8. [目标仓库与实施路线](architecture/repository-roadmap.md)：固定目录、阶段顺序、完成门槛和四语言任务拆分。
+8. [目标仓库与实施路线](architecture/repository-roadmap.md)：四阶段产品路线、完成门槛、C++ 优先与四语言任务拆分。
 9. [Phase 2B faults runner 所有权设计](development/phase2b-fault-runner.md)：资格 CLI 的单 owner、失败收口、
    动态 cleanup contract 和无硬件 failpoint 测试边界。
 10. [Phase 2B Controller close 中立化证据设计](development/phase2b-controller-cleanup-evidence.md)：
@@ -73,77 +73,38 @@
 - [ADR-0020：冻结 Controller 结算的 Runtime 前置合同（Accepted / Effective）](decisions/0020-controller-settlement-runtime-prerequisites.md)
 - [ADR-0021：冻结 Phase 4 C1 Windows high-resolution file-identity foundation 前置合同（Accepted / Effective）](decisions/0021-phase-4-c1-windows-loader-handle-identity-dependency.md)
 - [ADR-0022：Windows Workspace policy identity 与 evidence v2 合同（Accepted / Effective）](decisions/0022-windows-workspace-policy-identity-and-evidence-v2.md)
+- [ADR-0023：v1 宿主语言 SDK 路线与 ECS 延后（Accepted / Effective）](decisions/0023-v1-host-language-sdk-roadmap-and-ecs-deferral.md)
 
 ## v1 固定范围
 
 | 能力域 | v1 包含 | v1 明确排除 |
 | --- | --- | --- |
 | Controller | 设备发现/连接、按键、方向键、双摇杆、Amiibo、精确动作序列 | 固件字节码、烧录、远端启动/停止、操作录制、键鼠映射 |
-| Automation | ECS 编译、不可变程序、运行、停止、状态、诊断、日志和事件 | Python/Lua Runner、自定义语言回调、工程编辑器、推送副作用 |
 | Vision | 采集、最新帧截图、`.IL` 图像标签、模板匹配、OCR、HSV 颜色检测 | UI 搜图控制台、未完成的 `.ILX` 契约、未接通的旧像素匹配算法 |
-| 产品外壳 | C++、.NET、Python、Node.js/TypeScript SDK | 浏览器、独立服务进程、UI、配置界面、远程助手 |
+| Runtime 与产品外壳 | operation、事件、所有权、取消、deadline、close；C++、.NET、Python、Node.js/TypeScript SDK | ECS/Automation、浏览器、独立服务进程、UI、配置界面、远程助手 |
 
 ## 当前实施状态
 
-Phase 1 Runtime 已按 [ADR-0007](decisions/0007-phase-1-freeze.md) 冻结在可执行基线 `4261925`。
-Phase 2A Controller/Serial Candidate 已按 [ADR-0009](decisions/0009-phase-2a-freeze.md) 冻结：Windows x64
-system serial leaf、可注入 byte I/O、CH32 模拟器、Amiibo save/select、10,000-step VirtualClock 验收和
-软件热路径 latency harness 均已实现。详细证据和本地命令见
-[Runtime + Controller Phase 2A Candidate](development/runtime-controller-vertical-slice.md)。
+v1 路线由 [ADR-0023](decisions/0023-v1-host-language-sdk-roadmap-and-ecs-deferral.md) 固定为四个产品阶段：
 
-Phase 2B 的资格软件候选已按 [ADR-0011](decisions/0011-phase-2b-qualification-software-candidate-freeze.md) 冻结，
-包括设备身份接纳、持久 evidence transaction、operator/Ctrl+C、Amiibo 写前安全、telemetry 投影和五类 checkpoint。
-复审后的精确实现基线为 `bbebaf458a0f2c0d60f3de6169f0eecfe8ef9fd0`，tree 为
-`020635276554be62d77ef26f8ab9f5bb8237e8ca`；旧候选 `10742b6f28ed17ab429c7e365d520a5f54cff543`
-已被取代。新独立 reviewer 的 13/13 软件门禁通过，根 workspace 157 个测试、hardware workspace 164 个纯软件
-测试通过，且没有新的直接相关、可复现且 in-scope 的 P0/P1/P2。根门禁中的一次 Windows SetupAPI discovery
-只是 ADR-0009 固定的只读 OS conformance，不打开或写入串口，也不构成硬件资格证据。
-当前仍明确标记 `Hardware Unverified`：没有冻结任何具体板型/固件、Amiibo 容量、UART/USB/Switch 时序或完整
-物理中立化能力；O-01、O-02、O-04 保持开放，完整 Phase 2 未完成，也没有创建完整 Phase 2 冻结 ADR。
+1. Runtime、Controller、Vision 核心收口。
+2. 公共 C ABI 与 canonical native bundle。
+3. C++、.NET、Python、Node.js/TypeScript SDK，其中 C++ 优先形成可用候选。
+4. 打包、真实硬件、ABI、供应链与发布资格。
 
-Phase 3 私有 Vision 跨平台源码候选在旧候选 `76436de` 因 NativePool admission P2 被重开后，已按
-[ADR-0014](decisions/0014-phase-3-native-pool-admission-refreeze.md) 以 implementation
-`27444f16d0625a7ab7e4e1543736c7c3c225ce8a`、tree `334a3fb21bf4d6ca55e0bcbe3e2daa6e675b3194`
-重新冻结；[ADR-0013](decisions/0013-phase-3-vision-cross-platform-source-candidate-freeze.md) 保留历史原文。
-Windows software/native gates 已通过，capture hardware 保持
-`Hardware Unverified`；Linux x64 保持 `Candidate / Build Unverified`；macOS Apple Silicon arm64 保持
-`Experimental Source Candidate / Build Unverified / Hardware Unverified / Not Shipped`。该冻结不包含 public
-C ABI、Phase 4、Controller serial、四语言、package 或完整跨平台 SDK 支持。
+当前处于第一阶段的软件核心收口。Runtime 的通用修复候选仍须独立固定 SHA 审查；Controller settlement 尚未完成；
+Vision 已有源码候选，但真实硬件未验证。前三个产品阶段尚未全部完成，C++ SDK 尚未进入实施，C++ 可用候选也不等于
+四语言 GA。
 
-[ADR-0016](decisions/0016-phase-3-downstream-reopen-boundary.md) 现以 `Refrozen Governance Boundary` 状态接受：
-准备增加 Phase 4 按 ADR-0014 的现行字面规则确实重新打开该候选，本次 refreeze 已闭合该治理 reopen。从本次
-refreeze 之后，纯下游阶段增加本身不再自动重开 Phase 3，只有实际改变其冻结面时才重开。Phase 3 的同一
-implementation/tree 与平台状态保持不变；该治理决定本身不授权 Phase 4 target 或实现。
-
-[ADR-0017](decisions/0017-phase-4-ecs-automation-target.md) 现已作为
-`Accepted / Frozen Phase 4 ECS/Automation Target` 生效，固定接受候选为 `fa265dff`。该 target 冻结
-ECS/Automation 的 ownership、产品语义、ProgramHash/PCG golden、`EcsLimitsV1`、抽象 ports、Runtime 窄重开和
-安全实施 DAG。
-
-治理链从 G0a/design base `38ef0dc` 依次经过初始 proposal `6468da5`、第一轮修订 `9983d42` 与第二轮修订
-`fa265dff`；最终独立 full review 任务 `019f9348-1fb0-7130-86b6-57d69a0db31c` 结论为 `APPROVE`，
-P0/P1/P2=`0/0/0`。`main` 已在实现基线 `87544d9` 完成并合入 W0 与 S0：W0 只建立零依赖、可编译的
-`easycon-ecs` workspace 骨架，S0 只建立 11 条自包含 provenance records、33 个 SDK-local artifacts 及静态
-validator。[ADR-0018](decisions/0018-phase-2a-controller-lease-reopen.md) 已接受 Phase 5 Controller D0
-窄重开合同，但 D1/D2 尚未形成已接受实现；[ADR-0019](decisions/0019-phase-4-c1-lexer-contract.md) 已接受并冻结
-C1 lexer 合同，固定接受候选为 `e4b12b5`，独立 full review 任务
-`019fb40a-ef77-7f12-8075-885be6a0e917` 结论为 `APPROVE`、P0/P1/P2=`0/0/0`。C1 实现现已获授权但尚未形成
-implementation candidate。[ADR-0020](decisions/0020-controller-settlement-runtime-prerequisites.md) 现已
-`Accepted / Effective`，固定接受候选为 `a617e084`；它冻结 Runtime-only R0-v2 对 D1 的前置合同，并只解锁 R0-v2
-作为下一独立实现节点。R0-v2 implementation candidate、Phase 1 refreeze、D1 Controller/serial 集成与 D2 均尚未完成；
-D1 保持暂停并保留现有四条 RED，C1 的独立授权不变。
-[ADR-0021](decisions/0021-phase-4-c1-windows-loader-handle-identity-dependency.md) 现已
-`Accepted / Effective`，固定接受候选为 `ff109565`；独立 Sol Ultra review 任务
-`019fb4f5-362b-7003-8415-0eacd208341f` 结论为 `APPROVE`、P0/P1/P2=`0/0/0`。它冻结把现有
-qualification-private `FILE_ID_INFO` leaf 迁移为唯一共享 root safe foundation 的前置合同，并只解锁 F0 作为下一
-独立实现节点。F0 stable assertions、dependency admission、扩展后的 guards、root/hardware 两套完整门禁、fixed-SHA
-review 与单独 refreeze 尚未完成；此前 C1 继续暂停，W0/root workspace 合同继续有效。这些进展不代表 Phase 4 实现、
-硬件、支持或发布完成。
+现有 ECS spec、fixture、conformance、validator、guards 和 `easycon-ecs` crate 继续是 dormant workspace maintenance
+资产：现有健康门禁继续维护它们，但它们不属于 v1 public ABI、语言 SDK 的共同验收、硬件/soak 或发布资格。ADR-0017、
+ADR-0019 和 ADR-0021 保留为历史/未来 ECS 合同；ADR-0018、ADR-0020 中通用 Runtime/Controller 正确性仍可服务第一阶段，
+但其 ECS 专属 DAG 不定义 v1 产品路线。
 
 ## 首发基线
 
 - **[已决定]** Windows 10/11 x64 是 v1 Tier 1，v1.0 GA 目标三元组为 `x86_64-pc-windows-msvc`。
-- **[已决定]** Linux x64 是 v1 正式目标方向；Phase 3 只形成 Vision build candidate，serial、硬件、四语言包
+- **[已决定]** Linux x64 是 v1 正式目标方向；当前只形成 Vision build candidate，serial、硬件、四语言包
   和发布门禁完成前保持 Candidate/Unverified。
 - **[已决定]** macOS 只形成 Apple Silicon arm64 `Experimental Source Candidate / Build Unverified /
   Hardware Unverified / Not Shipped`；不承诺 Intel 或 universal binary。

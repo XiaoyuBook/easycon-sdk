@@ -4,7 +4,7 @@
 
 测试体系要证明三件事：
 
-1. Rust 共享核心对协议、ECS 和 Vision 的行为正确且资源可控。
+1. Rust 共享核心对 Runtime、Controller 协议和 Vision 的行为正确且资源可控。
 2. C ABI 在旧/新调用方、异常、并发和错误条件下仍兼容。
 3. C++、.NET、Python、Node.js/TypeScript 只是同一语义的惯用表达，不产生语言分叉。
 
@@ -21,16 +21,15 @@ spec/
 ├── conformance/            # 四语言共同场景
 ├── fixtures/
 │   ├── controller/         # report/协议字节和时序
-│   ├── ecs/                # source bundle、诊断、输出 trace
+│   ├── ecs/                # dormant ECS maintenance assets，非 v1 product corpus
 │   └── vision/             # 无版权争议的图像、标签和期望结果
 └── schemas/                # fixture/schema 版本
 ```
 
 fixture 必须自包含、可审阅且注明来源。`EasyCon/` 只用于本地形成候选差分结果，不能成为 CI input。
 
-Phase 4 S0 已在 `main` 基线 `87544d9` 登记 11 条自包含 ECS provenance records 和 33 个 SDK-local artifacts，
-并由静态 validator 校验 schema、分类、来源与 hash。它们是后续 C1/E1 的输入证据，不是 parser/evaluator 的
-可执行 conformance 通过结论；R0 也仍未独立 review/refreeze。
+现有 ECS spec、fixture、conformance、validator 和 guards 是 dormant workspace maintenance 资产。它们继续参加现有
+仓库健康门禁，但不是 v1 Runtime/Controller/Vision conformance、ABI、语言、硬件或 release evidence，也不声明 ECS 已发布。
 
 ## 3. 确定性测试后端
 
@@ -59,10 +58,6 @@ Phase 4 S0 已在 `main` 基线 `87544d9` 登记 11 条自包含 ECS provenance 
 - 确定性的 match/OCR/color result；
 - owned handle 计数与故意失败点。
 
-### RecordingPorts
-
-ECS 的 ControllerPort、VisionPort、OutputPort 记录按顺序的 typed call，可注入 cancel 和 runtime error。这样 parser/evaluator 测试不需要硬件或 native 库。
-
 所有 fake 都只能存在于 test/support crate，不进入 release features。
 
 ## 4. Rust 单元与模型测试
@@ -76,7 +71,7 @@ ECS 的 ControllerPort、VisionPort、OutputPort 记录按顺序的 typed call�
 ### `easycon-runtime`
 
 - Operation 每条合法/非法状态转换；终态单次提交；cancel 与 success 竞态；
-- wait timeout 与 operation deadline 分离；
+- event read/observation timeout 与 operation deadline 分离；
 - parent cancellation tree；task supervisor 无脱管任务；
 - event filter、sequence、reserved capacity、gap 合并和 drain；
 - Runtime explicit close 的逐步顺序、保存的 Closed/CloseFailed outcome、幂等和并发 waiter；
@@ -106,23 +101,12 @@ Rust、Cargo、behavior 或 conformance 提交都必须在普通 workspace tests
 - 20 字节 Amiibo 分包、重试、断线和 cancel；
 - direct state、reset、组合方向、冲突输入和中立报告；
 - precise sequence 同 offset 合并、最小 30 ms、无早发、取消中立化；
-- Automation lease 和 direct command 的 busy 规则。
-
-### `easycon-ecs`
-
-- lexer/parser/binder/lowerer/evaluator 分层测试；
-- CRLF/LF、UTF-8 中文、空文件、坏 token、span/行列；
-- lib 独立作用域、函数可见性、全局语句、`IMPORT` NOP 兼容；
-- 类型、数组/切片、函数/返回、循环和 BREAK/CONTINUE；
-- 按键、摇杆、WAIT、AMIIBO、label getter 和全部内建函数；
-- deterministic RAND seed、monotonic TIME、输出顺序；
-- 每个可阻塞点 cancel，终态 cleanup；
-- parser/evaluator fuzz 和有界资源测试。
+- Controller lease、direct command busy 与 `ActionSequence` 的 busy/取消/中立化规则。
 
 ### `easycon-vision`
 
 - `.IL` legacy JSON 的合法/非法/未知字段/重复名/超限 corpus；
-- ROI 边界、target 大于 range、分数 0.0..1.0 和 ECS 0..100 转换；
+- ROI 边界、target 大于 range 和分数 0.0..1.0；
 - Frame immutable/reference 生命周期；latest slot 并发替换；
 - snapshot 首帧等待、deadline、capture fault；
 - HSV hue wrap、空 ROI、阈值、ratio/count/bounding box；
@@ -132,10 +116,10 @@ Rust、Cargo、behavior 或 conformance 提交都必须在普通 workspace tests
 ### `easycon-sdk`
 
 - 跨域依赖检查和资源 admission；
-- 每 Runtime 单 run；Program dependency validation；
-- run success/failure/cancel 三条路径都先中立化再终态；
+- Runtime、Controller、Vision 的聚合不连接 ECS port；
+- Controller `ActionSequence` 的 success/failure/cancel 都先结算 stream 与中立化再终态；
 - Runtime close 按 Runtime-local `ResourceId` 顺序执行 resource callback，再 join task、收尾 operation、
-  检查 registry 并发布最终事件；跨域中立化和 lease 释放属于各 owner 的 cleanup，不依赖硬编码类型顺序。
+  检查 registry 并发布最终事件；中立化和 lease 释放属于各 owner 的 cleanup，不依赖硬编码类型顺序。
 
 单元覆盖门槛：共享 Rust 业务 crates 行覆盖 ≥85%、分支覆盖 ≥80%；关键状态转换和 unsafe wrapper 要求 100% 语义分支覆盖。覆盖率只是下限，不替代竞态/故障测试。
 
@@ -203,7 +187,7 @@ BackendUnavailable，不能以空 discovery/profile/frame success 通过测试�
 
 - 每种 handle create/clone/release/parent-close 路径；NULL release；类型/Runtime 混用；
 - Buffer/Event/Error/Result 的 accessor 生命周期；
-- Operation wait/cancel/result 竞态；多个 waiter；
+- Operation state/cancel/result 竞态；多个观察者；
 - subscription 单 reader 约束、timeout、gap、closed；
 - 强制 Rust panic 和 C++ exception，验证 status/error/event 与无跨边界 unwind；普通可恢复失败资源回基线，
   close callback 无法确认释放时提交保存的 `CloseFailed` outcome，并保留非零诊断注册直到 owner 实际
@@ -220,10 +204,8 @@ use-after-release 和同一 raw handle 与 release 并发属于 C 调用方未�
 ### Exact compatibility
 
 - report bytes、按钮/HAT/摇杆数值；
-- ECS token/parse/bind/evaluate 的已支持语义；
-- lib scope 和 `IMPORT` NOP；
 - `.IL` 字段、ROI 和启用模板算法；
-- ECS label 整数百分分数。
+- Vision 0.0..1.0 分数、位置、文本和颜色统计。
 
 这些 case 的 normalized result 必须与 EasyCon 当前实现一致，除非先批准兼容变更 ADR。
 
@@ -235,13 +217,14 @@ use-after-release 和同一 raw handle 与 release 并发属于 C 调用方未�
 - ACK listener 竞争；
 - 图像错误被吞成空结果；
 - `.ILX` 读写不自洽和未接通旧像素算法。
-- ALERT/BEEP 的应用副作用在 SDK 中改为 typed event；网络推送和 UI/系统提示不属于 v1。
+- Controller 取消后可能跳过 release，必须由 sequence cleanup 中立化；网络推送和 UI/系统提示不属于 v1。
 
 这些 case 保存“源码观察结果 + v1 规范结果 + 修正理由”，新核心只断言规范结果。
 
 ### Excluded behavior
 
-Python/Lua Runner、字节码/固件、远端控制、配置/推送、UI/键鼠、工程编辑不建立差分 harness。
+ECS/Automation、Python/Lua Runner、字节码/固件、远端控制、配置/推送、UI/键鼠、工程编辑不建立 v1 product 差分 harness。
+现有 ECS corpus 继续按 dormant maintenance 规则维护，不转换成 v1 release evidence。
 
 本地可选参考流程可在忽略的 `.tools/reference-easycon/` 使用 EasyCon 源码生成候选 trace 到 `artifacts/`；人工核对后只把最小 fixture/expected trace 纳入 `spec/`。CI 和 release 不读取 `.tools/` 或 `EasyCon/`。
 
@@ -255,10 +238,10 @@ Python/Lua Runner、字节码/固件、远端控制、配置/推送、UI/键鼠�
 2. 发现两个 fake device，连接 fallback、断线、重连由调用方发起。
 3. direct button/HAT/stick/reset 和 precise sequence trace。
 4. Amiibo save/select 的 success、ACK timeout、cancel。
-5. ECS valid/invalid compile，完整 diagnostics；run success/failure/stop、logs/events。
+5. Controller `ActionSequence` 的 success/failure/cancel、精确时间线和中立化。
 6. synthetic capture、snapshot、Frame metadata/encode。
 7. `.IL` load、template、OCR、color 的共同 result。
-8. wait timeout 不取消；语言 cancel 映射到 native Cancelled。
+8. event read timeout 不取消；语言 cancel 映射到 native Cancelled。
 9. queue overflow gap 和状态恢复查询。
 10. 显式 dispose/context exit 后资源/task/handle 计数为零。
 
@@ -289,7 +272,7 @@ Python/Lua Runner、字节码/固件、远端控制、配置/推送、UI/键鼠�
 | Serial | access denied、partial write、read timeout、hot unplug | operation Failed/Cancelled，Controller 明确状态 |
 | Protocol | wrong hello、busy、late/duplicate ACK | 不串请求，重试有界，正确 error |
 | Scheduler | cancel 与 deadline 同 tick、clock jump fake | 单一终态、单调规则不破坏 |
-| Automation | parser limit、infinite loop cancel、Vision error | diagnostics/运行错误，最终中立化 |
+| ActionSequence | step limit、取消、transport failure、close | 唯一终态、stream settlement 与中立化 |
 | Capture | no first frame、corrupt frame、read stuck、close | NO_FRAME/fault，可中断并 join |
 | Vision | invalid ROI、huge image、missing OCR model、native exception | 参数/模型/native 错误，无空成功 |
 | Events | 消费者停读、容量 1、terminal burst | gap + 可查询终态，生产者不阻塞 |
@@ -374,11 +357,11 @@ SLO 在专用、固定电源策略的测试机测量；O-04 依据首轮数据�
 - 1920x1080/30 FPS 仅在设备协商成功时宣称；实际格式写入 open result；
 - 拔卡后在协议期限内进入 Faulted，close 在 2 秒内完成；
 - 截图与已知帧色彩/尺寸一致；模板/OCR/颜色 fixture 通过；
-- capture + OCR + Automation 并发压力下 Controller 时序仍满足 SLO。
+- capture + OCR + Controller `ActionSequence` 并发压力下 Controller 时序仍满足 SLO。
 
 ### 长稳
 
-- 24 小时 ECS + capture + periodic Vision run；
+- 24 小时 Controller `ActionSequence` + capture + periodic Vision operation；
 - 10,000 次 Runtime/Controller/Capture create-close soak；
 - queue overflow、日志风暴和反复 cancel；
 - working set、handle、thread、native allocation 回归阈值由首个 Beta 建立，后续不得无解释上升。
