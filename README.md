@@ -8,9 +8,9 @@ EasyCon SDK 是基于 EasyCon 源码进行二次开发的多语言 SDK 项目，
 Runtime、Controller、Vision 核心收口；公共 C ABI 与 canonical native bundle；各语言 SDK；以及打包、真实硬件、ABI、
 供应链与发布资格。
 
-当前位于第一阶段的软件核心收口。Runtime 的通用修复候选仍需要独立的固定 SHA 审查；Controller settlement 尚未完成；
-Vision 已有源码候选，但 capture hardware 仍未验证。前三个产品阶段尚未全部完成，尚无稳定 public C ABI 或任一语言 SDK
-候选。C++ 会在第一、第二阶段完成后优先进入第三阶段；其可用候选也不等于四语言 v1 GA。
+当前位于第一阶段的软件核心收口。Runtime 的通用修复已完成 fixed-SHA review、集成和 R0-v2 refreeze；Controller
+settlement 是下一项软件缺口；Vision 已有源码候选，但 capture hardware 仍未验证。当前产品第一阶段仍未完成，尚无稳定
+public C ABI 或任一语言 SDK 候选。C++ 会在第一、第二阶段完成后优先进入第三阶段；其可用候选也不等于四语言 v1 GA。
 
 现有 `easycon-ecs`、ECS spec、fixture、conformance、validator 和 guards 保留为 dormant workspace maintenance 资产。
 它们继续参加仓库健康门禁，但不是 v1 public ABI、四语言共同验收、真实硬件、soak 或发布的前置。ADR-0017、ADR-0019

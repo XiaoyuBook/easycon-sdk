@@ -77,6 +77,7 @@
 - [ADR-0021：冻结 Phase 4 C1 Windows high-resolution file-identity foundation 前置合同（Accepted / Effective）](decisions/0021-phase-4-c1-windows-loader-handle-identity-dependency.md)
 - [ADR-0022：Windows Workspace policy identity 与 evidence v2 合同（Accepted / Effective）](decisions/0022-windows-workspace-policy-identity-and-evidence-v2.md)
 - [ADR-0023：v1 宿主语言 SDK 路线与 ECS 延后（Accepted / Effective）](decisions/0023-v1-host-language-sdk-roadmap-and-ecs-deferral.md)
+- [ADR-0024：重新冻结 Runtime R0-v2 实现基线（Refrozen Runtime Implementation / Effective）](decisions/0024-runtime-r0-v2-refreeze.md)
 
 ## v1 固定范围
 
@@ -95,9 +96,9 @@ v1 路线由 [ADR-0023](decisions/0023-v1-host-language-sdk-roadmap-and-ecs-defe
 3. C++、.NET、Python、Node.js/TypeScript SDK，其中 C++ 优先形成可用候选。
 4. 打包、真实硬件、ABI、供应链与发布资格。
 
-当前处于第一阶段的软件核心收口。Runtime 的通用修复候选仍须独立固定 SHA 审查；Controller settlement 尚未完成；
-Vision 已有源码候选，但真实硬件未验证。前三个产品阶段尚未全部完成，C++ SDK 尚未进入实施，C++ 可用候选也不等于
-四语言 GA。
+当前处于第一阶段的软件核心收口。Runtime 的通用修复已完成 fixed-SHA review、集成和 R0-v2 refreeze；Controller
+settlement 是下一项软件缺口；Vision 已有源码候选，但真实硬件仍未验证。当前产品第一阶段仍未完成，C++ SDK 尚未进入实施，
+C++ 可用候选也不等于四语言 GA。
 
 现有 ECS spec、fixture、conformance、validator、guards 和 `easycon-ecs` crate 继续是 dormant workspace maintenance
 资产：现有健康门禁继续维护它们，但它们不属于 v1 public ABI、语言 SDK 的共同验收、硬件/soak 或发布资格。ADR-0017、

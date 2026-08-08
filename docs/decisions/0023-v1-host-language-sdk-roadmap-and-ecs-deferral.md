@@ -74,6 +74,18 @@ ADR-0017、ADR-0019 和 ADR-0021 保持原文及其已审查的历史/未来 ECS
 - 不把 Python/Lua runner、字节码、固件、UI、工程编辑器、远程服务或自定义回调纳入 v1。
 - 不改变 `EasyCon/` 的只读参考源码边界，也不以它作为构建、CI 或发布输入。
 
+## 后续状态与关系说明
+
+本 ADR 中的“当前状态”是本决定于 2026-08-07 生效时的事实快照，保留原文，不以之后的实现进度倒写。现行状态由
+文档索引、[实施路线](../architecture/repository-roadmap.md) 与后续 ADR 推进；其中
+[ADR-0024](0024-runtime-r0-v2-refreeze.md) 记录了 Runtime R0-v2 的独立 Phase 1 refreeze 及其仅限 Runtime
+前置的关闭结论。
+
+该后续 refreeze 允许恢复 ADR-0020 所述的 D1 Controller 工作，但不使任何 D1 RED 自动通过，也不关闭本 ADR 的当前产品
+第一阶段：Controller settlement 仍未完成，Vision hardware 仍为 unverified。四个产品阶段、ECS dormant workspace
+maintenance、C++ first、`operation_wait` 的观察语义、独立 workflow delay/sleep API 的排除、`ActionSequence` 的成功/失败
+边界，以及 public ABI、binding、package、hardware 和 release 的后续门槛均保持不变。
+
 ## 关联
 
 - [目标仓库与实施路线](../architecture/repository-roadmap.md)
