@@ -22,6 +22,7 @@ spec/
 ├── fixtures/
 │   ├── controller/         # report/协议字节和时序
 │   ├── ecs/                # dormant ECS maintenance assets，非 v1 product corpus
+│   ├── runtime/            # deadline、terminal cleanup 与 close-owner 投影
 │   └── vision/             # 无版权争议的图像、标签和期望结果
 └── schemas/                # fixture/schema 版本
 ```
@@ -72,23 +73,35 @@ fixture 必须自包含、可审阅且注明来源。`EasyCon/` 只用于本地�
 
 - Operation 每条合法/非法状态转换；终态单次提交；cancel 与 success 竞态；
 - event read/observation timeout 与 operation deadline 分离；
+- generic deadline registration 的 already-due、SystemClock 独立进展、VirtualClock advance-only/同点 ID 顺序，
+  以及 fire/disarm/drop/close/stale-entry exactly-once；断言不分配 OperationId、不发 operation event、不改变公开 counts；
 - parent cancellation tree；task supervisor 无脱管任务；
 - event filter、sequence、reserved capacity、gap 合并和 drain；
 - Runtime explicit close 的逐步顺序、保存的 Closed/CloseFailed outcome、幂等和并发 waiter；
 - final owning Drop 只拒绝 admission/请求根取消，不执行 callback、join、finalizer 或最终事件；
 - supervised spawn 自动 owner binding、共享完成/JoinHandle ownership、真实 thread join/unregister，以及
   task 内 close 的 pre-state rejection；
-- operation terminal transaction 在 cleanup/event/registry 故障下仍注销并通知全部 waiter；
+- two-phase terminal arbiter 对 outstanding work 只记录 immutable cancellation intent；合法 owner 必须用互斥 settlement
+  evidence claim，accepted claim 到 commit 之间的 late cancellation 不改 winner，非 owner/evidence mismatch 被拒绝；
+- Success、Failure、Requested、Deadline、ParentClose 五路分别覆盖 cleanup Ok/Err/panic；cleanup 与 settlement observer
+  在锁外运行，commit/event/unlink/notify 各一次，竞争 caller 观察同一 completion；
+- close 只在 pre-held transferable owner、原 owner task 已 join 且共享 evidence 完整时一次 handoff；task panic 后仍先
+  settlement 再保存 TaskJoin failure。没有 transfer/evidence 时 CloseFailed 保留非终态、registry 和 waiter，且无
+  terminal/event/unlink/notify；
+- resource failure 后 deadline worker 必须继续服务到 external owner join；之后才 drain `RuntimeClosed`、join internal
+  worker 并检查 registry；
+- legacy operation terminal transaction 在 cleanup/event/registry 故障下仍注销并通知全部 waiter；
 - cancellation hook 调用、未触发 hook capture 析构和 panic payload 析构逐项隔离；capture 析构重入
   operation 查询不持有 operation/hooks/children 锁，poisoned synchronization state 可恢复；
-- 用 Loom 模型覆盖 parent terminal/child admission、hook panic/child propagation、supervised task
-  self-wait、hook capture 析构重入和 terminal commit/registry unlink/waiter notify。模型命令是
-  Phase 1 正式门禁。
+- 用 Loom 模型覆盖 parent terminal/child admission、hook panic/child propagation、supervised task self-wait、hook
+  capture 析构重入、terminal commit/registry unlink/waiter notify、deadline fire/disarm/close exactly-once、intent
+  不抢 claim、accepted claim 对 late cancellation 稳定、claim/commit 唯一，以及 handoff 的 join/pre-held 条件。
+  模型命令是 Phase 1 正式门禁。
 
 Phase 1 的正式模型入口是 `python tools/run_runtime_models.py`。它以 test-only `runtime-model`
 feature 执行独立的 `loom_runtime` target 并强制单 harness thread。模型直接调用 production 使用的
-child admission、cancellation tree、panic isolation、task owner rejection、task lifecycle 和
-unlink-before-notify 并发内核，而不是复制测试私有状态机。task 模型只能通过与 production 相同的
+child admission、cancellation tree、panic isolation、task owner rejection、task lifecycle、deadline resolution、
+terminal arbiter 和 unlink-before-notify 并发内核，而不是复制测试私有状态机。task 模型只能通过与 production 相同的
 owner/handle 安装、body outcome、真实 thread join、panic diagnostic 持久化和 registry unlink 转换推进；
 Loom 枚举内核同步交错，不使用随机 sleep。`runtime-model` 默认关闭，不进入普通 release API。任何 Runtime
 Rust、Cargo、behavior 或 conformance 提交都必须在普通 workspace tests 之后单独运行该入口。
@@ -275,10 +288,10 @@ ECS/Automation、Python/Lua Runner、字节码/固件、远端控制、配置/�
 
 | 层 | 故障 | 必须观察到 |
 | --- | --- | --- |
-| Runtime | executor admission failure、queue full、close/Drop race、resource/task panic | 保存的 CloseFailed 或 stable error/gap，无脱管 task、无伪造 operation 终态 |
+| Runtime | executor admission failure、queue full、close/Drop race、resource/task panic、settlement owner/evidence 丢失 | 保存的 CloseFailed 或 stable error/gap；合法 transferable owner 先 settlement，无 owner/evidence 时保留非终态/registry/waiter，无脱管 task 或伪造终态 |
 | Serial | access denied、partial write、read timeout、hot unplug | operation Failed/Cancelled，Controller 明确状态 |
 | Protocol | wrong hello、busy、late/duplicate ACK | 不串请求，重试有界，正确 error |
-| Scheduler | cancel 与 deadline 同 tick、clock jump fake | 单一终态、单调规则不破坏 |
+| Scheduler | cancel 与 deadline 同 tick、clock jump fake、deadline fire/disarm/close race | 单一 terminal winner；generic signal 只解析一次，同点按 registration ID，单调规则不破坏 |
 | ActionSequence | step limit、取消、transport failure、close | 唯一终态、stream settlement 与中立化 |
 | Capture | no first frame、corrupt frame、read stuck、close | NO_FRAME/fault，可中断并 join |
 | Vision | invalid ROI、huge image、missing OCR model、native exception | 参数/模型/native 错误，无空成功 |

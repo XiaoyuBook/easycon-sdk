@@ -4,10 +4,13 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use easycon_runtime::runtime_model::{
-    CancellationNode, TaskLifecycleState, TaskOwnerBinding, admit_child_while_locked,
-    cancellation_admission_open, claim_cancellation, invoke_isolated, runtime_close_rejected,
-    seal_cancelled_tree, seal_deactivated_tree, task_join_rejected, unlink_then_notify,
+    CancellationNode, DeadlineResolutionState, TaskLifecycleState, TaskOwnerBinding,
+    TerminalArbiterState, TerminalClaimResult, TerminalEvidenceKind, TerminalWinnerKind,
+    admit_child_while_locked, cancellation_admission_open, claim_cancellation, invoke_isolated,
+    runtime_close_rejected, seal_cancelled_tree, seal_deactivated_tree, task_join_rejected,
+    unlink_then_notify,
 };
+use easycon_runtime::{DeadlineOutcome, DeadlineResolution};
 use loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use loom::sync::{Arc, Condvar, Mutex};
 use loom::thread;
@@ -480,5 +483,216 @@ fn terminal_commit_unlinks_registry_before_waiter_notification() {
             terminal.join().expect("terminal transaction");
             assert!(waiter.join().expect("terminal waiter"));
         });
+    });
+}
+
+#[test]
+fn deadline_fire_disarm_and_close_resolve_exactly_once() {
+    loom::model(|| {
+        let state = Arc::new(Mutex::new(DeadlineResolutionState::armed()));
+        let wins = Arc::new(AtomicUsize::new(0));
+        let workers: Vec<_> = [
+            DeadlineResolution::Fired,
+            DeadlineResolution::Disarmed,
+            DeadlineResolution::RuntimeClosed,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, resolution)| {
+            let state = Arc::clone(&state);
+            let wins = Arc::clone(&wins);
+            thread::spawn(move || {
+                if state
+                    .lock()
+                    .expect("deadline resolution")
+                    .resolve(DeadlineOutcome {
+                        resolution,
+                        order: u64::try_from(index + 1).expect("model order"),
+                    })
+                {
+                    wins.fetch_add(1, Ordering::AcqRel);
+                }
+            })
+        })
+        .collect();
+        for worker in workers {
+            worker.join().expect("deadline resolver");
+        }
+
+        assert_eq!(wins.load(Ordering::Acquire), 1);
+        assert!(
+            state
+                .lock()
+                .expect("deadline resolution")
+                .outcome()
+                .is_some()
+        );
+    });
+}
+
+#[test]
+fn cancellation_intent_does_not_claim_before_accepted_evidence() {
+    loom::model(|| {
+        let intent = Arc::new(AtomicBool::new(false));
+        let arbiter = Arc::new(Mutex::new(TerminalArbiterState::new(1, None)));
+        let intent_writer = Arc::clone(&intent);
+        let intent_task = thread::spawn(move || {
+            intent_writer.store(true, Ordering::Release);
+        });
+        let owner_arbiter = Arc::clone(&arbiter);
+        let owner = thread::spawn(move || {
+            let mut state = owner_arbiter.lock().expect("terminal arbiter");
+            assert_eq!(
+                state.claim(
+                    1,
+                    TerminalEvidenceKind::EffectAccepted,
+                    TerminalWinnerKind::Success,
+                ),
+                TerminalClaimResult::Claimed
+            );
+            assert!(state.commit(1, TerminalWinnerKind::Success));
+        });
+        intent_task.join().expect("intent task");
+        owner.join().expect("settlement owner");
+
+        let state = arbiter.lock().expect("terminal arbiter");
+        assert!(intent.load(Ordering::Acquire));
+        assert_eq!(state.winner(), Some(TerminalWinnerKind::Success));
+        assert!(state.committed());
+    });
+}
+
+#[test]
+fn accepted_claim_is_stable_against_late_cancellation() {
+    loom::model(|| {
+        let shared = Arc::new((
+            Mutex::new(TerminalArbiterState::new(1, None)),
+            Condvar::new(),
+        ));
+        let owner_shared = Arc::clone(&shared);
+        let owner = thread::spawn(move || {
+            let (state, claimed) = &*owner_shared;
+            let mut state = state.lock().expect("terminal arbiter");
+            assert_eq!(
+                state.claim(
+                    1,
+                    TerminalEvidenceKind::EffectAccepted,
+                    TerminalWinnerKind::Success,
+                ),
+                TerminalClaimResult::Claimed
+            );
+            claimed.notify_all();
+            drop(state);
+            thread::yield_now();
+            assert!(
+                owner_shared
+                    .0
+                    .lock()
+                    .expect("terminal arbiter")
+                    .commit(1, TerminalWinnerKind::Success)
+            );
+        });
+        let late_shared = Arc::clone(&shared);
+        let late = thread::spawn(move || {
+            let (state, claimed) = &*late_shared;
+            let mut state = state.lock().expect("terminal arbiter");
+            while state.winner().is_none() {
+                state = claimed.wait(state).expect("terminal arbiter");
+            }
+            assert_eq!(
+                state.claim(
+                    9,
+                    TerminalEvidenceKind::NotDelivered,
+                    TerminalWinnerKind::Cancellation,
+                ),
+                TerminalClaimResult::Observe
+            );
+        });
+        owner.join().expect("settlement owner");
+        late.join().expect("late cancellation");
+
+        let state = shared.0.lock().expect("terminal arbiter");
+        assert_eq!(state.winner(), Some(TerminalWinnerKind::Success));
+        assert!(state.committed());
+    });
+}
+
+#[test]
+fn terminal_claim_and_commit_remain_unique() {
+    loom::model(|| {
+        let arbiter = Arc::new(Mutex::new(TerminalArbiterState::new(1, None)));
+        let claims = Arc::new(AtomicUsize::new(0));
+        let owner_arbiter = Arc::clone(&arbiter);
+        let owner_claims = Arc::clone(&claims);
+        let owner = thread::spawn(move || {
+            let mut state = owner_arbiter.lock().expect("terminal arbiter");
+            if state.claim(
+                1,
+                TerminalEvidenceKind::EffectAccepted,
+                TerminalWinnerKind::Success,
+            ) == TerminalClaimResult::Claimed
+            {
+                owner_claims.fetch_add(1, Ordering::AcqRel);
+                assert!(state.commit(1, TerminalWinnerKind::Success));
+            }
+        });
+        let stranger_arbiter = Arc::clone(&arbiter);
+        let stranger_claims = Arc::clone(&claims);
+        let stranger = thread::spawn(move || {
+            let mut state = stranger_arbiter.lock().expect("terminal arbiter");
+            if state.claim(
+                2,
+                TerminalEvidenceKind::NotDelivered,
+                TerminalWinnerKind::Cancellation,
+            ) == TerminalClaimResult::Claimed
+            {
+                stranger_claims.fetch_add(1, Ordering::AcqRel);
+            }
+        });
+        owner.join().expect("settlement owner");
+        stranger.join().expect("non-owner");
+
+        let state = arbiter.lock().expect("terminal arbiter");
+        assert_eq!(claims.load(Ordering::Acquire), 1);
+        assert_eq!(state.winner(), Some(TerminalWinnerKind::Success));
+        assert!(state.committed());
+    });
+}
+
+#[test]
+fn terminal_handoff_requires_join_and_preheld_transfer_owner() {
+    loom::model(|| {
+        let mut state = TerminalArbiterState::new(1, Some(2));
+        assert!(!state.handoff(2));
+        assert!(state.mark_primary_owner_joined(1));
+        let state = Arc::new(Mutex::new(state));
+        let handoffs = Arc::new(AtomicUsize::new(0));
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let state = Arc::clone(&state);
+                let handoffs = Arc::clone(&handoffs);
+                thread::spawn(move || {
+                    if state.lock().expect("terminal arbiter").handoff(2) {
+                        handoffs.fetch_add(1, Ordering::AcqRel);
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().expect("handoff contender");
+        }
+
+        let mut state = state.lock().expect("terminal arbiter");
+        assert_eq!(handoffs.load(Ordering::Acquire), 1);
+        assert_eq!(
+            state.claim(
+                2,
+                TerminalEvidenceKind::NotDelivered,
+                TerminalWinnerKind::Cancellation,
+            ),
+            TerminalClaimResult::Claimed
+        );
+        assert!(state.commit(2, TerminalWinnerKind::Cancellation));
+        assert_eq!(state.winner(), Some(TerminalWinnerKind::Cancellation));
     });
 }

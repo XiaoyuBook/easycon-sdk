@@ -81,8 +81,8 @@ Runtime 创建是同步的，只完成内存、executor、native context 和队�
 stateDiagram-v2
     [*] --> Pending
     Pending --> Running: admitted
-    Pending --> Cancelling: cancel / deadline / parent close
-    Running --> Cancelling: cancel / deadline / parent close
+    Pending --> Cancelling: NotDelivered evidence claims cancel / deadline / parent close
+    Running --> Cancelling: NotDelivered evidence claims cancel / deadline / parent close
     Running --> Succeeded: result committed
     Running --> Failed: error committed
     Cancelling --> Cancelled: cleanup complete
@@ -95,7 +95,11 @@ stateDiagram-v2
 ### Operation 不变量
 
 - `Succeeded`、`Failed`、`Cancelled` 是唯一终态，且只写一次。
-- `Cancelling` 表示已经请求取消但清理尚未结束；语言层不得提前把 Task/Promise 标成 canceled。
+- `Requested`、`Deadline` 或 `ParentClose` intent 只一次写入 first reason、传播 signal 并唤醒 owner。对仍有
+  outstanding effect 的 operation，intent 本身不取得 terminal winner，也不把 `Pending`/`Running` 提前改成
+  排除 `Succeeded` 的状态。
+- `Cancelling` 表示合法 settlement owner 已经用 `NotDelivered` evidence claim cancellation winner，但清理尚未
+  结束；语言层不得只因 intent 就把 Task/Promise 标成 canceled。
 - result/error 在终态提交前构造完成，提交后不可变。
 - terminal event 与终态提交在同一有序临界区完成；查询一定能看到不早于事件的状态。
 - `cancel` 幂等。对终态 operation 调用 cancel 返回成功但不改变结果。
@@ -103,14 +107,22 @@ stateDiagram-v2
 - `operation_wait` 超时只结束本次观察，返回 `WAIT_TIMEOUT`，不请求取消也不改变 operation 状态。
 - parent 开始终态事务时先封闭 cancellation node；在此之后 child admission 必须失败。已经在线性化点前
   admission 的 child 会被取消并继续由自己的 owner 清理。
-- 终态事务依次封闭 child admission、取消 subtree、执行 owner cleanup、提交 immutable 终态和 terminal
-  event、注销 registry，最后无条件通知全部 waiter。event、registry 或 poisoned lock 故障不得跳过
-  注销和通知。
+- 每个显式 owned Operation 只有一个 domain-neutral arbiter。合法 settlement owner 必须在消费 mutually exclusive
+  `EffectAccepted`、`NotDelivered` 或 `ExecutionFailed` evidence 的同一临界区 claim 匹配 winner；非 owner 或
+  evidence/candidate 不匹配的 caller 不能 claim。claim 本身不发 event、不注销 registry、不通知 waiter。
+- claim 后的终态事务依次封闭 child admission、取消 subtree，在 operation/arbiter 锁外完成 fallible owner cleanup
+  与 cleanup-settled bookkeeping，再提交 immutable 终态和唯一 terminal event、注销 registry，最后无条件通知
+  全部 waiter。竞争 caller 只观察同一 completion；event、registry 或 poisoned lock 故障不得跳过注销和通知。
+- Success + cleanup Ok 投影 `Succeeded`；Success + cleanup Err/panic 投影 cleanup `Failed`。Failure 保留原 primary
+  error；Requested、Deadline、ParentClose 保留 immutable first reason；后三类的 cleanup Err/panic 都只是 secondary。
 - cancellation tree 封闭期间只转移 hook 和 child ownership；hook 调用、未触发 hook capture 析构及
   可能执行用户析构的 ownership 释放都在 operation state、hooks 和 children 锁外逐项隔离。capture
   析构重入同一 operation 查询不得阻断终态、registry 注销或 waiter 通知。
 - owner cleanup panic 转成可诊断 internal failure，不得留下不可观察的半终态；terminal event 仍不是
   waiter 正确性的唯一通道。
+- supervisor handoff 不是普通 panic fallback。只有工作开始前已预持有 transferable owner、原 owner task 已 join，
+  且 cleanup 和 settlement evidence 全部位于共享 record 时，arbiter 才能一次性转移 owner identity。否则 close
+  保存 `CloseFailed`，operation/waiter/registry 保持非终态，且不发 terminal event、不 unlink、不 notify。
 
 ### Operation 观察、deadline 与 timeout
 
@@ -123,6 +135,19 @@ stateDiagram-v2
 
 所有期限都从单调时钟计算。`0` 表示轮询，`UINT64_MAX` 表示无限观察；公共 API 不使用负数或壁钟时间。v1 不提供独立的
 工作流 `wait()`/delay/sleep API；`operation_wait` 仅用于观察既有 operation。
+
+### generic deadline registration
+
+Runtime 还提供不属于 Operation/resource/task 的一次性 `DeadlineRegistration`/`DeadlineSignal`：
+
+- 输入是同一 Runtime Clock epoch 的 absolute `target_ns`；返回前已经登记。Runtime-local registration ID 单调
+  分配，在仍可观察时不复用。
+- registration 只从 `Armed` 一次转为 `Fired`、`Disarmed` 或 `RuntimeClosed`。显式 disarm、handle Drop、fire 和
+  close drain 竞争同一个 queue entry；迟到 heap entry 通过 ID 判为 stale，不能再次 wake。
+- 已到期 target 在注册返回前即为 `Fired`。SystemClock worker 不依赖 domain consumer/lane 进展；VirtualClock
+  只在 advance/on-change 后扫描，同一 target 按 registration ID 稳定 fire。
+- registration 不分配 OperationId，不发布 operation event，也不改变 operation/resource/task registry 或公开 counts。
+  wait timeout 只结束该次 signal wait，不改变 registration。
 
 ## 5. 取消树
 
@@ -277,20 +302,25 @@ stateDiagram-v2
 
 `Runtime.close` 是唯一确定性关闭路径。第一个外部 caller 取得 close ownership 后严格执行：
 
-1. 原子进入 Closing，永久拒绝新 resource、operation、subscription 和 task admission。
+1. 原子进入 Closing，永久拒绝新 resource、operation、subscription、task 和 generic deadline admission。
 2. 发布 closing 进度并请求根 cancellation tree 取消。
-3. 按 Runtime ID 顺序关闭 Controller/Capture 等 resource；每个 callback panic 单独捕获，健康资源继续。
-4. 等待 resource owner cleanup 完成，并等待、join 全部普通受监管 task。
-5. 只有对应 owner task 已退出后，才以 internal cancellation 兜底完成仍未终态的 operation。
-6. 停止并 join deadline/executor/scheduler 等 Runtime 内部 task，回收全部 Runtime-owned `JoinHandle`。
-7. 验证 operation、resource、active task 和待 join task registry 全部为空。
-8. 发布唯一 `RuntimeClosed`，关闭事件生产端并允许 subscription drain。
+3. 在 deadline worker 继续服务既有 registration 时，按 Runtime ID 顺序关闭 Controller/Capture 等 resource；每个
+   callback panic 单独捕获，健康资源继续，并保存按阶段最早的 failure。
+4. deadline worker 仍运行时等待、join 全部普通 supervised/external owner task。task panic 先持久化诊断并 join，
+   不能让 close 跳过后续合法 Operation settlement。
+5. external owner join 后完成 Operation settlement/fallback。只有预持有 transferable owner 且共享 evidence 完整时
+   才 handoff；无合法 owner/evidence 时保留非终态 operation/registry 并记下 `CloseFailed`。
+6. 所有可能持有 registration 的 external owner 已 join 且 Operation settlement/fallback 完成后，把剩余 `Armed`
+   registration 一次性 resolve 为 `RuntimeClosed`，再停止并 join deadline internal worker。
+7. internal worker join 后验证 operation、resource 和 active-task registry；保守 ownership-loss 分支必须保持非零。
+8. 没有失败时发布唯一 `RuntimeClosed`，关闭事件生产端并允许 subscription drain。
 9. 保存 `CloseOutcome::Closed`，进入 Closed，唤醒全部 close waiter；随后才允许释放 Runtime storage。
 
-任何阶段发生不可恢复故障时，不继续伪造成功路径：隔离可继续的 resource callback，保存包含阶段、
-相关 ID、稳定诊断和 registry counts 的 `CloseReport`，发布唯一 `runtime.close_failed`，关闭事件生产端，
-进入 CloseFailed 并唤醒全部 close waiter。尚未完成 owner cleanup 或 owner task 尚未退出的 operation 保持
-非终态；其真实 owner 后续仍可提交终态并唤醒 operation waiter。重复 close 返回同一个保存 outcome。
+任何阶段发生不可恢复故障时，不伪造成功，但仍执行所有可安全完成的后续阶段：resource failure 后继续 external
+owner join；task panic 后继续合法 handoff/保守保留；随后才 drain/join deadline worker 并检查 registry。close 保存按
+阶段最早的 failure、相关 ID、稳定诊断和最终 registry counts，发布唯一 `runtime.close_failed`，关闭事件生产端，进入
+CloseFailed 并唤醒 close waiter。合法 owner/evidence 即使 cleanup Err/panic 也必须完成确定 terminal/event/unlink/notify；
+只有 owner/evidence 丢失时，operation waiter 保持非终态且不唤醒。重复 close 返回同一个保存 outcome。
 
 所有长期 task 只能由 `Runtime::spawn_supervised` 或等价 API 创建。Runtime 在 task body 执行前登记
 task，自动绑定 owner thread、持有完成通知和 `JoinHandle`，并在退出/join 后注销；public API 不暴露
@@ -317,9 +347,9 @@ native 线程时卸载库。所有 backend 都必须可取消，因此正常关�
 | capture 热拔出 | read task 终结，Capture Faulted，latest frame 仍可由已有引用读取 |
 | event 消费者停止 | 只影响该 subscription，核心 operation 不阻塞 |
 | 调用方忘记关闭子资源 | Runtime close 从 registry 找到并按顺序关闭 |
-| resource close callback panic | 隔离该 callback 并继续关闭其他健康资源；保存失败 resource ID 与 counts，进入 CloseFailed、发布 `runtime.close_failed` 并唤醒 close waiter；owner 尚未清理时不强制 operation 终态 |
+| resource close callback panic | 隔离该 callback 并继续关闭其他健康资源、join external owner、完成合法 Operation settlement，并在 deadline worker 仍服务时等待 owner；最后保存失败 resource ID 与 counts，进入 CloseFailed、发布 `runtime.close_failed` |
 | Runtime 内部关闭阶段 panic | 捕获到 close boundary，保存失败阶段和稳定 internal error，进入 CloseFailed、关闭事件生产并唤醒全部 close waiter；不得跨 API unwind 或虚假声称 Closed |
-| task body panic | supervisor 保存 task ID/panic 诊断并 join handle；显式 close 返回保存的 CloseFailed outcome |
+| task body panic | supervisor 保存 task ID/panic 诊断并 join handle；有预持有 transferable owner 与共享 evidence 时先合法 settlement，否则保留非终态/registry；显式 close 返回保存的 TaskJoin CloseFailed outcome |
 | final owning Runtime handle Drop | 只拒绝 admission 和请求根取消；不执行 callback/join/final event，也不产生后台 finalizer |
 | binding finalizer 迟到 | 只报告遗漏或非阻塞 release；显式 close API 是唯一验收路径 |
 

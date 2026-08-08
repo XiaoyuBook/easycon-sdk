@@ -196,6 +196,10 @@ def encode_report(state):
 def validate_schemas():
     mappings = [
         ("schemas/behavior-v1.schema.json", "behavior/runtime-controller-v1.json"),
+        (
+            "schemas/runtime-r0-v2-fixture-v1.schema.json",
+            "fixtures/runtime/r0-v2-contract-v1.json",
+        ),
         ("schemas/controller-fixture-v1.schema.json", "fixtures/controller/reports-v1.json"),
         ("schemas/conformance-v1.schema.json", "conformance/runtime-controller-v1.json"),
         ("schemas/sequence-trace-v1.schema.json", "fixtures/controller/sequence-traces-v1.json"),
@@ -1384,9 +1388,11 @@ def validate_behavior():
     require(
         behavior["operations"]["terminal_transaction"]["order"]
         == [
+            "consume mutually exclusive settlement evidence and claim one winner",
             "seal child admission",
             "close and cancel the admitted cancellation subtree",
-            "complete owner cleanup",
+            "complete fallible owner cleanup outside operation and arbiter locks",
+            "record cleanup settlement outside operation and arbiter locks",
             "commit one immutable terminal state and terminal event",
             "unlink the operation registry entry",
             "notify every waiter unconditionally",
@@ -1415,18 +1421,23 @@ def validate_behavior():
         "Runtime states changed",
     )
     expected_close_order = [
-        "enter Closing and reject admission",
+        "enter Closing and seal work plus deadline admission",
         "publish RuntimeClosing and cancel the root tree",
-        "close resources in Runtime ID order while isolating each failure",
-        "wait for owner cleanup and join ordinary supervised tasks",
-        "finish non-terminal operations only after their owners exit",
-        "join internal workers and every retained task handle",
-        "verify operation, resource, active-task, and join registries are empty",
+        "close resources in Runtime ID order while the deadline worker remains active",
+        "join ordinary supervised and external owner tasks while the deadline worker remains active",
+        "settle operations through their joined legitimate owner or one pre-held transferable handoff and preserve ownership loss",
+        "resolve remaining deadlines as RuntimeClosed and join the internal deadline worker",
+        "verify operation, resource, and active-task registries after internal worker join",
         "publish RuntimeClosed and close producers",
         "save the Closed outcome, enter Closed, and notify close waiters",
     ]
     require(behavior["runtime"]["close_order"] == expected_close_order,
             "Runtime close order changed")
+    require(
+        behavior["runtime"]["generic_deadlines"]["states"]
+        == ["Armed", "Fired", "Disarmed", "RuntimeClosed"],
+        "Runtime generic deadline states changed",
+    )
     require(
         behavior["controller"]["default_minimum_report_interval_ns"] == 30_000_000,
         "controller interval must remain 30 ms",
@@ -1482,6 +1493,116 @@ def validate_behavior():
     )
     classes = {item["classification"] for item in behavior["classifications"]}
     require(classes == {"source-exact", "corrected"}, "behavior classifications are incomplete")
+
+
+def validate_runtime_r0_fixture():
+    fixture = load_json("fixtures/runtime/r0-v2-contract-v1.json")
+    deadline = fixture["deadline_registration"]
+    require(
+        deadline["terminal_resolutions"] == ["Fired", "Disarmed", "RuntimeClosed"],
+        "Runtime deadline terminal resolutions changed",
+    )
+    require(
+        deadline["same_target_registration_ids"] == deadline["same_target_fire_order"],
+        "same-target Runtime deadlines must fire in registration-ID order",
+    )
+    require(
+        deadline["same_target_registration_ids"]
+        == sorted(set(deadline["same_target_registration_ids"])),
+        "Runtime deadline fixture IDs must be unique and increasing",
+    )
+
+    evidence = {
+        "Success": "EffectAccepted",
+        "Failure": "ExecutionFailed",
+        "Requested": "NotDelivered",
+        "Deadline": "NotDelivered",
+        "ParentClose": "NotDelivered",
+    }
+    terminal = {
+        "Success": {"Ok": ("Succeeded", "None"),
+                    "Err": ("Failed", "Cleanup"),
+                    "Panic": ("Failed", "Cleanup")},
+        "Failure": {cleanup: ("Failed", "Primary")
+                    for cleanup in ["Ok", "Err", "Panic"]},
+        "Requested": {cleanup: ("Cancelled", "FirstCancellationReason")
+                      for cleanup in ["Ok", "Err", "Panic"]},
+        "Deadline": {cleanup: ("Cancelled", "FirstCancellationReason")
+                     for cleanup in ["Ok", "Err", "Panic"]},
+        "ParentClose": {cleanup: ("Cancelled", "FirstCancellationReason")
+                        for cleanup in ["Ok", "Err", "Panic"]},
+    }
+    expected_matrix = []
+    for primary in ["Success", "Failure", "Requested", "Deadline", "ParentClose"]:
+        for cleanup in ["Ok", "Err", "Panic"]:
+            state, error_source = terminal[primary][cleanup]
+            expected_matrix.append(
+                {
+                    "primary": primary,
+                    "evidence": evidence[primary],
+                    "cleanup": cleanup,
+                    "transition_outcome": (
+                        "Applied" if cleanup == "Ok" else "CleanupFailed"
+                    ),
+                    "terminal_state": state,
+                    "error_source": error_source,
+                }
+            )
+    require(
+        fixture["terminal_cleanup_matrix"] == expected_matrix,
+        "Runtime five-path cleanup projection matrix changed",
+    )
+
+    expected_close_cases = [
+        {
+            "id": "transferable-task-panic",
+            "task_panicked": True,
+            "preheld_transfer_owner": True,
+            "shared_evidence": "NotDelivered",
+            "deadline_resolution": "NotApplicable",
+            "close_phase": "TaskJoin",
+            "operation_state": "Cancelled",
+            "active_operations": 0,
+            "terminal_events": 1,
+        },
+        {
+            "id": "exclusive-task-panic",
+            "task_panicked": True,
+            "preheld_transfer_owner": False,
+            "shared_evidence": "None",
+            "deadline_resolution": "NotApplicable",
+            "close_phase": "TaskJoin",
+            "operation_state": "Running",
+            "active_operations": 1,
+            "terminal_events": 0,
+        },
+        {
+            "id": "exclusive-owner-exit",
+            "task_panicked": False,
+            "preheld_transfer_owner": False,
+            "shared_evidence": "None",
+            "deadline_resolution": "NotApplicable",
+            "close_phase": "OperationFinalization",
+            "operation_state": "Running",
+            "active_operations": 1,
+            "terminal_events": 0,
+        },
+        {
+            "id": "resource-failure-deadline-owner",
+            "task_panicked": False,
+            "preheld_transfer_owner": False,
+            "shared_evidence": "None",
+            "deadline_resolution": "Fired",
+            "close_phase": "ResourceCleanup",
+            "operation_state": "NotApplicable",
+            "active_operations": 0,
+            "terminal_events": 0,
+        },
+    ]
+    require(
+        fixture["close_cases"] == expected_close_cases,
+        "Runtime close ownership and deadline cases changed",
+    )
 
 
 def validate_controller_fixture():
@@ -2288,6 +2409,7 @@ def main():
     validate_validator_regressions()
     ecs_record_count = validate_ecs_provenance()
     validate_behavior()
+    validate_runtime_r0_fixture()
     validate_controller_fixture()
     validate_traces()
     validate_latency_result()
@@ -2301,7 +2423,7 @@ def main():
     validate_vision_model_provisioner_regressions()
     test_count = validate_conformance()
     print(
-        "validated 6 schemas, 1 behavior spec, 3 controller fixtures, "
+        "validated 7 schemas, 1 behavior spec, 1 Runtime fixture, 3 controller fixtures, "
         "15 vision binary fixtures, 1 capture manifest, 24 label corpus entries, "
         "{} ECS provenance records with 33 SDK-local artifacts, "
         "9 conformance scenarios, and {} exact Rust tests".format(

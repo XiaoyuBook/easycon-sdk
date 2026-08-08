@@ -13,30 +13,41 @@
     "terminal_states": ["Succeeded", "Failed", "Cancelled"],
     "transitions": [
       { "from": "Pending", "to": "Running", "cause": "admitted" },
-      { "from": "Pending", "to": "Cancelling", "cause": "cancel, deadline, or parent close" },
+      { "from": "Pending", "to": "Cancelling", "cause": "not-delivered settlement evidence claims cancel, deadline, or parent close" },
       { "from": "Pending", "to": "Failed", "cause": "admission or dependency failure" },
-      { "from": "Running", "to": "Cancelling", "cause": "cancel, deadline, or parent close" },
+      { "from": "Running", "to": "Cancelling", "cause": "not-delivered settlement evidence claims cancel, deadline, or parent close" },
       { "from": "Running", "to": "Succeeded", "cause": "result committed once" },
       { "from": "Running", "to": "Failed", "cause": "error committed once" },
       { "from": "Cancelling", "to": "Cancelled", "cause": "cleanup complete" }
     ],
     "timeouts": {
       "wait_timeout": "ends only the caller wait and never cancels the operation",
-      "operation_deadline": "requests cancellation and normally ends Cancelled with reason deadline",
+      "operation_deadline": "records immutable cancellation intent and wakes the settlement owner; only not-delivered evidence claims Cancelled with reason deadline, while already accepted effect evidence may still claim Succeeded",
       "protocol_timeout": "fails the operation in the controller error domain after a bounded handshake or ACK exchange",
       "transport_write_timeout": "bounds partial report and command writes independently from protocol replies"
     },
-    "terminal_commit": "exactly once; immutable result and error are mutually exclusive",
+    "terminal_commit": "exactly once after a legitimate settlement owner atomically consumes mutually exclusive evidence and claims one winner; immutable result and error are mutually exclusive",
     "terminal_transaction": {
+      "intent": "the first Requested, Deadline, or ParentClose reason is immutable and only signals the owner; intent alone never claims a winner or moves outstanding work onto a path that excludes Succeeded",
+      "claim": "the registered settlement owner consumes EffectAccepted, NotDelivered, or ExecutionFailed evidence and claims the matching winner in one arbiter critical section; claim publishes no event, unlink, or waiter notification",
       "child_admission": "the parent cancellation node is sealed before owner cleanup; admission linearized after sealing is rejected and previously admitted children are cancelled",
       "order": [
+        "consume mutually exclusive settlement evidence and claim one winner",
         "seal child admission",
         "close and cancel the admitted cancellation subtree",
-        "complete owner cleanup",
+        "complete fallible owner cleanup outside operation and arbiter locks",
+        "record cleanup settlement outside operation and arbiter locks",
         "commit one immutable terminal state and terminal event",
         "unlink the operation registry entry",
         "notify every waiter unconditionally"
       ],
+      "cleanup_projection": {
+        "success": "cleanup Ok preserves Succeeded; cleanup Err or panic becomes Failed with the cleanup error",
+        "failure": "cleanup Err or panic is secondary and the original failure remains primary",
+        "cancellation": "Requested, Deadline, and ParentClose each preserve the immutable first reason while cleanup Err or panic remains secondary"
+      },
+      "handoff": "handoff is allowed once only when a transferable owner was pre-held before work, the original owner task is joined, and all cleanup plus settlement evidence is in the shared record",
+      "ownership_loss": "without a joined legitimate owner, pre-held transferable owner, and shared evidence, close reports CloseFailed while preserving the non-terminal operation, registry identity, and waiter state with no terminal event, unlink, or notify",
       "failure_isolation": "cancellation tree sealing transfers hook and child ownership without invoking hooks or dropping user captures while operation state, cancellation hooks, or children locks are held; hook invocation, discarded capture destruction, child ownership release, and panic payload destruction are isolated per item, so one fault never truncates sibling hooks or child propagation; event, registry, hook, reentrant destruction, or poisoned-lock faults never skip registry unlink or waiter notification"
     }
   },
@@ -47,15 +58,24 @@
     "reentrant_close": "a resource callback running on the deterministic close owner thread receives CloseOwner before waiting when it synchronously re-enters close on the same Runtime; the outer close continues to the one saved outcome",
     "final_handle_drop": "synchronously rejects admission and requests root cancellation only; it never waits, invokes resource close callbacks, joins tasks, spawns a finalizer thread, closes event production, or promises RuntimeClosed",
     "supervised_tasks": "tasks are created only through Runtime supervised spawn; Runtime registers before body execution, binds owner automatically, shares one consumable completion and JoinHandle ownership with the returned task handle, joins and unregisters, rejects same-Runtime synchronous close from the task before state changes, and lets explicit task join wait for TLS destructors and OS thread exit even after nondeterministic Runtime storage release",
-    "close_failure": "resource, task, event, or registry failure commits CloseFailed with one saved diagnostic CloseReport, publishes runtime.close_failed as the final event, closes producers, and wakes all close waiters; operations whose owner cleanup or owner task has not finished remain non-terminal",
+    "close_failure": "resource, task, event, registry, or settlement-ownership failure commits one saved CloseFailed diagnostic after all safe later close phases finish; a legitimate transferable owner with shared evidence still settles before a task-panic report, while ownership loss preserves the non-terminal operation and registry without waking its waiter",
+    "generic_deadlines": {
+      "target": "absolute target_ns in the owning Runtime Clock epoch; an already-due target is Fired before registration returns",
+      "identity": "Runtime-local registration IDs increase monotonically and are not reused while observable",
+      "states": ["Armed", "Fired", "Disarmed", "RuntimeClosed"],
+      "independence": "a registration is not an Operation, resource, or supervised task and allocates no OperationId, emits no operation event, and changes no public registry count",
+      "system_clock": "the shared deadline worker fires without consumer or domain-lane progress and wakes to recompute after earlier registration or disarm",
+      "virtual_clock": "only clock advance wakes due entries; equal target_ns entries fire in registration-ID order",
+      "close": "close seals admission first, keeps existing registrations serviced through resource cleanup, external owner join, and legal Operation settlement, then resolves remaining Armed entries as RuntimeClosed and joins the worker"
+    },
     "close_order": [
-      "enter Closing and reject admission",
+      "enter Closing and seal work plus deadline admission",
       "publish RuntimeClosing and cancel the root tree",
-      "close resources in Runtime ID order while isolating each failure",
-      "wait for owner cleanup and join ordinary supervised tasks",
-      "finish non-terminal operations only after their owners exit",
-      "join internal workers and every retained task handle",
-      "verify operation, resource, active-task, and join registries are empty",
+      "close resources in Runtime ID order while the deadline worker remains active",
+      "join ordinary supervised and external owner tasks while the deadline worker remains active",
+      "settle operations through their joined legitimate owner or one pre-held transferable handoff and preserve ownership loss",
+      "resolve remaining deadlines as RuntimeClosed and join the internal deadline worker",
+      "verify operation, resource, and active-task registries after internal worker join",
       "publish RuntimeClosed and close producers",
       "save the Closed outcome, enter Closed, and notify close waiters"
     ],

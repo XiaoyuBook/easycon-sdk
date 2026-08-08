@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "milestone": "runtime-r0-v2",
+  "license": "GPL-3.0-only",
+  "source_contract": "ADR-0020",
+  "deadline_registration": {
+    "initial_state": "Armed",
+    "terminal_resolutions": ["Fired", "Disarmed", "RuntimeClosed"],
+    "resolution_count": 1,
+    "same_target_registration_ids": [1, 2, 3],
+    "same_target_fire_order": [1, 2, 3],
+    "public_registry_delta": {
+      "active_operations": 0,
+      "active_resources": 0,
+      "active_tasks": 0,
+      "operation_events": 0
+    }
+  },
+  "terminal_cleanup_matrix": [
+    { "primary": "Success", "evidence": "EffectAccepted", "cleanup": "Ok", "transition_outcome": "Applied", "terminal_state": "Succeeded", "error_source": "None" },
+    { "primary": "Success", "evidence": "EffectAccepted", "cleanup": "Err", "transition_outcome": "CleanupFailed", "terminal_state": "Failed", "error_source": "Cleanup" },
+    { "primary": "Success", "evidence": "EffectAccepted", "cleanup": "Panic", "transition_outcome": "CleanupFailed", "terminal_state": "Failed", "error_source": "Cleanup" },
+    { "primary": "Failure", "evidence": "ExecutionFailed", "cleanup": "Ok", "transition_outcome": "Applied", "terminal_state": "Failed", "error_source": "Primary" },
+    { "primary": "Failure", "evidence": "ExecutionFailed", "cleanup": "Err", "transition_outcome": "CleanupFailed", "terminal_state": "Failed", "error_source": "Primary" },
+    { "primary": "Failure", "evidence": "ExecutionFailed", "cleanup": "Panic", "transition_outcome": "CleanupFailed", "terminal_state": "Failed", "error_source": "Primary" },
+    { "primary": "Requested", "evidence": "NotDelivered", "cleanup": "Ok", "transition_outcome": "Applied", "terminal_state": "Cancelled", "error_source": "FirstCancellationReason" },
+    { "primary": "Requested", "evidence": "NotDelivered", "cleanup": "Err", "transition_outcome": "CleanupFailed", "terminal_state": "Cancelled", "error_source": "FirstCancellationReason" },
+    { "primary": "Requested", "evidence": "NotDelivered", "cleanup": "Panic", "transition_outcome": "CleanupFailed", "terminal_state": "Cancelled", "error_source": "FirstCancellationReason" },
+    { "primary": "Deadline", "evidence": "NotDelivered", "cleanup": "Ok", "transition_outcome": "Applied", "terminal_state": "Cancelled", "error_source": "FirstCancellationReason" },
+    { "primary": "Deadline", "evidence": "NotDelivered", "cleanup": "Err", "transition_outcome": "CleanupFailed", "terminal_state": "Cancelled", "error_source": "FirstCancellationReason" },
+    { "primary": "Deadline", "evidence": "NotDelivered", "cleanup": "Panic", "transition_outcome": "CleanupFailed", "terminal_state": "Cancelled", "error_source": "FirstCancellationReason" },
+    { "primary": "ParentClose", "evidence": "NotDelivered", "cleanup": "Ok", "transition_outcome": "Applied", "terminal_state": "Cancelled", "error_source": "FirstCancellationReason" },
+    { "primary": "ParentClose", "evidence": "NotDelivered", "cleanup": "Err", "transition_outcome": "CleanupFailed", "terminal_state": "Cancelled", "error_source": "FirstCancellationReason" },
+    { "primary": "ParentClose", "evidence": "NotDelivered", "cleanup": "Panic", "transition_outcome": "CleanupFailed", "terminal_state": "Cancelled", "error_source": "FirstCancellationReason" }
+  ],
+  "close_cases": [
+    { "id": "transferable-task-panic", "task_panicked": true, "preheld_transfer_owner": true, "shared_evidence": "NotDelivered", "deadline_resolution": "NotApplicable", "close_phase": "TaskJoin", "operation_state": "Cancelled", "active_operations": 0, "terminal_events": 1 },
+    { "id": "exclusive-task-panic", "task_panicked": true, "preheld_transfer_owner": false, "shared_evidence": "None", "deadline_resolution": "NotApplicable", "close_phase": "TaskJoin", "operation_state": "Running", "active_operations": 1, "terminal_events": 0 },
+    { "id": "exclusive-owner-exit", "task_panicked": false, "preheld_transfer_owner": false, "shared_evidence": "None", "deadline_resolution": "NotApplicable", "close_phase": "OperationFinalization", "operation_state": "Running", "active_operations": 1, "terminal_events": 0 },
+    { "id": "resource-failure-deadline-owner", "task_panicked": false, "preheld_transfer_owner": false, "shared_evidence": "None", "deadline_resolution": "Fired", "close_phase": "ResourceCleanup", "operation_state": "NotApplicable", "active_operations": 0, "terminal_events": 0 }
+  ]
+}

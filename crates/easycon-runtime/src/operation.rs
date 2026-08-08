@@ -1,10 +1,13 @@
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Instant;
 
-use easycon_model::{EasyConError, ErrorCode, ErrorDomain, OperationId};
+use easycon_model::{EasyConError, ErrorCode, ErrorDomain, OperationId, TaskId};
 
 use crate::cancellation::CancellationToken;
-use crate::concurrency::{catch_isolated, unlink_then_notify};
+use crate::concurrency::{
+    TerminalArbiterState, TerminalClaimResult, TerminalEvidenceKind, TerminalWinnerKind,
+    catch_isolated, drop_isolated, evidence_allows_winner, unlink_then_notify,
+};
 use crate::event::{EventDraft, EventKind, Severity};
 use crate::runtime::RuntimeInner;
 use crate::wait::WaitTimeout;
@@ -84,6 +87,47 @@ pub enum TransitionOutcome {
     CleanupFailed,
 }
 
+/// Mutually exclusive evidence consumed by a legitimate operation settlement owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SettlementEvidence {
+    /// The domain effect was fully accepted.
+    EffectAccepted,
+    /// The domain proved that the effect was not delivered.
+    NotDelivered,
+    /// Execution failed without an accepted effect.
+    ExecutionFailed,
+}
+
+impl SettlementEvidence {
+    const fn kind(self) -> TerminalEvidenceKind {
+        match self {
+            Self::EffectAccepted => TerminalEvidenceKind::EffectAccepted,
+            Self::NotDelivered => TerminalEvidenceKind::NotDelivered,
+            Self::ExecutionFailed => TerminalEvidenceKind::ExecutionFailed,
+        }
+    }
+}
+
+/// Whether Runtime supervision pre-holds a transferable settlement owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SettlementOwnerMode {
+    /// Only the original registered owner may claim settlement.
+    Exclusive,
+    /// Runtime supervision may hand off after the original owner is joined and evidence is shared.
+    Transferable,
+}
+
+/// Generic terminal candidate paired with settlement evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TerminalCandidate {
+    /// An accepted effect projects to success after cleanup.
+    Success(OperationValue),
+    /// Execution failure remains the primary error after cleanup.
+    Failure(EasyConError),
+    /// Not-delivered evidence projects the immutable first cancellation reason.
+    Cancellation,
+}
+
 /// Result of waiting for an operation terminal state.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WaitResult {
@@ -97,6 +141,13 @@ pub enum WaitResult {
 #[derive(Clone)]
 pub struct Operation {
     pub(crate) inner: Arc<OperationInner>,
+}
+
+/// Unique settlement capability for an explicitly owned operation.
+#[must_use = "dropping an unsettled owner may force conservative Runtime close failure"]
+pub struct OperationSettlementOwner {
+    pub(crate) inner: Arc<OperationInner>,
+    owner_id: u64,
 }
 
 pub(crate) struct OperationInner {
@@ -116,6 +167,69 @@ struct OperationData {
     error: Option<EasyConError>,
     cancellation_reason: Option<CancellationReason>,
     terminal_in_progress: bool,
+    owner: Option<OperationOwnerData>,
+}
+
+pub(crate) type OwnerCleanup = Box<dyn FnOnce() -> Result<(), EasyConError> + Send + 'static>;
+pub(crate) type OwnerCleanupSettled = Box<dyn FnOnce(Result<(), EasyConError>) + Send + 'static>;
+
+pub(crate) struct OperationOwnerSetup {
+    owner_id: u64,
+    transfer_owner_id: Option<u64>,
+    cleanup: OwnerCleanup,
+    on_cleanup_settled: OwnerCleanupSettled,
+}
+
+impl OperationOwnerSetup {
+    pub(crate) fn new(
+        owner_id: u64,
+        transfer_owner_id: Option<u64>,
+        cleanup: OwnerCleanup,
+        on_cleanup_settled: OwnerCleanupSettled,
+    ) -> Self {
+        Self {
+            owner_id,
+            transfer_owner_id,
+            cleanup,
+            on_cleanup_settled,
+        }
+    }
+}
+
+struct OperationOwnerData {
+    arbiter: TerminalArbiterState,
+    owner_task: Option<TaskId>,
+    cleanup: Option<OwnerCleanup>,
+    on_cleanup_settled: Option<OwnerCleanupSettled>,
+    handoff_record: Option<(SettlementEvidence, TerminalCandidate)>,
+}
+
+enum TerminalPrimary {
+    Success(OperationValue),
+    Failure(EasyConError),
+    Cancellation(CancellationReason),
+}
+
+enum LegacyTerminalRequest {
+    Execution(Result<OperationValue, EasyConError>),
+    Cancellation,
+}
+
+impl TerminalPrimary {
+    const fn winner_kind(&self) -> TerminalWinnerKind {
+        match self {
+            Self::Success(_) => TerminalWinnerKind::Success,
+            Self::Failure(_) => TerminalWinnerKind::Failure,
+            Self::Cancellation(_) => TerminalWinnerKind::Cancellation,
+        }
+    }
+}
+
+pub(crate) enum OperationFallbackOutcome {
+    Legacy,
+    AlreadyTerminal,
+    Settled,
+    OwnershipLost,
 }
 
 impl Operation {
@@ -137,6 +251,7 @@ impl Operation {
                     error: None,
                     cancellation_reason: None,
                     terminal_in_progress: false,
+                    owner: None,
                 }),
                 changed: Condvar::new(),
                 #[cfg(test)]
@@ -150,6 +265,57 @@ impl Operation {
             }
         });
         operation
+    }
+
+    pub(crate) fn new_owned(
+        id: OperationId,
+        runtime: std::sync::Weak<RuntimeInner>,
+        cancellation: CancellationToken,
+        deadline_ns: Option<u64>,
+        setup: OperationOwnerSetup,
+    ) -> (Self, OperationSettlementOwner) {
+        let OperationOwnerSetup {
+            owner_id,
+            transfer_owner_id,
+            cleanup,
+            on_cleanup_settled,
+        } = setup;
+        let operation = Self {
+            inner: Arc::new(OperationInner {
+                id,
+                runtime,
+                cancellation,
+                deadline_ns,
+                state: Mutex::new(OperationData {
+                    state: OperationState::Pending,
+                    result: None,
+                    error: None,
+                    cancellation_reason: None,
+                    terminal_in_progress: false,
+                    owner: Some(OperationOwnerData {
+                        arbiter: TerminalArbiterState::new(owner_id, transfer_owner_id),
+                        owner_task: None,
+                        cleanup: Some(cleanup),
+                        on_cleanup_settled: Some(on_cleanup_settled),
+                        handoff_record: None,
+                    }),
+                }),
+                changed: Condvar::new(),
+                #[cfg(test)]
+                wait_observers: Mutex::new(Vec::new()),
+            }),
+        };
+        let weak = Arc::downgrade(&operation.inner);
+        operation.inner.cancellation.on_cancel(move || {
+            if let Some(inner) = weak.upgrade() {
+                let _ = inner.request_cancel(CancellationReason::ParentClose);
+            }
+        });
+        let owner = OperationSettlementOwner {
+            inner: Arc::clone(&operation.inner),
+            owner_id,
+        };
+        (operation, owner)
     }
 
     /// Returns the Runtime-local operation identifier.
@@ -210,20 +376,22 @@ impl Operation {
         self.inner.finish_success(result)
     }
 
-    /// Runs non-blocking owner cleanup under the transition lock, then commits success once.
+    /// Runs owner cleanup outside the operation state lock, then commits success once.
     ///
-    /// The cleanup must not call back into this operation. A cleanup panic is isolated and commits
-    /// an internal failure with [`TransitionOutcome::CleanupFailed`].
+    /// A cleanup panic is isolated and commits an internal failure with
+    /// [`TransitionOutcome::CleanupFailed`].
     pub fn succeed_after_cleanup(
         &self,
         result: OperationValue,
         cleanup: impl FnOnce(),
     ) -> TransitionOutcome {
-        self.inner.finish_terminal_after_cleanup(
-            OperationState::Succeeded,
-            Some(result),
-            None,
-            cleanup,
+        self.inner.finish_legacy_after_cleanup(
+            LegacyTerminalRequest::Execution(Ok(result)),
+            || {
+                cleanup();
+                Ok(())
+            },
+            |_| {},
         )
     }
 
@@ -232,17 +400,23 @@ impl Operation {
         self.inner.finish_failure(error)
     }
 
-    /// Runs non-blocking owner cleanup under the transition lock, then commits failure once.
+    /// Runs owner cleanup outside the operation state lock, then commits failure once.
     ///
-    /// The cleanup must not call back into this operation. A cleanup panic is isolated and commits
-    /// an internal failure with [`TransitionOutcome::CleanupFailed`].
+    /// A cleanup panic is isolated and reports [`TransitionOutcome::CleanupFailed`] without
+    /// replacing the primary failure.
     pub fn fail_after_cleanup(
         &self,
         error: EasyConError,
         cleanup: impl FnOnce(),
     ) -> TransitionOutcome {
-        self.inner
-            .finish_terminal_after_cleanup(OperationState::Failed, None, Some(error), cleanup)
+        self.inner.finish_legacy_after_cleanup(
+            LegacyTerminalRequest::Execution(Err(error)),
+            || {
+                cleanup();
+                Ok(())
+            },
+            |_| {},
+        )
     }
 
     /// Commits `Cancelled` after owner-specific cleanup completes.
@@ -260,6 +434,38 @@ impl Operation {
     #[must_use]
     pub fn wait(&self, wait: WaitTimeout) -> WaitResult {
         self.inner.wait(wait)
+    }
+}
+
+impl OperationSettlementOwner {
+    /// Claims the unique winner from settlement evidence, runs shared cleanup, and commits once.
+    pub fn settle(
+        self,
+        evidence: SettlementEvidence,
+        candidate: TerminalCandidate,
+    ) -> TransitionOutcome {
+        self.inner.settle_owned(self.owner_id, evidence, candidate)
+    }
+
+    /// Stores mutually exclusive evidence in the pre-registered transferable record.
+    ///
+    /// This does not claim a terminal winner. Runtime supervision may consume the record only after
+    /// the original owner task has been joined.
+    pub fn record_for_handoff(
+        &self,
+        evidence: SettlementEvidence,
+        candidate: TerminalCandidate,
+    ) -> TransitionOutcome {
+        self.inner
+            .record_for_handoff(self.owner_id, evidence, candidate)
+    }
+
+    pub(crate) fn belongs_to(&self, runtime: &Arc<RuntimeInner>) -> bool {
+        self.inner.runtime.ptr_eq(&Arc::downgrade(runtime))
+    }
+
+    pub(crate) fn bind_task(&self, task_id: TaskId) -> bool {
+        self.inner.bind_owner_task(self.owner_id, task_id)
     }
 }
 
@@ -283,133 +489,367 @@ impl OperationInner {
     }
 
     fn request_cancel(&self, reason: CancellationReason) -> TransitionOutcome {
-        let outcome = {
+        let (outcome, propagation) = {
             let mut data = self.lock_state();
             if data.state.is_terminal() {
                 return TransitionOutcome::AlreadyTerminal;
             }
-            if data.terminal_in_progress {
-                return if data.state == OperationState::Cancelling {
-                    TransitionOutcome::Unchanged
-                } else {
-                    TransitionOutcome::Invalid
-                };
-            }
-            match data.state {
-                OperationState::Pending | OperationState::Running => {
-                    data.state = OperationState::Cancelling;
-                    data.cancellation_reason = Some(reason);
-                    self.publish(&data);
-                    TransitionOutcome::Applied
+            if data.owner.is_some() {
+                if data.cancellation_reason.is_some() {
+                    return TransitionOutcome::Unchanged;
                 }
-                OperationState::Cancelling => TransitionOutcome::Unchanged,
-                _ => unreachable!("terminal states returned before transition dispatch"),
+                data.cancellation_reason = Some(reason);
+                let propagation = self.cancellation.cancel_deferred();
+                (TransitionOutcome::Applied, Some(propagation))
+            } else {
+                if data.terminal_in_progress {
+                    return if data.state == OperationState::Cancelling {
+                        TransitionOutcome::Unchanged
+                    } else {
+                        TransitionOutcome::Invalid
+                    };
+                }
+                match data.state {
+                    OperationState::Pending | OperationState::Running => {
+                        data.state = OperationState::Cancelling;
+                        data.cancellation_reason = Some(reason);
+                        let propagation = self.cancellation.cancel_deferred();
+                        self.publish(&data);
+                        (TransitionOutcome::Applied, Some(propagation))
+                    }
+                    OperationState::Cancelling => (TransitionOutcome::Unchanged, None),
+                    _ => unreachable!("terminal states returned before transition dispatch"),
+                }
             }
         };
-        if outcome == TransitionOutcome::Applied {
-            let _ = catch_isolated(|| self.cancellation.cancel());
+        if let Some(propagation) = propagation {
+            let _ = catch_isolated(|| propagation.propagate());
             self.changed.notify_all();
         }
         outcome
     }
 
     fn finish_success(&self, result: OperationValue) -> TransitionOutcome {
-        self.finish_terminal(OperationState::Succeeded, Some(result), None)
+        self.finish_legacy_after_cleanup(
+            LegacyTerminalRequest::Execution(Ok(result)),
+            || Ok(()),
+            |_| {},
+        )
     }
 
     fn finish_failure(&self, error: EasyConError) -> TransitionOutcome {
-        self.finish_terminal(OperationState::Failed, None, Some(error))
+        self.finish_legacy_after_cleanup(
+            LegacyTerminalRequest::Execution(Err(error)),
+            || Ok(()),
+            |_| {},
+        )
     }
 
     fn finish_cancelled(&self) -> TransitionOutcome {
+        self.finish_legacy_after_cleanup(LegacyTerminalRequest::Cancellation, || Ok(()), |_| {})
+    }
+
+    fn finish_legacy_after_cleanup<C, S>(
+        &self,
+        request: LegacyTerminalRequest,
+        cleanup: C,
+        on_cleanup_settled: S,
+    ) -> TransitionOutcome
+    where
+        C: FnOnce() -> Result<(), EasyConError>,
+        S: FnOnce(Result<(), EasyConError>),
+    {
         let mut data = self.lock_state();
-        match data.state {
-            OperationState::Cancelling => {
-                if data.terminal_in_progress {
-                    return TransitionOutcome::Unchanged;
-                }
-                data.terminal_in_progress = true;
-                let propagation = self.cancellation.deactivate_deferred();
-                drop(data);
-                propagation.propagate();
-                let mut data = self.lock_state();
-                let reason = data
-                    .cancellation_reason
-                    .unwrap_or(CancellationReason::Requested);
-                let (code, message) = match reason {
-                    CancellationReason::Requested => (ErrorCode::Cancelled, "operation cancelled"),
-                    CancellationReason::Deadline => {
-                        (ErrorCode::DeadlineExceeded, "operation deadline elapsed")
-                    }
-                    CancellationReason::ParentClose => (
-                        ErrorCode::Cancelled,
-                        "parent operation, resource, or Runtime ended",
-                    ),
-                };
-                data.error = Some(EasyConError::new(ErrorDomain::Runtime, code, message));
-                data.state = OperationState::Cancelled;
-                self.publish(&data);
-                unlink_then_notify(
-                    || self.unlink_registry(),
-                    || {
-                        drop(data);
-                        self.changed.notify_all();
-                    },
-                );
-                TransitionOutcome::Applied
-            }
-            state if state.is_terminal() => TransitionOutcome::AlreadyTerminal,
-            _ => TransitionOutcome::Invalid,
+        if data.state.is_terminal() {
+            drop(data);
+            discard_terminal_callbacks(cleanup, on_cleanup_settled);
+            return TransitionOutcome::AlreadyTerminal;
         }
+        if data.owner.is_some() {
+            drop(data);
+            discard_terminal_callbacks(cleanup, on_cleanup_settled);
+            return TransitionOutcome::Invalid;
+        }
+        if data.terminal_in_progress {
+            drop(data);
+            discard_terminal_callbacks(cleanup, on_cleanup_settled);
+            return self.observe_terminal_completion();
+        }
+        let primary = match (data.state, request) {
+            (OperationState::Running, LegacyTerminalRequest::Execution(Ok(result))) => {
+                TerminalPrimary::Success(result)
+            }
+            (
+                OperationState::Pending | OperationState::Running,
+                LegacyTerminalRequest::Execution(Err(error)),
+            ) => TerminalPrimary::Failure(error),
+            (OperationState::Cancelling, LegacyTerminalRequest::Cancellation) => {
+                TerminalPrimary::Cancellation(
+                    data.cancellation_reason
+                        .unwrap_or(CancellationReason::Requested),
+                )
+            }
+            _ => {
+                drop(data);
+                discard_terminal_callbacks(cleanup, on_cleanup_settled);
+                return TransitionOutcome::Invalid;
+            }
+        };
+        data.terminal_in_progress = true;
+        let propagation = self.cancellation.deactivate_deferred();
+        drop(data);
+        self.finish_claimed_terminal(primary, None, propagation, cleanup, on_cleanup_settled)
     }
 
-    fn finish_terminal(
+    fn settle_owned(
         &self,
-        terminal: OperationState,
-        result: Option<OperationValue>,
-        error: Option<EasyConError>,
-    ) -> TransitionOutcome {
-        self.finish_terminal_after_cleanup(terminal, result, error, || {})
-    }
-
-    fn finish_terminal_after_cleanup(
-        &self,
-        terminal: OperationState,
-        result: Option<OperationValue>,
-        error: Option<EasyConError>,
-        cleanup: impl FnOnce(),
+        owner_id: u64,
+        evidence: SettlementEvidence,
+        candidate: TerminalCandidate,
     ) -> TransitionOutcome {
         let mut data = self.lock_state();
         if data.state.is_terminal() {
             return TransitionOutcome::AlreadyTerminal;
         }
-        if data.terminal_in_progress {
+        let Some(primary) = primary_from_candidate(candidate, data.state, data.cancellation_reason)
+        else {
             return TransitionOutcome::Invalid;
-        }
-        match data.state {
-            OperationState::Pending if terminal == OperationState::Failed => {}
-            OperationState::Running => {}
-            _ => return TransitionOutcome::Invalid,
+        };
+        let winner = primary.winner_kind();
+        let claim = {
+            let Some(owner) = data.owner.as_mut() else {
+                return TransitionOutcome::Invalid;
+            };
+            owner.arbiter.claim(owner_id, evidence.kind(), winner)
+        };
+        match claim {
+            TerminalClaimResult::Claimed => {}
+            TerminalClaimResult::Observe => {
+                drop(data);
+                return self.observe_terminal_completion();
+            }
+            TerminalClaimResult::RejectedOwner | TerminalClaimResult::RejectedEvidence => {
+                return TransitionOutcome::Invalid;
+            }
         }
         data.terminal_in_progress = true;
+        if winner == TerminalWinnerKind::Cancellation {
+            data.state = OperationState::Cancelling;
+            self.publish(&data);
+        }
+        let owner = data
+            .owner
+            .as_mut()
+            .expect("claimed owned operation retains its authority");
+        let cleanup = owner
+            .cleanup
+            .take()
+            .expect("owned operation cleanup is consumed once");
+        let on_cleanup_settled = owner
+            .on_cleanup_settled
+            .take()
+            .expect("owned operation settlement observer is consumed once");
         let propagation = self.cancellation.deactivate_deferred();
         drop(data);
-        propagation.propagate();
-        let cleanup_failed = catch_isolated(cleanup).is_err();
+        self.finish_claimed_terminal(
+            primary,
+            Some((owner_id, winner)),
+            propagation,
+            cleanup,
+            on_cleanup_settled,
+        )
+    }
+
+    fn record_for_handoff(
+        &self,
+        owner_id: u64,
+        evidence: SettlementEvidence,
+        candidate: TerminalCandidate,
+    ) -> TransitionOutcome {
         let mut data = self.lock_state();
+        if data.state.is_terminal() {
+            return TransitionOutcome::AlreadyTerminal;
+        }
+        let Some(primary) =
+            primary_from_candidate(candidate.clone(), data.state, data.cancellation_reason)
+        else {
+            return TransitionOutcome::Invalid;
+        };
+        let winner = primary.winner_kind();
+        if !evidence_allows_winner(evidence.kind(), winner) {
+            return TransitionOutcome::Invalid;
+        }
+        let Some(owner) = data.owner.as_mut() else {
+            return TransitionOutcome::Invalid;
+        };
+        if owner.arbiter.primary_owner() != owner_id
+            || owner.arbiter.transfer_owner().is_none()
+            || owner.arbiter.winner().is_some()
+            || owner.owner_task.is_none()
+        {
+            return TransitionOutcome::Invalid;
+        }
+        if let Some(existing) = &owner.handoff_record {
+            return if existing == &(evidence, candidate) {
+                TransitionOutcome::Unchanged
+            } else {
+                TransitionOutcome::Invalid
+            };
+        }
+        owner.handoff_record = Some((evidence, candidate));
+        TransitionOutcome::Applied
+    }
+
+    fn bind_owner_task(&self, owner_id: u64, task_id: TaskId) -> bool {
+        let mut data = self.lock_state();
+        let Some(owner) = data.owner.as_mut() else {
+            return false;
+        };
+        if owner.arbiter.primary_owner() != owner_id || owner.owner_task.is_some() {
+            return false;
+        }
+        owner.owner_task = Some(task_id);
+        true
+    }
+
+    pub(crate) fn mark_owner_task_joined(&self, task_id: TaskId) {
+        let mut data = self.lock_state();
+        let Some(owner) = data.owner.as_mut() else {
+            return;
+        };
+        if owner.owner_task != Some(task_id) {
+            return;
+        }
+        let primary_owner = owner.arbiter.primary_owner();
+        let _ = owner.arbiter.mark_primary_owner_joined(primary_owner);
+    }
+
+    pub(crate) fn settle_after_owner_join(&self) -> OperationFallbackOutcome {
+        let mut data = self.lock_state();
+        if data.state.is_terminal() {
+            return OperationFallbackOutcome::AlreadyTerminal;
+        }
+        let terminal_in_progress = data.terminal_in_progress;
+        let operation_state = data.state;
+        let cancellation_reason = data.cancellation_reason;
+        let Some(owner) = data.owner.as_mut() else {
+            return OperationFallbackOutcome::Legacy;
+        };
+        if terminal_in_progress {
+            drop(data);
+            let _ = self.observe_terminal_completion();
+            return OperationFallbackOutcome::Settled;
+        }
+        if !owner.arbiter.primary_owner_joined() {
+            return OperationFallbackOutcome::OwnershipLost;
+        }
+        let Some(transfer_owner) = owner.arbiter.transfer_owner() else {
+            return OperationFallbackOutcome::OwnershipLost;
+        };
+        let Some((evidence, candidate)) = owner.handoff_record.take() else {
+            return OperationFallbackOutcome::OwnershipLost;
+        };
+        let Some(primary) = primary_from_candidate(candidate, operation_state, cancellation_reason)
+        else {
+            return OperationFallbackOutcome::OwnershipLost;
+        };
+        let winner = primary.winner_kind();
+        if !owner.arbiter.handoff(transfer_owner)
+            || owner.arbiter.claim(transfer_owner, evidence.kind(), winner)
+                != TerminalClaimResult::Claimed
+        {
+            return OperationFallbackOutcome::OwnershipLost;
+        }
+        data.terminal_in_progress = true;
+        if winner == TerminalWinnerKind::Cancellation {
+            data.state = OperationState::Cancelling;
+            self.publish(&data);
+        }
+        let owner = data
+            .owner
+            .as_mut()
+            .expect("handoff retains shared owner record");
+        let cleanup = owner
+            .cleanup
+            .take()
+            .expect("handoff cleanup is pre-registered once");
+        let on_cleanup_settled = owner
+            .on_cleanup_settled
+            .take()
+            .expect("handoff observer is pre-registered once");
+        let propagation = self.cancellation.deactivate_deferred();
+        drop(data);
+        let _ = self.finish_claimed_terminal(
+            primary,
+            Some((transfer_owner, winner)),
+            propagation,
+            cleanup,
+            on_cleanup_settled,
+        );
+        OperationFallbackOutcome::Settled
+    }
+
+    fn finish_claimed_terminal<C, S>(
+        &self,
+        primary: TerminalPrimary,
+        owner_commit: Option<(u64, TerminalWinnerKind)>,
+        propagation: crate::cancellation::CancellationPropagation,
+        cleanup: C,
+        on_cleanup_settled: S,
+    ) -> TransitionOutcome
+    where
+        C: FnOnce() -> Result<(), EasyConError>,
+        S: FnOnce(Result<(), EasyConError>),
+    {
+        propagation.propagate();
+        let mut cleanup_outcome = match catch_isolated(cleanup) {
+            Ok(outcome) => outcome,
+            Err(()) => Err(cleanup_panic_error()),
+        };
+        if catch_isolated(|| on_cleanup_settled(cleanup_outcome.clone())).is_err()
+            && cleanup_outcome.is_ok()
+        {
+            cleanup_outcome = Err(cleanup_settlement_panic_error());
+        }
+        let cleanup_failed = cleanup_outcome.is_err();
+        let mut data = self.lock_state();
+        if let Some((owner_id, winner)) = owner_commit {
+            let owner = data
+                .owner
+                .as_mut()
+                .expect("owned claim retains arbiter through commit");
+            assert!(
+                owner.arbiter.commit(owner_id, winner),
+                "settlement owner commits its claimed winner once"
+            );
+            debug_assert!(owner.arbiter.committed());
+        }
+        data.terminal_in_progress = false;
+        data.result = None;
+        data.error = None;
+        match primary {
+            TerminalPrimary::Success(result) => match cleanup_outcome {
+                Ok(()) => {
+                    data.state = OperationState::Succeeded;
+                    data.result = Some(result);
+                }
+                Err(error) => {
+                    data.state = OperationState::Failed;
+                    data.error = Some(error);
+                }
+            },
+            TerminalPrimary::Failure(error) => {
+                data.state = OperationState::Failed;
+                data.error = Some(error);
+            }
+            TerminalPrimary::Cancellation(reason) => {
+                data.state = OperationState::Cancelled;
+                data.error = Some(cancellation_error(reason));
+            }
+        }
         let outcome = if cleanup_failed {
-            data.state = OperationState::Failed;
-            data.result = None;
-            data.error = Some(EasyConError::new(
-                ErrorDomain::Internal,
-                ErrorCode::Internal,
-                "operation owner cleanup panicked",
-            ));
             TransitionOutcome::CleanupFailed
         } else {
-            data.state = terminal;
-            data.result = result;
-            data.error = error;
             TransitionOutcome::Applied
         };
         self.publish(&data);
@@ -421,6 +861,26 @@ impl OperationInner {
             },
         );
         outcome
+    }
+
+    fn observe_terminal_completion(&self) -> TransitionOutcome {
+        let mut data = self.lock_state();
+        while !data.state.is_terminal() {
+            #[cfg(test)]
+            if let Some(observer) = self
+                .wait_observers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop()
+            {
+                let _ = observer.send(());
+            }
+            data = self
+                .changed
+                .wait(data)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        TransitionOutcome::AlreadyTerminal
     }
 
     fn unlink_registry(&self) {
@@ -512,6 +972,58 @@ impl OperationInner {
             let _ = runtime.try_publish_event(draft.with_operation(self.id));
         });
     }
+}
+
+fn primary_from_candidate(
+    candidate: TerminalCandidate,
+    state: OperationState,
+    cancellation_reason: Option<CancellationReason>,
+) -> Option<TerminalPrimary> {
+    match (state, candidate) {
+        (OperationState::Running, TerminalCandidate::Success(result)) => {
+            Some(TerminalPrimary::Success(result))
+        }
+        (OperationState::Pending | OperationState::Running, TerminalCandidate::Failure(error)) => {
+            Some(TerminalPrimary::Failure(error))
+        }
+        (OperationState::Pending | OperationState::Running, TerminalCandidate::Cancellation) => {
+            cancellation_reason.map(TerminalPrimary::Cancellation)
+        }
+        _ => None,
+    }
+}
+
+fn cancellation_error(reason: CancellationReason) -> EasyConError {
+    let (code, message) = match reason {
+        CancellationReason::Requested => (ErrorCode::Cancelled, "operation cancelled"),
+        CancellationReason::Deadline => (ErrorCode::DeadlineExceeded, "operation deadline elapsed"),
+        CancellationReason::ParentClose => (
+            ErrorCode::Cancelled,
+            "parent operation, resource, or Runtime ended",
+        ),
+    };
+    EasyConError::new(ErrorDomain::Runtime, code, message)
+}
+
+fn cleanup_panic_error() -> EasyConError {
+    EasyConError::new(
+        ErrorDomain::Internal,
+        ErrorCode::Internal,
+        "operation owner cleanup panicked",
+    )
+}
+
+fn cleanup_settlement_panic_error() -> EasyConError {
+    EasyConError::new(
+        ErrorDomain::Internal,
+        ErrorCode::Internal,
+        "operation cleanup settlement observer panicked",
+    )
+}
+
+fn discard_terminal_callbacks<C, S>(cleanup: C, on_cleanup_settled: S) {
+    let _ = drop_isolated(cleanup);
+    let _ = drop_isolated(on_cleanup_settled);
 }
 
 fn snapshot_data(data: &OperationData) -> OperationSnapshot {

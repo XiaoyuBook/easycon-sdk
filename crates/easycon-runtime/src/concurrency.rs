@@ -68,6 +68,142 @@ pub const fn claim_cancellation(already_cancelled: bool) -> bool {
     !already_cancelled
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalEvidenceKind {
+    EffectAccepted,
+    NotDelivered,
+    ExecutionFailed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalWinnerKind {
+    Success,
+    Failure,
+    Cancellation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalClaimResult {
+    Claimed,
+    Observe,
+    RejectedOwner,
+    RejectedEvidence,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TerminalArbiterState {
+    primary_owner: u64,
+    transfer_owner: Option<u64>,
+    active_owner: u64,
+    primary_owner_joined: bool,
+    handoff_used: bool,
+    winner: Option<TerminalWinnerKind>,
+    committed: bool,
+}
+
+impl TerminalArbiterState {
+    pub const fn new(primary_owner: u64, transfer_owner: Option<u64>) -> Self {
+        Self {
+            primary_owner,
+            transfer_owner,
+            active_owner: primary_owner,
+            primary_owner_joined: false,
+            handoff_used: false,
+            winner: None,
+            committed: false,
+        }
+    }
+
+    pub fn claim(
+        &mut self,
+        owner: u64,
+        evidence: TerminalEvidenceKind,
+        winner: TerminalWinnerKind,
+    ) -> TerminalClaimResult {
+        if self.winner.is_some() || self.committed {
+            return TerminalClaimResult::Observe;
+        }
+        if owner != self.active_owner {
+            return TerminalClaimResult::RejectedOwner;
+        }
+        if !evidence_allows_winner(evidence, winner) {
+            return TerminalClaimResult::RejectedEvidence;
+        }
+        self.winner = Some(winner);
+        TerminalClaimResult::Claimed
+    }
+
+    pub fn mark_primary_owner_joined(&mut self, owner: u64) -> bool {
+        if owner != self.primary_owner || self.primary_owner_joined {
+            return false;
+        }
+        self.primary_owner_joined = true;
+        true
+    }
+
+    pub fn handoff(&mut self, transfer_owner: u64) -> bool {
+        if self.committed
+            || self.winner.is_some()
+            || self.handoff_used
+            || !self.primary_owner_joined
+            || self.transfer_owner != Some(transfer_owner)
+            || self.active_owner != self.primary_owner
+        {
+            return false;
+        }
+        self.active_owner = transfer_owner;
+        self.handoff_used = true;
+        true
+    }
+
+    pub fn commit(&mut self, owner: u64, winner: TerminalWinnerKind) -> bool {
+        if self.committed || self.active_owner != owner || self.winner != Some(winner) {
+            return false;
+        }
+        self.committed = true;
+        true
+    }
+
+    pub const fn winner(&self) -> Option<TerminalWinnerKind> {
+        self.winner
+    }
+
+    pub const fn committed(&self) -> bool {
+        self.committed
+    }
+
+    pub const fn primary_owner_joined(&self) -> bool {
+        self.primary_owner_joined
+    }
+
+    pub const fn transfer_owner(&self) -> Option<u64> {
+        self.transfer_owner
+    }
+
+    pub const fn primary_owner(&self) -> u64 {
+        self.primary_owner
+    }
+}
+
+pub const fn evidence_allows_winner(
+    evidence: TerminalEvidenceKind,
+    winner: TerminalWinnerKind,
+) -> bool {
+    matches!(
+        (evidence, winner),
+        (
+            TerminalEvidenceKind::EffectAccepted,
+            TerminalWinnerKind::Success
+        ) | (
+            TerminalEvidenceKind::NotDelivered,
+            TerminalWinnerKind::Cancellation
+        ) | (
+            TerminalEvidenceKind::ExecutionFailed,
+            TerminalWinnerKind::Failure
+        )
+    )
+}
+
 pub fn contain_panic<T>(result: std::thread::Result<T>) -> Result<T, ()> {
     match result {
         Ok(value) => Ok(value),

@@ -15,11 +15,15 @@ use crate::concurrency::{
     TaskLifecycleState, TaskOwnerBinding, catch_isolated, contain_panic, runtime_close_rejected,
     task_join_rejected,
 };
+use crate::deadline::{DeadlineAdmission, DeadlineRegistration, DeadlineScheduler};
 use crate::event::{
     Event, EventDraft, EventKind, EventSubscription, Severity, SubscriptionInner,
     SubscriptionOptions, close_subscriptions_with_final,
 };
-use crate::operation::{CancellationReason, Operation, OperationInner};
+use crate::operation::{
+    CancellationReason, Operation, OperationFallbackOutcome, OperationInner, OperationOwnerSetup,
+    OperationSettlementOwner, OwnerCleanup, OwnerCleanupSettled, SettlementOwnerMode,
+};
 
 static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -146,6 +150,8 @@ pub struct Runtime {
 
 #[cfg(test)]
 type FinalEventObserver = Arc<dyn Fn(RuntimeCounts) + Send + Sync>;
+#[cfg(test)]
+type ExternalTaskJoinObserver = Arc<dyn Fn(TaskId) + Send + Sync>;
 
 pub(crate) struct RuntimeInner {
     id: RuntimeId,
@@ -167,6 +173,8 @@ pub(crate) struct RuntimeInner {
     #[cfg(test)]
     task_join_after_unlink: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
+    external_task_join_before_wait: Mutex<Option<ExternalTaskJoinObserver>>,
+    #[cfg(test)]
     deadline_worker_panic: AtomicBool,
     #[cfg(test)]
     final_event_failure_at: AtomicUsize,
@@ -180,6 +188,7 @@ pub(crate) struct RuntimeInner {
     subscriptions: Mutex<Vec<Weak<SubscriptionInner>>>,
     events_closed: AtomicBool,
     deadline_sender: Sender<DeadlineSignal>,
+    deadline_scheduler: Arc<DeadlineScheduler>,
     deadline_task: Mutex<Option<SupervisedTask>>,
     clock_hook: Mutex<Option<ClockChangeRegistration>>,
 }
@@ -407,6 +416,10 @@ impl Runtime {
         let runtime_number = NEXT_RUNTIME_ID.fetch_add(1, Ordering::Relaxed);
         assert!(runtime_number != 0, "Runtime ID space exhausted");
         let (deadline_sender, deadline_receiver) = mpsc::channel();
+        let scheduler_sender = deadline_sender.clone();
+        let deadline_scheduler = DeadlineScheduler::new(Arc::new(move || {
+            let _ = scheduler_sender.send(DeadlineSignal::Wake);
+        }));
         let runtime_id = RuntimeId::new(runtime_number);
         let next_id = AtomicU64::new(1);
         let deadline_task_number = next_id.fetch_add(1, Ordering::Relaxed);
@@ -435,6 +448,8 @@ impl Runtime {
             #[cfg(test)]
             task_join_after_unlink: Mutex::new(None),
             #[cfg(test)]
+            external_task_join_before_wait: Mutex::new(None),
+            #[cfg(test)]
             deadline_worker_panic: AtomicBool::new(false),
             #[cfg(test)]
             final_event_failure_at: AtomicUsize::new(usize::MAX),
@@ -448,6 +463,7 @@ impl Runtime {
             subscriptions: Mutex::new(Vec::new()),
             events_closed: AtomicBool::new(false),
             deadline_sender: deadline_sender.clone(),
+            deadline_scheduler,
             deadline_task: Mutex::new(None),
             clock_hook: Mutex::new(None),
         });
@@ -532,6 +548,23 @@ impl Runtime {
         deadline_ns: Option<u64>,
         parent: &CancellationToken,
     ) -> Result<Operation, EasyConError> {
+        if let Some(deadline) = deadline_ns {
+            let state = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            ensure_active(*state)?;
+            if parent.owner() != Some(self.inner.id) {
+                return Err(EasyConError::new(
+                    ErrorDomain::Validation,
+                    ErrorCode::InvalidArgument,
+                    "operation cancellation parent belongs to a different Runtime",
+                ));
+            }
+            drop(state);
+            self.inner.clock.register_deadline(deadline);
+        }
         let state = self
             .inner
             .state
@@ -554,9 +587,6 @@ impl Runtime {
         };
         let id = OperationId::new(self.inner.allocate_id());
         let operation = Operation::new(id, Arc::downgrade(&self.inner), cancellation, deadline_ns);
-        if let Some(deadline) = deadline_ns {
-            self.inner.clock.register_deadline(deadline);
-        }
         self.inner
             .operations
             .lock()
@@ -572,6 +602,80 @@ impl Runtime {
     /// Requests cancellation for operations whose execution deadline has elapsed.
     pub fn poll_deadlines(&self) -> usize {
         self.inner.poll_deadlines()
+    }
+
+    /// Registers a one-shot absolute deadline in this Runtime's clock epoch.
+    pub fn register_deadline(&self, target_ns: u64) -> Result<DeadlineRegistration, EasyConError> {
+        let admission = self.inner.reserve_deadline_admission(target_ns)?;
+        let trace_id = self.inner.clock.register_deadline(target_ns);
+        let now_ns = self.inner.clock.now_ns();
+        Ok(admission.commit(trace_id, now_ns, &*self.inner.clock))
+    }
+
+    /// Creates an operation with one explicit settlement owner and pre-registered cleanup record.
+    pub fn create_operation_with_settlement_owner<C, S>(
+        &self,
+        deadline_ns: Option<u64>,
+        mode: SettlementOwnerMode,
+        cleanup: C,
+        on_cleanup_settled: S,
+    ) -> Result<(Operation, OperationSettlementOwner), EasyConError>
+    where
+        C: FnOnce() -> Result<(), EasyConError> + Send + 'static,
+        S: FnOnce(Result<(), EasyConError>) + Send + 'static,
+    {
+        if let Some(deadline) = deadline_ns {
+            let state = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            ensure_active(*state)?;
+            drop(state);
+            self.inner.clock.register_deadline(deadline);
+        }
+        let state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ensure_active(*state)?;
+        let Some(cancellation) = self.inner.root_cancellation.try_child() else {
+            return Err(EasyConError::new(
+                ErrorDomain::Validation,
+                ErrorCode::InvalidArgument,
+                "operation cancellation parent is no longer active",
+            ));
+        };
+        let id = OperationId::new(self.inner.allocate_id());
+        let owner_id = self.inner.allocate_id();
+        let transfer_owner_id = match mode {
+            SettlementOwnerMode::Exclusive => None,
+            SettlementOwnerMode::Transferable => Some(self.inner.allocate_id()),
+        };
+        let setup = OperationOwnerSetup::new(
+            owner_id,
+            transfer_owner_id,
+            Box::new(cleanup) as OwnerCleanup,
+            Box::new(on_cleanup_settled) as OwnerCleanupSettled,
+        );
+        let (operation, owner) = Operation::new_owned(
+            id,
+            Arc::downgrade(&self.inner),
+            cancellation,
+            deadline_ns,
+            setup,
+        );
+        self.inner
+            .operations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id, Arc::clone(&operation.inner));
+        drop(state);
+        if deadline_ns.is_some() {
+            let _ = self.inner.deadline_sender.send(DeadlineSignal::Wake);
+        }
+        Ok((operation, owner))
     }
 
     /// Creates an independent bounded pull subscription.
@@ -663,6 +767,51 @@ impl Runtime {
         Ok(supervised)
     }
 
+    /// Spawns work after binding an explicit operation settlement owner to the supervised task.
+    pub fn spawn_operation_owner<F>(
+        &self,
+        name: impl Into<String>,
+        owner: OperationSettlementOwner,
+        task: F,
+    ) -> Result<SupervisedTask, EasyConError>
+    where
+        F: FnOnce(OperationSettlementOwner) + Send + 'static,
+    {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ensure_active(*state)?;
+        if !owner.belongs_to(&self.inner) {
+            return Err(EasyConError::new(
+                ErrorDomain::Validation,
+                ErrorCode::InvalidArgument,
+                "operation settlement owner belongs to a different Runtime",
+            ));
+        }
+        let id = TaskId::new(self.inner.allocate_id());
+        if !owner.bind_task(id) {
+            return Err(EasyConError::new(
+                ErrorDomain::Runtime,
+                ErrorCode::InvalidArgument,
+                "operation settlement owner is already bound",
+            ));
+        }
+        let owner_inner = Arc::clone(&owner.inner);
+        let supervised = match spawn_supervised_inner(&self.inner, id, name.into(), move || {
+            task(owner);
+        }) {
+            Ok(supervised) => supervised,
+            Err(error) => {
+                owner_inner.mark_owner_task_joined(id);
+                return Err(error);
+            }
+        };
+        drop(state);
+        Ok(supervised)
+    }
+
     /// Returns current supervised counts without changing lifecycle.
     #[must_use]
     pub fn counts(&self) -> RuntimeCounts {
@@ -696,6 +845,7 @@ impl Runtime {
             loop {
                 match *state {
                     RuntimeState::Active => {
+                        self.inner.deadline_scheduler.seal_admission();
                         *state = RuntimeState::Closing;
                         let acquired = self.inner.close_in_progress.compare_exchange(
                             false,
@@ -749,18 +899,23 @@ impl Runtime {
     }
 
     fn finish_close_success_path(&self, phase: &Cell<ClosePhase>) -> Result<(), CloseFailure> {
-        self.inner
-            .try_publish_event(EventDraft::critical(
-                EventKind::State,
-                "runtime.closing",
-                Severity::Info,
+        let mut first_failure = if matches!(
+            catch_isolated(|| {
+                self.inner.try_publish_event(EventDraft::critical(
+                    EventKind::State,
+                    "runtime.closing",
+                    Severity::Info,
+                ))
+            }),
+            Ok(Ok(_))
+        ) {
+            None
+        } else {
+            Some(CloseFailure::new(
+                ClosePhase::Start,
+                "Runtime closing event could not be published",
             ))
-            .map_err(|_| {
-                CloseFailure::new(
-                    ClosePhase::Start,
-                    "Runtime closing event could not be published",
-                )
-            })?;
+        };
         self.inner.root_cancellation.cancel();
 
         phase.set(ClosePhase::OperationFinalization);
@@ -830,23 +985,47 @@ impl Runtime {
             }
         }
         drop(resources);
-        if let Some(failure) = resource_failure {
-            return Err(failure);
+        if first_failure.is_none() {
+            first_failure = resource_failure;
         }
 
         phase.set(ClosePhase::TaskJoin);
-        self.inner.join_external_tasks()?;
+        if let Err(failure) = self.inner.join_external_tasks()
+            && first_failure.is_none()
+        {
+            first_failure = Some(failure);
+        }
 
         phase.set(ClosePhase::OperationFinalization);
+        let mut operation_failure = None;
         for operation in &operations {
             if !operation.snapshot().state.is_terminal() {
-                let _ = operation.finish_cancelled();
+                match operation.inner.settle_after_owner_join() {
+                    OperationFallbackOutcome::Legacy => {
+                        let _ = operation.finish_cancelled();
+                    }
+                    OperationFallbackOutcome::AlreadyTerminal
+                    | OperationFallbackOutcome::Settled => {}
+                    OperationFallbackOutcome::OwnershipLost => {
+                        if operation_failure.is_none() && first_failure.is_none() {
+                            operation_failure = Some(CloseFailure::new(
+                                ClosePhase::OperationFinalization,
+                                "operation settlement ownership and evidence are unavailable",
+                            ));
+                        }
+                    }
+                }
             }
         }
         drop(operations);
 
         phase.set(ClosePhase::InternalTaskJoin);
-        self.inner.stop_deadline_worker()?;
+        if let Err(failure) = self.inner.stop_deadline_worker()
+            && first_failure.is_none()
+            && operation_failure.is_none()
+        {
+            first_failure = Some(failure);
+        }
         phase.set(ClosePhase::RegistryConvergence);
         if self.inner.counts_recover()
             != (RuntimeCounts {
@@ -854,11 +1033,16 @@ impl Runtime {
                 active_resources: 0,
                 active_tasks: 0,
             })
+            && first_failure.is_none()
+            && operation_failure.is_none()
         {
-            return Err(CloseFailure::new(
+            first_failure = Some(CloseFailure::new(
                 ClosePhase::RegistryConvergence,
                 "Runtime registries did not converge during close",
             ));
+        }
+        if let Some(failure) = first_failure.or(operation_failure) {
+            return Err(failure);
         }
 
         phase.set(ClosePhase::FinalEvent);
@@ -914,6 +1098,7 @@ impl Drop for Runtime {
                     Err(poisoned) => poisoned.into_inner(),
                 };
                 if *state == RuntimeState::Active {
+                    self.inner.deadline_scheduler.seal_admission();
                     *state = RuntimeState::Closing;
                     true
                 } else {
@@ -930,6 +1115,20 @@ impl Drop for Runtime {
 }
 
 impl RuntimeInner {
+    fn reserve_deadline_admission(
+        &self,
+        target_ns: u64,
+    ) -> Result<DeadlineAdmission, EasyConError> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ensure_active(*state)?;
+        self.deadline_scheduler
+            .reserve(target_ns)
+            .map_err(|()| runtime_closing_error("Runtime deadline admission is sealed"))
+    }
+
     fn current_thread_owns_close(&self) -> bool {
         *self
             .close_owner
@@ -1122,6 +1321,7 @@ impl RuntimeInner {
             );
             tasks.remove(&id);
         }
+        self.mark_operation_owner_task_joined(id);
         #[cfg(test)]
         let after_unlink = self
             .task_join_after_unlink
@@ -1147,6 +1347,16 @@ impl RuntimeInner {
         tasks.sort_by_key(|(id, _)| *id);
         let mut panicked = Vec::new();
         for (id, completion) in tasks {
+            #[cfg(test)]
+            let before_wait = self
+                .external_task_join_before_wait
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            #[cfg(test)]
+            if let Some(before_wait) = before_wait {
+                before_wait(id);
+            }
             let outcome = self.join_supervised_task(id, &completion).map_err(|_| {
                 CloseFailure::new(
                     ClosePhase::TaskJoin,
@@ -1183,6 +1393,12 @@ impl RuntimeInner {
         id
     }
 
+    fn mark_operation_owner_task_joined(&self, task_id: TaskId) {
+        for operation in self.live_operations() {
+            operation.inner.mark_owner_task_joined(task_id);
+        }
+    }
+
     pub(crate) fn unregister_operation(&self, id: OperationId) {
         self.operations
             .lock()
@@ -1213,6 +1429,10 @@ impl RuntimeInner {
     }
 
     pub(crate) fn try_publish_event(&self, draft: EventDraft) -> Result<Event, EasyConError> {
+        if self.events_closed.load(Ordering::Acquire) {
+            return Err(events_closed_error());
+        }
+        let timestamp_ns = self.clock.now_ns();
         let mut subscriptions = self
             .subscriptions
             .lock()
@@ -1220,7 +1440,7 @@ impl RuntimeInner {
         if self.events_closed.load(Ordering::Acquire) {
             return Err(events_closed_error());
         }
-        let event = self.next_event(draft);
+        let event = self.finish_event(self.allocate_event_sequence(), timestamp_ns, draft);
         enqueue_event(&mut subscriptions, &event);
         Ok(event)
     }
@@ -1238,6 +1458,15 @@ impl RuntimeInner {
         draft: EventDraft,
         recover_clock_panic: bool,
     ) -> Result<(), ()> {
+        if self.events_closed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let timestamp_ns = if recover_clock_panic {
+            catch_isolated(|| self.clock.now_ns())
+                .unwrap_or_else(|_| self.last_event_timestamp_ns.load(Ordering::Acquire))
+        } else {
+            self.clock.now_ns()
+        };
         let mut subscriptions = self
             .subscriptions
             .lock()
@@ -1274,27 +1503,10 @@ impl RuntimeInner {
         {
             observer(self.counts_recover());
         }
-        let event = if recover_clock_panic {
-            self.next_event_recovering_clock(draft)
-        } else {
-            self.next_event(draft)
-        };
+        let event = self.finish_event(self.allocate_event_sequence(), timestamp_ns, draft);
         close_subscriptions_with_final(&live, event);
         self.events_closed.store(true, Ordering::Release);
         Ok(())
-    }
-
-    fn next_event(&self, draft: EventDraft) -> Event {
-        let sequence = self.allocate_event_sequence();
-        let timestamp_ns = self.clock.now_ns();
-        self.finish_event(sequence, timestamp_ns, draft)
-    }
-
-    fn next_event_recovering_clock(&self, draft: EventDraft) -> Event {
-        let sequence = self.allocate_event_sequence();
-        let timestamp_ns = catch_isolated(|| self.clock.now_ns())
-            .unwrap_or_else(|_| self.last_event_timestamp_ns.load(Ordering::Acquire));
-        self.finish_event(sequence, timestamp_ns, draft)
     }
 
     fn allocate_event_sequence(&self) -> u64 {
@@ -1368,6 +1580,7 @@ impl RuntimeInner {
     }
 
     fn stop_deadline_worker(&self) -> Result<(), CloseFailure> {
+        self.deadline_scheduler.drain_runtime_closed();
         self.clock_hook
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1516,10 +1729,17 @@ fn deadline_worker(runtime: Weak<RuntimeInner>, receiver: Receiver<DeadlineSigna
         if runtime.deadline_worker_panic.swap(false, Ordering::AcqRel) {
             panic!("failpoint:runtime.deadline_worker.panic");
         }
+        runtime.deadline_scheduler.fire_due(&*runtime.clock);
         runtime.poll_deadlines();
-        let wait = runtime
-            .next_deadline_ns()
-            .and_then(|deadline| runtime.clock.real_wait_duration(deadline));
+        let next_operation = runtime.next_deadline_ns();
+        let next_registration = runtime.deadline_scheduler.next_target_ns();
+        let next_deadline = match (next_operation, next_registration) {
+            (Some(operation), Some(registration)) => Some(operation.min(registration)),
+            (Some(operation), None) => Some(operation),
+            (None, Some(registration)) => Some(registration),
+            (None, None) => None,
+        };
+        let wait = next_deadline.and_then(|deadline| runtime.clock.real_wait_duration(deadline));
         drop(runtime);
 
         let signal = match wait {
@@ -1555,6 +1775,10 @@ fn events_closed_error() -> EasyConError {
     )
 }
 
+fn runtime_closing_error(message: &'static str) -> EasyConError {
+    EasyConError::new(ErrorDomain::Runtime, ErrorCode::RuntimeClosing, message)
+}
+
 fn ensure_active(state: RuntimeState) -> Result<(), EasyConError> {
     if state == RuntimeState::Active {
         Ok(())
@@ -1576,8 +1800,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::{
-        EventClass, EventDraft, EventGap, EventKind, OperationSnapshot, OperationState,
-        OperationValue, Severity, SubscriptionRead, SystemClock, TransitionOutcome, VirtualClock,
+        DeadlineResolution, DeadlineWaitResult, EventClass, EventDraft, EventGap, EventKind,
+        OperationSnapshot, OperationState, OperationValue, SettlementEvidence, Severity,
+        SubscriptionRead, SystemClock, TerminalCandidate, TransitionOutcome, VirtualClock,
         WaitResult, WaitTimeout,
     };
 
@@ -2682,6 +2907,134 @@ mod tests {
         }
     }
 
+    // conformance: runtime.resource-failure-deadline-service
+    #[test]
+    fn resource_failure_keeps_deadline_service_until_external_owner_join() {
+        let clock = Arc::new(VirtualClock::default());
+        let runtime = Runtime::new(clock.clone());
+        let registration = runtime.register_deadline(10).expect("deadline");
+        let signal = registration.signal();
+        let (resolution, observed_resolution) = mpsc::sync_channel(1);
+        let task = runtime
+            .spawn_supervised("deadline-owner", move || {
+                resolution
+                    .send(signal.wait(WaitTimeout::Infinite))
+                    .expect("deadline result observer");
+                drop(registration);
+            })
+            .expect("deadline owner task");
+
+        let panicking = Arc::new(PanickingResource::default());
+        let managed: Arc<dyn ManagedResource> = panicking.clone();
+        let resource_registration = runtime.register_resource(managed).expect("resource");
+        let resource_id = resource_registration.id();
+        *panicking.registration.lock().expect("registration lock") = Some(resource_registration);
+
+        let task_id = task.id();
+        let (join_started, observed_join) = mpsc::sync_channel(1);
+        *runtime
+            .inner
+            .external_task_join_before_wait
+            .lock()
+            .expect("external join observer lock") = Some(Arc::new(move |id| {
+            if id == task_id {
+                join_started.send(()).expect("external join observer");
+            }
+        }));
+        let closing_runtime = runtime.clone();
+        let closer = std::thread::spawn(move || closing_runtime.close());
+
+        observed_join
+            .recv_timeout(Duration::from_secs(2))
+            .expect("resource failure must proceed to external owner join");
+        clock.advance_to(10);
+        assert!(matches!(
+            observed_resolution
+                .recv_timeout(Duration::from_secs(2))
+                .expect("deadline resolution"),
+            DeadlineWaitResult::Resolved(outcome)
+                if outcome.resolution == DeadlineResolution::Fired
+        ));
+
+        let CloseOutcome::Failed(report) =
+            closer.join().expect("close thread").expect("close outcome")
+        else {
+            panic!("resource panic cannot report Closed");
+        };
+        assert_eq!(report.phase, ClosePhase::ResourceCleanup);
+        assert_eq!(report.resource_id, Some(resource_id));
+        assert_eq!(task.join(), Ok(SupervisedTaskOutcome::Completed));
+        panicking
+            .registration
+            .lock()
+            .expect("registration lock")
+            .take();
+        assert_eq!(runtime.counts().active_tasks, 0);
+    }
+
+    // conformance: operation.claimed-owner-close-wait
+    #[test]
+    fn close_waits_for_an_already_claimed_unbound_owner() {
+        let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+        let (cleanup_started, observed_cleanup) = mpsc::sync_channel(0);
+        let (release_cleanup, cleanup_released) = mpsc::sync_channel(0);
+        let (operation, owner) = runtime
+            .create_operation_with_settlement_owner(
+                None,
+                SettlementOwnerMode::Exclusive,
+                move || {
+                    cleanup_started.send(()).expect("cleanup start observer");
+                    cleanup_released.recv().expect("cleanup release");
+                    Ok(())
+                },
+                |_| {},
+            )
+            .expect("owned operation");
+        assert_eq!(operation.start(), TransitionOutcome::Applied);
+        let (settled, observed_settled) = mpsc::sync_channel(1);
+        let settling = std::thread::spawn(move || {
+            settled
+                .send(owner.settle(
+                    SettlementEvidence::EffectAccepted,
+                    TerminalCandidate::Success(OperationValue::Unit),
+                ))
+                .expect("settlement observer");
+        });
+        observed_cleanup
+            .recv_timeout(Duration::from_secs(2))
+            .expect("cleanup started");
+
+        let (wait_blocked, observed_wait_blocked) = mpsc::channel();
+        operation.observe_next_wait_blocked(wait_blocked);
+        let closing_runtime = runtime.clone();
+        let (closed, observed_close) = mpsc::sync_channel(1);
+        let closer = std::thread::spawn(move || {
+            closed
+                .send(closing_runtime.close())
+                .expect("close observer");
+        });
+        observed_wait_blocked
+            .recv_timeout(Duration::from_secs(2))
+            .expect("close observes the claimed terminal transaction");
+        assert!(matches!(
+            observed_close.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        release_cleanup.send(()).expect("release cleanup");
+        settling.join().expect("settlement thread");
+        assert_eq!(
+            observed_settled.recv_timeout(Duration::from_secs(2)),
+            Ok(TransitionOutcome::Applied)
+        );
+        assert_eq!(
+            observed_close.recv_timeout(Duration::from_secs(2)),
+            Ok(Ok(CloseOutcome::Closed))
+        );
+        closer.join().expect("close thread");
+        assert_eq!(operation.snapshot().state, OperationState::Succeeded);
+    }
+
     struct WarningEventPanickingResource {
         clock: Arc<OneShotThreadClock>,
         registration: Mutex<Option<ResourceRegistration>>,
@@ -2717,7 +3070,7 @@ mod tests {
     }
 
     #[test]
-    fn resource_close_panic_does_not_unwind_or_force_owner_terminal() {
+    fn resource_close_panic_does_not_unwind_and_still_joins_owner() {
         let runtime = Runtime::new(Arc::new(VirtualClock::default()));
         let operation = runtime.create_operation(None).expect("operation");
         operation.start();
@@ -2725,19 +3078,30 @@ mod tests {
         let managed: Arc<dyn ManagedResource> = panicking.clone();
         *panicking.registration.lock().expect("registration lock") =
             Some(runtime.register_resource(managed).expect("resource"));
+        let (owner_wake, owner_woken) = mpsc::channel();
+        operation.on_cancel(move || owner_wake.send(()).expect("owner cancellation wake"));
+        let (cleanup_started, observed_cleanup) = mpsc::channel();
         let (release_owner, owner_released) = mpsc::channel();
         let owner_operation = operation.clone();
         let owner = runtime
             .spawn_supervised("operation-owner", move || {
+                owner_woken.recv().expect("owner cancellation");
+                cleanup_started.send(()).expect("cleanup observer");
                 owner_released.recv().expect("owner cleanup release");
                 owner_operation.finish_cancelled();
             })
             .expect("owner task");
 
-        let close_result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime.close()));
-        let state_after_close = operation.snapshot().state;
+        let closing_runtime = runtime.clone();
+        let closer = std::thread::spawn(move || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| closing_runtime.close()))
+        });
+        observed_cleanup
+            .recv_timeout(Duration::from_secs(2))
+            .expect("owner cleanup started");
+        assert_eq!(operation.snapshot().state, OperationState::Cancelling);
         release_owner.send(()).expect("release owner cleanup");
+        let close_result = closer.join().expect("close thread");
         assert_eq!(
             owner.join().expect("owner task join"),
             SupervisedTaskOutcome::Completed
@@ -2752,7 +3116,8 @@ mod tests {
             close_result.is_ok(),
             "close failure crossed the API boundary"
         );
-        assert_eq!(state_after_close, OperationState::Cancelling);
+        assert!(matches!(close_result, Ok(Ok(CloseOutcome::Failed(_)))));
+        assert_eq!(operation.snapshot().state, OperationState::Cancelled);
     }
 
     struct OrderedResource {
@@ -3030,7 +3395,7 @@ mod tests {
     // conformance: runtime.owner-terminal-order
     // conformance: runtime.close-report
     #[test]
-    fn resource_panic_saves_one_report_without_forcing_owner_terminal() {
+    fn resource_panic_saves_one_report_after_owner_terminal_and_join() {
         let runtime = Runtime::new(Arc::new(VirtualClock::default()));
         let events = runtime
             .subscribe(SubscriptionOptions::default())
@@ -3090,6 +3455,7 @@ mod tests {
         release_callback
             .send(())
             .expect("release resource callback");
+        release_cleanup.send(()).expect("release owner cleanup");
 
         let outcomes: Vec<_> = callers
             .into_iter()
@@ -3113,16 +3479,19 @@ mod tests {
         assert_eq!(
             reports[0].counts,
             RuntimeCounts {
-                active_operations: 1,
+                active_operations: 0,
                 active_resources: 1,
-                active_tasks: 1,
+                active_tasks: 0,
             }
         );
         assert_eq!(runtime.state(), RuntimeState::CloseFailed);
         assert_eq!(panicking.close_count.load(Ordering::Acquire), 1);
         assert!(healthy.closed.load(Ordering::Acquire));
-        assert_eq!(operation.snapshot().state, OperationState::Cancelling);
-        assert_eq!(operation.wait(WaitTimeout::Poll), WaitResult::Timeout);
+        assert_eq!(operation.snapshot().state, OperationState::Cancelled);
+        assert!(matches!(
+            operation.wait(WaitTimeout::Poll),
+            WaitResult::Completed(_)
+        ));
         let later = runtime.close().expect("later close caller");
         let CloseOutcome::Failed(later_report) = later else {
             panic!("saved close failure changed to Closed");
@@ -3149,7 +3518,6 @@ mod tests {
         );
         assert!(!observed.iter().any(|event| event.code == "runtime.closed"));
 
-        release_cleanup.send(()).expect("release owner cleanup");
         assert_eq!(
             owner.join().expect("owner task join"),
             SupervisedTaskOutcome::Completed
@@ -3654,6 +4022,88 @@ mod tests {
             ))
             .expect_err("post-close event production must be rejected");
         assert_eq!(error.code(), ErrorCode::RuntimeClosing);
+    }
+
+    // conformance: runtime.start-failure-continues-close
+    #[test]
+    fn closing_event_failure_still_joins_external_owner_and_settles_operation() {
+        let clock = Arc::new(PanickingNowClock::new(41));
+        let runtime = Runtime::new(clock.clone());
+        let operation = runtime.create_operation(None).expect("operation");
+        assert_eq!(operation.start(), TransitionOutcome::Applied);
+        let (cancelled, observed_cancel) = mpsc::sync_channel(1);
+        operation.on_cancel(move || cancelled.send(()).expect("owner cancellation wake"));
+        let (cleanup_started, observed_cleanup) = mpsc::sync_channel(1);
+        let (release_cleanup, cleanup_released) = mpsc::sync_channel(0);
+        let owner_operation = operation.clone();
+        let owner = runtime
+            .spawn_supervised("start-failure-owner", move || {
+                observed_cancel.recv().expect("owner cancellation");
+                cleanup_started.send(()).expect("cleanup start observer");
+                cleanup_released.recv().expect("cleanup release");
+                assert_eq!(
+                    owner_operation.finish_cancelled(),
+                    TransitionOutcome::Applied
+                );
+            })
+            .expect("owner task");
+        let owner_id = owner.id();
+        let (join_started, observed_join) = mpsc::sync_channel(1);
+        *runtime
+            .inner
+            .external_task_join_before_wait
+            .lock()
+            .expect("external join observer lock") = Some(Arc::new(move |id| {
+            if id == owner_id {
+                join_started.send(()).expect("external join observer");
+            }
+        }));
+        let resource = Arc::new(TestResource::default());
+        let managed: Arc<dyn ManagedResource> = resource.clone();
+        *resource.registration.lock().expect("registration lock") =
+            Some(runtime.register_resource(managed).expect("resource"));
+
+        let closing_runtime = runtime.clone();
+        let closing_clock = clock.clone();
+        let (closed, observed_close) = mpsc::sync_channel(1);
+        let closer = std::thread::spawn(move || {
+            closing_clock.panic_on_current_thread();
+            closed
+                .send(closing_runtime.close())
+                .expect("close observer");
+        });
+        observed_cleanup
+            .recv_timeout(Duration::from_secs(2))
+            .expect("owner cleanup started");
+        observed_join
+            .recv_timeout(Duration::from_secs(2))
+            .expect("close continued to external owner join");
+        assert!(resource.closed.load(Ordering::Acquire));
+        assert!(matches!(
+            observed_close.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        release_cleanup.send(()).expect("release cleanup");
+        let CloseOutcome::Failed(report) = observed_close
+            .recv_timeout(Duration::from_secs(2))
+            .expect("close outcome")
+            .expect("external close caller")
+        else {
+            panic!("closing event failure cannot report Closed");
+        };
+        closer.join().expect("close thread");
+        assert_eq!(report.phase, ClosePhase::Start);
+        assert_eq!(owner.join(), Ok(SupervisedTaskOutcome::Completed));
+        assert_eq!(operation.snapshot().state, OperationState::Cancelled);
+        assert_eq!(
+            runtime.counts(),
+            RuntimeCounts {
+                active_operations: 0,
+                active_resources: 0,
+                active_tasks: 0,
+            }
+        );
     }
 
     // conformance: runtime.final-event-failure

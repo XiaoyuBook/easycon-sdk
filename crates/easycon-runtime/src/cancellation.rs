@@ -187,7 +187,7 @@ impl CancellationToken {
 
     /// Cancels this token and every live descendant exactly once.
     pub fn cancel(&self) {
-        cancel_inner(&self.inner);
+        self.cancel_deferred().propagate();
     }
 
     /// Registers a non-blocking hook used to wake supervised work on cancellation.
@@ -266,19 +266,23 @@ impl CancellationToken {
             retained_children,
         }
     }
-}
 
-fn cancel_inner(inner: &Arc<CancellationInner>) {
-    let mut hooks = Vec::new();
-    let mut discarded = Vec::new();
-    let mut retained_children = Vec::new();
-    seal_cancelled_tree(&**inner, &mut hooks, &mut discarded, &mut retained_children);
-    CancellationPropagation {
-        hooks,
-        discarded,
-        retained_children,
+    pub(crate) fn cancel_deferred(&self) -> CancellationPropagation {
+        let mut hooks = Vec::new();
+        let mut discarded = Vec::new();
+        let mut retained_children = Vec::new();
+        seal_cancelled_tree(
+            &*self.inner,
+            &mut hooks,
+            &mut discarded,
+            &mut retained_children,
+        );
+        CancellationPropagation {
+            hooks,
+            discarded,
+            retained_children,
+        }
     }
-    .propagate();
 }
 
 impl Drop for CancellationInner {

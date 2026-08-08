@@ -77,10 +77,33 @@
         "terminal_transaction": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["child_admission", "order", "failure_isolation"],
+          "required": [
+            "intent",
+            "claim",
+            "child_admission",
+            "order",
+            "cleanup_projection",
+            "handoff",
+            "ownership_loss",
+            "failure_isolation"
+          ],
           "properties": {
+            "intent": { "type": "string" },
+            "claim": { "type": "string" },
             "child_admission": { "type": "string" },
             "order": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+            "cleanup_projection": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["success", "failure", "cancellation"],
+              "properties": {
+                "success": { "type": "string" },
+                "failure": { "type": "string" },
+                "cancellation": { "type": "string" }
+              }
+            },
+            "handoff": { "type": "string" },
+            "ownership_loss": { "type": "string" },
             "failure_isolation": { "type": "string" }
           }
         }
@@ -89,7 +112,7 @@
     "runtime": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["states", "close_is_idempotent", "explicit_close", "reentrant_close", "final_handle_drop", "supervised_tasks", "close_failure", "close_order", "closed_counts"],
+      "required": ["states", "close_is_idempotent", "explicit_close", "reentrant_close", "final_handle_drop", "supervised_tasks", "close_failure", "generic_deadlines", "close_order", "closed_counts"],
       "properties": {
         "states": { "type": "array", "minItems": 4, "items": { "type": "string" }, "uniqueItems": true },
         "close_is_idempotent": { "type": "boolean" },
@@ -98,6 +121,34 @@
         "final_handle_drop": { "type": "string" },
         "supervised_tasks": { "type": "string" },
         "close_failure": { "type": "string" },
+        "generic_deadlines": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "target",
+            "identity",
+            "states",
+            "independence",
+            "system_clock",
+            "virtual_clock",
+            "close"
+          ],
+          "properties": {
+            "target": { "type": "string" },
+            "identity": { "type": "string" },
+            "states": {
+              "type": "array",
+              "minItems": 4,
+              "maxItems": 4,
+              "uniqueItems": true,
+              "items": { "enum": ["Armed", "Fired", "Disarmed", "RuntimeClosed"] }
+            },
+            "independence": { "type": "string" },
+            "system_clock": { "type": "string" },
+            "virtual_clock": { "type": "string" },
+            "close": { "type": "string" }
+          }
+        },
         "close_order": { "type": "array", "minItems": 1, "items": { "type": "string" } },
         "closed_counts": {
           "type": "object",

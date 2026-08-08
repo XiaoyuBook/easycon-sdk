@@ -1,0 +1,127 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://easycon.invalid/schemas/runtime-r0-v2-fixture-v1.schema.json",
+  "title": "EasyCon Runtime R0-v2 contract fixture v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "milestone",
+    "license",
+    "source_contract",
+    "deadline_registration",
+    "terminal_cleanup_matrix",
+    "close_cases"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "milestone": { "const": "runtime-r0-v2" },
+    "license": { "const": "GPL-3.0-only" },
+    "source_contract": { "const": "ADR-0020" },
+    "deadline_registration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "initial_state",
+        "terminal_resolutions",
+        "resolution_count",
+        "same_target_registration_ids",
+        "same_target_fire_order",
+        "public_registry_delta"
+      ],
+      "properties": {
+        "initial_state": { "const": "Armed" },
+        "terminal_resolutions": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "uniqueItems": true,
+          "items": { "enum": ["Fired", "Disarmed", "RuntimeClosed"] }
+        },
+        "resolution_count": { "const": 1 },
+        "same_target_registration_ids": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "integer", "minimum": 1 }
+        },
+        "same_target_fire_order": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "integer", "minimum": 1 }
+        },
+        "public_registry_delta": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "active_operations",
+            "active_resources",
+            "active_tasks",
+            "operation_events"
+          ],
+          "properties": {
+            "active_operations": { "const": 0 },
+            "active_resources": { "const": 0 },
+            "active_tasks": { "const": 0 },
+            "operation_events": { "const": 0 }
+          }
+        }
+      }
+    },
+    "terminal_cleanup_matrix": {
+      "type": "array",
+      "minItems": 15,
+      "maxItems": 15,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "primary",
+          "evidence",
+          "cleanup",
+          "transition_outcome",
+          "terminal_state",
+          "error_source"
+        ],
+        "properties": {
+          "primary": { "enum": ["Success", "Failure", "Requested", "Deadline", "ParentClose"] },
+          "evidence": { "enum": ["EffectAccepted", "NotDelivered", "ExecutionFailed"] },
+          "cleanup": { "enum": ["Ok", "Err", "Panic"] },
+          "transition_outcome": { "enum": ["Applied", "CleanupFailed"] },
+          "terminal_state": { "enum": ["Succeeded", "Failed", "Cancelled"] },
+          "error_source": { "enum": ["None", "Cleanup", "Primary", "FirstCancellationReason"] }
+        }
+      }
+    },
+    "close_cases": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "task_panicked",
+          "preheld_transfer_owner",
+          "shared_evidence",
+          "deadline_resolution",
+          "close_phase",
+          "operation_state",
+          "active_operations",
+          "terminal_events"
+        ],
+        "properties": {
+          "id": { "type": "string" },
+          "task_panicked": { "type": "boolean" },
+          "preheld_transfer_owner": { "type": "boolean" },
+          "shared_evidence": { "enum": ["None", "EffectAccepted", "NotDelivered", "ExecutionFailed"] },
+          "deadline_resolution": { "enum": ["NotApplicable", "Fired", "Disarmed", "RuntimeClosed"] },
+          "close_phase": { "enum": ["ResourceCleanup", "TaskJoin", "OperationFinalization"] },
+          "operation_state": { "enum": ["NotApplicable", "Pending", "Running", "Cancelling", "Succeeded", "Failed", "Cancelled"] },
+          "active_operations": { "type": "integer", "minimum": 0 },
+          "terminal_events": { "type": "integer", "minimum": 0, "maximum": 1 }
+        }
+      }
+    }
+  }
+}

@@ -53,7 +53,7 @@
     },
     {
       "id": "runtime-stabilization",
-      "test": "crates/easycon-runtime/src/runtime.rs::resource_panic_saves_one_report_without_forcing_owner_terminal",
+      "test": "crates/easycon-runtime/src/runtime.rs::resource_panic_saves_one_report_after_owner_terminal_and_join",
       "tests": [
         "crates/easycon-runtime/src/runtime.rs::task_close_without_manual_binding_does_not_self_wait",
         "crates/easycon-runtime/src/runtime.rs::task_exit_destructor_close_is_rejected_before_state_change",
@@ -62,8 +62,10 @@
         "crates/easycon-runtime/src/runtime.rs::concurrent_external_join_cannot_hide_a_task_panic_from_close",
         "crates/easycon-runtime/src/runtime.rs::resource_callback_reentrant_close_is_rejected_without_self_wait",
         "crates/easycon-runtime/src/runtime.rs::final_owning_drop_only_rejects_admission_and_requests_cancellation",
-        "crates/easycon-runtime/src/runtime.rs::resource_panic_saves_one_report_without_forcing_owner_terminal",
-        "crates/easycon-runtime/src/runtime.rs::final_event_failure_never_exposes_runtime_closed"
+        "crates/easycon-runtime/src/runtime.rs::resource_panic_saves_one_report_after_owner_terminal_and_join",
+        "crates/easycon-runtime/src/runtime.rs::resource_failure_keeps_deadline_service_until_external_owner_join",
+        "crates/easycon-runtime/src/runtime.rs::final_event_failure_never_exposes_runtime_closed",
+        "crates/easycon-runtime/src/runtime.rs::closing_event_failure_still_joins_external_owner_and_settles_operation"
       ],
       "steps": [
         { "id": "runtime.spawn-self-close", "action": "spawn a supervised task through Runtime and call synchronous close from its task body" },
@@ -76,7 +78,9 @@
         { "id": "runtime.drop-observe", "action": "observe admission rejection and root cancellation without releasing the resource owner" },
         { "id": "runtime.resource-panic", "action": "explicitly close another Runtime whose first resource callback panics and whose healthy resource can close" },
         { "id": "runtime.failed-owner-cleanup", "action": "hold the failed resource owner task in cleanup while concurrent close callers wait" },
-        { "id": "runtime.finish-real-cleanup", "action": "finish the real owner cleanup after every close caller receives the saved outcome" },
+        { "id": "runtime.finish-real-cleanup", "action": "finish the real owner cleanup so close can join it before saving the resource failure" },
+        { "id": "runtime.failed-resource-deadline", "action": "after a resource failure reaches external owner join, advance VirtualClock and resolve the owner's existing generic deadline" },
+        { "id": "runtime.start-failure-order", "action": "fail the RuntimeClosing event and hold an external owner cleanup while close continues through resource cleanup and task join" },
         { "id": "runtime.final-event-failure", "action": "fail final-event preflight both for an otherwise-successful close and after resource cleanup has already failed" },
         { "id": "runtime.repeat-close-failed", "action": "call close again after CloseFailed" }
       ],
@@ -124,27 +128,37 @@
         {
           "id": "runtime.healthy-cleanup-after-panic",
           "expect": "resource callback panic does not prevent healthy resource cleanup",
-          "test": "crates/easycon-runtime/src/runtime.rs::resource_panic_saves_one_report_without_forcing_owner_terminal"
+          "test": "crates/easycon-runtime/src/runtime.rs::resource_panic_saves_one_report_after_owner_terminal_and_join"
         },
         {
           "id": "runtime.saved-close-failed",
           "expect": "all concurrent and later close callers receive one saved CloseFailed outcome and runtime.close_failed is the final event",
-          "test": "crates/easycon-runtime/src/runtime.rs::resource_panic_saves_one_report_without_forcing_owner_terminal"
+          "test": "crates/easycon-runtime/src/runtime.rs::resource_panic_saves_one_report_after_owner_terminal_and_join"
         },
         {
           "id": "runtime.owner-terminal-order",
-          "expect": "an operation remains non-terminal until its real owner cleanup and owner task exit",
-          "test": "crates/easycon-runtime/src/runtime.rs::resource_panic_saves_one_report_without_forcing_owner_terminal"
+          "expect": "resource failure does not publish CloseFailed until the real owner cleanup has committed its operation terminal and the owner task is joined",
+          "test": "crates/easycon-runtime/src/runtime.rs::resource_panic_saves_one_report_after_owner_terminal_and_join"
+        },
+        {
+          "id": "runtime.resource-failure-deadline-service",
+          "expect": "an existing generic deadline remains serviceable through resource failure and fires before the external owner task is joined and the deadline worker is drained",
+          "test": "crates/easycon-runtime/src/runtime.rs::resource_failure_keeps_deadline_service_until_external_owner_join"
         },
         {
           "id": "runtime.close-report",
           "expect": "CloseFailed retains diagnostic resource or task IDs and non-converged registry counts",
-          "test": "crates/easycon-runtime/src/runtime.rs::resource_panic_saves_one_report_without_forcing_owner_terminal"
+          "test": "crates/easycon-runtime/src/runtime.rs::resource_panic_saves_one_report_after_owner_terminal_and_join"
         },
         {
           "id": "runtime.final-event-failure",
           "expect": "a failed final-event transaction during either successful or already-failing close recovers to runtime.close_failed and never exposes a partial runtime.closed",
           "test": "crates/easycon-runtime/src/runtime.rs::final_event_failure_never_exposes_runtime_closed"
+        },
+        {
+          "id": "runtime.start-failure-continues-close",
+          "expect": "a RuntimeClosing event failure remains the first saved error while close still cleans resources, joins external owners, and legally settles their operations before CloseFailed",
+          "test": "crates/easycon-runtime/src/runtime.rs::closing_event_failure_still_joins_external_owner_and_settles_operation"
         }
       ]
     },
@@ -153,6 +167,15 @@
       "test": "crates/easycon-runtime/src/runtime.rs::parent_terminal_seals_child_admission_before_owner_cleanup",
       "tests": [
         "crates/easycon-runtime/src/runtime.rs::parent_terminal_seals_child_admission_before_owner_cleanup",
+        "crates/easycon-runtime/src/runtime.rs::close_waits_for_an_already_claimed_unbound_owner",
+        "crates/easycon-runtime/tests/terminal_arbitration.rs::legitimate_owner_runs_five_terminal_paths_with_cleanup_projection",
+        "crates/easycon-runtime/tests/terminal_arbitration.rs::settlement_observer_panic_preserves_the_earlier_cleanup_error",
+        "crates/easycon-runtime/tests/terminal_arbitration.rs::cancellation_intent_before_accepted_evidence_does_not_override_success",
+        "crates/easycon-runtime/tests/terminal_arbitration.rs::observation_handle_cannot_claim_an_owned_operation",
+        "crates/easycon-runtime/tests/terminal_arbitration.rs::close_handoffs_only_preheld_owner_with_shared_settlement_evidence",
+        "crates/easycon-runtime/tests/terminal_arbitration.rs::task_panic_after_shared_evidence_still_settles_before_close_failure",
+        "crates/easycon-runtime/tests/terminal_arbitration.rs::task_panic_without_transfer_or_evidence_preserves_nonterminal_operation",
+        "crates/easycon-runtime/tests/terminal_arbitration.rs::close_failed_preserves_nonterminal_operation_when_owner_and_evidence_are_lost",
         "crates/easycon-runtime/src/cancellation.rs::hook_panic_does_not_skip_later_hooks_or_children",
         "crates/easycon-runtime/src/runtime.rs::operation_commits_terminal_state_and_event_once",
         "crates/easycon-runtime/src/runtime.rs::terminal_wait_observes_the_operation_already_unregistered",
@@ -163,6 +186,15 @@
       ],
       "steps": [
         { "id": "operation.parent-child-race", "action": "race parent terminal start against child operation admission" },
+        { "id": "operation.claimed-owner-close-wait", "action": "block cleanup after an unbound legitimate owner claims accepted-effect success, then start Runtime close" },
+        { "id": "operation.owner-cleanup-matrix", "action": "run Success, Failure, Requested, Deadline, and ParentClose through cleanup Ok, Err, and panic" },
+        { "id": "operation.cleanup-first-error", "action": "return a typed cleanup error and then panic the lock-free settlement observer" },
+        { "id": "operation.intent-before-claim", "action": "record cancellation intent before accepted-effect evidence, block cleanup, and inject a later deadline intent" },
+        { "id": "operation.non-owner-claim", "action": "attempt to commit an explicitly owned operation through its observation handle" },
+        { "id": "operation.transferable-close", "action": "join the original owner after it stores shared evidence and let close perform the pre-held one-time handoff" },
+        { "id": "operation.transferable-task-panic", "action": "panic the original owner after shared evidence is durable, then close and preserve TaskJoin as the first failure" },
+        { "id": "operation.task-panic-owner-loss", "action": "panic an exclusive owner without evidence or transfer authority and close conservatively" },
+        { "id": "operation.owner-loss", "action": "join an exclusive owner without settlement evidence and close conservatively" },
         { "id": "operation.hook-panic", "action": "register two cancellation hooks and a child where the first hook panics" },
         { "id": "operation.hook-reentry", "action": "observe the parent operation from a child cancellation hook during terminal sealing" },
         { "id": "operation.hook-capture-drop-reentry", "action": "finish success and failure while an uncalled hook capture destructor re-enters the same operation snapshot" },
@@ -175,6 +207,56 @@
           "id": "operation.child-admission",
           "expect": "child admission linearized after parent terminal sealing is rejected and an earlier child is cancelled",
           "test": "crates/easycon-runtime/src/runtime.rs::parent_terminal_seals_child_admission_before_owner_cleanup"
+        },
+        {
+          "id": "operation.claimed-owner-close-wait",
+          "expect": "close observes an already-claimed legitimate terminal transaction and waits for its lock-free cleanup instead of reporting ownership loss",
+          "test": "crates/easycon-runtime/src/runtime.rs::close_waits_for_an_already_claimed_unbound_owner"
+        },
+        {
+          "id": "operation.owner-evidence-cleanup-matrix",
+          "expect": "a legitimate owner maps Success, Failure, Requested, Deadline, and ParentClose through cleanup Ok, Err, and panic while preserving the primary-result rules",
+          "test": "crates/easycon-runtime/tests/terminal_arbitration.rs::legitimate_owner_runs_five_terminal_paths_with_cleanup_projection"
+        },
+        {
+          "id": "operation.cleanup-first-error",
+          "expect": "a settlement-observer panic cannot replace an earlier typed cleanup error before terminal commit",
+          "test": "crates/easycon-runtime/tests/terminal_arbitration.rs::settlement_observer_panic_preserves_the_earlier_cleanup_error"
+        },
+        {
+          "id": "operation.intent-does-not-claim",
+          "expect": "cancellation intent records the immutable first reason and wakes the owner without claiming terminal or changing outstanding work to Cancelling",
+          "test": "crates/easycon-runtime/tests/terminal_arbitration.rs::cancellation_intent_before_accepted_evidence_does_not_override_success"
+        },
+        {
+          "id": "operation.accepted-claim-late-cancel",
+          "expect": "accepted-effect evidence claims Success atomically and a later cancellation candidate cannot change the winner during cleanup",
+          "test": "crates/easycon-runtime/tests/terminal_arbitration.rs::cancellation_intent_before_accepted_evidence_does_not_override_success"
+        },
+        {
+          "id": "operation.non-owner-rejected",
+          "expect": "an observation handle cannot claim or commit an operation that has an explicit settlement owner",
+          "test": "crates/easycon-runtime/tests/terminal_arbitration.rs::observation_handle_cannot_claim_an_owned_operation"
+        },
+        {
+          "id": "operation.transferable-handoff",
+          "expect": "Runtime close transfers settlement authority exactly once only after the original task joins and only to an owner pre-held before work with shared evidence",
+          "test": "crates/easycon-runtime/tests/terminal_arbitration.rs::close_handoffs_only_preheld_owner_with_shared_settlement_evidence"
+        },
+        {
+          "id": "operation.transferable-handoff-after-task-panic",
+          "expect": "a task panic after durable shared evidence still permits legitimate handoff settlement before CloseFailed preserves the TaskJoin failure",
+          "test": "crates/easycon-runtime/tests/terminal_arbitration.rs::task_panic_after_shared_evidence_still_settles_before_close_failure"
+        },
+        {
+          "id": "operation.task-panic-owner-loss-preserves-registry",
+          "expect": "a task panic without transfer authority or evidence preserves the non-terminal operation and registry while TaskJoin remains the saved close failure",
+          "test": "crates/easycon-runtime/tests/terminal_arbitration.rs::task_panic_without_transfer_or_evidence_preserves_nonterminal_operation"
+        },
+        {
+          "id": "operation.ownership-loss-preserves-registry",
+          "expect": "owner loss without a transferable owner and settlement evidence emits no terminal event, unlink, or notify and preserves the non-terminal registry entry under CloseFailed",
+          "test": "crates/easycon-runtime/tests/terminal_arbitration.rs::close_failed_preserves_nonterminal_operation_when_owner_and_evidence_are_lost"
         },
         {
           "id": "operation.hook-panic-isolated",
@@ -219,6 +301,11 @@
       "tests": [
         "crates/easycon-runtime/src/runtime.rs::wait_timeout_does_not_cancel_operation",
         "crates/easycon-runtime/src/runtime.rs::deadline_requests_cancel_but_cleanup_owns_terminal_commit",
+        "crates/easycon-runtime/tests/deadline_registration.rs::already_due_registration_is_fired_before_return_without_registry_changes",
+        "crates/easycon-runtime/tests/deadline_registration.rs::virtual_clock_fires_only_after_advance_and_orders_same_target_by_id",
+        "crates/easycon-runtime/tests/deadline_registration.rs::system_clock_registration_fires_without_consumer_progress",
+        "crates/easycon-runtime/tests/deadline_registration.rs::disarm_drop_close_and_stale_entries_resolve_once",
+        "crates/easycon-runtime/tests/deadline_registration.rs::fire_disarm_and_close_race_resolves_the_production_registration_once",
         "tests/support/tests/controller_lane.rs::handshake_protocol_timeout_is_failed_not_cancelled",
         "tests/support/tests/sequence_ack.rs::blocked_ack_obeys_its_protocol_deadline",
         "tests/support/tests/sequence_ack.rs::blocked_report_write_obeys_its_io_deadline"
@@ -226,6 +313,10 @@
       "steps": [
         { "id": "timeout.poll", "action": "poll a running operation with zero wait timeout" },
         { "id": "timeout.deadline", "action": "advance past an operation deadline without manually polling Runtime" },
+        { "id": "deadline.registration-immediate", "action": "register an already-due generic deadline and inspect the signal plus public Runtime counts before return" },
+        { "id": "deadline.registration-virtual", "action": "register equal-target deadlines, keep VirtualClock unchanged, then advance once" },
+        { "id": "deadline.registration-system", "action": "register a SystemClock deadline without polling any domain consumer" },
+        { "id": "deadline.registration-races", "action": "race fire, disarm, drop, stale heap cleanup, and Runtime close resolution" },
         { "id": "timeout.handshake", "action": "inject a handshake protocol timeout in a separate operation" },
         { "id": "timeout.ack", "action": "block an ACK wait until its protocol deadline" },
         { "id": "timeout.write", "action": "block a report write until its independent I/O deadline" }
@@ -240,6 +331,31 @@
           "id": "timeout.deadline-cancels",
           "expect": "deadline requests cancellation and finishes Cancelled after cleanup",
           "test": "crates/easycon-runtime/src/runtime.rs::deadline_requests_cancel_but_cleanup_owns_terminal_commit"
+        },
+        {
+          "id": "deadline.registration-immediate",
+          "expect": "an already-due target is Fired before registration returns without OperationId, operation event, or public registry-count changes",
+          "test": "crates/easycon-runtime/tests/deadline_registration.rs::already_due_registration_is_fired_before_return_without_registry_changes"
+        },
+        {
+          "id": "deadline.registration-virtual-order",
+          "expect": "VirtualClock deadlines do not fire before advance and equal targets fire in monotonically increasing registration-ID order",
+          "test": "crates/easycon-runtime/tests/deadline_registration.rs::virtual_clock_fires_only_after_advance_and_orders_same_target_by_id"
+        },
+        {
+          "id": "deadline.registration-system-progress",
+          "expect": "SystemClock fires a generic deadline without domain-lane, consumer, or manual poll progress",
+          "test": "crates/easycon-runtime/tests/deadline_registration.rs::system_clock_registration_fires_without_consumer_progress"
+        },
+        {
+          "id": "deadline.registration-exactly-once",
+          "expect": "fire, disarm, handle drop, stale heap observation, and Runtime close resolve each registration exactly once as Fired, Disarmed, or RuntimeClosed",
+          "test": "crates/easycon-runtime/tests/deadline_registration.rs::disarm_drop_close_and_stale_entries_resolve_once"
+        },
+        {
+          "id": "deadline.registration-production-race",
+          "expect": "the production scheduler resolves a barrier-started fire, disarm, and Runtime-close race once and every observer sees the same stable resolution",
+          "test": "crates/easycon-runtime/tests/deadline_registration.rs::fire_disarm_and_close_race_resolves_the_production_registration_once"
         },
         {
           "id": "timeout.protocol-fails",
