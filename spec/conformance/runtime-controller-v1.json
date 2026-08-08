@@ -306,6 +306,7 @@
         "crates/easycon-runtime/tests/deadline_registration.rs::system_clock_registration_fires_without_consumer_progress",
         "crates/easycon-runtime/tests/deadline_registration.rs::disarm_drop_close_and_stale_entries_resolve_once",
         "crates/easycon-runtime/tests/deadline_registration.rs::fire_disarm_and_close_race_resolves_the_production_registration_once",
+        "crates/easycon-runtime/tests/deadline_registration.rs::same_target_waker_batch_commits_before_reentrant_runtime_calls",
         "tests/support/tests/controller_lane.rs::handshake_protocol_timeout_is_failed_not_cancelled",
         "tests/support/tests/sequence_ack.rs::blocked_ack_obeys_its_protocol_deadline",
         "tests/support/tests/sequence_ack.rs::blocked_report_write_obeys_its_io_deadline"
@@ -317,6 +318,7 @@
         { "id": "deadline.registration-virtual", "action": "register equal-target deadlines, keep VirtualClock unchanged, then advance once" },
         { "id": "deadline.registration-system", "action": "register a SystemClock deadline without polling any domain consumer" },
         { "id": "deadline.registration-races", "action": "race fire, disarm, drop, stale heap cleanup, and Runtime close resolution" },
+        { "id": "deadline.registration-waker", "action": "poll two equal-target signals, then let the first waker reenter Runtime state, registration, disarm, and close" },
         { "id": "timeout.handshake", "action": "inject a handshake protocol timeout in a separate operation" },
         { "id": "timeout.ack", "action": "block an ACK wait until its protocol deadline" },
         { "id": "timeout.write", "action": "block a report write until its independent I/O deadline" }
@@ -356,6 +358,11 @@
           "id": "deadline.registration-production-race",
           "expect": "the production scheduler resolves a barrier-started fire, disarm, and Runtime-close race once and every observer sees the same stable resolution",
           "test": "crates/easycon-runtime/tests/deadline_registration.rs::fire_disarm_and_close_race_resolves_the_production_registration_once"
+        },
+        {
+          "id": "deadline.registration-waker",
+          "expect": "a same-target observer batch commits every stable outcome before lock-free waker reentry, preserving registration-ID order and the supervised-task close rejection",
+          "test": "crates/easycon-runtime/tests/deadline_registration.rs::same_target_waker_batch_commits_before_reentrant_runtime_calls"
         },
         {
           "id": "timeout.protocol-fails",

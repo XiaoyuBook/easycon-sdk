@@ -1,20 +1,108 @@
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex, mpsc};
+use std::task::{Context, Poll, Wake, Waker};
 use std::thread::{self, JoinHandle, ThreadId};
 use std::time::Duration;
 
 use easycon_model::ErrorCode;
 use easycon_runtime::{
-    Clock, ClockChangeRegistration, CloseOutcome, DeadlineId, DeadlineResolution,
-    DeadlineWaitResult, EventDraft, EventKind, OperationValue, Runtime, RuntimeState,
-    SettlementEvidence, SettlementOwnerMode, Severity, SubscriptionOptions, SystemClock,
-    TerminalCandidate, TransitionOutcome, VirtualClock, WaitTimeout,
+    Clock, ClockChangeRegistration, CloseOutcome, CloseRejection, DeadlineId, DeadlineResolution,
+    DeadlineSignal, DeadlineWaitResult, EventDraft, EventKind, OperationValue, Runtime,
+    RuntimeState, SettlementEvidence, SettlementOwnerMode, Severity, SubscriptionOptions,
+    SystemClock, TerminalCandidate, TransitionOutcome, VirtualClock, WaitTimeout,
 };
 
 const REENTRY_WAIT: Duration = Duration::from_secs(2);
 const SAME_THREAD_REENTRY_HELPER: &str = "EASYCON_RUNTIME_SAME_THREAD_REENTRY_HELPER";
 const SAME_THREAD_REENTRY_TIMEOUT_EXIT: i32 = 97;
+
+struct CountingWake {
+    count: AtomicUsize,
+}
+
+impl CountingWake {
+    fn new() -> Self {
+        Self {
+            count: AtomicUsize::new(0),
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.count.load(Ordering::Acquire)
+    }
+}
+
+impl Wake for CountingWake {
+    fn wake(self: Arc<Self>) {
+        self.count.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+struct EventWake {
+    label: &'static str,
+    events: mpsc::Sender<&'static str>,
+    count: AtomicUsize,
+}
+
+impl EventWake {
+    fn new(label: &'static str, events: mpsc::Sender<&'static str>) -> Self {
+        Self {
+            label,
+            events,
+            count: AtomicUsize::new(0),
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.count.load(Ordering::Acquire)
+    }
+}
+
+impl Wake for EventWake {
+    fn wake(self: Arc<Self>) {
+        self.count.fetch_add(1, Ordering::AcqRel);
+        self.events
+            .send(self.label)
+            .expect("deadline waker event receiver remains alive");
+    }
+}
+
+struct ReentrantBatchWake {
+    runtime: Runtime,
+    other_signal: DeadlineSignal,
+    events: mpsc::Sender<&'static str>,
+}
+
+impl Wake for ReentrantBatchWake {
+    fn wake(self: Arc<Self>) {
+        assert!(matches!(
+            self.other_signal.resolution(),
+            Some(outcome) if outcome.resolution == DeadlineResolution::Fired
+        ));
+        assert_eq!(self.runtime.state(), RuntimeState::Active);
+        let nested = self
+            .runtime
+            .register_deadline(u64::MAX)
+            .expect("reentrant deadline admission");
+        assert_eq!(nested.disarm(), DeadlineResolution::Disarmed);
+        assert!(matches!(
+            self.runtime.close(),
+            Err(CloseRejection::SupervisedTask)
+        ));
+        self.events
+            .send("low")
+            .expect("deadline waker event receiver remains alive");
+    }
+}
+
+struct PanickingWake;
+
+impl Wake for PanickingWake {
+    fn wake(self: Arc<Self>) {
+        panic!("scripted deadline observer panic");
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ClockCallback {
@@ -641,4 +729,354 @@ fn fire_disarm_and_close_race_resolves_the_production_registration_once() {
             | DeadlineResolution::RuntimeClosed
     ));
     assert_eq!(signal.resolution(), Some(outcome));
+}
+
+#[test]
+fn deadline_signal_poll_resolution_contract_is_nonblocking() {
+    let clock = Arc::new(VirtualClock::default());
+    let runtime = Runtime::new(clock);
+    let registration = runtime.register_deadline(10).expect("deadline");
+    let signal = registration.signal();
+    let waker = Waker::noop();
+    let mut context = Context::from_waker(waker);
+
+    assert_eq!(signal.poll_resolution(&mut context), Poll::Pending);
+    assert_eq!(registration.disarm(), DeadlineResolution::Disarmed);
+    assert!(matches!(
+        signal.poll_resolution(&mut context),
+        Poll::Ready(outcome) if outcome.resolution == DeadlineResolution::Disarmed
+    ));
+    assert_eq!(runtime.close(), Ok(CloseOutcome::Closed));
+}
+
+#[test]
+fn already_resolved_deadline_signal_polls_ready_without_retaining_a_waker() {
+    let clock = Arc::new(VirtualClock::new(10));
+    let runtime = Runtime::new(clock);
+    let registration = runtime.register_deadline(10).expect("already-due deadline");
+    let signal = registration.signal();
+    let wake = Arc::new(CountingWake::new());
+    let waker = Waker::from(Arc::clone(&wake));
+    let mut context = Context::from_waker(&waker);
+
+    assert!(matches!(
+        signal.poll_resolution(&mut context),
+        Poll::Ready(outcome) if outcome.resolution == DeadlineResolution::Fired
+    ));
+    assert_eq!(wake.count(), 0);
+    assert!(matches!(
+        signal.poll_resolution(&mut context),
+        Poll::Ready(outcome) if outcome.resolution == DeadlineResolution::Fired
+    ));
+    assert_eq!(wake.count(), 0);
+    assert_eq!(runtime.close(), Ok(CloseOutcome::Closed));
+}
+
+#[test]
+fn deadline_signal_poll_resolution_deduplicates_and_replaces_wakers() {
+    let clock = Arc::new(VirtualClock::default());
+    let runtime = Runtime::new(clock);
+
+    let same_registration = runtime.register_deadline(10).expect("same waker deadline");
+    let same_signal = same_registration.signal();
+    let same_wake = Arc::new(CountingWake::new());
+    let same_waker = Waker::from(Arc::clone(&same_wake));
+    let mut same_context = Context::from_waker(&same_waker);
+    assert_eq!(
+        same_signal.poll_resolution(&mut same_context),
+        Poll::Pending
+    );
+    assert_eq!(
+        same_signal.poll_resolution(&mut same_context),
+        Poll::Pending
+    );
+    assert_eq!(same_wake.count(), 0);
+    assert_eq!(same_registration.disarm(), DeadlineResolution::Disarmed);
+    assert_eq!(same_wake.count(), 1);
+    assert!(matches!(
+        same_signal.poll_resolution(&mut same_context),
+        Poll::Ready(outcome) if outcome.resolution == DeadlineResolution::Disarmed
+    ));
+    assert_eq!(same_wake.count(), 1);
+
+    let replacement_registration = runtime.register_deadline(20).expect("replacement deadline");
+    let replacement_signal = replacement_registration.signal();
+    let old_wake = Arc::new(CountingWake::new());
+    let old_waker = Waker::from(Arc::clone(&old_wake));
+    let mut old_context = Context::from_waker(&old_waker);
+    let latest_wake = Arc::new(CountingWake::new());
+    let latest_waker = Waker::from(Arc::clone(&latest_wake));
+    let mut latest_context = Context::from_waker(&latest_waker);
+    assert_eq!(
+        replacement_signal.poll_resolution(&mut old_context),
+        Poll::Pending
+    );
+    assert_eq!(
+        replacement_signal.poll_resolution(&mut latest_context),
+        Poll::Pending
+    );
+    assert_eq!(
+        replacement_registration.disarm(),
+        DeadlineResolution::Disarmed
+    );
+    assert_eq!(old_wake.count(), 0);
+    assert_eq!(latest_wake.count(), 1);
+    assert!(matches!(
+        replacement_signal.poll_resolution(&mut latest_context),
+        Poll::Ready(outcome) if outcome.resolution == DeadlineResolution::Disarmed
+    ));
+    assert_eq!(runtime.close(), Ok(CloseOutcome::Closed));
+}
+
+#[test]
+fn deadline_signal_terminal_paths_wake_one_async_observer_once() {
+    let clock = Arc::new(VirtualClock::default());
+    let runtime = Runtime::new(clock);
+
+    let disarmed = runtime.register_deadline(10).expect("disarmed deadline");
+    let disarmed_signal = disarmed.signal();
+    let disarmed_wake = Arc::new(CountingWake::new());
+    let disarmed_waker = Waker::from(Arc::clone(&disarmed_wake));
+    let mut disarmed_context = Context::from_waker(&disarmed_waker);
+    assert_eq!(
+        disarmed_signal.poll_resolution(&mut disarmed_context),
+        Poll::Pending
+    );
+
+    let dropped = runtime.register_deadline(20).expect("dropped deadline");
+    let dropped_signal = dropped.signal();
+    let dropped_wake = Arc::new(CountingWake::new());
+    let dropped_waker = Waker::from(Arc::clone(&dropped_wake));
+    let mut dropped_context = Context::from_waker(&dropped_waker);
+    assert_eq!(
+        dropped_signal.poll_resolution(&mut dropped_context),
+        Poll::Pending
+    );
+
+    let closed = runtime.register_deadline(30).expect("closed deadline");
+    let closed_signal = closed.signal();
+    let closed_wake = Arc::new(CountingWake::new());
+    let closed_waker = Waker::from(Arc::clone(&closed_wake));
+    let mut closed_context = Context::from_waker(&closed_waker);
+    assert_eq!(
+        closed_signal.poll_resolution(&mut closed_context),
+        Poll::Pending
+    );
+
+    assert_eq!(disarmed.disarm(), DeadlineResolution::Disarmed);
+    drop(dropped);
+    assert_eq!(disarmed_wake.count(), 1);
+    assert_eq!(dropped_wake.count(), 1);
+    assert_eq!(runtime.close(), Ok(CloseOutcome::Closed));
+    assert_eq!(closed_wake.count(), 1);
+
+    assert!(matches!(
+        disarmed_signal.poll_resolution(&mut disarmed_context),
+        Poll::Ready(outcome) if outcome.resolution == DeadlineResolution::Disarmed
+    ));
+    assert!(matches!(
+        dropped_signal.poll_resolution(&mut dropped_context),
+        Poll::Ready(outcome) if outcome.resolution == DeadlineResolution::Disarmed
+    ));
+    assert!(matches!(
+        closed_signal.poll_resolution(&mut closed_context),
+        Poll::Ready(outcome) if outcome.resolution == DeadlineResolution::RuntimeClosed
+    ));
+    assert_eq!(disarmed_wake.count(), 1);
+    assert_eq!(dropped_wake.count(), 1);
+    assert_eq!(closed_wake.count(), 1);
+}
+
+#[test]
+fn system_clock_poll_resolution_wakes_without_consumer_progress() {
+    let clock = Arc::new(SystemClock::new());
+    let runtime = Runtime::new(clock.clone());
+    let target = clock.now_ns().saturating_add(20_000_000);
+    let registration = runtime.register_deadline(target).expect("deadline");
+    let signal = registration.signal();
+    let (events, observed_events) = mpsc::channel();
+    let wake = Arc::new(EventWake::new("system", events));
+    let waker = Waker::from(Arc::clone(&wake));
+    let mut context = Context::from_waker(&waker);
+
+    assert_eq!(signal.poll_resolution(&mut context), Poll::Pending);
+    assert_eq!(
+        observed_events
+            .recv_timeout(Duration::from_secs(5))
+            .expect("SystemClock deadline observer wake"),
+        "system"
+    );
+    assert_eq!(wake.count(), 1);
+    assert!(matches!(
+        signal.poll_resolution(&mut context),
+        Poll::Ready(outcome) if outcome.resolution == DeadlineResolution::Fired
+    ));
+    assert_eq!(wake.count(), 1);
+    assert_eq!(runtime.close(), Ok(CloseOutcome::Closed));
+}
+
+#[test]
+fn deadline_signal_blocking_wait_and_async_observer_can_coexist() {
+    let clock = Arc::new(VirtualClock::default());
+    let runtime = Runtime::new(clock.clone());
+    let registration = runtime.register_deadline(10).expect("deadline");
+    let signal = registration.signal();
+    let blocking_signal = signal.clone();
+    let (blocking_result, observed_blocking_result) = mpsc::sync_channel(1);
+    let blocking_waiter = thread::spawn(move || {
+        blocking_result
+            .send(blocking_signal.wait(WaitTimeout::Infinite))
+            .expect("blocking waiter receiver remains alive");
+    });
+    let (events, observed_events) = mpsc::channel();
+    let wake = Arc::new(EventWake::new("async", events));
+    let waker = Waker::from(Arc::clone(&wake));
+    let mut context = Context::from_waker(&waker);
+
+    assert_eq!(signal.poll_resolution(&mut context), Poll::Pending);
+    clock.advance_to(10);
+    assert_eq!(
+        observed_events
+            .recv_timeout(Duration::from_secs(5))
+            .expect("async observer wake"),
+        "async"
+    );
+    assert!(matches!(
+        observed_blocking_result
+            .recv_timeout(Duration::from_secs(5))
+            .expect("blocking observer result"),
+        DeadlineWaitResult::Resolved(outcome) if outcome.resolution == DeadlineResolution::Fired
+    ));
+    blocking_waiter.join().expect("blocking waiter");
+    assert_eq!(wake.count(), 1);
+    assert_eq!(runtime.close(), Ok(CloseOutcome::Closed));
+}
+
+// conformance: deadline.registration-waker
+#[test]
+fn same_target_waker_batch_commits_before_reentrant_runtime_calls() {
+    let clock = Arc::new(VirtualClock::default());
+    let runtime = Runtime::new(clock.clone());
+    let low = runtime.register_deadline(10).expect("low deadline");
+    let high = runtime.register_deadline(10).expect("high deadline");
+    let low_signal = low.signal();
+    let high_signal = high.signal();
+    let (events, observed_events) = mpsc::channel();
+    let low_wake = Waker::from(Arc::new(ReentrantBatchWake {
+        runtime: runtime.clone(),
+        other_signal: high_signal.clone(),
+        events: events.clone(),
+    }));
+    let high_wake = Waker::from(Arc::new(EventWake::new("high", events)));
+    let mut low_context = Context::from_waker(&low_wake);
+    let mut high_context = Context::from_waker(&high_wake);
+
+    assert_eq!(low_signal.poll_resolution(&mut low_context), Poll::Pending);
+    assert_eq!(
+        high_signal.poll_resolution(&mut high_context),
+        Poll::Pending
+    );
+    clock.advance_to(10);
+    assert_eq!(
+        observed_events
+            .recv_timeout(Duration::from_secs(5))
+            .expect("low reentrant wake"),
+        "low"
+    );
+    assert_eq!(
+        observed_events
+            .recv_timeout(Duration::from_secs(5))
+            .expect("high wake"),
+        "high"
+    );
+    let low_outcome = low_signal.resolution().expect("low outcome");
+    let high_outcome = high_signal.resolution().expect("high outcome");
+    assert_eq!(low_outcome.resolution, DeadlineResolution::Fired);
+    assert_eq!(high_outcome.resolution, DeadlineResolution::Fired);
+    assert!(low.id() < high.id());
+    assert!(low_outcome.order < high_outcome.order);
+    assert_eq!(runtime.close(), Ok(CloseOutcome::Closed));
+}
+
+#[test]
+fn panicking_waker_notifies_same_batch_before_worker_close_failure() {
+    let clock = Arc::new(VirtualClock::default());
+    let runtime = Runtime::new(clock.clone());
+    let first = runtime.register_deadline(10).expect("first deadline");
+    let second = runtime.register_deadline(10).expect("second deadline");
+    let first_signal = first.signal();
+    let second_signal = second.signal();
+    let first_waker = Waker::from(Arc::new(PanickingWake));
+    let (events, observed_events) = mpsc::channel();
+    let second_wake = Arc::new(EventWake::new("second", events));
+    let second_waker = Waker::from(Arc::clone(&second_wake));
+    let mut first_context = Context::from_waker(&first_waker);
+    let mut second_context = Context::from_waker(&second_waker);
+
+    assert_eq!(
+        first_signal.poll_resolution(&mut first_context),
+        Poll::Pending
+    );
+    assert_eq!(
+        second_signal.poll_resolution(&mut second_context),
+        Poll::Pending
+    );
+    clock.advance_to(10);
+    assert_eq!(
+        observed_events
+            .recv_timeout(Duration::from_secs(5))
+            .expect("second batch observer wake"),
+        "second"
+    );
+    assert_eq!(second_wake.count(), 1);
+    assert!(matches!(
+        first_signal.resolution(),
+        Some(outcome) if outcome.resolution == DeadlineResolution::Fired
+    ));
+    assert!(matches!(
+        second_signal.resolution(),
+        Some(outcome) if outcome.resolution == DeadlineResolution::Fired
+    ));
+    assert!(matches!(runtime.close(), Ok(CloseOutcome::Failed(_))));
+}
+
+#[test]
+fn runtime_closed_waker_panic_notifies_batch_before_close_failure() {
+    let clock = Arc::new(VirtualClock::default());
+    let runtime = Runtime::new(clock);
+    let first = runtime.register_deadline(10).expect("first deadline");
+    let second = runtime.register_deadline(10).expect("second deadline");
+    let first_signal = first.signal();
+    let second_signal = second.signal();
+    let first_waker = Waker::from(Arc::new(PanickingWake));
+    let (events, observed_events) = mpsc::channel();
+    let second_wake = Arc::new(EventWake::new("second", events));
+    let second_waker = Waker::from(Arc::clone(&second_wake));
+    let mut first_context = Context::from_waker(&first_waker);
+    let mut second_context = Context::from_waker(&second_waker);
+
+    assert_eq!(
+        first_signal.poll_resolution(&mut first_context),
+        Poll::Pending
+    );
+    assert_eq!(
+        second_signal.poll_resolution(&mut second_context),
+        Poll::Pending
+    );
+    assert!(matches!(runtime.close(), Ok(CloseOutcome::Failed(_))));
+    assert_eq!(
+        observed_events
+            .recv_timeout(Duration::from_secs(5))
+            .expect("second close-drain observer wake"),
+        "second"
+    );
+    assert_eq!(second_wake.count(), 1);
+    assert!(matches!(
+        first_signal.resolution(),
+        Some(outcome) if outcome.resolution == DeadlineResolution::RuntimeClosed
+    ));
+    assert!(matches!(
+        second_signal.resolution(),
+        Some(outcome) if outcome.resolution == DeadlineResolution::RuntimeClosed
+    ));
 }

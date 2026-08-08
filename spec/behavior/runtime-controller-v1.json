@@ -64,9 +64,9 @@
       "identity": "Runtime-local registration IDs increase monotonically and are not reused while observable",
       "states": ["Armed", "Fired", "Disarmed", "RuntimeClosed"],
       "independence": "a registration is not an Operation, resource, or supervised task and allocates no OperationId, emits no operation event, and changes no public registry count",
-      "system_clock": "the shared deadline worker fires without consumer or domain-lane progress and wakes to recompute after earlier registration or disarm",
-      "virtual_clock": "only clock advance wakes due entries; equal target_ns entries fire in registration-ID order",
-      "close": "close seals admission first, keeps existing registrations serviced through resource cleanup, external owner join, and legal Operation settlement, then resolves remaining Armed entries as RuntimeClosed and joins the worker"
+      "system_clock": "the shared deadline worker fires without consumer or domain-lane progress, wakes to recompute after earlier registration or disarm, and wakes one registered poll_resolution observer after committing its outcome",
+      "virtual_clock": "only clock advance wakes due entries; equal target_ns entries commit in registration-ID order before any observer notification, and dispatch records follow notification",
+      "close": "close seals admission first, keeps existing registrations serviced through resource cleanup, external owner join, and legal Operation settlement, then commits remaining Armed entries as RuntimeClosed before notifying observers and joining the worker"
     },
     "close_order": [
       "enter Closing and seal work plus deadline admission",

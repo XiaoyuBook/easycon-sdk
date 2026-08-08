@@ -1,10 +1,13 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
+use std::task::{Context, Poll, Waker};
 use std::time::Instant;
 
 use crate::clock::{Clock, DeadlineId};
+use crate::concurrency::contain_panic;
 use crate::wait::WaitTimeout;
 
 /// Runtime-local identity for one generic deadline registration.
@@ -67,14 +70,29 @@ struct DeadlineSignalInner {
     changed: Condvar,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DeadlineSignalNotification {
+    signal: Arc<DeadlineSignalInner>,
+    waker: Option<Waker>,
+}
+
+enum DeadlinePollResolution {
+    Ready(DeadlineOutcome, Waker),
+    PendingUnchanged(Waker),
+    PendingReplaced(Option<Waker>),
+}
+
+#[derive(Clone, Debug)]
 pub struct DeadlineResolutionState {
     outcome: Option<DeadlineOutcome>,
+    waker: Option<Waker>,
 }
 
 impl DeadlineResolutionState {
     pub const fn armed() -> Self {
-        Self { outcome: None }
+        Self {
+            outcome: None,
+            waker: None,
+        }
     }
 
     pub fn resolve(&mut self, outcome: DeadlineOutcome) -> bool {
@@ -88,6 +106,53 @@ impl DeadlineResolutionState {
     pub const fn outcome(&self) -> Option<DeadlineOutcome> {
         self.outcome
     }
+
+    fn poll_resolution(&mut self, candidate: Waker) -> DeadlinePollResolution {
+        if let Some(outcome) = self.outcome {
+            debug_assert!(
+                self.waker.is_none(),
+                "resolved deadline signal cannot retain a task waker"
+            );
+            return DeadlinePollResolution::Ready(outcome, candidate);
+        }
+        if self
+            .waker
+            .as_ref()
+            .is_some_and(|registered| registered.will_wake(&candidate))
+        {
+            return DeadlinePollResolution::PendingUnchanged(candidate);
+        }
+        DeadlinePollResolution::PendingReplaced(self.waker.replace(candidate))
+    }
+
+    fn take_waker(&mut self) -> Option<Waker> {
+        self.waker.take()
+    }
+
+    #[cfg(feature = "runtime-model")]
+    #[doc(hidden)]
+    pub fn poll_resolution_for_model(
+        &mut self,
+        candidate: Waker,
+    ) -> (Poll<DeadlineOutcome>, Option<Waker>) {
+        match self.poll_resolution(candidate) {
+            DeadlinePollResolution::Ready(outcome, candidate) => {
+                (Poll::Ready(outcome), Some(candidate))
+            }
+            DeadlinePollResolution::PendingUnchanged(candidate) => (Poll::Pending, Some(candidate)),
+            DeadlinePollResolution::PendingReplaced(displaced) => (Poll::Pending, displaced),
+        }
+    }
+
+    #[cfg(feature = "runtime-model")]
+    #[doc(hidden)]
+    pub fn resolve_for_model(&mut self, outcome: DeadlineOutcome) -> Option<Option<Waker>> {
+        if self.resolve(outcome) {
+            Some(self.take_waker())
+        } else {
+            None
+        }
+    }
 }
 
 impl DeadlineSignalInner {
@@ -98,18 +163,47 @@ impl DeadlineSignalInner {
         }
     }
 
-    fn resolve(&self, outcome: DeadlineOutcome) -> bool {
-        let mut current = lock_recover(&self.outcome);
-        if !current.resolve(outcome) {
-            return false;
-        }
-        drop(current);
-        self.changed.notify_all();
-        true
+    fn commit_resolution(
+        self: &Arc<Self>,
+        outcome: DeadlineOutcome,
+    ) -> Option<DeadlineSignalNotification> {
+        let waker = {
+            let mut current = lock_recover(&self.outcome);
+            if !current.resolve(outcome) {
+                return None;
+            }
+            current.take_waker()
+        };
+        Some(DeadlineSignalNotification {
+            signal: Arc::clone(self),
+            waker,
+        })
     }
 
     fn resolution(&self) -> Option<DeadlineOutcome> {
         lock_recover(&self.outcome).outcome()
+    }
+
+    fn poll_resolution(&self, cx: &mut Context<'_>) -> Poll<DeadlineOutcome> {
+        let candidate = cx.waker().clone();
+        let result = {
+            let mut current = lock_recover(&self.outcome);
+            current.poll_resolution(candidate)
+        };
+        match result {
+            DeadlinePollResolution::Ready(outcome, candidate) => {
+                drop(candidate);
+                Poll::Ready(outcome)
+            }
+            DeadlinePollResolution::PendingUnchanged(candidate) => {
+                drop(candidate);
+                Poll::Pending
+            }
+            DeadlinePollResolution::PendingReplaced(displaced) => {
+                drop(displaced);
+                Poll::Pending
+            }
+        }
     }
 
     fn wait(&self, wait: WaitTimeout) -> DeadlineWaitResult {
@@ -145,11 +239,41 @@ impl DeadlineSignalInner {
     }
 }
 
+impl DeadlineSignalNotification {
+    fn notify(mut self) {
+        self.signal.changed.notify_all();
+        if let Some(waker) = self.waker.take() {
+            waker.wake();
+        }
+    }
+}
+
+fn notify_deadline_signals(
+    notifications: impl IntoIterator<Item = DeadlineSignalNotification>,
+) -> Option<Box<dyn std::any::Any + Send>> {
+    let mut first_panic = None;
+    for notification in notifications {
+        if let Err(payload) = catch_unwind(AssertUnwindSafe(|| notification.notify())) {
+            if first_panic.is_none() {
+                first_panic = Some(payload);
+            } else {
+                let _ = contain_panic::<()>(Err(payload));
+            }
+        }
+    }
+    first_panic
+}
+
 impl DeadlineSignal {
     /// Returns the committed resolution without blocking.
     #[must_use]
     pub fn resolution(&self) -> Option<DeadlineOutcome> {
         self.inner.resolution()
+    }
+
+    /// Registers the current task for this one-shot resolution without blocking.
+    pub fn poll_resolution(&self, cx: &mut Context<'_>) -> Poll<DeadlineOutcome> {
+        self.inner.poll_resolution(cx)
     }
 
     /// Waits only for this one-shot signal; timeout has no scheduler side effect.
@@ -378,7 +502,7 @@ impl DeadlineScheduler {
         }
         // Commit each collected batch before invoking external Clock instrumentation. Callbacks may
         // panic or reenter the scheduler, so no scheduler lock can remain held across dispatch.
-        let due = {
+        let (due, notifications) = {
             let _fire = lock_recover(&self.fire_gate);
             let mut state = lock_recover(&self.state);
             prune_stale(&mut state);
@@ -397,14 +521,27 @@ impl DeadlineScheduler {
                 prune_stale(&mut state);
             }
             drop(state);
-            for entry in &due {
-                self.resolve_signal(&entry.signal, DeadlineResolution::Fired);
-            }
-            due
+            let notifications: Vec<_> = due
+                .iter()
+                .filter_map(|entry| self.commit_signal(&entry.signal, DeadlineResolution::Fired))
+                .collect();
+            (due, notifications)
         };
+        let notification_panic = notify_deadline_signals(notifications);
         let count = due.len();
-        for entry in due {
-            clock.record_dispatch(entry.trace_id, now_ns);
+        let dispatch = catch_unwind(AssertUnwindSafe(|| {
+            for entry in due {
+                clock.record_dispatch(entry.trace_id, now_ns);
+            }
+        }));
+        if let Err(payload) = dispatch {
+            if let Some(notification_panic) = notification_panic {
+                let _ = contain_panic::<()>(Err(notification_panic));
+            }
+            resume_unwind(payload);
+        }
+        if let Some(payload) = notification_panic {
+            resume_unwind(payload);
         }
         count
     }
@@ -456,17 +593,28 @@ impl DeadlineScheduler {
             entries
         };
         entries.sort_by_key(|(target_ns, id, _)| (*target_ns, *id));
-        for (_, _, signal) in entries {
-            self.resolve_signal(&signal, DeadlineResolution::RuntimeClosed);
-        }
+        let notifications: Vec<_> = entries
+            .into_iter()
+            .filter_map(|(_, _, signal)| {
+                self.commit_signal(&signal, DeadlineResolution::RuntimeClosed)
+            })
+            .collect();
+        let notification_panic = notify_deadline_signals(notifications);
         (self.wake_worker)();
+        if let Some(payload) = notification_panic {
+            resume_unwind(payload);
+        }
     }
 
     fn disarm(&self, id: DeadlineRegistrationId, signal: &DeadlineSignal) -> DeadlineResolution {
         let removed = lock_recover(&self.state).entries.remove(&id);
         if let Some(entry) = removed {
-            self.resolve_signal(&entry.signal, DeadlineResolution::Disarmed);
+            let notification = self.commit_signal(&entry.signal, DeadlineResolution::Disarmed);
+            let notification_panic = notify_deadline_signals(notification);
             (self.wake_worker)();
+            if let Some(payload) = notification_panic {
+                resume_unwind(payload);
+            }
         }
         match signal.wait(WaitTimeout::Infinite) {
             DeadlineWaitResult::Resolved(outcome) => outcome.resolution,
@@ -474,46 +622,55 @@ impl DeadlineScheduler {
         }
     }
 
-    fn resolve_signal(&self, signal: &DeadlineSignalInner, resolution: DeadlineResolution) {
+    fn commit_signal(
+        &self,
+        signal: &Arc<DeadlineSignalInner>,
+        resolution: DeadlineResolution,
+    ) -> Option<DeadlineSignalNotification> {
         let order = self.next_resolution_order.fetch_add(1, Ordering::Relaxed);
         assert!(
             order != 0,
             "Runtime deadline resolution order space exhausted"
         );
-        let resolved = signal.resolve(DeadlineOutcome { resolution, order });
-        debug_assert!(resolved, "deadline queue entry resolves exactly once");
+        let notification = signal.commit_resolution(DeadlineOutcome { resolution, order });
+        debug_assert!(
+            notification.is_some(),
+            "deadline queue entry resolves exactly once"
+        );
+        notification
     }
 }
 
 impl Drop for DeadlineScheduler {
     fn drop(&mut self) {
-        let state = self
-            .state
-            .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.admission_open = false;
-        let mut entries: Vec<_> = state
-            .pending
-            .drain()
-            .map(|(id, pending)| (pending.target_ns, id, pending.signal))
-            .collect();
-        entries.extend(
-            state
-                .entries
+        let mut entries: Vec<_> = {
+            let state = self
+                .state
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.admission_open = false;
+            let mut entries: Vec<_> = state
+                .pending
                 .drain()
-                .map(|(id, entry)| (entry.target_ns, id, entry.signal)),
-        );
-        entries.sort_by_key(|(target_ns, id, _)| (*target_ns, *id));
-        for (_, _, signal) in entries {
-            let order = self.next_resolution_order.fetch_add(1, Ordering::Relaxed);
-            assert!(
-                order != 0,
-                "Runtime deadline resolution order space exhausted"
+                .map(|(id, pending)| (pending.target_ns, id, pending.signal))
+                .collect();
+            entries.extend(
+                state
+                    .entries
+                    .drain()
+                    .map(|(id, entry)| (entry.target_ns, id, entry.signal)),
             );
-            let _ = signal.resolve(DeadlineOutcome {
-                resolution: DeadlineResolution::RuntimeClosed,
-                order,
-            });
+            entries
+        };
+        entries.sort_by_key(|(target_ns, id, _)| (*target_ns, *id));
+        let notifications: Vec<_> = entries
+            .into_iter()
+            .filter_map(|(_, _, signal)| {
+                self.commit_signal(&signal, DeadlineResolution::RuntimeClosed)
+            })
+            .collect();
+        if let Some(payload) = notify_deadline_signals(notifications) {
+            resume_unwind(payload);
         }
     }
 }
@@ -554,6 +711,7 @@ mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::mpsc::{self, Receiver, SyncSender};
+    use std::task::{Context, Poll, Wake, Waker};
     use std::thread::{self, ThreadId};
     use std::time::Duration;
 
@@ -806,6 +964,341 @@ mod tests {
             .signal()
             .resolution()
             .expect("deadline must resolve")
+    }
+
+    struct DropChecksSignalLock {
+        signal: Arc<DeadlineSignalInner>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Wake for DropChecksSignalLock {
+        fn wake(self: Arc<Self>) {
+            let _ = self.drops.load(Ordering::Relaxed);
+        }
+    }
+
+    impl Drop for DropChecksSignalLock {
+        fn drop(&mut self) {
+            let guard = self
+                .signal
+                .outcome
+                .try_lock()
+                .expect("replaced waker must drop after signal mutex release");
+            drop(guard);
+            self.drops.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    struct WakeChecksReleasedLocks {
+        signal: Arc<DeadlineSignalInner>,
+        scheduler: Arc<DeadlineScheduler>,
+        other_signal: DeadlineSignal,
+        order: u64,
+        events: Arc<Mutex<Vec<u64>>>,
+    }
+
+    impl Wake for WakeChecksReleasedLocks {
+        fn wake(self: Arc<Self>) {
+            let guard = self
+                .signal
+                .outcome
+                .try_lock()
+                .expect("terminal waker must run after signal mutex release");
+            drop(guard);
+            assert!(
+                self.scheduler.fire_gate_is_available(),
+                "terminal waker must run after fire gate release"
+            );
+            assert!(
+                self.other_signal.resolution().is_some(),
+                "same-target batch must commit every outcome before the first waker runs"
+            );
+            lock_recover(&self.events).push(self.order);
+        }
+    }
+
+    struct WakeChecksBatchCommit {
+        signal: Arc<DeadlineSignalInner>,
+        other_signal: DeadlineSignal,
+        order: u64,
+        events: Arc<Mutex<Vec<u64>>>,
+    }
+
+    impl Wake for WakeChecksBatchCommit {
+        fn wake(self: Arc<Self>) {
+            let guard = self
+                .signal
+                .outcome
+                .try_lock()
+                .expect("terminal waker must run after signal mutex release");
+            drop(guard);
+            assert!(
+                self.other_signal.resolution().is_some(),
+                "terminal batch must commit every outcome before the first waker runs"
+            );
+            lock_recover(&self.events).push(self.order);
+        }
+    }
+
+    struct PanicsOnWake;
+
+    impl Wake for PanicsOnWake {
+        fn wake(self: Arc<Self>) {
+            panic!("scripted first deadline observer panic");
+        }
+    }
+
+    struct DropPanickingPayload {
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for DropPanickingPayload {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::AcqRel);
+            panic!("scripted deadline observer payload drop panic");
+        }
+    }
+
+    struct PanicsWithDropPanickingPayload {
+        payload_drops: Arc<AtomicUsize>,
+    }
+
+    impl Wake for PanicsWithDropPanickingPayload {
+        fn wake(self: Arc<Self>) {
+            std::panic::panic_any(DropPanickingPayload {
+                drops: Arc::clone(&self.payload_drops),
+            });
+        }
+    }
+
+    struct CountsWake {
+        wakes: Arc<AtomicUsize>,
+    }
+
+    impl Wake for CountsWake {
+        fn wake(self: Arc<Self>) {
+            self.wakes.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    #[test]
+    fn replacing_stale_waker_drops_after_signal_mutex_release() {
+        let signal = Arc::new(DeadlineSignalInner::new());
+        let drops = Arc::new(AtomicUsize::new(0));
+        let stale_probe = Arc::new(DropChecksSignalLock {
+            signal: Arc::clone(&signal),
+            drops: Arc::clone(&drops),
+        });
+        let stale_waker = Waker::from(Arc::clone(&stale_probe));
+        drop(stale_probe);
+        let mut stale_context = Context::from_waker(&stale_waker);
+        assert_eq!(signal.poll_resolution(&mut stale_context), Poll::Pending);
+        drop(stale_waker);
+
+        let replacement_waker = Waker::noop();
+        let mut replacement_context = Context::from_waker(replacement_waker);
+        assert_eq!(
+            signal.poll_resolution(&mut replacement_context),
+            Poll::Pending
+        );
+        assert_eq!(drops.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn same_target_wakers_run_after_batch_commit_and_lock_release() {
+        let clock = Arc::new(VirtualClock::default());
+        let scheduler = scheduler();
+        let first = scheduler
+            .register(TARGET_NS, &*clock)
+            .expect("first registration");
+        let second = scheduler
+            .register(TARGET_NS, &*clock)
+            .expect("second registration");
+        let first_signal = first.signal();
+        let second_signal = second.signal();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let first_waker = Waker::from(Arc::new(WakeChecksReleasedLocks {
+            signal: Arc::clone(&first_signal.inner),
+            scheduler: Arc::clone(&scheduler),
+            other_signal: second_signal.clone(),
+            order: 1,
+            events: Arc::clone(&events),
+        }));
+        let second_waker = Waker::from(Arc::new(WakeChecksReleasedLocks {
+            signal: Arc::clone(&second_signal.inner),
+            scheduler: Arc::clone(&scheduler),
+            other_signal: first_signal.clone(),
+            order: 2,
+            events: Arc::clone(&events),
+        }));
+        let mut first_context = Context::from_waker(&first_waker);
+        let mut second_context = Context::from_waker(&second_waker);
+
+        assert_eq!(
+            first_signal.poll_resolution(&mut first_context),
+            Poll::Pending
+        );
+        assert_eq!(
+            second_signal.poll_resolution(&mut second_context),
+            Poll::Pending
+        );
+        clock.advance_to(TARGET_NS);
+        assert_eq!(scheduler.fire_due(&*clock), 2);
+        assert_eq!(*lock_recover(&events), vec![1, 2]);
+        assert!(outcome(&first).order < outcome(&second).order);
+    }
+
+    #[test]
+    fn close_drain_commits_batch_before_waking_observers() {
+        let clock = Arc::new(VirtualClock::default());
+        let scheduler = scheduler();
+        let first = scheduler
+            .register(TARGET_NS, &*clock)
+            .expect("first registration");
+        let second = scheduler
+            .register(TARGET_NS, &*clock)
+            .expect("second registration");
+        let first_signal = first.signal();
+        let second_signal = second.signal();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let first_waker = Waker::from(Arc::new(WakeChecksBatchCommit {
+            signal: Arc::clone(&first_signal.inner),
+            other_signal: second_signal.clone(),
+            order: 1,
+            events: Arc::clone(&events),
+        }));
+        let second_waker = Waker::from(Arc::new(WakeChecksBatchCommit {
+            signal: Arc::clone(&second_signal.inner),
+            other_signal: first_signal.clone(),
+            order: 2,
+            events: Arc::clone(&events),
+        }));
+        let mut first_context = Context::from_waker(&first_waker);
+        let mut second_context = Context::from_waker(&second_waker);
+
+        assert_eq!(
+            first_signal.poll_resolution(&mut first_context),
+            Poll::Pending
+        );
+        assert_eq!(
+            second_signal.poll_resolution(&mut second_context),
+            Poll::Pending
+        );
+        scheduler.drain_runtime_closed();
+        assert_eq!(*lock_recover(&events), vec![1, 2]);
+        assert_eq!(
+            outcome(&first).resolution,
+            DeadlineResolution::RuntimeClosed
+        );
+        assert_eq!(
+            outcome(&second).resolution,
+            DeadlineResolution::RuntimeClosed
+        );
+        assert!(outcome(&first).order < outcome(&second).order);
+    }
+
+    #[test]
+    fn scheduler_drop_commits_batch_before_waking_observers() {
+        let clock = Arc::new(VirtualClock::default());
+        let scheduler = scheduler();
+        let first = scheduler
+            .register(TARGET_NS, &*clock)
+            .expect("first registration");
+        let second = scheduler
+            .register(TARGET_NS, &*clock)
+            .expect("second registration");
+        let first_signal = first.signal();
+        let second_signal = second.signal();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let first_waker = Waker::from(Arc::new(WakeChecksBatchCommit {
+            signal: Arc::clone(&first_signal.inner),
+            other_signal: second_signal.clone(),
+            order: 1,
+            events: Arc::clone(&events),
+        }));
+        let second_waker = Waker::from(Arc::new(WakeChecksBatchCommit {
+            signal: Arc::clone(&second_signal.inner),
+            other_signal: first_signal.clone(),
+            order: 2,
+            events: Arc::clone(&events),
+        }));
+        let mut first_context = Context::from_waker(&first_waker);
+        let mut second_context = Context::from_waker(&second_waker);
+
+        assert_eq!(
+            first_signal.poll_resolution(&mut first_context),
+            Poll::Pending
+        );
+        assert_eq!(
+            second_signal.poll_resolution(&mut second_context),
+            Poll::Pending
+        );
+        drop(scheduler);
+        assert_eq!(*lock_recover(&events), vec![1, 2]);
+        assert_eq!(
+            outcome(&first).resolution,
+            DeadlineResolution::RuntimeClosed
+        );
+        assert_eq!(
+            outcome(&second).resolution,
+            DeadlineResolution::RuntimeClosed
+        );
+        assert!(outcome(&first).order < outcome(&second).order);
+    }
+
+    #[test]
+    fn panicking_wakers_do_not_orphan_later_same_batch_observers() {
+        let clock = Arc::new(VirtualClock::default());
+        let scheduler = scheduler();
+        let first = scheduler
+            .register(TARGET_NS, &*clock)
+            .expect("first registration");
+        let second = scheduler
+            .register(TARGET_NS, &*clock)
+            .expect("second registration");
+        let third = scheduler
+            .register(TARGET_NS, &*clock)
+            .expect("third registration");
+        let first_signal = first.signal();
+        let second_signal = second.signal();
+        let third_signal = third.signal();
+        let payload_drops = Arc::new(AtomicUsize::new(0));
+        let later_wakes = Arc::new(AtomicUsize::new(0));
+        let first_waker = Waker::from(Arc::new(PanicsOnWake));
+        let second_waker = Waker::from(Arc::new(PanicsWithDropPanickingPayload {
+            payload_drops: Arc::clone(&payload_drops),
+        }));
+        let third_waker = Waker::from(Arc::new(CountsWake {
+            wakes: Arc::clone(&later_wakes),
+        }));
+        let mut first_context = Context::from_waker(&first_waker);
+        let mut second_context = Context::from_waker(&second_waker);
+        let mut third_context = Context::from_waker(&third_waker);
+
+        assert_eq!(
+            first_signal.poll_resolution(&mut first_context),
+            Poll::Pending
+        );
+        assert_eq!(
+            second_signal.poll_resolution(&mut second_context),
+            Poll::Pending
+        );
+        assert_eq!(
+            third_signal.poll_resolution(&mut third_context),
+            Poll::Pending
+        );
+        clock.advance_to(TARGET_NS);
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| scheduler.fire_due(&*clock))).is_err(),
+            "the first observer panic must remain observable"
+        );
+        assert_eq!(payload_drops.load(Ordering::Acquire), 1);
+        assert_eq!(later_wakes.load(Ordering::Acquire), 1);
+        assert_eq!(outcome(&first).resolution, DeadlineResolution::Fired);
+        assert_eq!(outcome(&second).resolution, DeadlineResolution::Fired);
+        assert_eq!(outcome(&third).resolution, DeadlineResolution::Fired);
+        assert!(outcome(&first).order < outcome(&second).order);
+        assert!(outcome(&second).order < outcome(&third).order);
     }
 
     #[test]

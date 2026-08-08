@@ -1439,6 +1439,19 @@ def validate_behavior():
         "Runtime generic deadline states changed",
     )
     require(
+        behavior["runtime"]["generic_deadlines"]
+        == {
+            "target": "absolute target_ns in the owning Runtime Clock epoch; an already-due target is Fired before registration returns",
+            "identity": "Runtime-local registration IDs increase monotonically and are not reused while observable",
+            "states": ["Armed", "Fired", "Disarmed", "RuntimeClosed"],
+            "independence": "a registration is not an Operation, resource, or supervised task and allocates no OperationId, emits no operation event, and changes no public registry count",
+            "system_clock": "the shared deadline worker fires without consumer or domain-lane progress, wakes to recompute after earlier registration or disarm, and wakes one registered poll_resolution observer after committing its outcome",
+            "virtual_clock": "only clock advance wakes due entries; equal target_ns entries commit in registration-ID order before any observer notification, and dispatch records follow notification",
+            "close": "close seals admission first, keeps existing registrations serviced through resource cleanup, external owner join, and legal Operation settlement, then commits remaining Armed entries as RuntimeClosed before notifying observers and joining the worker",
+        },
+        "Runtime generic deadline observer contract changed",
+    )
+    require(
         behavior["controller"]["default_minimum_report_interval_ns"] == 30_000_000,
         "controller interval must remain 30 ms",
     )
@@ -1510,6 +1523,19 @@ def validate_runtime_r0_fixture():
         deadline["same_target_registration_ids"]
         == sorted(set(deadline["same_target_registration_ids"])),
         "Runtime deadline fixture IDs must be unique and increasing",
+    )
+    require(
+        deadline["async_observer"]
+        == {
+            "registration": "atomic-outcome-and-latest-waker",
+            "terminal_poll": "Ready",
+            "same_waker_wake_count": 1,
+            "replacement": "latest-waker-only",
+            "batch_order": ["commit-all", "notify-all", "record-dispatch"],
+            "blocking_wait": "coexists",
+            "panic": "notify-remaining-then-propagate",
+        },
+        "Runtime deadline async observer contract changed",
     )
 
     evidence = {

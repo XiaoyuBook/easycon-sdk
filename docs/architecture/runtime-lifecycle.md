@@ -144,8 +144,14 @@ Runtime 还提供不属于 Operation/resource/task 的一次性 `DeadlineRegistr
   分配，在仍可观察时不复用。
 - registration 只从 `Armed` 一次转为 `Fired`、`Disarmed` 或 `RuntimeClosed`。显式 disarm、handle Drop、fire 和
   close drain 竞争同一个 queue entry；迟到 heap entry 通过 ID 判为 stale，不能再次 wake。
+- `DeadlineSignal::poll_resolution(&mut Context) -> Poll<DeadlineOutcome>` 是非阻塞观察接口。它在同一 signal mutex 中
+  原子检查 outcome 并在 `Pending` 时保留一个最新 task waker；已终态立即返回 `Ready` 且不保留 waker，同一 task 的
+  重复 poll 去重，替换时旧 waker 在锁外析构。blocking `wait` 可以与该 observer 并存。
 - 已到期 target 在注册返回前即为 `Fired`。SystemClock worker 不依赖 domain consumer/lane 进展；VirtualClock
-  只在 advance/on-change 后扫描，同一 target 按 registration ID 稳定 fire。
+  只在 advance/on-change 后扫描，同一 target 按 registration ID 稳定 fire。每个 terminal path 先提交唯一 outcome 并
+  取走通知；同点 batch 的全部 outcome 在 fire gate 内提交后，才在所有 Runtime/scheduler/signal 锁外逐个 Condvar
+  notify/wake，随后才 record dispatch。waker 的重入或 panic 不得让同批其余 observer 遗失通知；panic 继续走既有
+  worker/close failure 边界。
 - registration 不分配 OperationId，不发布 operation event，也不改变 operation/resource/task registry 或公开 counts。
   wait timeout 只结束该次 signal wait，不改变 registration。
 

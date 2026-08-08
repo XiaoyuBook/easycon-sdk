@@ -2,6 +2,7 @@
 #![cfg(feature = "runtime-model")]
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::task::{Poll, Waker};
 
 use easycon_runtime::runtime_model::{
     CancellationNode, DeadlineResolutionState, TaskLifecycleState, TaskOwnerBinding,
@@ -520,6 +521,69 @@ fn deadline_fire_disarm_and_close_resolve_exactly_once() {
         }
 
         assert_eq!(wins.load(Ordering::Acquire), 1);
+        assert!(
+            state
+                .lock()
+                .expect("deadline resolution")
+                .outcome()
+                .is_some()
+        );
+    });
+}
+
+#[test]
+fn deadline_poll_registration_linearizes_against_resolution() {
+    loom::model(|| {
+        let state = Arc::new(Mutex::new(DeadlineResolutionState::armed()));
+        let poll_result = Arc::new(AtomicUsize::new(0));
+        let delivered_waker = Arc::new(AtomicBool::new(false));
+
+        let observer_state = Arc::clone(&state);
+        let observer_result = Arc::clone(&poll_result);
+        let observer = thread::spawn(move || {
+            let candidate = Waker::noop().clone();
+            let (poll, displaced) = {
+                observer_state
+                    .lock()
+                    .expect("deadline resolution")
+                    .poll_resolution_for_model(candidate)
+            };
+            drop(displaced);
+            observer_result.store(
+                match poll {
+                    Poll::Pending => 1,
+                    Poll::Ready(_) => 2,
+                },
+                Ordering::Release,
+            );
+        });
+
+        let resolver_state = Arc::clone(&state);
+        let resolver_delivered = Arc::clone(&delivered_waker);
+        let resolver = thread::spawn(move || {
+            let notification = {
+                resolver_state
+                    .lock()
+                    .expect("deadline resolution")
+                    .resolve_for_model(DeadlineOutcome {
+                        resolution: DeadlineResolution::Fired,
+                        order: 1,
+                    })
+                    .expect("one resolver commits the model deadline")
+            };
+            if notification.is_some() {
+                resolver_delivered.store(true, Ordering::Release);
+            }
+            drop(notification);
+        });
+
+        observer.join().expect("deadline observer");
+        resolver.join().expect("deadline resolver");
+        let observed = poll_result.load(Ordering::Acquire);
+        assert!(
+            observed == 2 || delivered_waker.load(Ordering::Acquire),
+            "a pending observer must have its registered waker taken by the resolver"
+        );
         assert!(
             state
                 .lock()

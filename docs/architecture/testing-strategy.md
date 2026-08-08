@@ -74,7 +74,9 @@ fixture 必须自包含、可审阅且注明来源。`EasyCon/` 只用于本地�
 - Operation 每条合法/非法状态转换；终态单次提交；cancel 与 success 竞态；
 - event read/observation timeout 与 operation deadline 分离；
 - generic deadline registration 的 already-due、SystemClock 独立进展、VirtualClock advance-only/同点 ID 顺序，
-  以及 fire/disarm/drop/close/stale-entry exactly-once；断言不分配 OperationId、不发 operation event、不改变公开 counts；
+  `poll_resolution` 的 atomic register/resolve、同 waker 去重/最新替换、blocking wait 并存，以及
+  fire/disarm/drop/close/stale-entry exactly-once；同点 batch 必须先提交全体 outcome 后在锁外 wake，覆盖可重入与
+  panic waker，断言不分配 OperationId、不发 operation event、不改变公开 counts；
 - parent cancellation tree；task supervisor 无脱管任务；
 - event filter、sequence、reserved capacity、gap 合并和 drain；
 - Runtime explicit close 的逐步顺序、保存的 Closed/CloseFailed outcome、幂等和并发 waiter；
@@ -94,8 +96,9 @@ fixture 必须自包含、可审阅且注明来源。`EasyCon/` 只用于本地�
 - cancellation hook 调用、未触发 hook capture 析构和 panic payload 析构逐项隔离；capture 析构重入
   operation 查询不持有 operation/hooks/children 锁，poisoned synchronization state 可恢复；
 - 用 Loom 模型覆盖 parent terminal/child admission、hook panic/child propagation、supervised task self-wait、hook
-  capture 析构重入、terminal commit/registry unlink/waiter notify、deadline fire/disarm/close exactly-once、intent
-  不抢 claim、accepted claim 对 late cancellation 稳定、claim/commit 唯一，以及 handoff 的 join/pre-held 条件。
+  capture 析构重入、terminal commit/registry unlink/waiter notify、deadline fire/disarm/close exactly-once 与
+  poll-register/resolve race、intent 不抢 claim、accepted claim 对 late cancellation 稳定、claim/commit 唯一，以及
+  handoff 的 join/pre-held 条件。
   模型命令是 Phase 1 正式门禁。
 
 Phase 1 的正式模型入口是 `python tools/run_runtime_models.py`。它以 test-only `runtime-model`

@@ -9,6 +9,15 @@
     "resolution_count": 1,
     "same_target_registration_ids": [1, 2, 3],
     "same_target_fire_order": [1, 2, 3],
+    "async_observer": {
+      "registration": "atomic-outcome-and-latest-waker",
+      "terminal_poll": "Ready",
+      "same_waker_wake_count": 1,
+      "replacement": "latest-waker-only",
+      "batch_order": ["commit-all", "notify-all", "record-dispatch"],
+      "blocking_wait": "coexists",
+      "panic": "notify-remaining-then-propagate"
+    },
     "public_registry_delta": {
       "active_operations": 0,
       "active_resources": 0,
