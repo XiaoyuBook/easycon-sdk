@@ -219,6 +219,32 @@ impl AutomationLease {
             record: Some(self.generation.request_cleanup()),
         }
     }
+
+    /// Installs a one-shot admission-resolution barrier for deterministic cross-crate tests.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn install_admission_resolution_hook_for_test(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        let mut installed = self
+            .generation
+            .admission_resolution_hook
+            .lock()
+            .expect("lease generation admission hook lock poisoned");
+        assert!(
+            installed.is_none(),
+            "an admission hook is already installed"
+        );
+        *installed = Some(hook);
+    }
+
+    /// Starts the same cleanup transaction without consuming the test's borrowed lease handle.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn request_cleanup_for_test(&self) -> AutomationLeaseRelease {
+        AutomationLeaseRelease {
+            record: Some(self.generation.request_cleanup()),
+        }
+    }
 }
 
 impl Drop for AutomationLease {
@@ -504,7 +530,8 @@ impl CloseOperationSettlement {
 }
 
 enum OperationSettlementState {
-    Pending(OperationSettlementOwner),
+    NotDispatched(OperationSettlementOwner),
+    Outstanding(OperationSettlementOwner),
     FullAcceptedReserved {
         owner: OperationSettlementOwner,
         strict_failure: Option<EasyConError>,
@@ -528,8 +555,37 @@ impl OperationSettlementRecord {
 
     fn new(owner: OperationSettlementOwner) -> Self {
         Self {
-            state: Mutex::new(OperationSettlementState::Pending(owner)),
+            state: Mutex::new(OperationSettlementState::NotDispatched(owner)),
         }
+    }
+
+    /// Orders generation seal against backend dispatch without performing Runtime work.
+    fn mark_dispatched(&self) -> bool {
+        let mut state = self.lock_state();
+        let owner = match std::mem::replace(&mut *state, OperationSettlementState::Failed) {
+            OperationSettlementState::NotDispatched(owner) => owner,
+            other => {
+                *state = other;
+                return false;
+            }
+        };
+        *state = OperationSettlementState::Outstanding(owner);
+        true
+    }
+
+    /// Linearizes a sealed generation's admission rejection against backend dispatch.
+    /// This only moves the local owner; Runtime cancellation is settled after every generation
+    /// and record lock has been released.
+    fn reserve_generation_rejection(&self) -> Option<OperationSettlementOwner> {
+        let mut state = self.lock_state();
+        let owner = match std::mem::replace(&mut *state, OperationSettlementState::Finished) {
+            OperationSettlementState::NotDispatched(owner) => owner,
+            other => {
+                *state = other;
+                return None;
+            }
+        };
+        Some(owner)
     }
 
     /// Reserves the owned record in the same short transaction as the backend final-byte gate.
@@ -538,7 +594,7 @@ impl OperationSettlementRecord {
     fn reserve_full_accepted(&self) -> bool {
         let mut state = self.lock_state();
         let owner = match std::mem::replace(&mut *state, OperationSettlementState::Failed) {
-            OperationSettlementState::Pending(owner) => owner,
+            OperationSettlementState::Outstanding(owner) => owner,
             other => {
                 *state = other;
                 return false;
@@ -622,7 +678,8 @@ impl OperationSettlementRecord {
     fn is_pending(&self) -> bool {
         matches!(
             *self.lock_state(),
-            OperationSettlementState::Pending(_)
+            OperationSettlementState::NotDispatched(_)
+                | OperationSettlementState::Outstanding(_)
                 | OperationSettlementState::FullAcceptedReserved { .. }
                 | OperationSettlementState::ClaimingFull { .. }
                 | OperationSettlementState::ClaimedFull(_)
@@ -667,7 +724,24 @@ impl OperationSettlementRecord {
         let owner = {
             let mut state = self.lock_state();
             match std::mem::replace(&mut *state, OperationSettlementState::Finished) {
-                OperationSettlementState::Pending(owner) => Some(owner),
+                OperationSettlementState::NotDispatched(owner)
+                | OperationSettlementState::Outstanding(owner) => Some(owner),
+                other => {
+                    *state = other;
+                    None
+                }
+            }
+        };
+        if let Some(owner) = owner {
+            settle_owned_cancellation(owner, operation);
+        }
+    }
+
+    fn settle_not_dispatched_cancellation(&self, operation: &Operation) {
+        let owner = {
+            let mut state = self.lock_state();
+            match std::mem::replace(&mut *state, OperationSettlementState::Finished) {
+                OperationSettlementState::NotDispatched(owner) => Some(owner),
                 other => {
                     *state = other;
                     None
@@ -683,7 +757,8 @@ impl OperationSettlementRecord {
         let owner = {
             let mut state = self.lock_state();
             match std::mem::replace(&mut *state, OperationSettlementState::Failed) {
-                OperationSettlementState::Pending(owner) => Some(owner),
+                OperationSettlementState::NotDispatched(owner)
+                | OperationSettlementState::Outstanding(owner) => Some(owner),
                 other => {
                     *state = other;
                     None
@@ -705,7 +780,8 @@ impl OperationSettlementRecord {
         let finish = {
             let mut state = self.lock_state();
             match std::mem::replace(&mut *state, OperationSettlementState::Failed) {
-                OperationSettlementState::Pending(owner) => Some(StrictFinish::Owner(owner)),
+                OperationSettlementState::NotDispatched(owner)
+                | OperationSettlementState::Outstanding(owner) => Some(StrictFinish::Owner(owner)),
                 OperationSettlementState::FullAcceptedReserved {
                     owner,
                     strict_failure,
@@ -1103,6 +1179,8 @@ struct LeaseGeneration {
     permanent_failure: Arc<ControllerCleanupFailure>,
     gate: Mutex<LeaseGenerationGate>,
     cleanup_failure: Mutex<Option<EasyConError>>,
+    #[cfg(debug_assertions)]
+    admission_resolution_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 #[derive(Clone)]
@@ -1154,7 +1232,24 @@ impl LeaseGeneration {
                 Err(automation_admission_panic_error())
             }
         };
-        let mut rejected_after_seal = None;
+        #[cfg(debug_assertions)]
+        if let Some(hook) = self
+            .admission_resolution_hook
+            .lock()
+            .expect("lease generation admission hook lock poisoned")
+            .take()
+        {
+            hook();
+        }
+        enum SealedAdmissionResolution {
+            Rejected {
+                operation: Operation,
+                owner: OperationSettlementOwner,
+            },
+            Dispatched(LeaseGenerationAction),
+        }
+
+        let mut sealed_resolution = None;
         let (result, wake_cleanup) = {
             let mut gate = self
                 .gate
@@ -1186,15 +1281,49 @@ impl LeaseGeneration {
                         .checked_sub(1)
                         .expect("Automation lease admission reservation underflow");
                     if let Ok(action) = submitted {
-                        rejected_after_seal = Some(action.clone());
-                        actions.push(action);
+                        let operation = action.operation.clone();
+                        if let Some(owner) = action.settlement.reserve_generation_rejection() {
+                            sealed_resolution = Some(SealedAdmissionResolution::Rejected {
+                                operation: operation.clone(),
+                                owner,
+                            });
+                            actions.push(action);
+                            (Err(invalid_automation_lease_error()), true)
+                        } else {
+                            sealed_resolution =
+                                Some(SealedAdmissionResolution::Dispatched(action.clone()));
+                            actions.push(action);
+                            (Ok(operation), true)
+                        }
+                    } else {
+                        (Err(invalid_automation_lease_error()), true)
                     }
-                    (Err(invalid_automation_lease_error()), true)
                 }
             }
         };
-        if let Some(action) = rejected_after_seal {
-            action.settlement.settle_cancellation(&action.operation);
+        if let Some(resolution) = sealed_resolution {
+            let cleanup_failure = self
+                .permanent_failure
+                .get()
+                .or_else(|| self.cleanup_failure());
+            match resolution {
+                SealedAdmissionResolution::Rejected { operation, owner } => {
+                    if let Some(error) = cleanup_failure {
+                        settle_owned_strict_failure(owner, error);
+                    } else {
+                        settle_owned_cancellation(owner, &operation);
+                    }
+                }
+                SealedAdmissionResolution::Dispatched(action) => {
+                    if let Some(error) = cleanup_failure {
+                        action.settlement.settle_strict_failure(error);
+                    } else {
+                        let _ = action
+                            .operation
+                            .request_cancel(CancellationReason::ParentClose);
+                    }
+                }
+            }
         }
         if wake_cleanup {
             let _ = self.sender.send(LaneCommand::Wake);
@@ -1300,7 +1429,9 @@ impl LeaseGeneration {
                 let _ = action
                     .operation
                     .request_cancel(CancellationReason::ParentClose);
-                action.settlement.settle_cancellation(&action.operation);
+                action
+                    .settlement
+                    .settle_not_dispatched_cancellation(&action.operation);
             }
         }
         self.release_interrupts.track(&record);
@@ -3448,6 +3579,8 @@ impl ControllerLane {
                 reservations: 0,
             }),
             cleanup_failure: Mutex::new(None),
+            #[cfg(debug_assertions)]
+            admission_resolution_hook: Mutex::new(None),
         });
         let controller_id = self.resource_id;
         let controller_identity = self.controller_identity.clone();
@@ -4355,8 +4488,10 @@ impl ControllerLane {
         if !completes_operation_effect {
             return WriteSettlement::tracked(None);
         }
+        let dispatch = Arc::clone(&operation_settlement);
         let reservation = Arc::clone(&operation_settlement);
-        WriteSettlement::tracked_with_full_reservation(
+        WriteSettlement::tracked_with_reservations(
+            Some(Box::new(move || dispatch.mark_dispatched())),
             Some(Box::new(move || reservation.reserve_full_accepted())),
             None,
         )
@@ -5745,7 +5880,7 @@ mod tests {
                     strict_failure: None,
                 },
             ) {
-                OperationSettlementState::Pending(owner) => owner,
+                OperationSettlementState::NotDispatched(owner) => owner,
                 _ => panic!("fresh record must retain its pending owner"),
             }
         };
@@ -5782,9 +5917,11 @@ mod tests {
         let record = Arc::new(OperationSettlementRecord::new(owner));
         let (entered_sender, entered_receiver) = mpsc::sync_channel(1);
         let (resume_sender, resume_receiver) = mpsc::sync_channel(1);
+        let dispatch_record = Arc::clone(&record);
         let reservation_record = Arc::clone(&record);
         let hook_record = Arc::clone(&record);
-        let settlement = WriteSettlement::tracked_with_full_reservation(
+        let settlement = WriteSettlement::tracked_with_reservations(
+            Some(Box::new(move || dispatch_record.mark_dispatched())),
             Some(Box::new(move || reservation_record.reserve_full_accepted())),
             Some(Box::new(move |outcome| {
                 if outcome == WriteSettlementOutcome::FullAccepted {
@@ -5832,6 +5969,38 @@ mod tests {
     }
 
     #[test]
+    fn generation_rejection_prevents_a_late_backend_dispatch() {
+        let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+        let (operation, owner) = runtime
+            .create_operation_with_settlement_owner(
+                None,
+                SettlementOwnerMode::Transferable,
+                || Ok(()),
+                |_| {},
+            )
+            .expect("owned operation");
+        let record = OperationSettlementRecord::new(owner);
+
+        let owner = record
+            .reserve_generation_rejection()
+            .expect("generation seal wins while the action is NotDispatched");
+        assert!(
+            !record.mark_dispatched(),
+            "backend dispatch cannot outrun an already reserved rejection"
+        );
+        super::settle_owned_cancellation(owner, &operation);
+
+        let snapshot = operation.snapshot();
+        assert_eq!(snapshot.state, OperationState::Cancelled);
+        assert_eq!(
+            snapshot.cancellation_reason,
+            Some(CancellationReason::ParentClose)
+        );
+        assert!(record.is_finished());
+        assert_eq!(runtime.close(), Ok(CloseOutcome::Closed));
+    }
+
+    #[test]
     fn final_acceptance_can_claim_an_action_after_an_isolated_hook_panic() {
         let runtime = Runtime::new(Arc::new(VirtualClock::default()));
         let (operation, owner) = runtime
@@ -5857,8 +6026,10 @@ mod tests {
         });
         assert!(poisoner.join().is_err(), "the scripted observer must panic");
 
+        let dispatch_record = Arc::clone(&record);
         let reservation_record = Arc::clone(&record);
-        let settlement = WriteSettlement::tracked_with_full_reservation(
+        let settlement = WriteSettlement::tracked_with_reservations(
+            Some(Box::new(move || dispatch_record.mark_dispatched())),
             Some(Box::new(move || reservation_record.reserve_full_accepted())),
             Some(Box::new(|outcome| {
                 if outcome == WriteSettlementOutcome::FullAccepted {
@@ -6281,6 +6452,8 @@ mod tests {
                 reservations: 0,
             }),
             cleanup_failure: std::sync::Mutex::new(None),
+            #[cfg(debug_assertions)]
+            admission_resolution_hook: std::sync::Mutex::new(None),
         });
         let record = generation.request_cleanup();
         let error = match generation

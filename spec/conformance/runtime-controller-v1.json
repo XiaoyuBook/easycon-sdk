@@ -853,6 +853,16 @@
           "id": "controller.lease.close-interrupt-release",
           "expect": "close interrupts an in-flight release neutral, settles the stream, and does not retry that neutral",
           "test": "tests/support/tests/controller_lease.rs::close_interrupts_release_neutral_before_acceptance_and_joins"
+        },
+        {
+          "id": "controller.lease.generation-release-windows-full-completion",
+          "expect": "generation release records intent without consuming an outstanding Windows settlement owner, so ERROR_NOT_FOUND followed by a full completion still succeeds before one release and one close neutral",
+          "test": "crates/easycon-serial/src/windows/io.rs::generation_release_preserves_windows_full_completion_after_cancel_not_found"
+        },
+        {
+          "id": "controller.lease.admission-resolution-windows-full-completion",
+          "expect": "generation admission resolution and backend dispatch share one order, so a dispatched action remains observable and ERROR_NOT_FOUND followed by a full completion still succeeds before one release and one close neutral",
+          "test": "crates/easycon-serial/src/windows/io.rs::admission_resolution_preserves_outstanding_windows_full_completion_after_seal"
         }
       ],
       "obligations": [

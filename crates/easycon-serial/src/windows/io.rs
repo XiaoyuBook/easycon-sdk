@@ -586,10 +586,251 @@ fn port_path(port_name: &str) -> Result<Vec<u16>, SerialError> {
 
 #[cfg(test)]
 mod tests {
-    use easycon_runtime::{CancellationToken, VirtualClock};
+    use std::future::Future;
+    use std::pin::{Pin, pin};
+    use std::sync::{Arc, Condvar, Mutex, mpsc};
+    use std::task::{Context, Poll, Wake, Waker};
+
+    use easycon_controller::{
+        AutomationLeaseAcquireOutcome, AutomationLeaseReleaseOutcome, ConnectOptions,
+        ControllerAction, ControllerOptions, ControllerSession, HANDSHAKE_REPLY, HANDSHAKE_REQUEST,
+        WriteKind,
+    };
+    use easycon_model::Button;
+    use easycon_runtime::{
+        CancellationReason, CancellationToken, CloseOutcome, Operation, OperationState, Runtime,
+        VirtualClock, WaitResult, WaitTimeout,
+    };
 
     use super::*;
-    use crate::ByteIoOperation;
+    use crate::{
+        ByteIo, ByteIoFactory, ByteIoOperation, ByteIoRequest, SerialControllerTransport,
+        SerialPortDescriptor,
+    };
+
+    const TEST_WAIT: Duration = Duration::from_secs(2);
+
+    #[derive(Default)]
+    struct CompletionBoundaryState {
+        admission_resolution_waiting: bool,
+        allow_admission_resolution: bool,
+        full_completion_waiting: bool,
+        interrupt_observed: bool,
+        allow_completion_consumption: bool,
+        cancel_not_found_consumed: bool,
+        report_writes: usize,
+        neutral_writes: usize,
+    }
+
+    #[derive(Default)]
+    struct CompletionBoundary {
+        state: Mutex<CompletionBoundaryState>,
+        changed: Condvar,
+    }
+
+    impl CompletionBoundary {
+        fn wait_for(&self, predicate: impl Fn(&CompletionBoundaryState) -> bool, message: &str) {
+            let state = self.state.lock().expect("completion boundary lock");
+            let (state, timeout) = self
+                .changed
+                .wait_timeout_while(state, TEST_WAIT, |state| !predicate(state))
+                .expect("completion boundary wait");
+            assert!(!timeout.timed_out() && predicate(&state), "{message}");
+        }
+
+        fn allow_completion_consumption(&self) {
+            let mut state = self.state.lock().expect("completion boundary lock");
+            state.allow_completion_consumption = true;
+            self.changed.notify_all();
+        }
+
+        fn admission_resolution_hook(&self) {
+            let mut state = self.state.lock().expect("completion boundary lock");
+            state.admission_resolution_waiting = true;
+            self.changed.notify_all();
+            while !state.allow_admission_resolution {
+                state = self
+                    .changed
+                    .wait(state)
+                    .expect("completion boundary admission wait");
+            }
+        }
+
+        fn allow_admission_resolution(&self) {
+            let mut state = self.state.lock().expect("completion boundary lock");
+            state.allow_admission_resolution = true;
+            self.changed.notify_all();
+        }
+
+        fn counts(&self) -> (usize, usize, bool) {
+            let state = self.state.lock().expect("completion boundary lock");
+            (
+                state.report_writes,
+                state.neutral_writes,
+                state.cancel_not_found_consumed,
+            )
+        }
+    }
+
+    struct CompletionFactory {
+        boundary: Arc<CompletionBoundary>,
+    }
+
+    impl ByteIoFactory for CompletionFactory {
+        fn open(
+            &mut self,
+            _port: &SerialPortDescriptor,
+            baud_rate: u32,
+            request: ByteIoRequest,
+        ) -> Result<Box<dyn ByteIo>, SerialError> {
+            assert_eq!(baud_rate, 115_200);
+            assert_eq!(request.operation, ByteIoOperation::Open);
+            assert!(request.interruption().is_none());
+            Ok(Box::new(CompletionIo {
+                boundary: Arc::clone(&self.boundary),
+            }))
+        }
+    }
+
+    struct CompletionIo {
+        boundary: Arc<CompletionBoundary>,
+    }
+
+    impl ByteIo for CompletionIo {
+        fn read(
+            &mut self,
+            buffer: &mut [u8],
+            request: ByteIoRequest,
+        ) -> Result<usize, SerialError> {
+            if request.operation != ByteIoOperation::HandshakeRead || buffer.is_empty() {
+                return Err(SerialError::new(
+                    SerialErrorKind::Protocol,
+                    "scripted Windows completion received an unexpected read",
+                ));
+            }
+            buffer[0] = HANDSHAKE_REPLY;
+            Ok(1)
+        }
+
+        fn write(&mut self, buffer: &[u8], request: ByteIoRequest) -> Result<usize, SerialError> {
+            match request.operation {
+                ByteIoOperation::HandshakeWrite => {
+                    assert_eq!(buffer, HANDSHAKE_REQUEST);
+                    Ok(buffer.len())
+                }
+                ByteIoOperation::ControllerWrite(context) if context.kind == WriteKind::Report => {
+                    let boundary = Arc::clone(&self.boundary);
+                    let wake_boundary = Arc::clone(&boundary);
+                    let _cancel_wake = request
+                        .cancellation
+                        .on_cancel_scoped(move || wake_boundary.changed.notify_all());
+                    let mut state = boundary.state.lock().expect("completion boundary lock");
+                    state.full_completion_waiting = true;
+                    boundary.changed.notify_all();
+                    while !state.allow_completion_consumption
+                        || !request.cancellation.is_cancelled()
+                    {
+                        if request.cancellation.is_cancelled() && !state.interrupt_observed {
+                            state.interrupt_observed = true;
+                            boundary.changed.notify_all();
+                        }
+                        state = boundary
+                            .changed
+                            .wait(state)
+                            .expect("completion boundary wait");
+                    }
+                    state.interrupt_observed = true;
+                    boundary.changed.notify_all();
+                    drop(state);
+
+                    let interruption = request
+                        .interruption()
+                        .expect("generation release requests the Windows interrupt");
+                    let transferred = settle_cancelled_completion(
+                        cancel_request_error(ERROR_NOT_FOUND),
+                        Ok(u32::try_from(buffer.len()).expect("test report fits u32")),
+                        interruption,
+                    )?;
+                    {
+                        let mut state = boundary.state.lock().expect("completion boundary lock");
+                        state.cancel_not_found_consumed = true;
+                    }
+                    let transferred = usize::try_from(transferred).expect("u32 fits usize");
+                    request.publish_final_write_acceptance(transferred)?;
+                    let mut state = boundary.state.lock().expect("completion boundary lock");
+                    state.report_writes += 1;
+                    boundary.changed.notify_all();
+                    Ok(transferred)
+                }
+                ByteIoOperation::ControllerWrite(context)
+                    if context.kind == WriteKind::Neutralize =>
+                {
+                    request.publish_final_write_acceptance(buffer.len())?;
+                    let mut state = self
+                        .boundary
+                        .state
+                        .lock()
+                        .expect("completion boundary lock");
+                    state.neutral_writes += 1;
+                    self.boundary.changed.notify_all();
+                    Ok(buffer.len())
+                }
+                _ => Err(SerialError::new(
+                    SerialErrorKind::Protocol,
+                    "scripted Windows completion received an unexpected write",
+                )),
+            }
+        }
+
+        fn discard_input(&mut self, _request: ByteIoRequest) -> Result<(), SerialError> {
+            Ok(())
+        }
+
+        fn close(&mut self) {
+            self.boundary.changed.notify_all();
+        }
+    }
+
+    struct ChannelWake(mpsc::SyncSender<()>);
+
+    impl Wake for ChannelWake {
+        fn wake(self: Arc<Self>) {
+            let _ = self.0.try_send(());
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            let _ = self.0.try_send(());
+        }
+    }
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        let (wake_sender, wake_receiver) = mpsc::sync_channel(1);
+        let waker = Waker::from(Arc::new(ChannelWake(wake_sender)));
+        let mut context = Context::from_waker(&waker);
+        let mut future = pin!(future);
+        loop {
+            match future.as_mut().poll(&mut context) {
+                Poll::Ready(output) => return output,
+                Poll::Pending => wake_receiver
+                    .recv_timeout(TEST_WAIT)
+                    .expect("future did not wake before the bounded test deadline"),
+            }
+        }
+    }
+
+    fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
+        let (wake_sender, _wake_receiver) = mpsc::sync_channel(1);
+        let waker = Waker::from(Arc::new(ChannelWake(wake_sender)));
+        let mut context = Context::from_waker(&waker);
+        future.poll(&mut context)
+    }
+
+    fn wait_terminal(operation: &Operation) {
+        assert!(matches!(
+            operation.wait(WaitTimeout::For(TEST_WAIT)),
+            WaitResult::Completed(_)
+        ));
+    }
 
     // conformance: phase2a.serial.safe-open-path
     #[test]
@@ -634,6 +875,205 @@ mod tests {
             prefer_causal_interruption(io, Some(deadline)).kind(),
             SerialErrorKind::Io
         );
+    }
+
+    // conformance: controller.lease.generation-release-windows-full-completion
+    #[test]
+    fn generation_release_preserves_windows_full_completion_after_cancel_not_found() {
+        let clock = Arc::new(VirtualClock::default());
+        let runtime = Runtime::new(clock.clone());
+        let boundary = Arc::new(CompletionBoundary::default());
+        let port = SerialPortDescriptor::new("ROOT\\TEST\\R", "COM1").expect("test port");
+        let transport = SerialControllerTransport::new(
+            clock.clone(),
+            port,
+            Box::new(CompletionFactory {
+                boundary: Arc::clone(&boundary),
+            }),
+        );
+        let controller = ControllerSession::new(
+            &runtime,
+            Box::new(transport),
+            ControllerOptions {
+                minimum_report_interval_ns: 1,
+                ..ControllerOptions::default()
+            },
+        )
+        .expect("controller");
+        let connect = controller
+            .connect(ConnectOptions::default())
+            .expect("connect");
+        wait_terminal(&connect);
+        assert_eq!(connect.snapshot().state, OperationState::Succeeded);
+
+        let cancellation = CancellationToken::root();
+        let lease = match block_on(controller.acquire_automation_lease(&cancellation, None)) {
+            AutomationLeaseAcquireOutcome::Granted(lease) => lease,
+            _ => panic!("Automation lease was not granted"),
+        };
+        let action = controller
+            .direct_with_lease(&lease, ControllerAction::ButtonDown(Button::A))
+            .expect("generation action");
+        boundary.wait_for(
+            |state| state.full_completion_waiting,
+            "backend did not reach the full Windows completion boundary",
+        );
+
+        let mut release = pin!(lease.neutralize_and_release());
+        boundary.wait_for(
+            |state| state.interrupt_observed,
+            "generation release did not request the Windows interrupt",
+        );
+        let sealed_snapshot = action.snapshot();
+        let release_was_pending = matches!(poll_once(release.as_mut()), Poll::Pending);
+        boundary.allow_completion_consumption();
+
+        wait_terminal(&action);
+        let action_snapshot = action.snapshot();
+        clock.advance_to(1);
+        let release_outcome = block_on(release.as_mut());
+        let before_close = boundary.counts();
+        clock.advance_to(2);
+        controller.close();
+        let runtime_close = runtime.close();
+        let after_close = boundary.counts();
+
+        assert_eq!(sealed_snapshot.state, OperationState::Running);
+        assert_eq!(
+            sealed_snapshot.cancellation_reason,
+            Some(CancellationReason::ParentClose)
+        );
+        assert!(
+            release_was_pending,
+            "release remains nonterminal until backend settlement"
+        );
+        assert_eq!(action_snapshot.state, OperationState::Succeeded);
+        assert_eq!(
+            action_snapshot.cancellation_reason,
+            Some(CancellationReason::ParentClose)
+        );
+        assert_eq!(
+            release_outcome,
+            Ok(AutomationLeaseReleaseOutcome::NeutralAccepted)
+        );
+        assert_eq!(before_close, (1, 1, true));
+        assert_eq!(after_close, (1, 2, true));
+        assert_eq!(runtime_close, Ok(CloseOutcome::Closed));
+    }
+
+    #[cfg(debug_assertions)]
+    // conformance: controller.lease.admission-resolution-windows-full-completion
+    #[test]
+    fn admission_resolution_preserves_outstanding_windows_full_completion_after_seal() {
+        let clock = Arc::new(VirtualClock::default());
+        let runtime = Runtime::new(clock.clone());
+        let boundary = Arc::new(CompletionBoundary::default());
+        let port = SerialPortDescriptor::new("ROOT\\TEST\\ADMISSION", "COM1").expect("test port");
+        let transport = SerialControllerTransport::new(
+            clock.clone(),
+            port,
+            Box::new(CompletionFactory {
+                boundary: Arc::clone(&boundary),
+            }),
+        );
+        let controller = ControllerSession::new(
+            &runtime,
+            Box::new(transport),
+            ControllerOptions {
+                minimum_report_interval_ns: 1,
+                ..ControllerOptions::default()
+            },
+        )
+        .expect("controller");
+        let connect = controller
+            .connect(ConnectOptions::default())
+            .expect("connect");
+        wait_terminal(&connect);
+        assert_eq!(connect.snapshot().state, OperationState::Succeeded);
+
+        let cancellation = CancellationToken::root();
+        let lease = match block_on(controller.acquire_automation_lease(&cancellation, None)) {
+            AutomationLeaseAcquireOutcome::Granted(lease) => lease,
+            _ => panic!("Automation lease was not granted"),
+        };
+        let hook_boundary = Arc::clone(&boundary);
+        lease.install_admission_resolution_hook_for_test(Arc::new(move || {
+            hook_boundary.admission_resolution_hook();
+        }));
+
+        let (submitted, sealed_snapshot, release_was_pending, release_outcome) =
+            std::thread::scope(|scope| {
+                let submit_controller = controller.clone();
+                let submit_lease = &lease;
+                let submit = scope.spawn(move || {
+                    submit_controller
+                        .direct_with_lease(submit_lease, ControllerAction::ButtonDown(Button::A))
+                });
+                boundary.wait_for(
+                    |state| state.admission_resolution_waiting,
+                    "submitter did not stop before generation admission resolution",
+                );
+                boundary.wait_for(
+                    |state| state.full_completion_waiting,
+                    "backend did not reach the full Windows completion boundary",
+                );
+
+                let mut release = pin!(lease.request_cleanup_for_test());
+                boundary.allow_admission_resolution();
+                let submitted = submit.join().expect("Automation admission thread");
+                boundary.wait_for(
+                    |state| state.interrupt_observed,
+                    "post-seal admission did not request the Windows interrupt",
+                );
+                let sealed_snapshot = submitted.as_ref().ok().map(Operation::snapshot);
+                let release_was_pending = matches!(poll_once(release.as_mut()), Poll::Pending);
+                boundary.allow_completion_consumption();
+
+                if let Ok(action) = &submitted {
+                    wait_terminal(action);
+                }
+                clock.advance_to(1);
+                let release_outcome = block_on(release.as_mut());
+                (
+                    submitted,
+                    sealed_snapshot,
+                    release_was_pending,
+                    release_outcome,
+                )
+            });
+
+        let action = submitted.expect(
+            "backend dispatch must make the post-seal admission return its truthful operation",
+        );
+        let action_snapshot = action.snapshot();
+        let before_close = boundary.counts();
+        clock.advance_to(2);
+        controller.close();
+        let runtime_close = runtime.close();
+        let after_close = boundary.counts();
+
+        let sealed_snapshot = sealed_snapshot.expect("dispatched admission returns an operation");
+        assert_eq!(sealed_snapshot.state, OperationState::Running);
+        assert_eq!(
+            sealed_snapshot.cancellation_reason,
+            Some(CancellationReason::ParentClose)
+        );
+        assert!(
+            release_was_pending,
+            "release remains nonterminal until backend settlement"
+        );
+        assert_eq!(action_snapshot.state, OperationState::Succeeded);
+        assert_eq!(
+            action_snapshot.cancellation_reason,
+            Some(CancellationReason::ParentClose)
+        );
+        assert_eq!(
+            release_outcome,
+            Ok(AutomationLeaseReleaseOutcome::NeutralAccepted)
+        );
+        assert_eq!(before_close, (1, 1, true));
+        assert_eq!(after_close, (1, 2, true));
+        assert_eq!(runtime_close, Ok(CloseOutcome::Closed));
     }
 
     // conformance: controller.lease.serial-cancel-not-found

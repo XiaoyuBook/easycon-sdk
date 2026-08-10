@@ -105,6 +105,10 @@ pub(crate) enum WriteSettlementOutcome {
 }
 
 type WriteSettlementHook = Box<dyn FnOnce(WriteSettlementOutcome) + Send + 'static>;
+// This reservation moves only the owning Controller record from NotDispatched to Outstanding.
+// It runs while the settlement gate is locked so generation seal and backend dispatch have one
+// ordering. It must not call Runtime, Clock, publish, wake, or user code.
+type WriteSettlementDispatchReservation = Box<dyn FnOnce() -> bool + Send + 'static>;
 // This reservation is intentionally narrower than a hook: it may only move the owning
 // Controller record into its local full-acceptance state. It runs while the settlement gate is
 // locked so cancellation/close cannot claim the record between physical acceptance and the
@@ -114,6 +118,7 @@ type WriteSettlementFullReservation = Box<dyn FnOnce() -> bool + Send + 'static>
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WriteSettlementPhase {
     NotDispatched,
+    DispatchRejected,
     Outstanding,
     FullAcceptedReserved,
     FullAcceptanceRejected,
@@ -125,6 +130,7 @@ struct WriteSettlementState {
     phase: WriteSettlementPhase,
     outcome: Option<WriteSettlementOutcome>,
     accepted_at_ns: Option<u64>,
+    dispatch_reservation: Option<WriteSettlementDispatchReservation>,
     full_acceptance_reservation: Option<WriteSettlementFullReservation>,
     hook: Option<WriteSettlementHook>,
 }
@@ -148,6 +154,7 @@ impl WriteSettlement {
                 phase: WriteSettlementPhase::Outstanding,
                 outcome: None,
                 accepted_at_ns: None,
+                dispatch_reservation: None,
                 full_acceptance_reservation: None,
                 hook: None,
             })),
@@ -162,11 +169,20 @@ impl WriteSettlement {
         full_acceptance_reservation: Option<WriteSettlementFullReservation>,
         hook: Option<WriteSettlementHook>,
     ) -> Self {
+        Self::tracked_with_reservations(None, full_acceptance_reservation, hook)
+    }
+
+    pub(crate) fn tracked_with_reservations(
+        dispatch_reservation: Option<WriteSettlementDispatchReservation>,
+        full_acceptance_reservation: Option<WriteSettlementFullReservation>,
+        hook: Option<WriteSettlementHook>,
+    ) -> Self {
         Self {
             state: Arc::new(Mutex::new(WriteSettlementState {
                 phase: WriteSettlementPhase::NotDispatched,
                 outcome: None,
                 accepted_at_ns: None,
+                dispatch_reservation,
                 full_acceptance_reservation,
                 hook,
             })),
@@ -179,6 +195,12 @@ impl WriteSettlement {
             .lock()
             .expect("write settlement gate lock poisoned");
         if state.phase != WriteSettlementPhase::NotDispatched {
+            return false;
+        }
+        if let Some(reservation) = state.dispatch_reservation.take()
+            && !reservation()
+        {
+            state.phase = WriteSettlementPhase::DispatchRejected;
             return false;
         }
         state.phase = WriteSettlementPhase::Outstanding;
