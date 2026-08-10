@@ -4,9 +4,10 @@ use std::time::Duration;
 
 use easycon_model::{EasyConError, ErrorCode, ErrorDomain};
 use easycon_runtime::{
-    CancellationReason, CloseOutcome, EventKind, Operation, OperationState, OperationValue,
-    Runtime, RuntimeCounts, SettlementEvidence, SettlementOwnerMode, SubscriptionOptions,
-    SubscriptionRead, TerminalCandidate, TransitionOutcome, VirtualClock, WaitResult, WaitTimeout,
+    CancellationReason, ClaimOutcome, CloseOutcome, EventKind, Operation, OperationState,
+    OperationValue, Runtime, RuntimeCounts, SettlementEvidence, SettlementOwnerMode,
+    SubscriptionOptions, SubscriptionRead, TerminalCandidate, TransitionOutcome, VirtualClock,
+    WaitResult, WaitTimeout,
 };
 
 const WAIT: Duration = Duration::from_secs(5);
@@ -49,6 +50,21 @@ fn terminal_events(
     )
     .filter(|event| event.kind == EventKind::Terminal && event.operation_id == Some(operation.id()))
     .count()
+}
+
+fn operation_event_codes(
+    runtime_events: &easycon_runtime::EventSubscription,
+    operation: &Operation,
+) -> Vec<&'static str> {
+    std::iter::from_fn(
+        || match runtime_events.read(WaitTimeout::Poll).expect("event read") {
+            SubscriptionRead::Event(event) => Some(event),
+            SubscriptionRead::Timeout | SubscriptionRead::Closed => None,
+        },
+    )
+    .filter(|event| event.operation_id == Some(operation.id()))
+    .map(|event| event.code)
+    .collect()
 }
 
 // conformance: operation.owner-evidence-cleanup-matrix
@@ -226,6 +242,336 @@ fn settlement_observer_panic_preserves_the_earlier_cleanup_error() {
     assert_eq!(snapshot.state, OperationState::Failed);
     assert_eq!(snapshot.error, Some(expected));
     assert_eq!(runtime.close(), Ok(CloseOutcome::Closed));
+}
+
+// conformance: operation.split-claim-deferred-finish
+#[test]
+fn claim_fixes_the_winner_without_committing_until_finish() {
+    let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+    let events = runtime
+        .subscribe(SubscriptionOptions::default())
+        .expect("events");
+    let cleanup_calls = Arc::new(AtomicUsize::new(0));
+    let observed_cleanup_calls = Arc::clone(&cleanup_calls);
+    let (operation, owner) = runtime
+        .create_operation_with_settlement_owner(
+            None,
+            SettlementOwnerMode::Exclusive,
+            move || {
+                observed_cleanup_calls.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            },
+            |_| {},
+        )
+        .expect("owned operation");
+    assert_eq!(operation.start(), TransitionOutcome::Applied);
+
+    let ClaimOutcome::Claimed(claim) = owner.claim(
+        SettlementEvidence::EffectAccepted,
+        TerminalCandidate::Success(OperationValue::Unit),
+    ) else {
+        panic!("accepted evidence must claim the pending owner");
+    };
+    assert_eq!(operation.snapshot().state, OperationState::Running);
+    assert_eq!(operation.wait(WaitTimeout::Poll), WaitResult::Timeout);
+    assert_eq!(terminal_events(&events, &operation), 0);
+    assert_eq!(operation.cancel(), TransitionOutcome::Applied);
+    assert_eq!(
+        operation.snapshot().cancellation_reason,
+        Some(CancellationReason::Requested)
+    );
+    assert!(matches!(
+        owner.claim(
+            SettlementEvidence::NotDelivered,
+            TerminalCandidate::Cancellation,
+        ),
+        ClaimOutcome::Observe
+    ));
+
+    assert_eq!(claim.finish(Ok(())), TransitionOutcome::Applied);
+    assert_eq!(operation.snapshot().state, OperationState::Succeeded);
+    assert_eq!(cleanup_calls.load(Ordering::Acquire), 1);
+    assert_eq!(terminal_events(&events, &operation), 1);
+    assert_eq!(runtime.counts().active_operations, 0);
+    assert_eq!(runtime.close(), Ok(CloseOutcome::Closed));
+}
+
+// conformance: operation.claimed-cancellation-cancelling-event
+#[test]
+fn claimed_cancellation_publishes_cancelling_before_cleanup_for_direct_and_handoff() {
+    let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+    let events = runtime
+        .subscribe(SubscriptionOptions::default())
+        .expect("direct events");
+    let (cleanup_started, observed_cleanup) = mpsc::sync_channel(0);
+    let (release_cleanup, cleanup_released) = mpsc::sync_channel(0);
+    let (operation, owner) = runtime
+        .create_operation_with_settlement_owner(
+            None,
+            SettlementOwnerMode::Exclusive,
+            move || {
+                cleanup_started.send(()).expect("direct cleanup start");
+                cleanup_released.recv().expect("direct cleanup release");
+                Ok(())
+            },
+            |_| {},
+        )
+        .expect("direct owned operation");
+    assert_eq!(operation.start(), TransitionOutcome::Applied);
+    assert_eq!(
+        operation_event_codes(&events, &operation),
+        vec!["runtime.operation.running"]
+    );
+    assert_eq!(
+        operation.request_cancel(CancellationReason::Requested),
+        TransitionOutcome::Applied
+    );
+    assert_eq!(operation.snapshot().state, OperationState::Running);
+    assert!(operation_event_codes(&events, &operation).is_empty());
+
+    let ClaimOutcome::Claimed(claim) = owner.claim(
+        SettlementEvidence::NotDelivered,
+        TerminalCandidate::Cancellation,
+    ) else {
+        panic!("not-delivered evidence must claim cancellation");
+    };
+    assert_eq!(operation.snapshot().state, OperationState::Cancelling);
+    assert_eq!(
+        operation_event_codes(&events, &operation),
+        vec!["runtime.operation.cancelling"]
+    );
+    assert_eq!(operation.wait(WaitTimeout::Poll), WaitResult::Timeout);
+
+    let finisher = std::thread::spawn(move || claim.finish(Ok(())));
+    observed_cleanup
+        .recv_timeout(WAIT)
+        .expect("direct cleanup started");
+    assert_eq!(operation.snapshot().state, OperationState::Cancelling);
+    assert!(operation_event_codes(&events, &operation).is_empty());
+    release_cleanup.send(()).expect("release direct cleanup");
+    assert_eq!(
+        finisher.join().expect("direct finisher"),
+        TransitionOutcome::Applied
+    );
+    assert_eq!(operation.snapshot().state, OperationState::Cancelled);
+    assert_eq!(
+        operation_event_codes(&events, &operation),
+        vec!["runtime.operation.cancelled"]
+    );
+    assert_eq!(runtime.close(), Ok(CloseOutcome::Closed));
+
+    let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+    let events = runtime
+        .subscribe(SubscriptionOptions::default())
+        .expect("handoff events");
+    let (cleanup_started, observed_cleanup) = mpsc::sync_channel(0);
+    let (release_cleanup, cleanup_released) = mpsc::sync_channel(0);
+    let (operation, owner) = runtime
+        .create_operation_with_settlement_owner(
+            None,
+            SettlementOwnerMode::Transferable,
+            move || {
+                cleanup_started.send(()).expect("handoff cleanup start");
+                cleanup_released.recv().expect("handoff cleanup release");
+                Ok(())
+            },
+            |_| {},
+        )
+        .expect("transferable owned operation");
+    assert_eq!(operation.start(), TransitionOutcome::Applied);
+    assert_eq!(
+        operation_event_codes(&events, &operation),
+        vec!["runtime.operation.running"]
+    );
+    let owner_operation = operation.clone();
+    let task = runtime
+        .spawn_operation_owner("cancellation-handoff-owner", owner, move |owner| {
+            assert_eq!(
+                owner_operation.request_cancel(CancellationReason::Requested),
+                TransitionOutcome::Applied
+            );
+            assert_eq!(
+                owner.record_for_handoff(
+                    SettlementEvidence::NotDelivered,
+                    TerminalCandidate::Cancellation,
+                ),
+                TransitionOutcome::Applied
+            );
+        })
+        .expect("handoff owner task");
+    assert_eq!(
+        task.join(),
+        Ok(easycon_runtime::SupervisedTaskOutcome::Completed)
+    );
+    assert_eq!(operation.snapshot().state, OperationState::Running);
+    assert!(operation_event_codes(&events, &operation).is_empty());
+
+    let closing_runtime = runtime.clone();
+    let closer = std::thread::spawn(move || closing_runtime.close());
+    observed_cleanup
+        .recv_timeout(WAIT)
+        .expect("handoff cleanup started");
+    assert_eq!(operation.snapshot().state, OperationState::Cancelling);
+    assert_eq!(
+        operation_event_codes(&events, &operation),
+        vec!["runtime.operation.cancelling"]
+    );
+    assert_eq!(operation.wait(WaitTimeout::Poll), WaitResult::Timeout);
+    release_cleanup.send(()).expect("release handoff cleanup");
+    assert_eq!(
+        closer.join().expect("handoff closer"),
+        Ok(CloseOutcome::Closed)
+    );
+    assert_eq!(operation.snapshot().state, OperationState::Cancelled);
+    assert_eq!(
+        operation_event_codes(&events, &operation),
+        vec!["runtime.operation.cancelled"]
+    );
+}
+
+// conformance: operation.legacy-settle-observe-waits
+#[test]
+fn legacy_settle_observe_waits_for_the_existing_claim_to_commit() {
+    let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+    let (operation, owner) = runtime
+        .create_operation_with_settlement_owner(
+            None,
+            SettlementOwnerMode::Exclusive,
+            || Ok(()),
+            |_| {},
+        )
+        .expect("owned operation");
+    assert_eq!(operation.start(), TransitionOutcome::Applied);
+    let ClaimOutcome::Claimed(claim) = owner.claim(
+        SettlementEvidence::EffectAccepted,
+        TerminalCandidate::Success(OperationValue::Unit),
+    ) else {
+        panic!("accepted evidence must claim the owner");
+    };
+    let (settled, observed_settled) = mpsc::sync_channel(1);
+    let waiter = std::thread::spawn(move || {
+        settled
+            .send(owner.settle(
+                SettlementEvidence::EffectAccepted,
+                TerminalCandidate::Success(OperationValue::Unit),
+            ))
+            .expect("settlement observer remains alive");
+    });
+    assert!(matches!(
+        observed_settled.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+
+    assert_eq!(claim.finish(Ok(())), TransitionOutcome::Applied);
+    assert_eq!(
+        observed_settled.recv_timeout(WAIT),
+        Ok(TransitionOutcome::AlreadyTerminal)
+    );
+    waiter.join().expect("settlement waiter");
+    assert_eq!(operation.snapshot().state, OperationState::Succeeded);
+    assert_eq!(runtime.close(), Ok(CloseOutcome::Closed));
+}
+
+// conformance: operation.claim-abandoned-same-owner-reclaim
+#[test]
+fn abandoned_claim_is_reclaimable_by_the_same_owner_without_observing_forever() {
+    let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+    let (operation, owner) = runtime
+        .create_operation_with_settlement_owner(
+            None,
+            SettlementOwnerMode::Exclusive,
+            || Ok(()),
+            |_| {},
+        )
+        .expect("owned operation");
+    assert_eq!(operation.start(), TransitionOutcome::Applied);
+
+    let ClaimOutcome::Claimed(claim) = owner.claim(
+        SettlementEvidence::EffectAccepted,
+        TerminalCandidate::Success(OperationValue::Unit),
+    ) else {
+        panic!("accepted evidence must claim the owner");
+    };
+    drop(claim);
+
+    assert_eq!(
+        owner.settle(
+            SettlementEvidence::EffectAccepted,
+            TerminalCandidate::Success(OperationValue::Unit),
+        ),
+        TransitionOutcome::Applied,
+        "the original owner must reclaim and finish its abandoned transaction without observing forever"
+    );
+    assert_eq!(operation.snapshot().state, OperationState::Succeeded);
+    assert_eq!(runtime.close(), Ok(CloseOutcome::Closed));
+}
+
+// conformance: operation.strict-cleanup-over-cancel
+#[test]
+fn proven_cleanup_failure_overrides_a_registered_cancellation_for_an_unowned_operation() {
+    let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+    let operation = runtime.create_operation(None).expect("operation");
+    assert_eq!(operation.start(), TransitionOutcome::Applied);
+    assert_eq!(operation.cancel(), TransitionOutcome::Applied);
+    let error = easycon_model::EasyConError::new(
+        easycon_model::ErrorDomain::Io,
+        easycon_model::ErrorCode::Transport,
+        "scripted cleanup failure",
+    );
+    assert_eq!(
+        operation.fail_strict_cleanup(error.clone()),
+        TransitionOutcome::Applied
+    );
+    let snapshot = operation.snapshot();
+    assert_eq!(snapshot.state, OperationState::Failed);
+    assert_eq!(snapshot.error, Some(error));
+    assert_eq!(runtime.close(), Ok(CloseOutcome::Closed));
+}
+
+// conformance: operation.claim-abandonment-preserves-registry
+#[test]
+fn joined_transferable_owner_keeps_an_abandoned_claim_nonterminal_without_domain_finish_evidence() {
+    let runtime = Runtime::new(Arc::new(VirtualClock::default()));
+    let cleanup_calls = Arc::new(AtomicUsize::new(0));
+    let observed_cleanup_calls = Arc::clone(&cleanup_calls);
+    let (operation, owner) = runtime
+        .create_operation_with_settlement_owner(
+            None,
+            SettlementOwnerMode::Transferable,
+            move || {
+                observed_cleanup_calls.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            },
+            |_| {},
+        )
+        .expect("owned operation");
+    assert_eq!(operation.start(), TransitionOutcome::Applied);
+    let task = runtime
+        .spawn_operation_owner("abandoned-claimed-owner", owner, move |owner| {
+            let ClaimOutcome::Claimed(claim) = owner.claim(
+                SettlementEvidence::EffectAccepted,
+                TerminalCandidate::Success(OperationValue::Unit),
+            ) else {
+                panic!("accepted evidence must claim the transferable owner");
+            };
+            drop(claim);
+        })
+        .expect("owner task");
+
+    let CloseOutcome::Failed(report) = runtime.close().expect("close outcome") else {
+        panic!("an abandoned claim cannot be completed as Runtime Closed");
+    };
+    assert_eq!(
+        report.phase,
+        easycon_runtime::ClosePhase::OperationFinalization
+    );
+    assert_eq!(
+        task.join(),
+        Ok(easycon_runtime::SupervisedTaskOutcome::Completed)
+    );
+    assert_eq!(operation.snapshot().state, OperationState::Running);
+    assert_eq!(cleanup_calls.load(Ordering::Acquire), 0);
+    assert_eq!(runtime.counts().active_operations, 1);
 }
 
 // conformance: operation.intent-does-not-claim

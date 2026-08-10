@@ -171,6 +171,7 @@
         "crates/easycon-runtime/tests/terminal_arbitration.rs::legitimate_owner_runs_five_terminal_paths_with_cleanup_projection",
         "crates/easycon-runtime/tests/terminal_arbitration.rs::settlement_observer_panic_preserves_the_earlier_cleanup_error",
         "crates/easycon-runtime/tests/terminal_arbitration.rs::cancellation_intent_before_accepted_evidence_does_not_override_success",
+        "crates/easycon-runtime/tests/terminal_arbitration.rs::claimed_cancellation_publishes_cancelling_before_cleanup_for_direct_and_handoff",
         "crates/easycon-runtime/tests/terminal_arbitration.rs::observation_handle_cannot_claim_an_owned_operation",
         "crates/easycon-runtime/tests/terminal_arbitration.rs::close_handoffs_only_preheld_owner_with_shared_settlement_evidence",
         "crates/easycon-runtime/tests/terminal_arbitration.rs::task_panic_after_shared_evidence_still_settles_before_close_failure",
@@ -182,7 +183,12 @@
         "crates/easycon-runtime/src/runtime.rs::terminal_faults_still_unlink_and_wake_waiters",
         "crates/easycon-runtime/src/runtime.rs::terminal_child_hook_can_observe_parent_without_deadlock",
         "crates/easycon-runtime/src/runtime.rs::terminal_discards_hook_captures_outside_state_lock_for_success_and_failure",
-        "crates/easycon-runtime/src/runtime.rs::poisoned_operation_registry_does_not_kill_deadline_supervision"
+        "crates/easycon-runtime/src/runtime.rs::poisoned_operation_registry_does_not_kill_deadline_supervision",
+        "crates/easycon-runtime/tests/terminal_arbitration.rs::claim_fixes_the_winner_without_committing_until_finish",
+        "crates/easycon-runtime/tests/terminal_arbitration.rs::legacy_settle_observe_waits_for_the_existing_claim_to_commit",
+        "crates/easycon-runtime/tests/terminal_arbitration.rs::abandoned_claim_is_reclaimable_by_the_same_owner_without_observing_forever",
+        "crates/easycon-runtime/tests/terminal_arbitration.rs::proven_cleanup_failure_overrides_a_registered_cancellation_for_an_unowned_operation",
+        "crates/easycon-runtime/tests/terminal_arbitration.rs::joined_transferable_owner_keeps_an_abandoned_claim_nonterminal_without_domain_finish_evidence"
       ],
       "steps": [
         { "id": "operation.parent-child-race", "action": "race parent terminal start against child operation admission" },
@@ -190,6 +196,7 @@
         { "id": "operation.owner-cleanup-matrix", "action": "run Success, Failure, Requested, Deadline, and ParentClose through cleanup Ok, Err, and panic" },
         { "id": "operation.cleanup-first-error", "action": "return a typed cleanup error and then panic the lock-free settlement observer" },
         { "id": "operation.intent-before-claim", "action": "record cancellation intent before accepted-effect evidence, block cleanup, and inject a later deadline intent" },
+        { "id": "operation.claimed-cancellation", "action": "claim not-delivered cancellation evidence for direct and transferable owners, block cleanup, and observe one Cancelling state event before terminal commit" },
         { "id": "operation.non-owner-claim", "action": "attempt to commit an explicitly owned operation through its observation handle" },
         { "id": "operation.transferable-close", "action": "join the original owner after it stores shared evidence and let close perform the pre-held one-time handoff" },
         { "id": "operation.transferable-task-panic", "action": "panic the original owner after shared evidence is durable, then close and preserve TaskJoin as the first failure" },
@@ -200,7 +207,11 @@
         { "id": "operation.hook-capture-drop-reentry", "action": "finish success and failure while an uncalled hook capture destructor re-enters the same operation snapshot" },
         { "id": "operation.event-fault", "action": "inject terminal event delivery failure while an operation waiter is blocked" },
         { "id": "operation.registry-fault", "action": "inject operation registry unlink failure while a second waiter is blocked" },
-        { "id": "operation.poison-recovery", "action": "poison each recoverable Runtime synchronization lock before retrying its operation" }
+        { "id": "operation.poison-recovery", "action": "poison each recoverable Runtime synchronization lock before retrying its operation" },
+        { "id": "operation.split-claim", "action": "claim accepted-effect evidence without terminal commit, then finish only after domain cleanup" },
+        { "id": "operation.claim-abandonment", "action": "drop a deferred transferable claim after its owner joins and retain the nonterminal registry under CloseFailed" },
+        { "id": "operation.claim-abandoned-same-owner-reclaim", "action": "drop a deferred claim, then let the same owner reclaim identical evidence and finish without observing forever" },
+        { "id": "operation.strict-cleanup", "action": "register cancellation before a proven cleanup failure and retain the cleanup failure as terminal" }
       ],
       "assertions": [
         {
@@ -232,6 +243,11 @@
           "id": "operation.accepted-claim-late-cancel",
           "expect": "accepted-effect evidence claims Success atomically and a later cancellation candidate cannot change the winner during cleanup",
           "test": "crates/easycon-runtime/tests/terminal_arbitration.rs::cancellation_intent_before_accepted_evidence_does_not_override_success"
+        },
+        {
+          "id": "operation.claimed-cancellation-cancelling-event",
+          "expect": "a not-delivered cancellation winner exposes exactly one Cancelling state event before cleanup and terminal Cancelled publication for direct and transferable owner settlement",
+          "test": "crates/easycon-runtime/tests/terminal_arbitration.rs::claimed_cancellation_publishes_cancelling_before_cleanup_for_direct_and_handoff"
         },
         {
           "id": "operation.non-owner-rejected",
@@ -292,6 +308,31 @@
           "id": "operation.poison-recovery",
           "expect": "a poisoned operation registry is recovered without killing deadline supervision or changing successful close",
           "test": "crates/easycon-runtime/src/runtime.rs::poisoned_operation_registry_does_not_kill_deadline_supervision"
+        },
+        {
+          "id": "operation.split-claim-deferred-finish",
+          "expect": "accepted evidence fixes the winner and seals admission without committing until its unique deferred finish completes cleanup and terminal publication",
+          "test": "crates/easycon-runtime/tests/terminal_arbitration.rs::claim_fixes_the_winner_without_committing_until_finish"
+        },
+        {
+          "id": "operation.legacy-settle-observe-waits",
+          "expect": "the legacy settle compatibility path observes a competing deferred claim until commit rather than returning while terminal state is still pending",
+          "test": "crates/easycon-runtime/tests/terminal_arbitration.rs::legacy_settle_observe_waits_for_the_existing_claim_to_commit"
+        },
+        {
+          "id": "operation.claim-abandoned-same-owner-reclaim",
+          "expect": "after a deferred claim is abandoned, only the original owner with identical evidence and candidate reclaims and finishes that frozen winner without observing forever",
+          "test": "crates/easycon-runtime/tests/terminal_arbitration.rs::abandoned_claim_is_reclaimable_by_the_same_owner_without_observing_forever"
+        },
+        {
+          "id": "operation.strict-cleanup-over-cancel",
+          "expect": "a proven cleanup failure on an unowned operation overrides a previously registered cancellation rather than applying ordinary cancellation precedence",
+          "test": "crates/easycon-runtime/tests/terminal_arbitration.rs::proven_cleanup_failure_overrides_a_registered_cancellation_for_an_unowned_operation"
+        },
+        {
+          "id": "operation.claim-abandonment-preserves-registry",
+          "expect": "an abandoned deferred claim without domain finish evidence remains nonterminal and Runtime close fails closed instead of synthesizing a result",
+          "test": "crates/easycon-runtime/tests/terminal_arbitration.rs::joined_transferable_owner_keeps_an_abandoned_claim_nonterminal_without_domain_finish_evidence"
         }
       ]
     },
@@ -388,7 +429,6 @@
         "tests/support/tests/controller_lane.rs::fallback_connect_partial_direct_and_close_are_exact",
         "tests/support/tests/sequence_ack.rs::ack_matcher_ignores_late_generation_and_rejects_wrong_reply",
         "tests/support/tests/sequence_ack.rs::ack_waits_for_an_earlier_report_in_the_fifo_lane",
-        "tests/support/tests/sequence_ack.rs::cancel_after_final_sequence_acceptance_still_neutralizes",
         "tests/support/tests/controller_lane.rs::report_spacing_and_snapshot_use_transport_acceptance_time",
         "tests/support/tests/sequence_ack.rs::close_interrupts_a_blocked_report_write_and_joins",
         "tests/support/tests/sequence_ack.rs::ack_disconnect_resets_desired_state_before_explicit_reconnect",
@@ -400,7 +440,6 @@
         { "id": "transport.late-ack", "action": "ignore a late ACK from an older generation" },
         { "id": "transport.error-ack", "action": "reject an error ACK" },
         { "id": "transport.ack-after-report", "action": "queue an ACK behind a report that is waiting for its minimum interval" },
-        { "id": "transport.accepted-cancel", "action": "cancel after direct and final sequence bytes are accepted but before write returns" },
         { "id": "transport.close-after-report", "action": "close immediately after an accepted report" },
         { "id": "transport.close-blocked-write", "action": "close while a report write is blocked before acceptance" },
         { "id": "transport.ack-disconnect", "action": "disconnect during an ACK and reconnect explicitly" },
@@ -422,11 +461,6 @@
           "id": "transport.ack-fifo",
           "expect": "ACK waits for the earlier report instead of returning resource busy",
           "test": "tests/support/tests/sequence_ack.rs::ack_waits_for_an_earlier_report_in_the_fifo_lane"
-        },
-        {
-          "id": "transport.accepted-cancel-terminal",
-          "expect": "accepted-byte cancellation neutralizes and reaches Cancelled exactly once",
-          "test": "tests/support/tests/sequence_ack.rs::cancel_after_final_sequence_acceptance_still_neutralizes"
         },
         {
           "id": "transport.close-spacing",
@@ -728,6 +762,379 @@
           "id": "phase2a.latency.unfiltered-recorder",
           "expect": "the in-memory recorder retains every direct sample and deterministic close reaches the transport",
           "test": "tests/support/tests/phase2a_latency.rs::direct_report_records_monotonic_software_path_stages_without_filtering"
+        }
+      ]
+    },
+    {
+      "id": "controller-settlement",
+      "test": "tests/support/tests/controller_lease.rs::system_clock_acquire_deadline_settles_without_lane_progress",
+      "tests": [
+        "tests/support/tests/controller_lease.rs::cancelled_acquire_wins_before_lane_grant",
+        "tests/support/tests/controller_lease.rs::system_clock_acquire_deadline_settles_without_lane_progress",
+        "tests/support/tests/controller_lease.rs::busy_acquire_projects_failure_without_grant",
+        "crates/easycon-controller/src/session.rs::acquire_record_uses_stable_same_point_priority",
+        "crates/easycon-controller/src/session.rs::abandoned_acquire_record_rejects_a_late_grant_transition",
+        "tests/support/tests/controller_lease.rs::successive_lease_generations_are_nonzero_and_not_reused",
+        "tests/support/tests/controller_lease.rs::wrong_controller_lease_is_rejected_without_affecting_its_owner",
+        "crates/easycon-controller/src/session.rs::sealed_generation_rejects_stale_action_admission",
+        "tests/support/tests/controller_lease.rs::release_interrupts_an_uneffected_generation_action_before_neutral",
+        "tests/support/tests/controller_lease.rs::release_cancels_a_future_generation_action_without_waiting_for_its_target",
+        "tests/support/tests/controller_lease.rs::dropping_a_lease_starts_one_neutral_cleanup_before_next_grant",
+        "tests/support/tests/controller_lease.rs::release_neutral_does_not_dispatch_before_its_pacing_target",
+        "tests/support/tests/controller_lease.rs::release_accepts_one_neutral_and_settles_its_waiter",
+        "tests/support/tests/controller_lease.rs::partial_automation_write_failure_settles_stream_before_release",
+        "tests/support/tests/controller_lease.rs::action_cleanup_failure_is_projected_to_its_sealed_release",
+        "tests/support/tests/controller_lease.rs::final_close_failure_overrides_a_pending_report_cancellation",
+        "tests/support/tests/controller_lease.rs::cancelled_connect_recovery_checked_close_failure_overrides_cancellation",
+        "tests/support/tests/controller_lease.rs::cleanup_failure_after_registered_cancel_wins_over_cancellation_for_action_and_release",
+        "crates/easycon-controller/src/session.rs::strict_failure_while_full_claim_is_in_flight_finishes_the_same_claim",
+        "tests/support/tests/controller_lease.rs::close_settles_pending_acquire_actions_and_release_before_join",
+        "crates/easycon-controller/src/session.rs::release_completion_consumes_close_requested_before_the_backend_gate",
+        "tests/support/tests/controller_lease.rs::full_accepted_release_requires_an_independent_final_close_neutral",
+        "tests/support/tests/controller_lease.rs::close_settles_release_registered_after_close_seal",
+        "tests/support/tests/controller_lease.rs::close_interrupts_release_neutral_before_acceptance_and_joins",
+        "tests/support/tests/controller_lease.rs::backend_last_byte_acceptance_wins_over_late_close_cancellation",
+        "crates/easycon-serial/src/windows/io.rs::cancel_not_found_still_consumes_a_full_overlapped_completion",
+        "tests/support/tests/serial_ch32.rs::fake_and_serial_adapter_match_reusable_and_partial_write_settlement",
+        "tests/support/tests/controller_lease.rs::controller_ownership_loss_preserves_release_record_until_runtime_close_failed",
+        "tests/support/tests/controller_lease.rs::post_acceptance_lane_panic_keeps_the_claimed_report_settleable_after_join",
+        "tests/support/tests/sequence_ack.rs::direct_acceptance_wins_over_late_cancel",
+        "tests/support/tests/sequence_ack.rs::final_sequence_acceptance_wins_over_late_cancel",
+        "tests/support/tests/sequence_ack.rs::sequence_cancel_neutralizes_and_releases_before_terminal",
+        "tests/support/tests/sequence_ack.rs::final_sequence_partial_failure_never_succeeds_and_settles_stream",
+        "tests/support/tests/controller_lease.rs::settled_release_requires_one_independent_final_close_neutral",
+        "tests/support/tests/controller_lease.rs::close_traverses_a_later_gate_claimed_release_after_an_older_retained_settlement",
+        "tests/support/tests/controller_lease.rs::close_after_gate_claimed_drop_release_runs_one_independent_final_neutral",
+        "crates/easycon-controller/src/session.rs::registry_close_transitions_every_record_after_a_prior_record_was_consumed",
+        "tests/support/tests/controller_lease.rs::physical_final_completion_reserves_success_before_close_can_cancel_the_action",
+        "tests/support/tests/controller_lease.rs::physical_final_completion_before_close_requires_an_independent_final_neutral",
+        "crates/easycon-controller/src/transport.rs::rejected_full_reservation_cannot_be_upgraded_by_a_duplicate_completion"
+      ],
+      "steps": [
+        { "id": "controller.lease.acquire", "action": "register a cancellable Runtime-clock-deadlined acquire record before returning its future" },
+        { "id": "controller.lease.action-seal", "action": "seal one generation, cancel every uneffected admitted action, and preserve any already accepted effect" },
+        { "id": "controller.lease.partial", "action": "inject a partial logical report failure and settle the stream before release completion" },
+        { "id": "controller.lease.release", "action": "dispatch exactly one paced neutral after all generation actions reach terminal settlement" },
+        { "id": "controller.lease.close", "action": "close during pending acquire, action, and release work, then join the single writer" },
+        { "id": "controller.lease.close-late-release", "action": "register release after close seals the lane and settle it only after the stream closes" }
+      ],
+      "assertions": [
+        {
+          "id": "controller.lease.acquire-deadline",
+          "expect": "a SystemClock absolute acquire deadline resolves without Controller lane progress",
+          "test": "tests/support/tests/controller_lease.rs::system_clock_acquire_deadline_settles_without_lane_progress"
+        },
+        {
+          "id": "controller.lease.action-seal-inflight",
+          "expect": "release cancels an in-flight uneffected action before its neutral report is accepted",
+          "test": "tests/support/tests/controller_lease.rs::release_interrupts_an_uneffected_generation_action_before_neutral"
+        },
+        {
+          "id": "controller.lease.action-seal-future",
+          "expect": "a sealed future action settles without waiting for its original report target",
+          "test": "tests/support/tests/controller_lease.rs::release_cancels_a_future_generation_action_without_waiting_for_its_target"
+        },
+        {
+          "id": "controller.lease.partial-stream-settlement",
+          "expect": "a partial report failure closes the stream before release reports not-delivered settlement",
+          "test": "tests/support/tests/controller_lease.rs::partial_automation_write_failure_settles_stream_before_release"
+        },
+        {
+          "id": "controller.lease.close-settlement",
+          "expect": "close resolves pending acquire, accepted and cancelled actions, and release before lane join",
+          "test": "tests/support/tests/controller_lease.rs::close_settles_pending_acquire_actions_and_release_before_join"
+        },
+        {
+          "id": "controller.lease.close-late-release",
+          "expect": "a release registered after close seals the lane completes as stream-settled before join",
+          "test": "tests/support/tests/controller_lease.rs::close_settles_release_registered_after_close_seal"
+        },
+        {
+          "id": "controller.lease.close-interrupt-release",
+          "expect": "close interrupts an in-flight release neutral, settles the stream, and does not retry that neutral",
+          "test": "tests/support/tests/controller_lease.rs::close_interrupts_release_neutral_before_acceptance_and_joins"
+        }
+      ],
+      "obligations": [
+        {
+          "id": "controller.lease.acquire-cancelled",
+          "adr": "ADR-0018:91-129",
+          "expect": "a cancelled acquire resolves Cancelled before lane grant",
+          "test": "tests/support/tests/controller_lease.rs::cancelled_acquire_wins_before_lane_grant",
+          "marker": "controller.lease.acquire-cancelled"
+        },
+        {
+          "id": "controller.lease.acquire-deadline",
+          "adr": "ADR-0018:91-129",
+          "expect": "an absolute Runtime-clock acquire deadline settles without lane progress",
+          "test": "tests/support/tests/controller_lease.rs::system_clock_acquire_deadline_settles_without_lane_progress",
+          "marker": "controller.lease.acquire-deadline"
+        },
+        {
+          "id": "controller.lease.acquire-failure",
+          "adr": "ADR-0018:91-129",
+          "expect": "busy admission projects Failure without granting another lease",
+          "test": "tests/support/tests/controller_lease.rs::busy_acquire_projects_failure_without_grant",
+          "marker": "controller.lease.acquire-failure"
+        },
+        {
+          "id": "controller.lease.acquire-same-point-priority",
+          "adr": "ADR-0018:91-104",
+          "expect": "Cancelled, Deadline, Closed, and Failure retain the specified same-observation priority",
+          "test": "crates/easycon-controller/src/session.rs::acquire_record_uses_stable_same_point_priority",
+          "marker": "controller.lease.acquire-same-point-priority"
+        },
+        {
+          "id": "controller.lease.acquire-abandonment",
+          "adr": "ADR-0018:104-109",
+          "expect": "a dropped unresolved acquire cannot later grant a lease",
+          "test": "crates/easycon-controller/src/session.rs::abandoned_acquire_record_rejects_a_late_grant_transition",
+          "marker": "controller.lease.acquire-abandonment"
+        },
+        {
+          "id": "controller.lease.generation-non-reuse",
+          "adr": "ADR-0018:26-32",
+          "expect": "successive lease generations are non-zero and never reused",
+          "test": "tests/support/tests/controller_lease.rs::successive_lease_generations_are_nonzero_and_not_reused",
+          "marker": "controller.lease.generation-non-reuse"
+        },
+        {
+          "id": "controller.lease.generation-wrong-controller",
+          "adr": "ADR-0018:26-30",
+          "expect": "a lease from another Controller cannot authorize an action",
+          "test": "tests/support/tests/controller_lease.rs::wrong_controller_lease_is_rejected_without_affecting_its_owner",
+          "marker": "controller.lease.generation-wrong-controller"
+        },
+        {
+          "id": "controller.lease.generation-stale-sealed",
+          "adr": "ADR-0018:132-149",
+          "expect": "a sealed generation rejects stale action admission before submission",
+          "test": "crates/easycon-controller/src/session.rs::sealed_generation_rejects_stale_action_admission",
+          "marker": "controller.lease.generation-stale-sealed"
+        },
+        {
+          "id": "controller.lease.action-seal-inflight",
+          "adr": "ADR-0018:132-144",
+          "expect": "release interrupts an uneffected in-flight generation action before neutral acceptance",
+          "test": "tests/support/tests/controller_lease.rs::release_interrupts_an_uneffected_generation_action_before_neutral",
+          "marker": "controller.lease.action-seal-inflight"
+        },
+        {
+          "id": "controller.lease.action-seal-future",
+          "adr": "ADR-0018:132-149",
+          "expect": "a sealed future action settles without waiting for its former target",
+          "test": "tests/support/tests/controller_lease.rs::release_cancels_a_future_generation_action_without_waiting_for_its_target",
+          "marker": "controller.lease.action-seal-future"
+        },
+        {
+          "id": "controller.lease.drop-cleanup",
+          "adr": "ADR-0018:175-190",
+          "expect": "Drop seals a lease and starts its one neutral cleanup before another grant",
+          "test": "tests/support/tests/controller_lease.rs::dropping_a_lease_starts_one_neutral_cleanup_before_next_grant",
+          "marker": "controller.lease.drop-cleanup"
+        },
+        {
+          "id": "controller.lease.release-pacing",
+          "adr": "ADR-0018:31-32",
+          "expect": "the release neutral does not dispatch before the shared pacing target",
+          "test": "tests/support/tests/controller_lease.rs::release_neutral_does_not_dispatch_before_its_pacing_target",
+          "marker": "controller.lease.release-pacing"
+        },
+        {
+          "id": "controller.lease.release-accepted",
+          "adr": "ADR-0018:151-169",
+          "expect": "a fully accepted neutral settles its release waiter as NeutralAccepted",
+          "test": "tests/support/tests/controller_lease.rs::release_accepts_one_neutral_and_settles_its_waiter",
+          "marker": "controller.lease.release-accepted"
+        },
+        {
+          "id": "controller.lease.partial-stream-settlement",
+          "adr": "ADR-0020:252-268",
+          "expect": "partial automation I/O settles the stream before release reports not-delivered",
+          "test": "tests/support/tests/controller_lease.rs::partial_automation_write_failure_settles_stream_before_release",
+          "marker": "controller.lease.partial-stream-settlement"
+        },
+        {
+          "id": "controller.lease.cleanup-failure-projection",
+          "adr": "ADR-0020:289-305",
+          "expect": "one typed cleanup failure projects identically to action and sealed release waiters",
+          "test": "tests/support/tests/controller_lease.rs::action_cleanup_failure_is_projected_to_its_sealed_release",
+          "marker": "controller.lease.cleanup-failure-projection"
+        },
+        {
+          "id": "controller.close.strict-failure-pending-report",
+          "adr": "ADR-0020:289-305",
+          "expect": "a typed final checked-close failure overrides a pending report's close cancellation and projects the same Runtime close failure",
+          "test": "tests/support/tests/controller_lease.rs::final_close_failure_overrides_a_pending_report_cancellation",
+          "marker": "controller.close.strict-failure-pending-report"
+        },
+        {
+          "id": "controller.connect.strict-cleanup-over-cancel",
+          "adr": "ADR-0020:289-305",
+          "expect": "a proven connect-recovery checked-close error or panic overrides an already registered cancellation and permanently seals admission",
+          "test": "tests/support/tests/controller_lease.rs::cancelled_connect_recovery_checked_close_failure_overrides_cancellation",
+          "marker": "controller.connect.strict-cleanup-over-cancel"
+        },
+        {
+          "id": "controller.cleanup.strict-failure-over-cancel",
+          "adr": "ADR-0020:289-305",
+          "expect": "a proven action cleanup failure overrides a registered cancellation for the action, sealed release, Controller admission, and Runtime close",
+          "test": "tests/support/tests/controller_lease.rs::cleanup_failure_after_registered_cancel_wins_over_cancellation_for_action_and_release",
+          "marker": "controller.cleanup.strict-failure-over-cancel"
+        },
+        {
+          "id": "controller.report.gate-claim-strict-cleanup",
+          "adr": "ADR-0020:289-305",
+          "expect": "a strict cleanup failure arriving while FullAccepted claim is in flight finishes that same claimed Runtime transaction as Failed",
+          "test": "crates/easycon-controller/src/session.rs::strict_failure_while_full_claim_is_in_flight_finishes_the_same_claim",
+          "marker": "controller.report.gate-claim-strict-cleanup"
+        },
+        {
+          "id": "controller.lease.close-settlement",
+          "adr": "ADR-0018:175-190",
+          "expect": "close settles pending acquire, action, and release waiters before joining the lane",
+          "test": "tests/support/tests/controller_lease.rs::close_settles_pending_acquire_actions_and_release_before_join",
+          "marker": "controller.lease.close-settlement"
+        },
+        {
+          "id": "controller.lease.close-record-transition",
+          "adr": "ADR-0020:270-287",
+          "expect": "completion and close intent share one release-record transition lock before the backend gate",
+          "test": "crates/easycon-controller/src/session.rs::release_completion_consumes_close_requested_before_the_backend_gate",
+          "marker": "controller.lease.close-record-transition"
+        },
+        {
+          "id": "controller.lease.release-full-accepted-before-close-final-neutral",
+          "adr": "ADR-0020:270-287",
+          "expect": "a release whose backend FullAccepted precedes close remains gate-owned and close dispatches one independent paced final neutral",
+          "test": "tests/support/tests/controller_lease.rs::full_accepted_release_requires_an_independent_final_close_neutral",
+          "marker": "controller.lease.release-full-accepted-before-close-final-neutral"
+        },
+        {
+          "id": "controller.lease.close-late-release",
+          "adr": "ADR-0018:175-190",
+          "expect": "a release registered after close seal settles only after the stream is closed",
+          "test": "tests/support/tests/controller_lease.rs::close_settles_release_registered_after_close_seal",
+          "marker": "controller.lease.close-late-release"
+        },
+        {
+          "id": "controller.lease.close-interrupt-release",
+          "adr": "ADR-0020:270-287",
+          "expect": "close interrupts an unaccepted neutral and settles its existing record without retry",
+          "test": "tests/support/tests/controller_lease.rs::close_interrupts_release_neutral_before_acceptance_and_joins",
+          "marker": "controller.lease.close-interrupt-release"
+        },
+        {
+          "id": "controller.lease.backend-last-byte-late-cancel",
+          "adr": "ADR-0020:176-224",
+          "expect": "backend final-byte acceptance wins over a late close cancellation request",
+          "test": "tests/support/tests/controller_lease.rs::backend_last_byte_acceptance_wins_over_late_close_cancellation",
+          "marker": "controller.lease.backend-last-byte-late-cancel"
+        },
+        {
+          "id": "controller.lease.serial-cancel-not-found",
+          "adr": "ADR-0020:220-224",
+          "expect": "CancelIoEx ERROR_NOT_FOUND still consumes a full overlapped completion",
+          "test": "crates/easycon-serial/src/windows/io.rs::cancel_not_found_still_consumes_a_full_overlapped_completion",
+          "marker": "controller.lease.serial-cancel-not-found"
+        },
+        {
+          "id": "controller.lease.fake-serial-parity",
+          "adr": "ADR-0020:231-268",
+          "expect": "fake and system-serial adapters agree on reusable and partial write settlement",
+          "test": "tests/support/tests/serial_ch32.rs::fake_and_serial_adapter_match_reusable_and_partial_write_settlement",
+          "marker": "controller.lease.fake-serial-parity"
+        },
+        {
+          "id": "controller.lease.ownership-loss",
+          "adr": "ADR-0020:289-305",
+          "expect": "ownership loss preserves a nonterminal record and reports close failure without a false wake",
+          "test": "tests/support/tests/controller_lease.rs::controller_ownership_loss_preserves_release_record_until_runtime_close_failed",
+          "marker": "controller.lease.ownership-loss"
+        },
+        {
+          "id": "controller.report.gate-time-claim-owner-loss",
+          "adr": "ADR-0020:178-224",
+          "expect": "a lane panic after physical FullAccepted preserves the already claimed report success while Runtime close records lane ownership loss",
+          "test": "tests/support/tests/controller_lease.rs::post_acceptance_lane_panic_keeps_the_claimed_report_settleable_after_join",
+          "marker": "controller.report.gate-time-claim-owner-loss"
+        },
+        {
+          "id": "controller.lease.direct-final-acceptance-late-cancel",
+          "adr": "ADR-0020:178-224",
+          "expect": "ordinary direct final-byte acceptance claims Succeeded before a registered or late cancellation can rewrite it",
+          "test": "tests/support/tests/sequence_ack.rs::direct_acceptance_wins_over_late_cancel",
+          "marker": "transport.direct-final-acceptance-late-cancel"
+        },
+        {
+          "id": "controller.lease.sequence-final-acceptance-late-cancel",
+          "adr": "ADR-0020:178-224",
+          "expect": "the final precise-sequence report claims whole-operation Succeeded before a registered or late cancellation can rewrite it",
+          "test": "tests/support/tests/sequence_ack.rs::final_sequence_acceptance_wins_over_late_cancel",
+          "marker": "transport.sequence-final-acceptance-late-cancel"
+        },
+        {
+          "id": "controller.lease.sequence-intermediate-accepted-cancel-before-final",
+          "adr": "ADR-0020:178-224",
+          "expect": "an accepted intermediate precise-sequence report remains nonterminal; cancellation before final acceptance neutralizes and releases before Cancelled",
+          "test": "tests/support/tests/sequence_ack.rs::sequence_cancel_neutralizes_and_releases_before_terminal",
+          "marker": "transport.sequence-intermediate-accepted-cancel-before-final"
+        },
+        {
+          "id": "controller.lease.sequence-final-partial-or-failure-stream-settlement",
+          "adr": "ADR-0020:252-268",
+          "expect": "a final precise-sequence partial or failed report never succeeds and settles the stream before terminal observation",
+          "test": "tests/support/tests/sequence_ack.rs::final_sequence_partial_failure_never_succeeds_and_settles_stream",
+          "marker": "transport.sequence-final-partial-or-failure-stream-settlement"
+        },
+        {
+          "id": "controller.lease.release-settled-before-close-final-neutral",
+          "adr": "ADR-0020:270-287",
+          "expect": "a retained lane-owned Committed record cannot consume a later close; close dispatches one independent paced final neutral",
+          "test": "tests/support/tests/controller_lease.rs::settled_release_requires_one_independent_final_close_neutral",
+          "marker": "controller.lease.release-settled-before-close-final-neutral"
+        },
+        {
+          "id": "controller.lease.close-older-settled-before-gate-claimed-record",
+          "adr": "ADR-0020:270-287",
+          "expect": "an older retained settlement cannot short-circuit close transition of a later GateClaimed release record",
+          "test": "tests/support/tests/controller_lease.rs::close_traverses_a_later_gate_claimed_release_after_an_older_retained_settlement",
+          "marker": "controller.lease.close-older-settled-before-gate-claimed-record"
+        },
+        {
+          "id": "controller.lease.close-gate-claimed-drop-final-neutral",
+          "adr": "ADR-0020:270-287",
+          "expect": "a drop-started GateClaimed release remains gate-owned and close runs exactly one independent final neutral",
+          "test": "tests/support/tests/controller_lease.rs::close_after_gate_claimed_drop_release_runs_one_independent_final_neutral",
+          "marker": "controller.lease.close-gate-claimed-drop-final-neutral"
+        },
+        {
+          "id": "controller.lease.close-all-records-traversed",
+          "adr": "ADR-0020:270-287",
+          "expect": "close transitions every retained release record before aggregating whether an existing neutral was consumed",
+          "test": "crates/easycon-controller/src/session.rs::registry_close_transitions_every_record_after_a_prior_record_was_consumed",
+          "marker": "controller.lease.close-all-records-traversed"
+        },
+        {
+          "id": "controller.report.physical-final-completion-gate",
+          "adr": "ADR-0020:178-224",
+          "expect": "the backend physical final-byte completion reserves the report owner before cancel or close can take it, then deferred publication commits the accepted action",
+          "test": "tests/support/tests/controller_lease.rs::physical_final_completion_reserves_success_before_close_can_cancel_the_action",
+          "marker": "controller.report.physical-final-completion-gate"
+        },
+        {
+          "id": "controller.lease.release-physical-final-completion-gate",
+          "adr": "ADR-0020:270-287",
+          "expect": "a release physical final-byte reservation precedes close ownership, so close after reservation sends one independent paced final neutral",
+          "test": "tests/support/tests/controller_lease.rs::physical_final_completion_before_close_requires_an_independent_final_neutral",
+          "marker": "controller.lease.release-physical-final-completion-gate"
+        },
+        {
+          "id": "controller.transport.rejected-full-reservation-duplicates",
+          "adr": "ADR-0020:178-224",
+          "expect": "a rejected final-byte reservation cannot be upgraded by a sequential or concurrent duplicate completion",
+          "test": "crates/easycon-controller/src/transport.rs::rejected_full_reservation_cannot_be_upgraded_by_a_duplicate_completion",
+          "marker": "controller.transport.rejected-full-reservation-duplicates"
         }
       ]
     }

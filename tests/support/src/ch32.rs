@@ -610,6 +610,25 @@ impl ByteIo for SimulatedByteIo {
             }
         }
         let accepted = buffer.len().min(state.maximum_write_chunk);
+        if let ByteIoOperation::ControllerWrite(context) = request.operation {
+            drop(state);
+            request.publish_final_write_acceptance(accepted)?;
+            let accepted_at_ns = self.clock.now_ns();
+            let mut state = self
+                .shared
+                .state
+                .lock()
+                .expect("CH32 state after write completion");
+            ensure_stream(&state, self.stream_id)?;
+            state.byte_write_calls = state
+                .byte_write_calls
+                .checked_add(1)
+                .expect("CH32 byte write count exhausted");
+            append_controller_bytes(&mut state, context, &buffer[..accepted], accepted_at_ns)?;
+            drop(state);
+            self.shared.changed.notify_all();
+            return Ok(accepted);
+        }
         state.byte_write_calls = state
             .byte_write_calls
             .checked_add(1)
@@ -619,18 +638,11 @@ impl ByteIo for SimulatedByteIo {
                 state.handshake_bytes.extend_from_slice(&buffer[..accepted]);
                 finish_handshake_if_complete(&mut state)?;
             }
-            ByteIoOperation::ControllerWrite(context) => {
-                append_controller_bytes(
-                    &mut state,
-                    context,
-                    &buffer[..accepted],
-                    self.clock.now_ns(),
-                )?;
-            }
             ByteIoOperation::Open
             | ByteIoOperation::HandshakeRead
             | ByteIoOperation::AckRead { .. }
-            | ByteIoOperation::DiscardInput { .. } => unreachable!("write purpose checked above"),
+            | ByteIoOperation::DiscardInput { .. }
+            | ByteIoOperation::ControllerWrite(_) => unreachable!("write purpose checked above"),
         }
         self.shared.changed.notify_all();
         Ok(accepted)

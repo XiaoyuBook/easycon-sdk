@@ -201,6 +201,10 @@ def validate_schemas():
             "fixtures/runtime/r0-v2-contract-v1.json",
         ),
         ("schemas/controller-fixture-v1.schema.json", "fixtures/controller/reports-v1.json"),
+        (
+            "schemas/controller-lease-settlement-v1.schema.json",
+            "fixtures/controller/lease-settlement-v1.json",
+        ),
         ("schemas/conformance-v1.schema.json", "conformance/runtime-controller-v1.json"),
         ("schemas/sequence-trace-v1.schema.json", "fixtures/controller/sequence-traces-v1.json"),
         ("schemas/latency-result-v1.schema.json", "fixtures/controller/phase2a-latency-result-v1.json"),
@@ -1463,6 +1467,35 @@ def validate_behavior():
         behavior["controller"]["serial"]["system_leaf"] is True,
         "serial must remain a system leaf",
     )
+    require(
+        behavior["controller"]["direct_success_boundary"]
+        == (
+            "the unique backend final-byte completion owner reserves the shared settlement gate before "
+            "Clock, telemetry, or hook work; that reservation protects the accepted ordinary-direct "
+            "winner, and later publication claims Succeeded so cancellation or close intent cannot rewrite it"
+        ),
+        "ordinary direct final-byte settlement contract changed",
+    )
+    require(
+        behavior["controller"]["automation_lease"]
+        == (
+            "exclusive Controller-only primitive: asynchronous acquire resolves Granted, Cancelled, "
+            "Deadline, Closed, or Failure on one record with Cancelled > Deadline > Closed > Failure "
+            "> Granted priority; each non-zero generation seals action admission before one paced "
+            "neutral release settles as accepted, stream-settled not-delivered, or explicit cleanup "
+            "failure; the unique backend final-byte completion reserves that release record before "
+            "Clock, telemetry, or hook work, so a close after reservation requires one independent final "
+            "paced neutral; a legitimate Controller lane owner with completion and stream-settlement evidence "
+            "completes affected action/release waiters exactly once with Err(cleanup_failure), while lane "
+            "ownership loss with no transferable owner or evidence preserves their nonterminal record and "
+            "requires Runtime CloseFailed; Controller close takes over an Undispatched or Outstanding "
+            "release record before the backend gate, while a GateClaimed or retained Committed lane-owned "
+            "record requires one independent final paced neutral; a release record registered after close "
+            "admission seal "
+            "completes only after its closed stream is settled; ECS is outside this milestone"
+        ),
+        "Controller Automation lease settlement contract changed",
+    )
     amiibo = behavior["controller"]["amiibo"]
     require(
         {
@@ -1713,6 +1746,354 @@ def validate_controller_fixture():
         corrected == {"keystroke-future-time", "cancel-missing-release", "competing-ack-listeners"},
         "corrected controller behavior set changed",
     )
+
+
+CONTROLLER_LEASE_OBLIGATION_MAPPINGS = {
+    "controller.lease.acquire-cancelled": (
+        "ADR-0018:91-129",
+        "tests/support/tests/controller_lease.rs::cancelled_acquire_wins_before_lane_grant",
+        "controller.lease.acquire-cancelled",
+    ),
+    "controller.lease.acquire-deadline": (
+        "ADR-0018:91-129",
+        "tests/support/tests/controller_lease.rs::system_clock_acquire_deadline_settles_without_lane_progress",
+        "controller.lease.acquire-deadline",
+    ),
+    "controller.lease.acquire-failure": (
+        "ADR-0018:91-129",
+        "tests/support/tests/controller_lease.rs::busy_acquire_projects_failure_without_grant",
+        "controller.lease.acquire-failure",
+    ),
+    "controller.lease.acquire-same-point-priority": (
+        "ADR-0018:91-104",
+        "crates/easycon-controller/src/session.rs::acquire_record_uses_stable_same_point_priority",
+        "controller.lease.acquire-same-point-priority",
+    ),
+    "controller.lease.acquire-abandonment": (
+        "ADR-0018:104-109",
+        "crates/easycon-controller/src/session.rs::abandoned_acquire_record_rejects_a_late_grant_transition",
+        "controller.lease.acquire-abandonment",
+    ),
+    "controller.lease.generation-non-reuse": (
+        "ADR-0018:26-32",
+        "tests/support/tests/controller_lease.rs::successive_lease_generations_are_nonzero_and_not_reused",
+        "controller.lease.generation-non-reuse",
+    ),
+    "controller.lease.generation-wrong-controller": (
+        "ADR-0018:26-30",
+        "tests/support/tests/controller_lease.rs::wrong_controller_lease_is_rejected_without_affecting_its_owner",
+        "controller.lease.generation-wrong-controller",
+    ),
+    "controller.lease.generation-stale-sealed": (
+        "ADR-0018:132-149",
+        "crates/easycon-controller/src/session.rs::sealed_generation_rejects_stale_action_admission",
+        "controller.lease.generation-stale-sealed",
+    ),
+    "controller.lease.action-seal-inflight": (
+        "ADR-0018:132-144",
+        "tests/support/tests/controller_lease.rs::release_interrupts_an_uneffected_generation_action_before_neutral",
+        "controller.lease.action-seal-inflight",
+    ),
+    "controller.lease.action-seal-future": (
+        "ADR-0018:132-149",
+        "tests/support/tests/controller_lease.rs::release_cancels_a_future_generation_action_without_waiting_for_its_target",
+        "controller.lease.action-seal-future",
+    ),
+    "controller.lease.drop-cleanup": (
+        "ADR-0018:175-190",
+        "tests/support/tests/controller_lease.rs::dropping_a_lease_starts_one_neutral_cleanup_before_next_grant",
+        "controller.lease.drop-cleanup",
+    ),
+    "controller.lease.release-pacing": (
+        "ADR-0018:31-32",
+        "tests/support/tests/controller_lease.rs::release_neutral_does_not_dispatch_before_its_pacing_target",
+        "controller.lease.release-pacing",
+    ),
+    "controller.lease.release-accepted": (
+        "ADR-0018:151-169",
+        "tests/support/tests/controller_lease.rs::release_accepts_one_neutral_and_settles_its_waiter",
+        "controller.lease.release-accepted",
+    ),
+    "controller.lease.partial-stream-settlement": (
+        "ADR-0020:252-268",
+        "tests/support/tests/controller_lease.rs::partial_automation_write_failure_settles_stream_before_release",
+        "controller.lease.partial-stream-settlement",
+    ),
+    "controller.lease.cleanup-failure-projection": (
+        "ADR-0020:289-305",
+        "tests/support/tests/controller_lease.rs::action_cleanup_failure_is_projected_to_its_sealed_release",
+        "controller.lease.cleanup-failure-projection",
+    ),
+    "controller.close.strict-failure-pending-report": (
+        "ADR-0020:289-305",
+        "tests/support/tests/controller_lease.rs::final_close_failure_overrides_a_pending_report_cancellation",
+        "controller.close.strict-failure-pending-report",
+    ),
+    "controller.connect.strict-cleanup-over-cancel": (
+        "ADR-0020:289-305",
+        "tests/support/tests/controller_lease.rs::cancelled_connect_recovery_checked_close_failure_overrides_cancellation",
+        "controller.connect.strict-cleanup-over-cancel",
+    ),
+    "controller.cleanup.strict-failure-over-cancel": (
+        "ADR-0020:289-305",
+        "tests/support/tests/controller_lease.rs::cleanup_failure_after_registered_cancel_wins_over_cancellation_for_action_and_release",
+        "controller.cleanup.strict-failure-over-cancel",
+    ),
+    "controller.report.gate-claim-strict-cleanup": (
+        "ADR-0020:289-305",
+        "crates/easycon-controller/src/session.rs::strict_failure_while_full_claim_is_in_flight_finishes_the_same_claim",
+        "controller.report.gate-claim-strict-cleanup",
+    ),
+    "controller.lease.close-settlement": (
+        "ADR-0018:175-190",
+        "tests/support/tests/controller_lease.rs::close_settles_pending_acquire_actions_and_release_before_join",
+        "controller.lease.close-settlement",
+    ),
+    "controller.lease.close-record-transition": (
+        "ADR-0020:270-287",
+        "crates/easycon-controller/src/session.rs::release_completion_consumes_close_requested_before_the_backend_gate",
+        "controller.lease.close-record-transition",
+    ),
+    "controller.lease.release-full-accepted-before-close-final-neutral": (
+        "ADR-0020:270-287",
+        "tests/support/tests/controller_lease.rs::full_accepted_release_requires_an_independent_final_close_neutral",
+        "controller.lease.release-full-accepted-before-close-final-neutral",
+    ),
+    "controller.lease.close-late-release": (
+        "ADR-0018:175-190",
+        "tests/support/tests/controller_lease.rs::close_settles_release_registered_after_close_seal",
+        "controller.lease.close-late-release",
+    ),
+    "controller.lease.close-interrupt-release": (
+        "ADR-0020:270-287",
+        "tests/support/tests/controller_lease.rs::close_interrupts_release_neutral_before_acceptance_and_joins",
+        "controller.lease.close-interrupt-release",
+    ),
+    "controller.lease.backend-last-byte-late-cancel": (
+        "ADR-0020:176-224",
+        "tests/support/tests/controller_lease.rs::backend_last_byte_acceptance_wins_over_late_close_cancellation",
+        "controller.lease.backend-last-byte-late-cancel",
+    ),
+    "controller.lease.serial-cancel-not-found": (
+        "ADR-0020:220-224",
+        "crates/easycon-serial/src/windows/io.rs::cancel_not_found_still_consumes_a_full_overlapped_completion",
+        "controller.lease.serial-cancel-not-found",
+    ),
+    "controller.lease.fake-serial-parity": (
+        "ADR-0020:231-268",
+        "tests/support/tests/serial_ch32.rs::fake_and_serial_adapter_match_reusable_and_partial_write_settlement",
+        "controller.lease.fake-serial-parity",
+    ),
+    "controller.lease.ownership-loss": (
+        "ADR-0020:289-305",
+        "tests/support/tests/controller_lease.rs::controller_ownership_loss_preserves_release_record_until_runtime_close_failed",
+        "controller.lease.ownership-loss",
+    ),
+    "controller.report.gate-time-claim-owner-loss": (
+        "ADR-0020:178-224",
+        "tests/support/tests/controller_lease.rs::post_acceptance_lane_panic_keeps_the_claimed_report_settleable_after_join",
+        "controller.report.gate-time-claim-owner-loss",
+    ),
+    "controller.lease.direct-final-acceptance-late-cancel": (
+        "ADR-0020:178-224",
+        "tests/support/tests/sequence_ack.rs::direct_acceptance_wins_over_late_cancel",
+        "transport.direct-final-acceptance-late-cancel",
+    ),
+    "controller.lease.sequence-final-acceptance-late-cancel": (
+        "ADR-0020:178-224",
+        "tests/support/tests/sequence_ack.rs::final_sequence_acceptance_wins_over_late_cancel",
+        "transport.sequence-final-acceptance-late-cancel",
+    ),
+    "controller.lease.sequence-intermediate-accepted-cancel-before-final": (
+        "ADR-0020:178-224",
+        "tests/support/tests/sequence_ack.rs::sequence_cancel_neutralizes_and_releases_before_terminal",
+        "transport.sequence-intermediate-accepted-cancel-before-final",
+    ),
+    "controller.lease.sequence-final-partial-or-failure-stream-settlement": (
+        "ADR-0020:252-268",
+        "tests/support/tests/sequence_ack.rs::final_sequence_partial_failure_never_succeeds_and_settles_stream",
+        "transport.sequence-final-partial-or-failure-stream-settlement",
+    ),
+    "controller.lease.release-settled-before-close-final-neutral": (
+        "ADR-0020:270-287",
+        "tests/support/tests/controller_lease.rs::settled_release_requires_one_independent_final_close_neutral",
+        "controller.lease.release-settled-before-close-final-neutral",
+    ),
+    "controller.lease.close-older-settled-before-gate-claimed-record": (
+        "ADR-0020:270-287",
+        "tests/support/tests/controller_lease.rs::close_traverses_a_later_gate_claimed_release_after_an_older_retained_settlement",
+        "controller.lease.close-older-settled-before-gate-claimed-record",
+    ),
+    "controller.lease.close-gate-claimed-drop-final-neutral": (
+        "ADR-0020:270-287",
+        "tests/support/tests/controller_lease.rs::close_after_gate_claimed_drop_release_runs_one_independent_final_neutral",
+        "controller.lease.close-gate-claimed-drop-final-neutral",
+    ),
+    "controller.lease.close-all-records-traversed": (
+        "ADR-0020:270-287",
+        "crates/easycon-controller/src/session.rs::registry_close_transitions_every_record_after_a_prior_record_was_consumed",
+        "controller.lease.close-all-records-traversed",
+    ),
+    "controller.report.physical-final-completion-gate": (
+        "ADR-0020:178-224",
+        "tests/support/tests/controller_lease.rs::physical_final_completion_reserves_success_before_close_can_cancel_the_action",
+        "controller.report.physical-final-completion-gate",
+    ),
+    "controller.lease.release-physical-final-completion-gate": (
+        "ADR-0020:270-287",
+        "tests/support/tests/controller_lease.rs::physical_final_completion_before_close_requires_an_independent_final_neutral",
+        "controller.lease.release-physical-final-completion-gate",
+    ),
+    "controller.transport.rejected-full-reservation-duplicates": (
+        "ADR-0020:178-224",
+        "crates/easycon-controller/src/transport.rs::rejected_full_reservation_cannot_be_upgraded_by_a_duplicate_completion",
+        "controller.transport.rejected-full-reservation-duplicates",
+    ),
+}
+
+
+def validate_controller_lease_obligation_entries(obligations):
+    require(isinstance(obligations, list), "Controller lease obligation matrix is missing")
+    ids = [entry.get("id") for entry in obligations]
+    require(len(ids) == len(set(ids)), "duplicate Controller lease obligation ID")
+    require(
+        set(ids) == set(CONTROLLER_LEASE_OBLIGATION_MAPPINGS),
+        "Controller lease obligation set changed",
+    )
+    tests = [entry.get("test") for entry in obligations]
+    require(len(tests) == len(set(tests)), "Controller lease obligations reuse an executable test")
+    markers = [entry.get("marker") for entry in obligations]
+    require(len(markers) == len(set(markers)), "Controller lease obligations reuse a Rust marker")
+    for entry in obligations:
+        expected = CONTROLLER_LEASE_OBLIGATION_MAPPINGS[entry["id"]]
+        require(
+            (entry.get("adr"), entry.get("test"), entry.get("marker")) == expected,
+            "Controller lease obligation mapping changed: {}".format(entry["id"]),
+        )
+        require(entry.get("expect"), "Controller lease obligation has no expectation: {}".format(entry["id"]))
+
+
+def validate_controller_lease_fixture_contract(fixture):
+    require(
+        {key: value for key, value in fixture.items() if key != "obligation_matrix"}
+        == {
+            "schema_version": 1,
+            "fixture_id": "controller-lease-settlement-v1",
+            "license": "GPL-3.0-only",
+            "scope": (
+                "Controller D1 software settlement only; Hardware Unverified and no Stage 1 refreeze"
+            ),
+            "acquire": {
+                "outcomes": ["Granted", "Cancelled", "Deadline", "Closed", "Failure"],
+                "same_observation_priority": [
+                    "Cancelled", "Deadline", "Closed", "Failure", "Granted"
+                ],
+                "deadline_clock": "absolute target_ns in the owning Runtime Clock epoch",
+                "abandoned_future": (
+                    "an unresolved record cannot grant; an unobserved granted lease falls back to "
+                    "the same generation cleanup"
+                ),
+            },
+            "actions": {
+                "generation_nonzero": True,
+                "effect_boundary": (
+                    "Succeeded only when the backend settlement gate consumes the physical final-byte "
+                    "completion for the complete logical report"
+                ),
+                "backend_final_byte": (
+                    "ordinary direct, Automation direct, and the effect-completing final "
+                    "precise-sequence report bind one Operation settlement owner to the backend gate; "
+                    "the unique physical completion owner reserves FullAccepted before Clock, telemetry, "
+                    "or hook work, so late cancellation or close cannot take the owner; reservation "
+                    "rejection fails closed and duplicate completion cannot fabricate FullAccepted"
+                ),
+                "intermediate_sequence": (
+                    "an accepted non-final precise-sequence report is not whole-operation success; "
+                    "cancellation or failure before final acceptance settles its neutral and stream "
+                    "before the operation terminal"
+                ),
+                "sealed_action": (
+                    "release seals admission, cancels uneffected admitted actions, settles each "
+                    "action, then dispatches one neutral"
+                ),
+                "partial_io": (
+                    "a partial logical write that cannot complete closes the stream before action "
+                    "or release settlement"
+                ),
+            },
+            "release": {
+                "states": ["Undispatched", "Outstanding", "GateClaimed", "Committed"],
+                "accepted": "NeutralAccepted",
+                "not_delivered": "NeutralNotDeliveredStreamSettled(cause)",
+                "failure": (
+                    "Err(cleanup_failure) only after a legitimate owner has proved completion and "
+                    "stream settlement; missing owner/evidence is ownership loss rather than release failure"
+                ),
+                "pacing": (
+                    "neutral target is max(Runtime Clock now, last accepted report plus minimum interval)"
+                ),
+                "close_after_settlement": (
+                    "a close that acquires a record before backend final-byte reservation consumes its "
+                    "same neutral; "
+                    "GateClaimed or retained Committed lane-owned records cannot consume a later resource "
+                    "close, which dispatches one independent paced final neutral"
+                ),
+            },
+            "cleanup": {
+                "proven_owner": {
+                    "precondition": (
+                        "a legitimate Controller lane owner consumed the completion and proved stream "
+                        "settlement before later cleanup failure"
+                    ),
+                    "waiter": (
+                        "every affected action and release waiter completes exactly once with the same "
+                        "Err(cleanup_failure)"
+                    ),
+                    "close": (
+                        "the Controller permanently seals admission, preserves the first failure, and "
+                        "Runtime close reports CloseFailed after required join"
+                    ),
+                },
+                "ownership_loss": {
+                    "precondition": (
+                        "Controller lane ownership is lost and no transferable owner, completion, or "
+                        "stream-settlement evidence is provable"
+                    ),
+                    "waiter": (
+                        "the affected action and release waiter stay nonterminal and are not woken"
+                    ),
+                    "close": (
+                        "the record and registry identity remain for diagnosis and Runtime close reports "
+                        "CloseFailed"
+                    ),
+                },
+            },
+            "close": {
+                "takes_over_release": True,
+                "retry_interrupted_neutral": False,
+                "traverses_all_records": True,
+                "waiters": (
+                    "close seals acquire and action admission, settles acquire/action/release "
+                    "waiters including records registered after close seal, then joins the lane"
+                ),
+            },
+            "serial": {
+                "cancelioex": "Windows CancelIoEx requests interruption only",
+                "completion_owner": (
+                    "the unique Windows completion owner reserves and publishes final-byte settlement "
+                    "before returning a full count to the Controller lane"
+                ),
+            },
+        },
+        "Controller lease settlement fixture changed",
+    )
+
+
+def validate_controller_lease_fixture():
+    fixture = load_json("fixtures/controller/lease-settlement-v1.json")
+    validate_controller_lease_fixture_contract(fixture)
+    validate_controller_lease_obligation_entries(fixture.get("obligation_matrix"))
+    return fixture
 
 
 def validate_traces():
@@ -2082,6 +2463,7 @@ def validate_conformance_document(conformance, markers):
         "phase2a-serial",
         "phase2a-amiibo",
         "phase2a-acceptance",
+        "controller-settlement",
     ]
     require(scenario_ids == required, "conformance scenarios changed or were reordered")
     require(len(scenario_ids) == len(set(scenario_ids)), "duplicate conformance scenario ID")
@@ -2092,10 +2474,17 @@ def validate_conformance_document(conformance, markers):
     )
     known_tests = set(markers.values())
     step_ids = set()
-    assertion_ids = set()
+    marker_ids = set()
     for scenario in conformance["scenarios"]:
         require(scenario["steps"], "{} has no steps".format(scenario["id"]))
-        require(scenario["assertions"], "{} has no assertions".format(scenario["id"]))
+        assertions = scenario.get("assertions", [])
+        obligations = scenario.get("obligations", [])
+        if scenario["id"] == "controller-settlement":
+            require(assertions, "controller settlement has no narrative assertions")
+            require(obligations, "controller settlement has no obligation matrix")
+        else:
+            require(assertions, "{} has no assertions".format(scenario["id"]))
+            require(not obligations, "{} has unexpected obligations".format(scenario["id"]))
         require(scenario["tests"], "{} has no executable test suite".format(scenario["id"]))
         require(
             len(scenario["tests"]) == len(set(scenario["tests"])),
@@ -2125,32 +2514,181 @@ def validate_conformance_document(conformance, markers):
                     "duplicate conformance step ID: {}".format(step["id"]))
             step_ids.add(step["id"])
         expected_scenario_tests = []
-        for assertion in scenario["assertions"]:
+        for assertion in assertions:
             assertion_id = assertion["id"]
             require(assertion_id, "{} has an empty assertion ID".format(scenario["id"]))
             require(assertion["expect"], "{} has an empty expectation".format(assertion_id))
             require(
-                assertion_id not in assertion_ids,
+                assertion_id not in marker_ids,
                 "duplicate conformance assertion ID: {}".format(assertion_id),
             )
-            assertion_ids.add(assertion_id)
+            marker_ids.add(assertion_id)
             require(
                 markers.get(assertion_id) == assertion["test"],
                 "{} has a missing, stale, or invalid Rust test mapping: {}".format(
                     assertion_id, assertion["test"]
                 ),
             )
-            if assertion["test"] not in expected_scenario_tests:
+            if not obligations and assertion["test"] not in expected_scenario_tests:
                 expected_scenario_tests.append(assertion["test"])
+        obligation_ids = set()
+        obligation_tests = set()
+        for obligation in obligations:
+            obligation_id = obligation.get("id")
+            marker = obligation.get("marker")
+            test_ref = obligation.get("test")
+            require(obligation_id, "{} has an empty obligation ID".format(scenario["id"]))
+            require(obligation.get("adr"), "{} has no ADR reference".format(obligation_id))
+            require(obligation.get("expect"), "{} has no expectation".format(obligation_id))
+            require(marker, "{} has no Rust marker".format(obligation_id))
+            require(test_ref, "{} has no executable test".format(obligation_id))
+            require(
+                obligation_id not in obligation_ids,
+                "duplicate Controller settlement obligation ID: {}".format(obligation_id),
+            )
+            obligation_ids.add(obligation_id)
+            require(
+                test_ref not in obligation_tests,
+                "Controller settlement obligations reuse executable test: {}".format(test_ref),
+            )
+            obligation_tests.add(test_ref)
+            if marker not in marker_ids:
+                marker_ids.add(marker)
+            require(
+                markers.get(marker) == test_ref,
+                "{} has a missing, stale, or invalid Rust marker mapping: {}".format(
+                    obligation_id, test_ref
+                ),
+            )
+            if test_ref not in expected_scenario_tests:
+                expected_scenario_tests.append(test_ref)
         require(
             scenario["tests"] == expected_scenario_tests,
-            "{} executable suite does not exactly cover its assertions".format(scenario["id"]),
+            "{} executable suite does not exactly cover its assertions and obligations".format(
+                scenario["id"]
+            ),
         )
     require(
-        assertion_ids == set(markers),
-        "conformance assertion and Rust marker sets differ: spec_only={!r}, rust_only={!r}".format(
-            sorted(assertion_ids - set(markers)), sorted(set(markers) - assertion_ids)
+        marker_ids == set(markers),
+        "conformance mappings and Rust marker sets differ: spec_only={!r}, rust_only={!r}".format(
+            sorted(marker_ids - set(markers)), sorted(set(markers) - marker_ids)
         ),
+    )
+
+
+def controller_settlement_scenario(conformance):
+    return next(
+        scenario
+        for scenario in conformance["scenarios"]
+        if scenario["id"] == "controller-settlement"
+    )
+
+
+def validate_controller_lease_conformance_matrix(conformance, markers):
+    fixture = load_json("fixtures/controller/lease-settlement-v1.json")
+    obligations = fixture.get("obligation_matrix")
+    validate_controller_lease_obligation_entries(obligations)
+    scenario = controller_settlement_scenario(conformance)
+    require(
+        scenario.get("obligations") == obligations,
+        "Controller conformance obligations differ from the lease settlement fixture",
+    )
+    for obligation in obligations:
+        require(
+            markers.get(obligation["marker"]) == obligation["test"],
+            "Controller lease obligation has no executable Rust marker: {}".format(
+                obligation["id"]
+            ),
+        )
+
+
+def require_controller_lease_obligations_rejected(obligations, message):
+    try:
+        validate_controller_lease_obligation_entries(obligations)
+    except ValidationError:
+        return
+    raise ValidationError(message)
+
+
+def require_controller_lease_fixture_contract_rejected(fixture, message):
+    try:
+        validate_controller_lease_fixture_contract(fixture)
+    except ValidationError:
+        return
+    raise ValidationError(message)
+
+
+def validate_controller_lease_obligation_regressions():
+    fixture = load_json("fixtures/controller/lease-settlement-v1.json")
+    duplicate_test = copy.deepcopy(fixture["obligation_matrix"])
+    duplicate_test[1]["test"] = duplicate_test[0]["test"]
+    require_controller_lease_obligations_rejected(
+        duplicate_test, "duplicate Controller obligation test mapping was accepted"
+    )
+
+    missing = copy.deepcopy(fixture["obligation_matrix"])
+    missing.pop()
+    require_controller_lease_obligations_rejected(
+        missing, "missing Controller obligation mapping was accepted"
+    )
+
+    generic_ownership_loss = copy.deepcopy(fixture["obligation_matrix"])
+    ownership_loss = next(
+        entry
+        for entry in generic_ownership_loss
+        if entry["id"] == "controller.lease.ownership-loss"
+    )
+    ownership_loss["test"] = (
+        "crates/easycon-runtime/tests/terminal_arbitration.rs::"
+        "close_failed_preserves_nonterminal_operation_when_owner_and_evidence_are_lost"
+    )
+    ownership_loss["marker"] = "operation.ownership-loss-preserves-registry"
+    require_controller_lease_obligations_rejected(
+        generic_ownership_loss,
+        "generic Runtime ownership-loss test was accepted for a Controller obligation",
+    )
+
+    swapped_cleanup = copy.deepcopy(fixture)
+    cleanup = swapped_cleanup["cleanup"]
+    cleanup["proven_owner"], cleanup["ownership_loss"] = (
+        cleanup["ownership_loss"],
+        cleanup["proven_owner"],
+    )
+    require_controller_lease_fixture_contract_rejected(
+        swapped_cleanup, "swapped Controller cleanup paths were accepted"
+    )
+
+    merged_cleanup = copy.deepcopy(fixture)
+    merged_cleanup["cleanup"].pop("ownership_loss")
+    require_controller_lease_fixture_contract_rejected(
+        merged_cleanup, "merged Controller cleanup paths were accepted"
+    )
+
+    accepted_cancelled = copy.deepcopy(fixture)
+    accepted_cancelled["actions"]["backend_final_byte"] = (
+        "ordinary direct and final precise-sequence FullAccepted may map to Cancelled"
+    )
+    require_controller_lease_fixture_contract_rejected(
+        accepted_cancelled,
+        "Controller final-byte FullAccepted to Cancelled mapping was accepted",
+    )
+
+    intermediate_success = copy.deepcopy(fixture)
+    intermediate_success["actions"]["intermediate_sequence"] = (
+        "an accepted non-final precise-sequence report completes the whole operation"
+    )
+    require_controller_lease_fixture_contract_rejected(
+        intermediate_success,
+        "intermediate precise-sequence acceptance was accepted as whole-operation success",
+    )
+
+    settled_release_consumed = copy.deepcopy(fixture)
+    settled_release_consumed["release"]["close_after_settlement"] = (
+        "a retained ReleaseSettled lane-owned record consumes a later resource close"
+    )
+    require_controller_lease_fixture_contract_rejected(
+        settled_release_consumed,
+        "settled lane-owned release was accepted as close-consumed",
     )
 
 
@@ -2191,11 +2729,21 @@ def validate_conformance_regressions(conformance, markers):
         incomplete_suite, markers, "incomplete conformance scenario suite was not rejected"
     )
 
+    duplicate_obligation = copy.deepcopy(conformance)
+    obligations = controller_settlement_scenario(duplicate_obligation)["obligations"]
+    obligations[1]["test"] = obligations[0]["test"]
+    require_conformance_rejected(
+        duplicate_obligation,
+        markers,
+        "duplicate Controller obligation executable mapping was accepted",
+    )
+
 
 def validate_conformance():
     conformance = load_json("conformance/runtime-controller-v1.json")
     markers = conformance_test_markers()
     validate_conformance_document(conformance, markers)
+    validate_controller_lease_conformance_matrix(conformance, markers)
     validate_conformance_regressions(conformance, markers)
     tests = conformance_test_targets(markers, cargo_metadata())
     validate_conformance_execution_regressions()
@@ -2437,6 +2985,8 @@ def main():
     validate_behavior()
     validate_runtime_r0_fixture()
     validate_controller_fixture()
+    validate_controller_lease_fixture()
+    validate_controller_lease_obligation_regressions()
     validate_traces()
     validate_latency_result()
     validate_vision_fixture_validator_regressions()
@@ -2449,10 +2999,10 @@ def main():
     validate_vision_model_provisioner_regressions()
     test_count = validate_conformance()
     print(
-        "validated 7 schemas, 1 behavior spec, 1 Runtime fixture, 3 controller fixtures, "
+        "validated 8 schemas, 1 behavior spec, 1 Runtime fixture, 4 controller fixtures, "
         "15 vision binary fixtures, 1 capture manifest, 24 label corpus entries, "
         "{} ECS provenance records with 33 SDK-local artifacts, "
-        "9 conformance scenarios, and {} exact Rust tests".format(
+        "10 conformance scenarios, and {} exact Rust tests".format(
             ecs_record_count, test_count
         )
     )

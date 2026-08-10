@@ -21,10 +21,11 @@ pub struct SerialControllerTransport {
     active_write: Option<ActiveWrite>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct ActiveWrite {
     context: easycon_controller::WriteContext,
     accepted: usize,
+    settlement: easycon_controller::WriteSettlement,
 }
 
 impl SerialControllerTransport {
@@ -64,6 +65,7 @@ impl SerialControllerTransport {
             deadline_ns,
             cancellation,
             resource_cancellation,
+            final_write_settlement: None,
         }
     }
 
@@ -146,8 +148,12 @@ impl ControllerTransport for SerialControllerTransport {
                 "serial write remainder exceeds its logical payload",
             ));
         };
-        match self.active_write {
-            Some(active) if active.context != request.context || active.accepted != offset => {
+        match self.active_write.as_ref() {
+            Some(active)
+                if active.context != request.context
+                    || active.accepted != offset
+                    || !active.settlement.same_handle(&request.settlement) =>
+            {
                 self.close_stream();
                 return Err(TransportError::new(
                     TransportErrorKind::Disconnected,
@@ -163,14 +169,24 @@ impl ControllerTransport for SerialControllerTransport {
             }
             Some(_) | None => {}
         }
-        let io_request = self.request(
-            request.deadline_ns,
-            request.cancellation,
-            request.resource_cancellation,
-            ByteIoOperation::ControllerWrite(request.context),
-        );
-        if let Err(error) = check_interruption(&io_request, IoPhase::Write) {
-            return Err(self.close_after_write_failure(request.context.kind, offset, error));
+        let io_request = self
+            .request(
+                request.deadline_ns,
+                request.cancellation,
+                request.resource_cancellation,
+                ByteIoOperation::ControllerWrite(request.context),
+            )
+            .with_final_write_settlement(
+                request.settlement.clone(),
+                offset,
+                request.context.total_len,
+            );
+        if let Some(error) = io_request.interruption() {
+            return Err(self.close_after_write_failure(
+                request.context.kind,
+                offset,
+                zero_effect_write_error(error, offset),
+            ));
         }
         if self.io.is_none() {
             return Err(self.close_after_write_failure(
@@ -188,22 +204,41 @@ impl ControllerTransport for SerialControllerTransport {
             purge_request.operation = ByteIoOperation::DiscardInput {
                 write_sequence: request.context.sequence,
             };
-            io.discard_input(purge_request)
-                .map_err(|error| map_error(error, IoPhase::Write))?;
+            if let Err(error) = io.discard_input(purge_request) {
+                return Err(self.close_after_write_failure(
+                    request.context.kind,
+                    offset,
+                    zero_effect_write_error(error, offset),
+                ));
+            }
             self.prepared_command_sequence = Some(request.context.sequence);
         }
 
-        let result = io
-            .write(request.bytes, io_request)
-            .map_err(|error| map_error(error, IoPhase::Write))
-            .and_then(|written| {
-                validate_progress(written, request.bytes.len(), IoPhase::Write)?;
-                Ok(written)
-            });
-        let written = match result {
+        let written = match io.write(request.bytes, io_request) {
+            Ok(0) => {
+                return Err(self.close_after_write_failure(
+                    request.context.kind,
+                    offset,
+                    zero_progress_write_error(offset),
+                ));
+            }
+            Ok(written) if written > request.bytes.len() => {
+                return Err(self.close_after_write_failure(
+                    request.context.kind,
+                    offset,
+                    TransportError::new(
+                        TransportErrorKind::Protocol,
+                        "serial byte I/O exceeded the supplied buffer",
+                    ),
+                ));
+            }
             Ok(written) => written,
             Err(error) => {
-                return Err(self.close_after_write_failure(request.context.kind, offset, error));
+                return Err(self.close_after_write_failure(
+                    request.context.kind,
+                    offset,
+                    zero_effect_write_error(error, offset),
+                ));
             }
         };
         let accepted = offset
@@ -211,10 +246,18 @@ impl ControllerTransport for SerialControllerTransport {
             .expect("serial accepted-byte count cannot overflow total length");
         if accepted == request.context.total_len {
             self.active_write = None;
+            if !request.settlement.is_full_accepted() {
+                self.close_stream();
+                return Err(TransportError::new(
+                    TransportErrorKind::Io,
+                    "serial backend returned a full payload without final-byte settlement",
+                ));
+            }
         } else {
             self.active_write = Some(ActiveWrite {
                 context: request.context,
                 accepted,
+                settlement: request.settlement.clone(),
             });
         }
         Ok(written)
@@ -254,17 +297,39 @@ impl SerialControllerTransport {
         accepted_prefix: usize,
         error: TransportError,
     ) -> TransportError {
-        if accepted_prefix == 0 && kind != WriteKind::Neutralize {
+        if accepted_prefix == 0 && error.stream_reusable() {
             return error;
         }
         self.close_stream();
-        let message = if accepted_prefix == 0 {
-            format!("serial stream closed after neutralization failure: {error}")
-        } else {
-            format!("serial stream closed after partial-write failure: {error}")
+        let message = match (accepted_prefix == 0, kind) {
+            (true, WriteKind::Neutralize) => {
+                format!("serial stream closed after neutralization failure: {error}")
+            }
+            (true, _) => format!("serial stream closed after unproven zero-byte failure: {error}"),
+            (false, _) => format!("serial stream closed after partial-write failure: {error}"),
         };
         TransportError::new(TransportErrorKind::Disconnected, message)
     }
+}
+
+fn zero_effect_write_error(error: SerialError, accepted_prefix: usize) -> TransportError {
+    let zero_effect = accepted_prefix == 0 && error.backend_proved_zero_effect();
+    let mapped = map_error(error, IoPhase::Write);
+    if zero_effect {
+        TransportError::reusable_stream(mapped.kind(), mapped.message())
+    } else {
+        mapped
+    }
+}
+
+fn zero_progress_write_error(accepted_prefix: usize) -> TransportError {
+    zero_effect_write_error(
+        SerialError::zero_effect(
+            SerialErrorKind::ZeroProgress,
+            "serial byte I/O returned zero progress",
+        ),
+        accepted_prefix,
+    )
 }
 
 impl Drop for SerialControllerTransport {

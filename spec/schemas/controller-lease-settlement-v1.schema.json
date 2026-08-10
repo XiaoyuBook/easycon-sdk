@@ -1,0 +1,157 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://easycon.invalid/schemas/controller-lease-settlement-v1.schema.json",
+  "title": "EasyCon Controller lease settlement fixture v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "fixture_id",
+    "license",
+    "scope",
+    "acquire",
+    "actions",
+    "release",
+    "cleanup",
+    "close",
+    "serial",
+    "obligation_matrix"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "fixture_id": { "const": "controller-lease-settlement-v1" },
+    "license": { "const": "GPL-3.0-only" },
+    "scope": { "type": "string" },
+    "acquire": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["outcomes", "same_observation_priority", "deadline_clock", "abandoned_future"],
+      "properties": {
+        "outcomes": {
+          "type": "array",
+          "minItems": 5,
+          "items": {
+            "type": "string",
+            "enum": ["Granted", "Cancelled", "Deadline", "Closed", "Failure"]
+          }
+        },
+        "same_observation_priority": {
+          "type": "array",
+          "minItems": 5,
+          "items": {
+            "type": "string",
+            "enum": ["Granted", "Cancelled", "Deadline", "Closed", "Failure"]
+          }
+        },
+        "deadline_clock": { "type": "string" },
+        "abandoned_future": { "type": "string" }
+      }
+    },
+    "actions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["generation_nonzero", "effect_boundary", "backend_final_byte", "intermediate_sequence", "sealed_action", "partial_io"],
+      "properties": {
+        "generation_nonzero": { "type": "boolean" },
+        "effect_boundary": { "type": "string" },
+        "backend_final_byte": { "type": "string" },
+        "intermediate_sequence": { "type": "string" },
+        "sealed_action": { "type": "string" },
+        "partial_io": { "type": "string" }
+      }
+    },
+    "release": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["states", "accepted", "not_delivered", "failure", "pacing", "close_after_settlement"],
+      "properties": {
+        "states": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": ["Undispatched", "Outstanding", "GateClaimed", "Committed"]
+          }
+        },
+        "accepted": { "type": "string" },
+        "not_delivered": { "type": "string" },
+        "failure": { "type": "string" },
+        "pacing": { "type": "string" },
+        "close_after_settlement": { "type": "string" }
+      }
+    },
+    "cleanup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["proven_owner", "ownership_loss"],
+      "properties": {
+        "proven_owner": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["precondition", "waiter", "close"],
+          "properties": {
+            "precondition": { "type": "string" },
+            "waiter": { "type": "string" },
+            "close": { "type": "string" }
+          }
+        },
+        "ownership_loss": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["precondition", "waiter", "close"],
+          "properties": {
+            "precondition": { "type": "string" },
+            "waiter": { "type": "string" },
+            "close": { "type": "string" }
+          }
+        }
+      }
+    },
+    "close": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["takes_over_release", "retry_interrupted_neutral", "traverses_all_records", "waiters"],
+      "properties": {
+        "takes_over_release": { "type": "boolean" },
+        "retry_interrupted_neutral": { "type": "boolean" },
+        "traverses_all_records": { "type": "boolean" },
+        "waiters": { "type": "string" }
+      }
+    },
+    "serial": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cancelioex", "completion_owner"],
+      "properties": {
+        "cancelioex": { "type": "string" },
+        "completion_owner": { "type": "string" }
+      }
+    },
+    "obligation_matrix": {
+      "type": "array",
+      "minItems": 32,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "adr", "expect", "test", "marker"],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "adr": {
+            "type": "string"
+          },
+          "expect": { "type": "string" },
+          "test": {
+            "type": "string"
+          },
+          "marker": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

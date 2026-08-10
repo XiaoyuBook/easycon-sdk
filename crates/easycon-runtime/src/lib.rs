@@ -23,9 +23,9 @@ pub use event::{
     SubscriptionOptions, SubscriptionRead,
 };
 pub use operation::{
-    CancellationReason, Operation, OperationSettlementOwner, OperationSnapshot, OperationState,
-    OperationValue, SettlementEvidence, SettlementOwnerMode, TerminalCandidate, TransitionOutcome,
-    WaitResult,
+    CancellationReason, ClaimOutcome, Operation, OperationSettlementClaim,
+    OperationSettlementOwner, OperationSnapshot, OperationState, OperationValue,
+    SettlementEvidence, SettlementOwnerMode, TerminalCandidate, TransitionOutcome, WaitResult,
 };
 pub use runtime::{
     CloseOutcome, ClosePhase, CloseRejection, CloseReport, ManagedResource, ResourceRegistration,

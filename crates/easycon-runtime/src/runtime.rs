@@ -138,6 +138,14 @@ pub struct SupervisedTask {
 pub trait ManagedResource: Send + Sync + 'static {
     /// Cancels, neutralizes where applicable, and joins the resource's work.
     fn close(&self);
+
+    /// Performs deterministic close while retaining a typed resource failure for Runtime's
+    /// saved close report. Existing resources may use the compatibility boundary when their
+    /// close path cannot report a domain error.
+    fn close_checked(&self) -> Result<(), EasyConError> {
+        self.close();
+        Ok(())
+    }
 }
 
 /// Cloneable root owner for operations, resources, tasks, events, and cancellation.
@@ -198,10 +206,9 @@ enum DeadlineSignal {
     Shutdown,
 }
 
-#[derive(Clone, Copy)]
 struct CloseFailure {
     phase: ClosePhase,
-    diagnostic: &'static str,
+    diagnostic: Arc<str>,
     resource_id: Option<ResourceId>,
     task_id: Option<TaskId>,
 }
@@ -220,21 +227,21 @@ impl Drop for CloseOwnerGuard<'_> {
 }
 
 impl CloseFailure {
-    const fn new(phase: ClosePhase, diagnostic: &'static str) -> Self {
+    fn new(phase: ClosePhase, diagnostic: impl Into<Arc<str>>) -> Self {
         Self {
             phase,
-            diagnostic,
+            diagnostic: diagnostic.into(),
             resource_id: None,
             task_id: None,
         }
     }
 
-    const fn with_resource(mut self, resource_id: ResourceId) -> Self {
+    fn with_resource(mut self, resource_id: ResourceId) -> Self {
         self.resource_id = Some(resource_id);
         self
     }
 
-    const fn with_task(mut self, task_id: TaskId) -> Self {
+    fn with_task(mut self, task_id: TaskId) -> Self {
         self.task_id = Some(task_id);
         self
     }
@@ -812,6 +819,49 @@ impl Runtime {
         Ok(supervised)
     }
 
+    /// Binds an operation settlement owner to an already registered supervised task.
+    ///
+    /// This is for a resource with one long-lived lane that creates short-lived operations after
+    /// the lane itself has been admitted. The binding is checked against this Runtime and may be
+    /// performed once, before the owner claims terminal evidence.
+    pub fn bind_operation_settlement_owner_to_task(
+        &self,
+        owner: &OperationSettlementOwner,
+        task: &SupervisedTask,
+    ) -> Result<(), EasyConError> {
+        if !owner.belongs_to(&self.inner)
+            || task.runtime_id != self.inner.id
+            || !task.runtime.ptr_eq(&Arc::downgrade(&self.inner))
+        {
+            return Err(EasyConError::new(
+                ErrorDomain::Validation,
+                ErrorCode::InvalidArgument,
+                "operation settlement owner and supervised task must belong to this Runtime",
+            ));
+        }
+        let tasks = self
+            .inner
+            .tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !tasks.contains_key(&task.id) {
+            return Err(EasyConError::new(
+                ErrorDomain::Runtime,
+                ErrorCode::InvalidArgument,
+                "operation settlement owner task is no longer supervised",
+            ));
+        }
+        if !owner.bind_task(task.id) {
+            return Err(EasyConError::new(
+                ErrorDomain::Runtime,
+                ErrorCode::InvalidArgument,
+                "operation settlement owner is already bound",
+            ));
+        }
+        drop(tasks);
+        Ok(())
+    }
+
     /// Returns current supervised counts without changing lifecycle.
     #[must_use]
     pub fn counts(&self) -> RuntimeCounts {
@@ -959,29 +1009,51 @@ impl Runtime {
         resources.sort_by_key(|(id, _)| *id);
         let mut resource_failure = None;
         for (id, resource) in &resources {
-            if catch_isolated(|| resource.close()).is_err() {
-                if resource_failure.is_none() {
-                    resource_failure = Some(
-                        CloseFailure::new(
-                            ClosePhase::ResourceCleanup,
-                            "ManagedResource::close panicked",
-                        )
-                        .with_resource(*id),
-                    );
+            match catch_isolated(|| resource.close_checked()) {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    if resource_failure.is_none() {
+                        resource_failure = Some(
+                            CloseFailure::new(ClosePhase::ResourceCleanup, error.to_string())
+                                .with_resource(*id),
+                        );
+                    }
+                    let _ = catch_isolated(|| {
+                        let _ = self.inner.try_publish_event(
+                            EventDraft::critical(
+                                EventKind::Warning,
+                                "runtime.resource.close_failed",
+                                Severity::Error,
+                            )
+                            .with_resource(*id)
+                            .with_detail(error.to_string()),
+                        );
+                    });
                 }
-                let _ = catch_isolated(|| {
-                    let _ = self.inner.try_publish_event(
-                        EventDraft::critical(
-                            EventKind::Warning,
-                            "runtime.resource.close_panicked",
-                            Severity::Error,
-                        )
-                        .with_resource(*id)
-                        .with_detail(
-                            "ManagedResource::close panicked; registration remains supervised",
-                        ),
-                    );
-                });
+                Err(()) => {
+                    if resource_failure.is_none() {
+                        resource_failure = Some(
+                            CloseFailure::new(
+                                ClosePhase::ResourceCleanup,
+                                "ManagedResource::close panicked",
+                            )
+                            .with_resource(*id),
+                        );
+                    }
+                    let _ = catch_isolated(|| {
+                        let _ = self.inner.try_publish_event(
+                            EventDraft::critical(
+                                EventKind::Warning,
+                                "runtime.resource.close_panicked",
+                                Severity::Error,
+                            )
+                            .with_resource(*id)
+                            .with_detail(
+                                "ManagedResource::close panicked; registration remains supervised",
+                            ),
+                        );
+                    });
+                }
             }
         }
         drop(resources);
@@ -1206,7 +1278,7 @@ impl RuntimeInner {
         });
         let report = Arc::new(CloseReport {
             phase: failure.phase,
-            diagnostic: Arc::from(failure.diagnostic),
+            diagnostic: failure.diagnostic,
             resource_id: failure.resource_id,
             task_id: failure.task_id,
             counts: self.counts_recover(),

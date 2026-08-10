@@ -119,6 +119,28 @@ enum RuntimeReentry {
     Close,
 }
 
+struct WorkerWaitGate {
+    reached: mpsc::SyncSender<()>,
+    release: mpsc::Receiver<()>,
+}
+
+struct WorkerWaitBarrier {
+    reached: mpsc::Receiver<()>,
+    release: mpsc::SyncSender<()>,
+}
+
+impl WorkerWaitBarrier {
+    fn wait_until_reached(&self, message: &str) {
+        self.reached.recv_timeout(REENTRY_WAIT).expect(message);
+    }
+}
+
+impl Drop for WorkerWaitBarrier {
+    fn drop(&mut self) {
+        let _ = self.release.try_send(());
+    }
+}
+
 struct ReentrantRuntimeClock {
     inner: VirtualClock,
     callback: ClockCallback,
@@ -128,6 +150,8 @@ struct ReentrantRuntimeClock {
     reenter_once: AtomicBool,
     callback_completed: Mutex<Option<bool>>,
     callback_thread: Mutex<Option<JoinHandle<()>>>,
+    worker_wait_gate: Mutex<Option<WorkerWaitGate>>,
+    worker_wait_release_on_callback: Mutex<Option<mpsc::SyncSender<()>>>,
 }
 
 impl ReentrantRuntimeClock {
@@ -141,6 +165,8 @@ impl ReentrantRuntimeClock {
             reenter_once: AtomicBool::new(false),
             callback_completed: Mutex::new(None),
             callback_thread: Mutex::new(None),
+            worker_wait_gate: Mutex::new(None),
+            worker_wait_release_on_callback: Mutex::new(None),
         }
     }
 
@@ -151,6 +177,62 @@ impl ReentrantRuntimeClock {
     fn arm_current_thread(&self) {
         *self.armed_thread.lock().expect("reentry armed thread") = Some(thread::current().id());
         self.reenter_once.store(true, Ordering::Release);
+    }
+
+    fn hold_next_worker_wait(&self) -> WorkerWaitBarrier {
+        let (reached_sender, reached_receiver) = mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = mpsc::sync_channel(1);
+        let replaced = self
+            .worker_wait_gate
+            .lock()
+            .expect("worker wait gate")
+            .replace(WorkerWaitGate {
+                reached: reached_sender,
+                release: release_receiver,
+            });
+        assert!(replaced.is_none(), "only one worker wait gate is active");
+        WorkerWaitBarrier {
+            reached: reached_receiver,
+            release: release_sender,
+        }
+    }
+
+    fn release_worker_wait_on_callback(&self, barrier: &WorkerWaitBarrier) {
+        let replaced = self
+            .worker_wait_release_on_callback
+            .lock()
+            .expect("worker wait callback release")
+            .replace(barrier.release.clone());
+        assert!(
+            replaced.is_none(),
+            "only one worker wait callback release is active"
+        );
+    }
+
+    fn release_worker_wait_after_callback_entry(&self) {
+        let release = self
+            .worker_wait_release_on_callback
+            .lock()
+            .expect("worker wait callback release")
+            .take();
+        if let Some(release) = release {
+            release
+                .try_send(())
+                .expect("worker remains at the callback release barrier");
+        }
+    }
+
+    fn wait_for_test_release(&self) {
+        let Some(gate) = self
+            .worker_wait_gate
+            .lock()
+            .expect("worker wait gate")
+            .take()
+        else {
+            return;
+        };
+        let _ = gate.reached.send(());
+        let _ = gate.release.recv_timeout(REENTRY_WAIT);
     }
 
     fn assert_reentry_completed(&self) {
@@ -191,6 +273,7 @@ impl ReentrantRuntimeClock {
                 .expect("Runtime attached before callback is armed")
         };
         let reentry = self.reentry;
+        self.release_worker_wait_after_callback_entry();
         let (completion_sender, observed_completion) = mpsc::sync_channel(1);
         let callback_thread = thread::spawn(move || {
             let reentry_completed = match reentry {
@@ -236,6 +319,7 @@ impl Clock for ReentrantRuntimeClock {
     }
 
     fn real_wait_duration(&self, target_ns: u64) -> Option<Duration> {
+        self.wait_for_test_release();
         self.inner.real_wait_duration(target_ns)
     }
 }
@@ -463,9 +547,14 @@ fn already_due_dispatch_callback_can_reenter_public_runtime_close() {
     let (clock, runtime) =
         runtime_with_reentrant_clock(10, ClockCallback::Dispatch, RuntimeReentry::Close);
 
+    let first_worker_wait = clock.hold_next_worker_wait();
+    let worker_anchor = runtime
+        .register_deadline(100)
+        .expect("worker anchor deadline");
+    first_worker_wait.wait_until_reached("deadline worker completed its empty due scan");
+    clock.release_worker_wait_on_callback(&first_worker_wait);
     clock.arm_current_thread();
     let registration = runtime.register_deadline(10).expect("already-due deadline");
-    clock.assert_reentry_completed();
 
     assert_eq!(
         registration
@@ -474,6 +563,15 @@ fn already_due_dispatch_callback_can_reenter_public_runtime_close() {
             .expect("deadline resolution")
             .resolution,
         DeadlineResolution::Fired
+    );
+    clock.assert_reentry_completed();
+    assert_eq!(
+        worker_anchor
+            .signal()
+            .resolution()
+            .expect("worker anchor resolution")
+            .resolution,
+        DeadlineResolution::RuntimeClosed
     );
     assert_eq!(runtime.close(), Ok(CloseOutcome::Closed));
 }
@@ -925,7 +1023,7 @@ fn deadline_signal_blocking_wait_and_async_observer_can_coexist() {
     let (blocking_result, observed_blocking_result) = mpsc::sync_channel(1);
     let blocking_waiter = thread::spawn(move || {
         blocking_result
-            .send(blocking_signal.wait(WaitTimeout::Infinite))
+            .send(blocking_signal.wait(WaitTimeout::For(REENTRY_WAIT)))
             .expect("blocking waiter receiver remains alive");
     });
     let (events, observed_events) = mpsc::channel();

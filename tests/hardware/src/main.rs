@@ -36,6 +36,8 @@ use easycon_controller::{
     ControllerSnapshot, ControllerState, ControllerTransport, HandshakeRequest, PreciseSequence,
     SequenceStep, TransportError, WriteContext, WriteKind, WriteRequest,
 };
+#[cfg(test)]
+use easycon_controller::WriteSettlement;
 use easycon_hardware_qualification::{option_value, required_value, value_or};
 use easycon_model::{Button, Hat, ResourceId, StickPosition};
 use easycon_runtime::{
@@ -580,6 +582,7 @@ impl ControllerTransport for ObservedTransport {
     fn write(&mut self, request: WriteRequest<'_>) -> Result<usize, TransportError> {
         let context = request.context;
         let remaining = request.bytes.len();
+        let settlement = request.settlement.clone();
         let entered = self.clock.now_ns();
         if context.kind == WriteKind::Report {
             self.telemetry
@@ -595,21 +598,38 @@ impl ControllerTransport for ObservedTransport {
                 .begin_neutralization(context, remaining, entered);
         }
         let result = self.inner.write(request);
+        let final_payload_returned = result.as_ref().is_ok_and(|accepted| {
+            context
+                .total_len
+                .checked_sub(remaining)
+                .and_then(|offset| offset.checked_add(*accepted))
+                == Some(context.total_len)
+        });
+        let telemetry_result = if final_payload_returned && !settlement.is_full_accepted() {
+            Err(TransportError::new(
+                easycon_controller::TransportErrorKind::Io,
+                "observed transport returned a full payload without backend settlement",
+            ))
+        } else {
+            result
+        };
+        // A decorator must validate the backend gate before it performs its own observable Clock
+        // or telemetry work. It cannot infer accepted bytes from a successful inner return.
         let accepted_at = self.clock.now_ns();
         if context.kind == WriteKind::Report {
             self.telemetry
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .logical_reports
-                .finish(context, remaining, accepted_at, &result);
+                .finish(context, remaining, accepted_at, &telemetry_result);
         }
         if context.kind == WriteKind::Neutralize {
             self.telemetry
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
-                .finish_neutralization(context, remaining, &result);
+                .finish_neutralization(context, remaining, &telemetry_result);
         }
-        result
+        telemetry_result
     }
 
     fn wait_for_ack(&mut self, request: AckRequest) -> Result<AckFrame, TransportError> {
@@ -618,6 +638,10 @@ impl ControllerTransport for ObservedTransport {
 
     fn close(&mut self) {
         self.inner.close();
+    }
+
+    fn close_checked(&mut self) -> Result<(), TransportError> {
+        self.inner.close_checked()
     }
 }
 
@@ -5755,6 +5779,27 @@ mod tests {
         calls: usize,
     }
 
+    struct FullReturnWithoutSettlement;
+
+    impl ControllerTransport for FullReturnWithoutSettlement {
+        fn handshake(&mut self, _request: HandshakeRequest) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn write(&mut self, request: WriteRequest<'_>) -> Result<usize, TransportError> {
+            Ok(request.bytes.len())
+        }
+
+        fn wait_for_ack(&mut self, _request: AckRequest) -> Result<AckFrame, TransportError> {
+            Err(TransportError::new(
+                TransportErrorKind::Protocol,
+                "unsettled synthetic transport has no ACK",
+            ))
+        }
+
+        fn close(&mut self) {}
+    }
+
     struct NativeFailureByteIo {
         controller_write_calls: usize,
     }
@@ -5806,6 +5851,19 @@ mod tests {
         }
     }
 
+    fn accept_synthetic_full(request: &WriteRequest<'_>) -> Result<usize, TransportError> {
+        if !request
+            .settlement
+            .full_accepted_at(request.context.timestamp_ns)
+        {
+            return Err(TransportError::new(
+                TransportErrorKind::Io,
+                "synthetic transport rejected final-byte settlement",
+            ));
+        }
+        Ok(request.bytes.len())
+    }
+
     impl ControllerTransport for ThreeThenFiveTransport {
         fn handshake(&mut self, _request: HandshakeRequest) -> Result<(), TransportError> {
             Ok(())
@@ -5816,7 +5874,7 @@ mod tests {
             if self.calls == 1 {
                 Ok(3)
             } else {
-                Ok(request.bytes.len())
+                accept_synthetic_full(&request)
             }
         }
 
@@ -6042,7 +6100,7 @@ mod tests {
         }
 
         fn write(&mut self, request: WriteRequest<'_>) -> Result<usize, TransportError> {
-            Ok(request.bytes.len())
+            accept_synthetic_full(&request)
         }
 
         fn wait_for_ack(&mut self, _request: AckRequest) -> Result<AckFrame, TransportError> {
@@ -6055,6 +6113,39 @@ mod tests {
         fn close(&mut self) {}
     }
 
+    struct CheckedCloseFailureTransport {
+        close_calls: Arc<AtomicUsize>,
+    }
+
+    impl ControllerTransport for CheckedCloseFailureTransport {
+        fn handshake(&mut self, _request: HandshakeRequest) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn write(&mut self, request: WriteRequest<'_>) -> Result<usize, TransportError> {
+            accept_synthetic_full(&request)
+        }
+
+        fn wait_for_ack(&mut self, _request: AckRequest) -> Result<AckFrame, TransportError> {
+            Err(TransportError::new(
+                TransportErrorKind::Protocol,
+                "no ACK in checked-close delegation test",
+            ))
+        }
+
+        fn close(&mut self) {
+            self.close_calls.fetch_add(1, Ordering::AcqRel);
+        }
+
+        fn close_checked(&mut self) -> Result<(), TransportError> {
+            self.close();
+            Err(TransportError::new(
+                TransportErrorKind::Io,
+                "injected typed checked-close failure",
+            ))
+        }
+    }
+
     struct SuccessfulAmiiboTransport;
 
     impl ControllerTransport for SuccessfulAmiiboTransport {
@@ -6063,7 +6154,7 @@ mod tests {
         }
 
         fn write(&mut self, request: WriteRequest<'_>) -> Result<usize, TransportError> {
-            Ok(request.bytes.len())
+            accept_synthetic_full(&request)
         }
 
         fn wait_for_ack(&mut self, request: AckRequest) -> Result<AckFrame, TransportError> {
@@ -6092,7 +6183,7 @@ mod tests {
                     "injected Amiibo final neutral failure",
                 ))
             } else {
-                Ok(request.bytes.len())
+                accept_synthetic_full(&request)
             }
         }
 
@@ -6118,7 +6209,7 @@ mod tests {
         }
 
         fn write(&mut self, request: WriteRequest<'_>) -> Result<usize, TransportError> {
-            Ok(request.bytes.len())
+            accept_synthetic_full(&request)
         }
 
         fn wait_for_ack(&mut self, request: AckRequest) -> Result<AckFrame, TransportError> {
@@ -6159,7 +6250,7 @@ mod tests {
         }
 
         fn write(&mut self, request: WriteRequest<'_>) -> Result<usize, TransportError> {
-            Ok(request.bytes.len())
+            accept_synthetic_full(&request)
         }
 
         fn wait_for_ack(&mut self, _request: AckRequest) -> Result<AckFrame, TransportError> {
@@ -6191,7 +6282,7 @@ mod tests {
                     ));
                 }
             }
-            Ok(request.bytes.len())
+            accept_synthetic_full(&request)
         }
 
         fn wait_for_ack(&mut self, _request: AckRequest) -> Result<AckFrame, TransportError> {
@@ -6220,7 +6311,7 @@ mod tests {
                     "injected final neutral write failure",
                 ))
             } else {
-                Ok(request.bytes.len())
+                accept_synthetic_full(&request)
             }
         }
 
@@ -6247,7 +6338,7 @@ mod tests {
             if request.context.kind != WriteKind::Neutralize
                 || request.context.operation_id.is_some()
             {
-                return Ok(request.bytes.len());
+                return accept_synthetic_full(&request);
             }
             if !self.accepted_prefix {
                 self.accepted_prefix = true;
@@ -7930,6 +8021,7 @@ mod tests {
             deadline_ns: u64::MAX,
             cancellation: CancellationToken::root(),
             resource_cancellation: CancellationToken::root(),
+            final_write_settlement: None,
         };
 
         assert!(factory.open(&descriptor, 115_200, request()).is_err());
@@ -9311,6 +9403,27 @@ mod tests {
     }
 
     #[test]
+    fn observed_transport_projects_inner_typed_checked_close_failure() {
+        let close_calls = Arc::new(AtomicUsize::new(0));
+        let harness = observed_harness(
+            Box::new(CheckedCloseFailureTransport {
+                close_calls: close_calls.clone(),
+            }),
+            "OBSERVED-CHECKED-CLOSE",
+        );
+        harness
+            .connect(ConnectOptions::default())
+            .expect("synthetic connect");
+
+        let cleanup = harness.close();
+
+        assert_eq!(close_calls.load(Ordering::Acquire), 1);
+        assert!(!cleanup_succeeded(&cleanup));
+        assert_eq!(cleanup["runtime"]["outcome"], "Failed");
+        assert_eq!(cleanup["runtime"]["report"]["phase"], "ResourceCleanup");
+    }
+
+    #[test]
     fn disconnected_close_records_not_required_without_claiming_delivery() {
         let harness = observed_harness(Box::new(NoopTransport), "FINAL-NEUTRAL-NOT-REQUIRED");
 
@@ -9648,6 +9761,7 @@ mod tests {
         };
         let cancellation = CancellationToken::root();
         let resource_cancellation = CancellationToken::root();
+        let settlement = WriteSettlement::untracked();
         let bytes = [0_u8; 8];
 
         assert_eq!(
@@ -9657,6 +9771,7 @@ mod tests {
                 deadline_ns: u64::MAX,
                 cancellation: cancellation.clone(),
                 resource_cancellation: resource_cancellation.clone(),
+                settlement: settlement.clone(),
             }),
             Ok(3)
         );
@@ -9667,6 +9782,7 @@ mod tests {
                 deadline_ns: u64::MAX,
                 cancellation,
                 resource_cancellation,
+                settlement,
             }),
             Ok(5)
         );
@@ -9679,6 +9795,39 @@ mod tests {
         assert_eq!(row["partial_count"], 2);
         assert_eq!(row["operation_id"], 11);
         assert_eq!(row["write_sequence"], 13);
+    }
+
+    #[test]
+    fn observed_transport_rejects_a_full_return_without_the_shared_settlement_gate() {
+        let telemetry = Arc::new(Mutex::new(Telemetry::default()));
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock::default());
+        let mut observed = ObservedTransport {
+            inner: Box::new(FullReturnWithoutSettlement),
+            clock,
+            telemetry,
+        };
+        let context = WriteContext {
+            resource_id: ResourceId::new(7),
+            operation_id: Some(OperationId::new(11)),
+            sequence: 13,
+            timestamp_ns: 90,
+            direct_timing: None,
+            total_len: 8,
+            kind: WriteKind::Report,
+        };
+        let bytes = [0_u8; 8];
+
+        let error = observed
+            .write(WriteRequest {
+                context,
+                bytes: &bytes,
+                deadline_ns: u64::MAX,
+                cancellation: CancellationToken::root(),
+                resource_cancellation: CancellationToken::root(),
+                settlement: WriteSettlement::untracked(),
+            })
+            .expect_err("a decorator must not turn an un-gated full return into acceptance");
+        assert_eq!(error.kind(), TransportErrorKind::Io);
     }
 
     #[test]
@@ -9757,6 +9906,7 @@ mod tests {
             kind: WriteKind::Report,
         };
         let bytes = [0_u8; 8];
+        let settlement = WriteSettlement::untracked();
         assert_eq!(
             observed.write(WriteRequest {
                 context,
@@ -9764,6 +9914,7 @@ mod tests {
                 deadline_ns: u64::MAX,
                 cancellation: cancellation.clone(),
                 resource_cancellation: resource_cancellation.clone(),
+                settlement: settlement.clone(),
             }),
             Ok(3)
         );
@@ -9774,6 +9925,7 @@ mod tests {
                 deadline_ns: u64::MAX,
                 cancellation,
                 resource_cancellation,
+                settlement,
             })
             .expect_err("injected native failure");
         assert_eq!(mapped.kind(), TransportErrorKind::Disconnected);

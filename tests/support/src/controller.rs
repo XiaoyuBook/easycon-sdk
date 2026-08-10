@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::ThreadId;
 use std::time::Duration;
 
@@ -90,10 +90,14 @@ struct FakeState {
     maximum_write_chunk: usize,
     write_calls: usize,
     fail_write_call: Option<(usize, TransportError)>,
+    invalid_write_count_call: Option<(usize, usize)>,
     next_write_delay_ns: Option<u64>,
     write_block: Option<WriteBlockMode>,
     write_waiting: bool,
     write_release: bool,
+    write_block_observers: Vec<mpsc::Sender<()>>,
+    write_interrupt_observers: Vec<mpsc::Sender<()>>,
+    close_failure: Option<CloseFailure>,
     ack_outcomes: VecDeque<AckOutcome>,
     ack_waiting: bool,
     open: bool,
@@ -110,13 +114,29 @@ struct PartialWrite {
     bytes: Vec<u8>,
     writer_thread: ThreadId,
     calls: usize,
-    block_after_acceptance: bool,
+    block_after_acceptance: Option<WriteBlockMode>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WriteBlockMode {
     BeforeAcceptance,
+    AfterFinalCompletionBeforeSettlement,
     AfterAcceptance,
+    AfterAcceptanceThenCancelled,
+}
+
+enum CloseFailure {
+    Error(TransportError),
+    Panic,
+    PanicWithDroppingPayload,
+}
+
+struct PanicOnDropPayload;
+
+impl Drop for PanicOnDropPayload {
+    fn drop(&mut self) {
+        panic!("scripted fake close panic payload dropped");
+    }
 }
 
 impl FakeControllerTransport {
@@ -132,10 +152,14 @@ impl FakeControllerTransport {
                 maximum_write_chunk: usize::MAX,
                 write_calls: 0,
                 fail_write_call: None,
+                invalid_write_count_call: None,
                 next_write_delay_ns: None,
                 write_block: None,
                 write_waiting: false,
                 write_release: false,
+                write_block_observers: Vec::new(),
+                write_interrupt_observers: Vec::new(),
+                close_failure: None,
                 ack_outcomes: VecDeque::new(),
                 ack_waiting: false,
                 open: false,
@@ -186,6 +210,16 @@ impl FakeControllerTransport {
             .fail_write_call = Some((call, error));
     }
 
+    /// Returns an invalid byte count from one one-based partial write call.
+    pub fn return_invalid_write_count(&self, call: usize, accepted: usize) {
+        assert!(call != 0, "write call index is one-based");
+        self.shared
+            .state
+            .lock()
+            .expect("fake transport lock poisoned")
+            .invalid_write_count_call = Some((call, accepted));
+    }
+
     /// Advances virtual time before the next logical write accepts its first byte.
     pub fn delay_next_write_by(&self, elapsed_ns: u64) {
         let mut state = self
@@ -228,6 +262,35 @@ impl FakeControllerTransport {
         state.write_block = Some(WriteBlockMode::AfterAcceptance);
     }
 
+    /// Blocks after the fake has reserved its final physical byte but before it publishes the
+    /// logical-report settlement hook. This is a deterministic adapter-boundary probe.
+    pub fn block_next_write_after_final_completion_before_settlement(&self) {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .expect("fake transport lock poisoned");
+        assert!(
+            state.write_block.is_none(),
+            "a write block is already scripted"
+        );
+        state.write_block = Some(WriteBlockMode::AfterFinalCompletionBeforeSettlement);
+    }
+
+    /// Blocks after final byte acceptance, then reports a late cancellation to its caller.
+    pub fn block_next_write_after_acceptance_then_cancelled(&self) {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .expect("fake transport lock poisoned");
+        assert!(
+            state.write_block.is_none(),
+            "a write block is already scripted"
+        );
+        state.write_block = Some(WriteBlockMode::AfterAcceptanceThenCancelled);
+    }
+
     /// Waits until the fake is blocked in a transport write.
     #[must_use]
     pub fn wait_until_write_blocked(&self, timeout: Duration) -> bool {
@@ -253,6 +316,74 @@ impl FakeControllerTransport {
             .expect("fake transport lock poisoned");
         state.write_release = true;
         self.shared.changed.notify_all();
+    }
+
+    /// Returns a one-shot observation channel for the next blocked transport write.
+    #[must_use]
+    pub fn observe_next_write_blocked(&self) -> mpsc::Receiver<()> {
+        let (sender, receiver) = mpsc::channel();
+        self.shared
+            .state
+            .lock()
+            .expect("fake transport lock poisoned")
+            .write_block_observers
+            .push(sender);
+        receiver
+    }
+
+    /// Returns a one-shot channel notified when a blocked write observes cancellation.
+    #[must_use]
+    pub fn observe_next_write_interrupted(&self) -> mpsc::Receiver<()> {
+        let (sender, receiver) = mpsc::channel();
+        self.shared
+            .state
+            .lock()
+            .expect("fake transport lock poisoned")
+            .write_interrupt_observers
+            .push(sender);
+        receiver
+    }
+
+    /// Makes the next checked close return a typed transport failure after it closes the stream.
+    pub fn fail_next_close(&self, error: TransportError) {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .expect("fake transport lock poisoned");
+        assert!(
+            state.close_failure.is_none(),
+            "a close failure is already scripted"
+        );
+        state.close_failure = Some(CloseFailure::Error(error));
+    }
+
+    /// Makes the next checked close panic after it closes the stream.
+    pub fn panic_next_close(&self) {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .expect("fake transport lock poisoned");
+        assert!(
+            state.close_failure.is_none(),
+            "a close failure is already scripted"
+        );
+        state.close_failure = Some(CloseFailure::Panic);
+    }
+
+    /// Makes the next checked close panic with a payload whose destructor also panics.
+    pub fn panic_next_close_with_dropping_payload(&self) {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .expect("fake transport lock poisoned");
+        assert!(
+            state.close_failure.is_none(),
+            "a close failure is already scripted"
+        );
+        state.close_failure = Some(CloseFailure::PanicWithDroppingPayload);
     }
 
     /// Appends one ACK result.
@@ -457,18 +588,34 @@ impl ControllerTransport for FakeControllerTransport {
             ));
         }
         if operation_cancel.is_cancelled() || resource_cancel.is_cancelled() {
+            let zero_effect = state.partial.is_none();
             state.partial = None;
-            return Err(TransportError::new(
-                TransportErrorKind::Cancelled,
-                "write cancelled before transport acceptance",
-            ));
+            return Err(if zero_effect {
+                TransportError::reusable_stream(
+                    TransportErrorKind::Cancelled,
+                    "write cancelled before transport acceptance",
+                )
+            } else {
+                TransportError::new(
+                    TransportErrorKind::Cancelled,
+                    "write cancelled after a partial prefix",
+                )
+            });
         }
         if self.clock.now_ns() >= request.deadline_ns {
+            let zero_effect = state.partial.is_none();
             state.partial = None;
-            return Err(TransportError::new(
-                TransportErrorKind::WriteTimeout,
-                "write I/O deadline elapsed",
-            ));
+            return Err(if zero_effect {
+                TransportError::reusable_stream(
+                    TransportErrorKind::WriteTimeout,
+                    "write I/O deadline elapsed before transport acceptance",
+                )
+            } else {
+                TransportError::new(
+                    TransportErrorKind::WriteTimeout,
+                    "write I/O deadline elapsed after a partial prefix",
+                )
+            });
         }
         let (block, delay_ns) = if state.partial.is_none() {
             (
@@ -481,6 +628,9 @@ impl ControllerTransport for FakeControllerTransport {
         if block == Some(WriteBlockMode::BeforeAcceptance) {
             state.write_waiting = true;
             state.write_release = false;
+            for observer in std::mem::take(&mut state.write_block_observers) {
+                let _ = observer.send(());
+            }
             self.shared.changed.notify_all();
             while !operation_cancel.is_cancelled()
                 && !resource_cancel.is_cancelled()
@@ -497,7 +647,7 @@ impl ControllerTransport for FakeControllerTransport {
             self.shared.changed.notify_all();
             if operation_cancel.is_cancelled() || resource_cancel.is_cancelled() {
                 state.partial = None;
-                return Err(TransportError::new(
+                return Err(TransportError::reusable_stream(
                     TransportErrorKind::Cancelled,
                     "write cancelled before transport acceptance",
                 ));
@@ -511,9 +661,9 @@ impl ControllerTransport for FakeControllerTransport {
             }
             if self.clock.now_ns() >= request.deadline_ns {
                 state.partial = None;
-                return Err(TransportError::new(
+                return Err(TransportError::reusable_stream(
                     TransportErrorKind::WriteTimeout,
-                    "write I/O deadline elapsed",
+                    "write I/O deadline elapsed before transport acceptance",
                 ));
             }
         }
@@ -535,16 +685,16 @@ impl ControllerTransport for FakeControllerTransport {
             }
             if operation_cancel.is_cancelled() || resource_cancel.is_cancelled() {
                 state.partial = None;
-                return Err(TransportError::new(
+                return Err(TransportError::reusable_stream(
                     TransportErrorKind::Cancelled,
-                    "write cancelled during transport delay",
+                    "write cancelled during transport delay before acceptance",
                 ));
             }
             if self.clock.now_ns() >= request.deadline_ns {
                 state.partial = None;
-                return Err(TransportError::new(
+                return Err(TransportError::reusable_stream(
                     TransportErrorKind::WriteTimeout,
-                    "write I/O deadline elapsed during transport delay",
+                    "write I/O deadline elapsed during transport delay before acceptance",
                 ));
             }
         }
@@ -564,6 +714,17 @@ impl ControllerTransport for FakeControllerTransport {
             state.partial = None;
             return Err(error);
         }
+        if state
+            .invalid_write_count_call
+            .as_ref()
+            .is_some_and(|(call, _)| *call == state.write_calls)
+        {
+            let (_, accepted) = state
+                .invalid_write_count_call
+                .take()
+                .expect("invalid write count checked above");
+            return Ok(accepted);
+        }
         let accepted = state.maximum_write_chunk.min(bytes.len());
         let thread = std::thread::current().id();
         if state.partial.is_none() {
@@ -572,7 +733,14 @@ impl ControllerTransport for FakeControllerTransport {
                 bytes: Vec::with_capacity(context.total_len),
                 writer_thread: thread,
                 calls: 0,
-                block_after_acceptance: block == Some(WriteBlockMode::AfterAcceptance),
+                block_after_acceptance: match block {
+                    Some(
+                        mode @ (WriteBlockMode::AfterAcceptance
+                        | WriteBlockMode::AfterAcceptanceThenCancelled
+                        | WriteBlockMode::AfterFinalCompletionBeforeSettlement),
+                    ) => Some(mode),
+                    Some(WriteBlockMode::BeforeAcceptance) | None => None,
+                },
             });
         }
         let partial = state.partial.as_mut().expect("partial initialized above");
@@ -584,26 +752,82 @@ impl ControllerTransport for FakeControllerTransport {
         }
         partial.bytes.extend_from_slice(&bytes[..accepted]);
         partial.calls = partial.calls.checked_add(1).expect("partial call overflow");
-        let mut block_after_acceptance = false;
+        let mut block_after_acceptance = None;
+        let mut completed_write = None;
         if partial.bytes.len() == context.total_len {
             let complete = state.partial.take().expect("complete partial exists");
             block_after_acceptance = complete.block_after_acceptance;
-            state.accepted_writes.push(AcceptedWrite {
+            completed_write = Some(AcceptedWrite {
                 context: complete.context,
                 bytes: complete.bytes,
                 writer_thread: complete.writer_thread,
                 partial_calls: complete.calls,
             });
-            self.shared.changed.notify_all();
         } else if partial.bytes.len() > context.total_len {
             return Err(TransportError::new(
                 TransportErrorKind::Protocol,
                 "partial writes exceeded the logical payload length",
             ));
         }
-        if block_after_acceptance {
+        if let Some(completed_write) = completed_write {
+            drop(state);
+            if !request.settlement.reserve_full_acceptance() {
+                return Err(TransportError::new(
+                    TransportErrorKind::Io,
+                    "fake backend rejected final-byte settlement reservation",
+                ));
+            }
+            state = self
+                .shared
+                .state
+                .lock()
+                .expect("fake transport lock poisoned after final-byte reservation");
+            if block_after_acceptance == Some(WriteBlockMode::AfterFinalCompletionBeforeSettlement)
+            {
+                state.write_waiting = true;
+                state.write_release = false;
+                for observer in std::mem::take(&mut state.write_block_observers) {
+                    let _ = observer.send(());
+                }
+                self.shared.changed.notify_all();
+                while !state.write_release {
+                    state = self
+                        .shared
+                        .changed
+                        .wait(state)
+                        .expect("fake transport lock poisoned at final completion boundary");
+                }
+                state.write_waiting = false;
+                state.write_release = false;
+                self.shared.changed.notify_all();
+            }
+            drop(state);
+            let accepted_at_ns = self.clock.now_ns();
+            let claimed = request
+                .settlement
+                .publish_reserved_full_acceptance(accepted_at_ns);
+            state = self
+                .shared
+                .state
+                .lock()
+                .expect("fake transport lock poisoned after final-byte settlement");
+            if !claimed {
+                return Err(TransportError::new(
+                    TransportErrorKind::Io,
+                    "fake backend rejected final-byte settlement gate",
+                ));
+            }
+            state.accepted_writes.push(completed_write);
+            self.shared.changed.notify_all();
+        }
+        if let Some(block_after_acceptance) = block_after_acceptance
+            && block_after_acceptance != WriteBlockMode::AfterFinalCompletionBeforeSettlement
+        {
             state.write_waiting = true;
             state.write_release = false;
+            for observer in std::mem::take(&mut state.write_block_observers) {
+                let _ = observer.send(());
+            }
             self.shared.changed.notify_all();
             while !state.write_release
                 && !operation_cancel.is_cancelled()
@@ -620,6 +844,17 @@ impl ControllerTransport for FakeControllerTransport {
             state.write_waiting = false;
             state.write_release = false;
             self.shared.changed.notify_all();
+            if operation_cancel.is_cancelled() || resource_cancel.is_cancelled() {
+                for observer in std::mem::take(&mut state.write_interrupt_observers) {
+                    let _ = observer.send(());
+                }
+            }
+            if block_after_acceptance == WriteBlockMode::AfterAcceptanceThenCancelled {
+                return Err(TransportError::new(
+                    TransportErrorKind::Cancelled,
+                    "backend completion reported cancellation after accepting the final byte",
+                ));
+            }
         }
         Ok(accepted)
     }
@@ -728,5 +963,24 @@ impl ControllerTransport for FakeControllerTransport {
         state.closed = true;
         state.partial = None;
         self.shared.changed.notify_all();
+    }
+
+    fn close_checked(&mut self) -> Result<(), TransportError> {
+        let failure = self
+            .shared
+            .state
+            .lock()
+            .expect("fake transport lock poisoned")
+            .close_failure
+            .take();
+        self.close();
+        match failure {
+            None => Ok(()),
+            Some(CloseFailure::Error(error)) => Err(error),
+            Some(CloseFailure::Panic) => panic!("scripted fake checked-close panic"),
+            Some(CloseFailure::PanicWithDroppingPayload) => {
+                std::panic::panic_any(PanicOnDropPayload)
+            }
+        }
     }
 }

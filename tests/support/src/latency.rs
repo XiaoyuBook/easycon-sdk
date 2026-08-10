@@ -164,14 +164,31 @@ impl ControllerTransport for DirectLatencyTransport {
                 "latency transport write cancelled",
             ));
         }
-        let mut state = self.shared.state.lock().expect("latency transport state");
+        let state = self.shared.state.lock().expect("latency transport state");
         if !state.connected || state.closed {
             return Err(TransportError::new(
                 TransportErrorKind::Disconnected,
                 "latency transport is closed",
             ));
         }
-        if request.context.kind == WriteKind::Report {
+        drop(state);
+        if !request.settlement.reserve_full_acceptance() {
+            return Err(TransportError::new(
+                TransportErrorKind::Io,
+                "latency transport rejected final-byte settlement reservation",
+            ));
+        }
+        let accepted_at_ns = self.clock.now_ns();
+        if !request
+            .settlement
+            .publish_reserved_full_acceptance(accepted_at_ns)
+        {
+            return Err(TransportError::new(
+                TransportErrorKind::Io,
+                "latency transport could not publish final-byte settlement",
+            ));
+        }
+        let report_sample = if request.context.kind == WriteKind::Report {
             let timing = request.context.direct_timing.ok_or_else(|| {
                 protocol_error("latency report did not carry direct timing stages")
             })?;
@@ -179,8 +196,7 @@ impl ControllerTransport for DirectLatencyTransport {
                 .context
                 .operation_id
                 .ok_or_else(|| protocol_error("latency report did not carry an operation ID"))?;
-            let accepted_at_ns = self.clock.now_ns();
-            state.samples.push(DirectLatencySample {
+            Some(DirectLatencySample {
                 operation_id,
                 write_sequence: request.context.sequence,
                 command_admitted_ns: timing.command_admitted_ns,
@@ -188,9 +204,16 @@ impl ControllerTransport for DirectLatencyTransport {
                 lane_dispatch_ns: request.context.timestamp_ns,
                 transport_write_entered_ns: entered_at_ns,
                 transport_accepted_ns: accepted_at_ns,
-            });
-            self.shared.changed.notify_all();
+            })
+        } else {
+            None
+        };
+        let mut state = self.shared.state.lock().expect("latency transport state");
+        if let Some(sample) = report_sample {
+            state.samples.push(sample);
         }
+        drop(state);
+        self.shared.changed.notify_all();
         Ok(request.bytes.len())
     }
 

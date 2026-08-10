@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use easycon_controller::{
     AckRequest, ControllerTransport, HANDSHAKE_REPLY, HANDSHAKE_REQUEST, HandshakeRequest,
-    TransportErrorKind, WriteContext, WriteKind, WriteRequest,
+    TransportErrorKind, WriteContext, WriteKind, WriteRequest, WriteSettlement,
 };
 use easycon_runtime::{CancellationToken, Clock, VirtualClock};
 use easycon_serial::{
@@ -61,12 +61,16 @@ impl ByteIo for Io {
         if let Some(error) = request.interruption() {
             return Err(error);
         }
-        let mut state = self.0.lock().expect("state");
-        let count = state
+        let count = self
+            .0
+            .lock()
+            .expect("state")
             .chunks
             .pop_front()
             .unwrap_or(buffer.len())
             .min(buffer.len());
+        request.publish_final_write_acceptance(count)?;
+        let mut state = self.0.lock().expect("state after completion");
         state.writes.extend_from_slice(&buffer[..count]);
         Ok(count)
     }
@@ -130,6 +134,7 @@ fn injectable_adapter_handles_partial_handshake_and_command_generation() {
     };
     let cancellation = CancellationToken::root();
     let resource_cancellation = CancellationToken::root();
+    let settlement = WriteSettlement::untracked();
     assert_eq!(
         transport
             .write(WriteRequest {
@@ -138,9 +143,14 @@ fn injectable_adapter_handles_partial_handshake_and_command_generation() {
                 deadline_ns: 100,
                 cancellation: cancellation.clone(),
                 resource_cancellation: resource_cancellation.clone(),
+                settlement: settlement.clone(),
             })
             .expect("first partial"),
         1
+    );
+    assert!(
+        !settlement.is_full_accepted(),
+        "partial transport completion must not accept the logical report"
     );
     assert_eq!(
         transport
@@ -150,9 +160,14 @@ fn injectable_adapter_handles_partial_handshake_and_command_generation() {
                 deadline_ns: 100,
                 cancellation: cancellation.clone(),
                 resource_cancellation: resource_cancellation.clone(),
+                settlement: settlement.clone(),
             })
             .expect("second partial"),
         1
+    );
+    assert!(
+        settlement.is_full_accepted(),
+        "serial final-byte completion must claim the logical settlement gate"
     );
     let frame = transport
         .wait_for_ack(AckRequest {
@@ -204,6 +219,7 @@ fn zero_progress_deadline_and_cancellation_are_normalized() {
             deadline_ns: 100,
             cancellation: cancellation.clone(),
             resource_cancellation: resource_cancellation.clone(),
+            settlement: WriteSettlement::untracked(),
         })
         .expect_err("zero progress");
     assert_eq!(error.kind(), TransportErrorKind::Io);
@@ -216,6 +232,7 @@ fn zero_progress_deadline_and_cancellation_are_normalized() {
             deadline_ns: 100,
             cancellation: cancellation.clone(),
             resource_cancellation: resource_cancellation.clone(),
+            settlement: WriteSettlement::untracked(),
         })
         .expect_err("deadline");
     assert_eq!(error.kind(), TransportErrorKind::WriteTimeout);

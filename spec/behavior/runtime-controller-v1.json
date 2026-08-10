@@ -29,7 +29,7 @@
     "terminal_commit": "exactly once after a legitimate settlement owner atomically consumes mutually exclusive evidence and claims one winner; immutable result and error are mutually exclusive",
     "terminal_transaction": {
       "intent": "the first Requested, Deadline, or ParentClose reason is immutable and only signals the owner; intent alone never claims a winner or moves outstanding work onto a path that excludes Succeeded",
-      "claim": "the registered settlement owner consumes EffectAccepted, NotDelivered, or ExecutionFailed evidence and claims the matching winner in one arbiter critical section; claim publishes no event, unlink, or waiter notification",
+      "claim": "the registered settlement owner consumes EffectAccepted, NotDelivered, or ExecutionFailed evidence and claims the matching winner in one arbiter critical section; only that same owner with identical evidence and candidate may reclaim its abandoned deferred transaction, while other claimers fail closed; claim publishes no event, unlink, or waiter notification",
       "child_admission": "the parent cancellation node is sealed before owner cleanup; admission linearized after sealing is rejected and previously admitted children are cancelled",
       "order": [
         "consume mutually exclusive settlement evidence and claim one winner",
@@ -93,7 +93,7 @@
     "default_minimum_report_interval_ns": 30000000,
     "report_interval_scope": "every report, including cancellation and close neutralization",
     "write_timeout_ns": 1000000000,
-    "direct_success_boundary": "the complete report bytes were accepted by transport",
+    "direct_success_boundary": "the unique backend final-byte completion owner reserves the shared settlement gate before Clock, telemetry, or hook work; that reservation protects the accepted ordinary-direct winner, and later publication claims Succeeded so cancellation or close intent cannot rewrite it",
     "hardware_execution_claimed": false,
     "serial": {
       "platform": "Windows 10/11 x64",
@@ -139,7 +139,7 @@
       "maximum_steps": 10000,
       "phase2a_acceptance": "VirtualClock executes 10,000 input steps with exact order, same-offset merge, no early report, absolute targets without cumulative drift, one terminal event, and operation/resource/task registry convergence"
     },
-    "automation_lease": "exclusive arbitration primitive only; ECS is outside this milestone"
+    "automation_lease": "exclusive Controller-only primitive: asynchronous acquire resolves Granted, Cancelled, Deadline, Closed, or Failure on one record with Cancelled > Deadline > Closed > Failure > Granted priority; each non-zero generation seals action admission before one paced neutral release settles as accepted, stream-settled not-delivered, or explicit cleanup failure; the unique backend final-byte completion reserves that release record before Clock, telemetry, or hook work, so a close after reservation requires one independent final paced neutral; a legitimate Controller lane owner with completion and stream-settlement evidence completes affected action/release waiters exactly once with Err(cleanup_failure), while lane ownership loss with no transferable owner or evidence preserves their nonterminal record and requires Runtime CloseFailed; Controller close takes over an Undispatched or Outstanding release record before the backend gate, while a GateClaimed or retained Committed lane-owned record requires one independent final paced neutral; a release record registered after close admission seal completes only after its closed stream is settled; ECS is outside this milestone"
   },
   "classifications": [
     {

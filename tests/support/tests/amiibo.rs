@@ -1,13 +1,18 @@
-use std::sync::Arc;
+use std::future::Future;
+use std::pin::pin;
+use std::sync::{Arc, mpsc};
+use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
 use easycon_controller::{
-    AmiiboLimits, AmiiboSaveOptions, AmiiboSelectOptions, ConnectOptions, ControllerLeaseState,
-    ControllerOptions, ControllerSession, ControllerState, SwitchReport, WriteKind,
+    AmiiboLimits, AmiiboSaveOptions, AmiiboSelectOptions, AutomationLease,
+    AutomationLeaseAcquireOutcome, ConnectOptions, ControllerLeaseState, ControllerOptions,
+    ControllerSession, ControllerState, SwitchReport, WriteKind,
 };
 use easycon_model::ErrorCode;
 use easycon_runtime::{
-    Clock, Operation, OperationState, Runtime, VirtualClock, WaitResult, WaitTimeout,
+    CancellationToken, Clock, Operation, OperationState, Runtime, VirtualClock, WaitResult,
+    WaitTimeout,
 };
 use easycon_serial::SerialPortDescriptor;
 use easycon_test_support::{
@@ -58,6 +63,52 @@ fn wait_terminal(operation: &Operation) {
         operation.wait(WaitTimeout::For(Duration::from_secs(2))),
         WaitResult::Completed(_)
     ));
+}
+
+struct ChannelWake(mpsc::SyncSender<()>);
+
+impl Wake for ChannelWake {
+    fn wake(self: Arc<Self>) {
+        let _ = self.0.try_send(());
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        let _ = self.0.try_send(());
+    }
+}
+
+fn block_on<F: Future>(future: F) -> F::Output {
+    let (wake_sender, wake_receiver) = mpsc::sync_channel(1);
+    let waker = Waker::from(Arc::new(ChannelWake(wake_sender)));
+    let mut context = Context::from_waker(&waker);
+    let mut future = pin!(future);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => return output,
+            Poll::Pending => wake_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("future did not wake before bounded test deadline"),
+        }
+    }
+}
+
+fn acquire_lease(controller: &ControllerSession) -> AutomationLease {
+    let cancellation = CancellationToken::root();
+    match block_on(controller.acquire_automation_lease(&cancellation, None)) {
+        AutomationLeaseAcquireOutcome::Granted(lease) => lease,
+        AutomationLeaseAcquireOutcome::Cancelled => {
+            panic!("Automation lease acquire was cancelled")
+        }
+        AutomationLeaseAcquireOutcome::Deadline => {
+            panic!("Automation lease acquire reached a deadline")
+        }
+        AutomationLeaseAcquireOutcome::Closed => {
+            panic!("Controller closed before Automation lease acquire")
+        }
+        AutomationLeaseAcquireOutcome::Failure(error) => {
+            panic!("Automation lease acquire failed: {error}")
+        }
+    }
 }
 
 fn close_connected(runtime: &Runtime, controller: &ControllerSession) {
@@ -330,9 +381,7 @@ fn save_partial_failure_reports_completed_chunks_and_releases_the_lane() {
     assert_eq!(snapshot.commands.len(), 4);
     assert_eq!(snapshot.commands[3], [0xa5, 0x81, 0xa5, 0x81, 0xa5, 0x81]);
     assert_eq!(snapshot.amiibo_chunks.len(), 1);
-    let lease = controller
-        .acquire_automation_lease()
-        .expect("Automation lease");
+    let lease = acquire_lease(&controller);
     let busy = controller
         .select_amiibo(0, AmiiboSelectOptions::default())
         .expect("busy select operation");
@@ -341,7 +390,7 @@ fn save_partial_failure_reports_completed_chunks_and_releases_the_lane() {
         busy.snapshot().error.expect("lease busy").code(),
         ErrorCode::ResourceBusy
     );
-    lease.release();
+    block_on(lease.neutralize_and_release()).expect("settled Automation lease release");
 
     simulator.push_ack(Ch32AckBehavior::Reply(0x00));
     simulator.push_ack(Ch32AckBehavior::NoReply);

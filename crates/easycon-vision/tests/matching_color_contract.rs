@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
+use std::time::{Duration, Instant};
 
 use easycon_native_sys::NativeErrorKind;
 use easycon_runtime::{CancellationToken, CloseOutcome, Runtime, VirtualClock};
@@ -7,6 +8,42 @@ use easycon_vision::{
     TemplateMethod, VisionErrorKind, VisionLimits, match_edge, match_template,
     native_resource_counts, preprocess_edge,
 };
+
+static NATIVE_COUNTER_GATE: RwLock<()> = RwLock::new(());
+
+fn shared_native_gate() -> RwLockReadGuard<'static, ()> {
+    let started = Instant::now();
+    loop {
+        match NATIVE_COUNTER_GATE.try_read() {
+            Ok(guard) => return guard,
+            Err(TryLockError::Poisoned(error)) => return error.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                assert!(
+                    started.elapsed() < Duration::from_secs(2),
+                    "native counter gate did not release before the bounded test deadline"
+                );
+                std::thread::yield_now();
+            }
+        }
+    }
+}
+
+fn exclusive_native_counter_gate() -> RwLockWriteGuard<'static, ()> {
+    let started = Instant::now();
+    loop {
+        match NATIVE_COUNTER_GATE.try_write() {
+            Ok(guard) => return guard,
+            Err(TryLockError::Poisoned(error)) => return error.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                assert!(
+                    started.elapsed() < Duration::from_secs(2),
+                    "native counter gate did not release before the bounded test deadline"
+                );
+                std::thread::yield_now();
+            }
+        }
+    }
+}
 
 struct TestNative {
     runtime: Runtime,
@@ -121,6 +158,7 @@ fn assert_close(actual: f32, expected: f32) {
 
 #[test]
 fn normalized_template_modes_keep_location_and_frozen_score_mapping() {
+    let _native_gate = shared_native_gate();
     let native = TestNative::new();
     let search = gray_image("template-search", 6, 5);
     let target = gray_image("template-target", 3, 3);
@@ -148,6 +186,7 @@ fn normalized_template_modes_keep_location_and_frozen_score_mapping() {
 
 #[test]
 fn edge_preprocess_pixels_and_final_match_are_independently_fixed() {
+    let _native_gate = shared_native_gate();
     let native = TestNative::new();
     let search = bgr_from_gray("edge-search", 18, 17);
     let target = bgr_from_gray("edge-target", 11, 11);
@@ -199,6 +238,7 @@ fn edge_preprocess_pixels_and_final_match_are_independently_fixed() {
 
 #[test]
 fn hsv_normal_wrap_full_none_ratio_threshold_and_absolute_bbox_are_exact() {
+    let _native_gate = shared_native_gate();
     let native = TestNative::new();
     let image = Image::new(
         Arc::from(fixture("hsv")),
@@ -268,6 +308,7 @@ fn hsv_normal_wrap_full_none_ratio_threshold_and_absolute_bbox_are_exact() {
 
 #[test]
 fn matching_and_color_validation_are_deterministic_and_leak_free() {
+    let _native_gate = exclusive_native_counter_gate();
     let native = TestNative::new();
     let baseline = native_resource_counts().expect("baseline");
     let search = gray_image("template-search", 6, 5);

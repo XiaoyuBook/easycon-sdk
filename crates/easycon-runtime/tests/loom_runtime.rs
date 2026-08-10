@@ -679,6 +679,83 @@ fn accepted_claim_is_stable_against_late_cancellation() {
         assert_eq!(state.winner(), Some(TerminalWinnerKind::Success));
         assert!(state.committed());
     });
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum DeferredClaimPhase {
+        Held,
+        Abandoned,
+        Finishing,
+        Committed,
+    }
+
+    struct DeferredClaimModel {
+        arbiter: TerminalArbiterState,
+        phase: DeferredClaimPhase,
+        finishing_observed: bool,
+    }
+
+    loom::model(|| {
+        let shared = Arc::new((
+            Mutex::new(DeferredClaimModel {
+                arbiter: TerminalArbiterState::new(1, None),
+                phase: DeferredClaimPhase::Held,
+                finishing_observed: false,
+            }),
+            Condvar::new(),
+        ));
+        {
+            let mut state = shared.0.lock().expect("deferred claim model");
+            assert_eq!(
+                state.arbiter.claim(
+                    1,
+                    TerminalEvidenceKind::EffectAccepted,
+                    TerminalWinnerKind::Success,
+                ),
+                TerminalClaimResult::Claimed
+            );
+            // Claim token Drop marks the frozen winner abandoned; it does not commit a result.
+            state.phase = DeferredClaimPhase::Abandoned;
+        }
+
+        let reclaim_shared = Arc::clone(&shared);
+        let reclaim = thread::spawn(move || {
+            let (state_lock, changed) = &*reclaim_shared;
+            let mut guard = state_lock.lock().expect("deferred claim model");
+            assert_eq!(guard.phase, DeferredClaimPhase::Abandoned);
+            // The original owner restores this exact frozen winner without a second arbiter claim.
+            guard.phase = DeferredClaimPhase::Finishing;
+            changed.notify_all();
+            while !guard.finishing_observed {
+                guard = changed.wait(guard).expect("deferred claim model");
+            }
+
+            assert!(guard.arbiter.commit(1, TerminalWinnerKind::Success));
+            guard.phase = DeferredClaimPhase::Committed;
+            changed.notify_all();
+        });
+        let (state_lock, changed) = &*shared;
+        let mut state = state_lock.lock().expect("deferred claim model");
+        while state.phase != DeferredClaimPhase::Finishing {
+            state = changed.wait(state).expect("deferred claim model");
+        }
+        assert_eq!(
+            state.arbiter.claim(
+                1,
+                TerminalEvidenceKind::EffectAccepted,
+                TerminalWinnerKind::Success,
+            ),
+            TerminalClaimResult::Observe
+        );
+        state.finishing_observed = true;
+        changed.notify_all();
+        while state.phase != DeferredClaimPhase::Committed {
+            state = changed.wait(state).expect("deferred claim model");
+        }
+        assert_eq!(state.arbiter.winner(), Some(TerminalWinnerKind::Success));
+        assert!(state.arbiter.committed());
+        drop(state);
+        reclaim.join().expect("same-owner reclaim");
+    });
 }
 
 #[test]

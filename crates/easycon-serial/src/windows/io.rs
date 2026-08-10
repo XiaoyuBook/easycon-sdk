@@ -181,12 +181,14 @@ impl WindowsByteIo {
             }
         };
         if started != 0 {
-            return normalize_progress(overlapped_result(
+            let transferred = normalize_progress(overlapped_result(
                 &self.shared,
                 overlapped.as_mut(),
                 operation,
                 false,
-            )?);
+            )?)?;
+            request.publish_final_write_acceptance(transferred)?;
+            return Ok(transferred);
         }
         // SAFETY: sampled immediately after ReadFile/WriteFile on the same thread.
         let start_error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
@@ -227,7 +229,9 @@ impl WindowsByteIo {
                 );
             }),
         };
-        normalize_progress(transferred)
+        let transferred = normalize_progress(transferred)?;
+        request.publish_final_write_acceptance(transferred)?;
+        Ok(transferred)
     }
 }
 
@@ -458,11 +462,27 @@ fn cancel_and_settle(
     let cancel_error = if unsafe { CancelIoEx(shared.handle.raw(), overlapped) } == 0 {
         // SAFETY: sampled immediately after CancelIoEx on the same thread.
         let code = unsafe { windows_sys::Win32::Foundation::GetLastError() };
-        (code != ERROR_NOT_FOUND).then(|| from_code("CancelIoEx(serial I/O)", code))
+        cancel_request_error(code)
     } else {
         None
     };
-    match overlapped_result(shared, overlapped, operation, true) {
+    settle_cancelled_completion(
+        cancel_error,
+        overlapped_result(shared, overlapped, operation, true),
+        interruption,
+    )
+}
+
+fn cancel_request_error(code: u32) -> Option<SerialError> {
+    (code != ERROR_NOT_FOUND).then(|| from_code("CancelIoEx(serial I/O)", code))
+}
+
+fn settle_cancelled_completion(
+    cancel_error: Option<SerialError>,
+    completion: Result<u32, SerialError>,
+    interruption: SerialError,
+) -> Result<u32, SerialError> {
+    match completion {
         Ok(transferred) => Ok(transferred),
         Err(error) if error.os_code() == Some(ERROR_OPERATION_ABORTED) => Err(interruption),
         Err(error) => Err(cancel_error.unwrap_or(error)),
@@ -616,6 +636,18 @@ mod tests {
         );
     }
 
+    // conformance: controller.lease.serial-cancel-not-found
+    #[test]
+    fn cancel_not_found_still_consumes_a_full_overlapped_completion() {
+        let interruption = SerialError::new(SerialErrorKind::Cancelled, "close requested");
+        assert!(cancel_request_error(ERROR_NOT_FOUND).is_none());
+        assert_eq!(
+            settle_cancelled_completion(cancel_request_error(ERROR_NOT_FOUND), Ok(8), interruption)
+                .expect("final eight-byte completion wins over late cancellation"),
+            8
+        );
+    }
+
     // conformance: phase2a.serial.unwind-settle
     #[test]
     fn unwind_cleanup_runs_before_the_original_panic_is_resumed() {
@@ -641,6 +673,7 @@ mod tests {
             deadline_ns: 2,
             cancellation: CancellationToken::root(),
             resource_cancellation: CancellationToken::root(),
+            final_write_settlement: None,
         };
 
         let error = match WindowsByteIoFactory.open(&descriptor, 115_200, request) {

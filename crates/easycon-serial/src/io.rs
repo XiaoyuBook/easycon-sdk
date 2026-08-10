@@ -1,7 +1,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use easycon_controller::WriteContext;
+use easycon_controller::{WriteContext, WriteSettlement};
 use easycon_runtime::{CancellationToken, Clock};
 
 use crate::SerialPortDescriptor;
@@ -40,6 +40,7 @@ pub struct SerialError {
     kind: SerialErrorKind,
     message: Arc<str>,
     os_code: Option<u32>,
+    backend_proved_zero_effect: bool,
 }
 
 impl SerialError {
@@ -50,6 +51,18 @@ impl SerialError {
             kind,
             message: message.into(),
             os_code: None,
+            backend_proved_zero_effect: false,
+        }
+    }
+
+    /// Creates an error after the backend proved that this byte-I/O attempt accepted no bytes.
+    #[must_use]
+    pub fn zero_effect(kind: SerialErrorKind, message: impl Into<Arc<str>>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            os_code: None,
+            backend_proved_zero_effect: true,
         }
     }
 
@@ -60,6 +73,7 @@ impl SerialError {
             kind,
             message: message.into(),
             os_code: Some(os_code),
+            backend_proved_zero_effect: false,
         }
     }
 
@@ -83,6 +97,12 @@ impl SerialError {
     #[must_use]
     pub const fn os_code(&self) -> Option<u32> {
         self.os_code
+    }
+
+    /// Returns whether the concrete backend proved this failed call accepted no bytes.
+    #[must_use]
+    pub const fn backend_proved_zero_effect(&self) -> bool {
+        self.backend_proved_zero_effect
     }
 }
 
@@ -111,6 +131,21 @@ pub struct ByteIoRequest {
     pub cancellation: CancellationToken,
     /// Cancellation owned by the Controller resource.
     pub resource_cancellation: CancellationToken,
+    /// Final-byte gate carried only by one Controller logical write.
+    pub final_write_settlement: Option<ByteIoFinalWriteSettlement>,
+}
+
+/// Typed final-byte settlement capability carried from the Controller transport to one Byte-I/O
+/// backend call.
+///
+/// The capability is inert for partial completions. A concrete byte backend must consume its own
+/// physical completion count and invoke [`ByteIoRequest::publish_final_write_acceptance`] before
+/// exposing a complete logical report to its caller, telemetry, or a test observer.
+#[derive(Clone)]
+pub struct ByteIoFinalWriteSettlement {
+    settlement: WriteSettlement,
+    accepted_before: usize,
+    total_len: usize,
 }
 
 /// Logical purpose carried across injectable byte-I/O calls without interpreting device state.
@@ -131,22 +166,85 @@ pub enum ByteIoOperation {
 }
 
 impl ByteIoRequest {
-    /// Returns cancellation or deadline failure before entering a backend call.
+    /// Returns a zero-effect cancellation or deadline failure before entering a backend call.
     #[must_use]
     pub fn interruption(&self) -> Option<SerialError> {
         if self.cancellation.is_cancelled() || self.resource_cancellation.is_cancelled() {
-            Some(SerialError::new(
+            Some(SerialError::zero_effect(
                 SerialErrorKind::Cancelled,
                 "serial byte I/O was cancelled",
             ))
         } else if self.clock.now_ns() >= self.deadline_ns {
-            Some(SerialError::new(
+            Some(SerialError::zero_effect(
                 SerialErrorKind::DeadlineExceeded,
                 "serial byte I/O deadline elapsed",
             ))
         } else {
             None
         }
+    }
+
+    /// Attaches the final-byte settlement gate to a Controller write fragment.
+    #[must_use]
+    pub(crate) fn with_final_write_settlement(
+        mut self,
+        settlement: WriteSettlement,
+        accepted_before: usize,
+        total_len: usize,
+    ) -> Self {
+        self.final_write_settlement = Some(ByteIoFinalWriteSettlement {
+            settlement,
+            accepted_before,
+            total_len,
+        });
+        self
+    }
+
+    /// Reserves and publishes a final logical write at this backend's physical completion point.
+    ///
+    /// Callers must invoke this after they have consumed the exact count for `written`, while they
+    /// still exclusively own that completion, and after releasing backend-local locks. It samples
+    /// `Clock` only after reservation, then invokes the Controller hook without any Byte-I/O lock
+    /// held. Partial calls are intentionally inert.
+    pub fn publish_final_write_acceptance(&self, written: usize) -> Result<(), SerialError> {
+        let Some(final_write) = &self.final_write_settlement else {
+            return Ok(());
+        };
+        let accepted = final_write
+            .accepted_before
+            .checked_add(written)
+            .ok_or_else(|| {
+                SerialError::new(
+                    SerialErrorKind::Protocol,
+                    "serial final-byte settlement count overflowed",
+                )
+            })?;
+        if accepted > final_write.total_len {
+            return Err(SerialError::new(
+                SerialErrorKind::Protocol,
+                "serial backend completion exceeded its logical report length",
+            ));
+        }
+        if accepted != final_write.total_len {
+            return Ok(());
+        }
+        if !final_write.settlement.reserve_full_acceptance() {
+            return Err(SerialError::new(
+                SerialErrorKind::Io,
+                "serial backend rejected final-byte settlement reservation",
+            ));
+        }
+        let accepted_at_ns = self.clock.now_ns();
+        if !final_write
+            .settlement
+            .publish_reserved_full_acceptance(accepted_at_ns)
+        {
+            return Err(SerialError::new(
+                SerialErrorKind::Io,
+                "serial backend could not publish final-byte settlement",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -156,6 +254,10 @@ pub trait ByteIo: Send + 'static {
     fn read(&mut self, buffer: &mut [u8], request: ByteIoRequest) -> Result<usize, SerialError>;
 
     /// Writes a non-empty prefix or returns a stable failure.
+    ///
+    /// Implementations use [`SerialError::zero_effect`] only when they have consumed the
+    /// underlying completion and proved the failed call accepted no bytes. All other errors leave
+    /// framing uncertain for the Controller transport to settle.
     fn write(&mut self, buffer: &[u8], request: ByteIoRequest) -> Result<usize, SerialError>;
 
     /// Discards bytes received before a new request/response generation starts.

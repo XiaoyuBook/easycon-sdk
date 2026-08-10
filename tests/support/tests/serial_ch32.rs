@@ -3,14 +3,17 @@ use std::time::{Duration, Instant};
 
 use easycon_controller::{
     ConnectOptions, ControllerAction, ControllerOptions, ControllerSession, ControllerState,
-    SwitchReport, WriteKind,
+    SwitchReport, TransportError, TransportErrorKind, WriteKind,
 };
 use easycon_model::{Button, ErrorCode};
 use easycon_runtime::{
     Clock, Operation, OperationState, Runtime, VirtualClock, WaitResult, WaitTimeout,
 };
 use easycon_serial::{SerialErrorKind, SerialPortDescriptor};
-use easycon_test_support::{Ch32AckBehavior, Ch32ByteSimulator, Ch32HandshakeBehavior};
+use easycon_test_support::{
+    Ch32AckBehavior, Ch32ByteSimulator, Ch32HandshakeBehavior, FakeControllerTransport,
+    HandshakeOutcome,
+};
 
 fn create_controller(
     _clock: &Arc<VirtualClock>,
@@ -47,6 +50,30 @@ fn connected() -> (
     wait_terminal(&connect);
     assert_eq!(connect.snapshot().state, OperationState::Succeeded);
     (clock, runtime, simulator, controller)
+}
+
+fn connected_fake() -> (
+    Arc<VirtualClock>,
+    Runtime,
+    FakeControllerTransport,
+    ControllerSession,
+) {
+    let clock = Arc::new(VirtualClock::default());
+    let runtime = Runtime::new(clock.clone());
+    let fake = FakeControllerTransport::new(clock.clone());
+    fake.push_handshake(115_200, HandshakeOutcome::Success { elapsed_ns: 0 });
+    let controller = ControllerSession::new(
+        &runtime,
+        Box::new(fake.clone()),
+        ControllerOptions::default(),
+    )
+    .expect("Controller over fake transport");
+    let connect = controller
+        .connect(ConnectOptions::default())
+        .expect("fake connect operation");
+    wait_terminal(&connect);
+    assert_eq!(connect.snapshot().state, OperationState::Succeeded);
+    (clock, runtime, fake, controller)
 }
 
 fn wait_terminal(operation: &Operation) {
@@ -424,4 +451,100 @@ fn zero_progress_write_fails_only_after_connected_neutral_cleanup() {
     assert_eq!(snapshot.reports[0].bytes, SwitchReport::NEUTRAL.encode());
     assert_eq!(controller.snapshot().state, ControllerState::Connected);
     close_controller(&clock, &runtime, &controller);
+}
+
+// conformance: controller.lease.fake-serial-parity
+#[test]
+fn fake_and_serial_adapter_match_reusable_and_partial_write_settlement() {
+    let (fake_clock, fake_runtime, fake, fake_controller) = connected_fake();
+    fake.fail_write_call(
+        1,
+        TransportError::reusable_stream(TransportErrorKind::Io, "fake backend proved zero effect"),
+    );
+    let fake_zero_effect = fake_controller
+        .direct(ControllerAction::ButtonDown(Button::A))
+        .expect("fake zero-effect direct operation");
+    wait_terminal(&fake_zero_effect);
+    assert_eq!(fake_zero_effect.snapshot().state, OperationState::Failed);
+    assert_eq!(fake_controller.snapshot().state, ControllerState::Connected);
+    assert_eq!(fake.accepted_writes().len(), 1);
+    assert_eq!(
+        fake.accepted_writes()[0].context.kind,
+        WriteKind::Neutralize
+    );
+
+    let (serial_clock, serial_runtime, simulator, serial_controller) = connected();
+    simulator.zero_next_write();
+    let serial_zero_effect = serial_controller
+        .direct(ControllerAction::ButtonDown(Button::A))
+        .expect("serial zero-effect direct operation");
+    wait_terminal(&serial_zero_effect);
+    assert_eq!(serial_zero_effect.snapshot().state, OperationState::Failed);
+    assert_eq!(
+        serial_zero_effect
+            .snapshot()
+            .error
+            .expect("serial zero-effect error")
+            .code(),
+        fake_zero_effect
+            .snapshot()
+            .error
+            .expect("fake zero-effect error")
+            .code()
+    );
+    assert_eq!(
+        serial_controller.snapshot().state,
+        ControllerState::Connected
+    );
+    assert_eq!(simulator.snapshot().reports.len(), 1);
+    assert_eq!(
+        simulator.snapshot().reports[0].context.kind,
+        WriteKind::Neutralize
+    );
+
+    close_controller(&fake_clock, &fake_runtime, &fake_controller);
+    close_controller(&serial_clock, &serial_runtime, &serial_controller);
+
+    let (_fake_clock, fake_runtime, fake, fake_controller) = connected_fake();
+    fake.set_maximum_write_chunk(2);
+    fake.fail_write_call(
+        2,
+        TransportError::new(TransportErrorKind::Io, "fake partial write failure"),
+    );
+    let fake_partial = fake_controller
+        .direct(ControllerAction::ButtonDown(Button::A))
+        .expect("fake partial direct operation");
+    wait_terminal(&fake_partial);
+    assert_eq!(fake_partial.snapshot().state, OperationState::Failed);
+    assert_eq!(
+        fake_controller.snapshot().state,
+        ControllerState::Disconnected
+    );
+    assert!(fake.is_closed(), "fake partial prefix closes the stream");
+    assert!(fake.accepted_writes().is_empty());
+
+    let (_serial_clock, serial_runtime, simulator, serial_controller) = connected();
+    simulator.set_maximum_write_chunk(2);
+    simulator.fail_controller_write_after_bytes(2, SerialErrorKind::Io);
+    let serial_partial = serial_controller
+        .direct(ControllerAction::ButtonDown(Button::A))
+        .expect("serial partial direct operation");
+    wait_terminal(&serial_partial);
+    assert_eq!(
+        serial_partial.snapshot().state,
+        fake_partial.snapshot().state
+    );
+    assert_eq!(
+        serial_controller.snapshot().state,
+        ControllerState::Disconnected
+    );
+    let snapshot = simulator.snapshot();
+    assert!(snapshot.reports.is_empty());
+    assert_eq!(snapshot.active_streams, 0);
+    assert_eq!(snapshot.closed_streams, 1);
+
+    fake_controller.close();
+    serial_controller.close();
+    fake_runtime.close().expect("fake Runtime close");
+    serial_runtime.close().expect("serial Runtime close");
 }

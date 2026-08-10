@@ -51,6 +51,22 @@
                 "test": { "type": "string" }
               }
             }
+          },
+          "obligations": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["id", "adr", "expect", "test", "marker"],
+              "properties": {
+                "id": { "type": "string" },
+                "adr": { "type": "string" },
+                "expect": { "type": "string" },
+                "test": { "type": "string" },
+                "marker": { "type": "string" }
+              }
+            }
           }
         }
       }

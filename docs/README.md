@@ -78,6 +78,7 @@
 - [ADR-0022：Windows Workspace policy identity 与 evidence v2 合同（Accepted / Effective）](decisions/0022-windows-workspace-policy-identity-and-evidence-v2.md)
 - [ADR-0023：v1 宿主语言 SDK 路线与 ECS 延后（Accepted / Effective）](decisions/0023-v1-host-language-sdk-roadmap-and-ecs-deferral.md)
 - [ADR-0024：重新冻结 Runtime R0-v2 实现基线（Refrozen Runtime Implementation / Effective）](decisions/0024-runtime-r0-v2-refreeze.md)
+- [ADR-0025：Stage 1 开发 working implementation base（Not a refreeze）](decisions/0025-stage1-working-implementation-base.md)
 
 ## v1 固定范围
 
@@ -96,9 +97,13 @@ v1 路线由 [ADR-0023](decisions/0023-v1-host-language-sdk-roadmap-and-ecs-defe
 3. C++、.NET、Python、Node.js/TypeScript SDK，其中 C++ 优先形成可用候选。
 4. 打包、真实硬件、ABI、供应链与发布资格。
 
-当前处于第一阶段的软件核心收口。Runtime 的通用修复已完成 fixed-SHA review、集成和 R0-v2 refreeze；Controller
-settlement 是下一项软件缺口；Vision 已有源码候选，但真实硬件仍未验证。当前产品第一阶段仍未完成，C++ SDK 尚未进入实施，
-C++ 可用候选也不等于四语言 GA。
+Runtime、Controller 与 Vision 的 Stage 1 初版软件开发已经形成 builder candidate：Runtime 的 operation/close
+settlement、Controller 的 backend-final-byte settlement/lease/`ActionSequence`，以及 Vision 的 native/capture
+software lifecycle 都由 fake 或 synthetic 路径验证。该候选不关闭或重新冻结 Stage 1，也不声明真实硬件资格；C++ SDK
+尚未进入实施，C++ 可用候选也不等于四语言 GA。
+
+Controller D1 以 [ADR-0025](decisions/0025-stage1-working-implementation-base.md) 记录的 working implementation
+base 完成 builder 开发候选；该记录和候选都不是 Runtime、Controller 或 Stage 1 的重新冻结或 closeout 声明。
 
 现有 ECS spec、fixture、conformance、validator、guards 和 `easycon-ecs` crate 继续是 dormant workspace maintenance
 资产：现有健康门禁继续维护它们，但它们不属于 v1 public ABI、语言 SDK 的共同验收、硬件/soak 或发布资格。ADR-0017、

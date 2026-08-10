@@ -74,10 +74,12 @@ easycon sdk/
 退出门槛：核心行为、所有权与关闭顺序由实现测试覆盖；ActionSequence 的精确时间线经过核心校验；Controller 与 Vision
 不依赖语言 binding 才能运行。软件收口不把真实设备资格、四语言 package 或正式 ABI 冻结提前声明为完成。
 
-当前状态：此阶段正在进行。Runtime R0-v2 已完成 fixed-SHA review、集成和
-[独立重新冻结](../decisions/0024-runtime-r0-v2-refreeze.md)，满足 ADR-0020 要求的 separate Phase 1 refreeze。因此 D1
-Controller 可以恢复，但仍须完整完成 D1 实现以及 D2 fixed-SHA review/refreeze；既有 D1 RED 不会因此自动变绿。Controller
-settlement 仍是下一项软件缺口；Vision 已有源码候选，但 capture hardware 仍未验证；当前产品第一阶段仍未完成。
+当前状态：Runtime R0-v2 已完成 fixed-SHA review、集成和
+[独立重新冻结](../decisions/0024-runtime-r0-v2-refreeze.md)，满足 ADR-0020 要求的 separate Phase 1 refreeze。基于
+[ADR-0025](../decisions/0025-stage1-working-implementation-base.md) 的 builder candidate 已完成 D1 所需的
+Controller/serial settlement，并为 backend final-byte claim 窄扩展 Runtime deferred finish transaction；Vision 以既有
+native/capture 软件路径完成同一候选的集成验证。该状态只表示 Stage 1 初版软件开发候选已经完成，不构成 D2 independent
+review/refreeze、Stage 1 closeout 或真实 capture hardware 资格；这些后续决议仍未发生。
 
 ### 公共 C ABI 与 canonical native bundle
 

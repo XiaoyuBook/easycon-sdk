@@ -150,6 +150,33 @@ pub struct OperationSettlementOwner {
     owner_id: u64,
 }
 
+/// Result of attempting to fix the winner of an owned terminal transaction.
+///
+/// Claiming only seals the winner and child admission. Call
+/// [`OperationSettlementClaim::finish`] after domain bookkeeping and cleanup are ready to
+/// commit the terminal result.
+pub enum ClaimOutcome {
+    /// This caller fixed the winner and owns the deferred terminal transaction.
+    Claimed(OperationSettlementClaim),
+    /// Another owner already fixed a winner. This path never waits for terminal completion.
+    Observe,
+    /// The caller or its evidence cannot claim this operation.
+    Rejected,
+    /// The operation had already committed a terminal state.
+    Closed,
+}
+
+/// One non-cloneable deferred terminal transaction returned by a successful claim.
+///
+/// Dropping a claim never synthesizes success. It preserves the frozen winner and marks the
+/// transaction abandoned so Runtime close can fail closed rather than wait forever.
+#[must_use = "a claimed terminal transaction must be finished or will fail closed"]
+pub struct OperationSettlementClaim {
+    inner: Arc<OperationInner>,
+    owner_id: u64,
+    active: bool,
+}
+
 pub(crate) struct OperationInner {
     id: OperationId,
     runtime: std::sync::Weak<RuntimeInner>,
@@ -202,8 +229,27 @@ struct OperationOwnerData {
     cleanup: Option<OwnerCleanup>,
     on_cleanup_settled: Option<OwnerCleanupSettled>,
     handoff_record: Option<(SettlementEvidence, TerminalCandidate)>,
+    claimed: Option<ClaimedTerminalTransaction>,
 }
 
+struct ClaimedTerminalTransaction {
+    owner_id: u64,
+    evidence: SettlementEvidence,
+    candidate: TerminalCandidate,
+    primary: TerminalPrimary,
+    winner: TerminalWinnerKind,
+    propagation: Option<crate::cancellation::CancellationPropagation>,
+    state: ClaimedTerminalState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClaimedTerminalState {
+    Held,
+    Finishing,
+    Abandoned,
+}
+
+#[derive(Clone)]
 enum TerminalPrimary {
     Success(OperationValue),
     Failure(EasyConError),
@@ -298,6 +344,7 @@ impl Operation {
                         cleanup: Some(cleanup),
                         on_cleanup_settled: Some(on_cleanup_settled),
                         handoff_record: None,
+                        claimed: None,
                     }),
                 }),
                 changed: Condvar::new(),
@@ -400,6 +447,15 @@ impl Operation {
         self.inner.finish_failure(error)
     }
 
+    /// Commits a proven cleanup failure even when cancellation was already requested.
+    ///
+    /// This narrow path is for resource cleanup failures whose contract requires the retained
+    /// first failure to prevail over ordinary cancellation precedence. Owned operations must use
+    /// their [`OperationSettlementOwner`] claim transaction instead.
+    pub fn fail_strict_cleanup(&self, error: EasyConError) -> TransitionOutcome {
+        self.inner.finish_strict_cleanup_failure(error)
+    }
+
     /// Runs owner cleanup outside the operation state lock, then commits failure once.
     ///
     /// A cleanup panic is isolated and reports [`TransitionOutcome::CleanupFailed`] without
@@ -438,13 +494,36 @@ impl Operation {
 }
 
 impl OperationSettlementOwner {
-    /// Claims the unique winner from settlement evidence, runs shared cleanup, and commits once.
+    /// Fixes the unique winner from settlement evidence without committing a terminal result.
+    ///
+    /// The claim critical section performs no cleanup, event publication, wake, Clock access, or
+    /// foreign callback. A cancellation winner publishes its public `Cancelling` state only after
+    /// that critical section ends. The returned token owns the deferred finish transaction.
+    pub fn claim(
+        &self,
+        evidence: SettlementEvidence,
+        candidate: TerminalCandidate,
+    ) -> ClaimOutcome {
+        OperationInner::claim_owned(&self.inner, self.owner_id, evidence, candidate)
+    }
+
+    /// Claims the unique winner, runs shared cleanup, and commits once.
+    ///
+    /// This remains a compatibility wrapper for ordinary Runtime owner users. Controller report
+    /// paths use [`Self::claim`] and finish only after their post-write bookkeeping is durable.
     pub fn settle(
         self,
         evidence: SettlementEvidence,
         candidate: TerminalCandidate,
     ) -> TransitionOutcome {
-        self.inner.settle_owned(self.owner_id, evidence, candidate)
+        match self.claim(evidence, candidate) {
+            ClaimOutcome::Claimed(claim) => claim.finish(Ok(())),
+            // `claim` is explicitly nonblocking, but the established `settle` API only returns
+            // after the competing terminal transaction has committed.
+            ClaimOutcome::Observe => self.inner.observe_terminal_completion(),
+            ClaimOutcome::Rejected => TransitionOutcome::Invalid,
+            ClaimOutcome::Closed => TransitionOutcome::AlreadyTerminal,
+        }
     }
 
     /// Stores mutually exclusive evidence in the pre-registered transferable record.
@@ -466,6 +545,25 @@ impl OperationSettlementOwner {
 
     pub(crate) fn bind_task(&self, task_id: TaskId) -> bool {
         self.inner.bind_owner_task(self.owner_id, task_id)
+    }
+}
+
+impl OperationSettlementClaim {
+    /// Completes the frozen transaction after domain-specific cleanup has settled.
+    ///
+    /// A domain error is retained as the first cleanup failure while Runtime still executes its
+    /// pre-registered cleanup and observer exactly once.
+    pub fn finish(mut self, domain_cleanup: Result<(), EasyConError>) -> TransitionOutcome {
+        self.active = false;
+        self.inner.finish_claimed(self.owner_id, domain_cleanup)
+    }
+}
+
+impl Drop for OperationSettlementClaim {
+    fn drop(&mut self) {
+        if self.active {
+            self.inner.abandon_claimed(self.owner_id);
+        }
     }
 }
 
@@ -545,6 +643,34 @@ impl OperationInner {
         )
     }
 
+    fn finish_strict_cleanup_failure(&self, error: EasyConError) -> TransitionOutcome {
+        let propagation = {
+            let mut data = self.lock_state();
+            if data.state.is_terminal() {
+                return TransitionOutcome::AlreadyTerminal;
+            }
+            if data.owner.is_some() || data.terminal_in_progress {
+                return TransitionOutcome::Invalid;
+            }
+            match data.state {
+                OperationState::Pending | OperationState::Running | OperationState::Cancelling => {}
+                OperationState::Succeeded | OperationState::Failed | OperationState::Cancelled => {
+                    unreachable!("terminal states returned before strict cleanup failure")
+                }
+            }
+            data.terminal_in_progress = true;
+            self.cancellation.deactivate_deferred()
+        };
+        self.finish_claimed_terminal(
+            TerminalPrimary::Failure(error),
+            None,
+            propagation,
+            || Ok(()),
+            |_| {},
+            Ok(()),
+        )
+    }
+
     fn finish_cancelled(&self) -> TransitionOutcome {
         self.finish_legacy_after_cleanup(LegacyTerminalRequest::Cancellation, || Ok(()), |_| {})
     }
@@ -598,66 +724,164 @@ impl OperationInner {
         data.terminal_in_progress = true;
         let propagation = self.cancellation.deactivate_deferred();
         drop(data);
-        self.finish_claimed_terminal(primary, None, propagation, cleanup, on_cleanup_settled)
+        self.finish_claimed_terminal(
+            primary,
+            None,
+            propagation,
+            cleanup,
+            on_cleanup_settled,
+            Ok(()),
+        )
     }
 
-    fn settle_owned(
-        &self,
+    fn claim_owned(
+        self: &Arc<Self>,
         owner_id: u64,
         evidence: SettlementEvidence,
         candidate: TerminalCandidate,
-    ) -> TransitionOutcome {
+    ) -> ClaimOutcome {
         let mut data = self.lock_state();
         if data.state.is_terminal() {
-            return TransitionOutcome::AlreadyTerminal;
+            return ClaimOutcome::Closed;
         }
-        let Some(primary) = primary_from_candidate(candidate, data.state, data.cancellation_reason)
+        if let Some(owner) = data.owner.as_mut()
+            && let Some(claimed) = owner.claimed.as_mut()
+        {
+            match claimed.state {
+                ClaimedTerminalState::Abandoned
+                    if claimed.owner_id == owner_id
+                        && claimed.evidence == evidence
+                        && claimed.candidate == candidate =>
+                {
+                    // The arbiter winner is already frozen. The original owner may only recover
+                    // this exact abandoned transaction; it does not make a second arbiter claim.
+                    claimed.state = ClaimedTerminalState::Held;
+                    return ClaimOutcome::Claimed(OperationSettlementClaim {
+                        inner: Arc::clone(self),
+                        owner_id,
+                        active: true,
+                    });
+                }
+                ClaimedTerminalState::Finishing | ClaimedTerminalState::Held => {
+                    return ClaimOutcome::Observe;
+                }
+                ClaimedTerminalState::Abandoned => return ClaimOutcome::Rejected,
+            }
+        }
+        let Some(primary) =
+            primary_from_candidate(candidate.clone(), data.state, data.cancellation_reason)
         else {
-            return TransitionOutcome::Invalid;
+            return ClaimOutcome::Rejected;
         };
         let winner = primary.winner_kind();
         let claim = {
             let Some(owner) = data.owner.as_mut() else {
-                return TransitionOutcome::Invalid;
+                return ClaimOutcome::Rejected;
             };
             owner.arbiter.claim(owner_id, evidence.kind(), winner)
         };
         match claim {
             TerminalClaimResult::Claimed => {}
-            TerminalClaimResult::Observe => {
-                drop(data);
-                return self.observe_terminal_completion();
-            }
+            TerminalClaimResult::Observe => return ClaimOutcome::Observe,
             TerminalClaimResult::RejectedOwner | TerminalClaimResult::RejectedEvidence => {
-                return TransitionOutcome::Invalid;
+                return ClaimOutcome::Rejected;
             }
         }
         data.terminal_in_progress = true;
-        if winner == TerminalWinnerKind::Cancellation {
-            data.state = OperationState::Cancelling;
-            self.publish(&data);
-        }
+        // This only seals cancellation admission. Propagation remains part of the deferred finish;
+        // a cancellation winner publishes its public state after the claim critical section.
+        let propagation = self.cancellation.deactivate_deferred();
+        let cancellation_winner = matches!(&primary, TerminalPrimary::Cancellation(_));
         let owner = data
             .owner
             .as_mut()
             .expect("claimed owned operation retains its authority");
-        let cleanup = owner
-            .cleanup
-            .take()
-            .expect("owned operation cleanup is consumed once");
-        let on_cleanup_settled = owner
-            .on_cleanup_settled
-            .take()
-            .expect("owned operation settlement observer is consumed once");
-        let propagation = self.cancellation.deactivate_deferred();
+        debug_assert!(owner.claimed.is_none());
+        owner.claimed = Some(ClaimedTerminalTransaction {
+            owner_id,
+            evidence,
+            candidate,
+            primary,
+            winner,
+            propagation: Some(propagation),
+            state: ClaimedTerminalState::Held,
+        });
+        let claim = OperationSettlementClaim {
+            inner: Arc::clone(self),
+            owner_id,
+            active: true,
+        };
         drop(data);
+        if cancellation_winner {
+            self.publish_claimed_cancellation();
+        }
+        ClaimOutcome::Claimed(claim)
+    }
+
+    fn finish_claimed(
+        &self,
+        owner_id: u64,
+        domain_cleanup: Result<(), EasyConError>,
+    ) -> TransitionOutcome {
+        let (primary, winner, propagation, cleanup, on_cleanup_settled) = {
+            let mut data = self.lock_state();
+            if data.state.is_terminal() {
+                return TransitionOutcome::AlreadyTerminal;
+            }
+            let Some(owner) = data.owner.as_mut() else {
+                return TransitionOutcome::Invalid;
+            };
+            let Some(claimed) = owner.claimed.as_mut() else {
+                return TransitionOutcome::Invalid;
+            };
+            if claimed.owner_id != owner_id || claimed.state != ClaimedTerminalState::Held {
+                return TransitionOutcome::Invalid;
+            }
+            claimed.state = ClaimedTerminalState::Finishing;
+            let primary = claimed.primary.clone();
+            let winner = claimed.winner;
+            let propagation = claimed
+                .propagation
+                .take()
+                .expect("claimed transaction retains deferred cancellation propagation");
+            let cleanup = owner
+                .cleanup
+                .take()
+                .expect("owned operation cleanup is consumed once at finish");
+            let on_cleanup_settled = owner
+                .on_cleanup_settled
+                .take()
+                .expect("owned operation settlement observer is consumed once at finish");
+            (primary, winner, propagation, cleanup, on_cleanup_settled)
+        };
         self.finish_claimed_terminal(
             primary,
             Some((owner_id, winner)),
             propagation,
             cleanup,
             on_cleanup_settled,
+            domain_cleanup,
         )
+    }
+
+    fn abandon_claimed(&self, owner_id: u64) {
+        let abandoned = {
+            let mut data = self.lock_state();
+            let Some(owner) = data.owner.as_mut() else {
+                return;
+            };
+            let Some(claimed) = owner.claimed.as_mut() else {
+                return;
+            };
+            if claimed.owner_id != owner_id || claimed.state != ClaimedTerminalState::Held {
+                return;
+            }
+            claimed.state = ClaimedTerminalState::Abandoned;
+            true
+        };
+        if abandoned {
+            self.changed.notify_all();
+        }
     }
 
     fn record_for_handoff(
@@ -729,16 +953,27 @@ impl OperationInner {
         if data.state.is_terminal() {
             return OperationFallbackOutcome::AlreadyTerminal;
         }
-        let terminal_in_progress = data.terminal_in_progress;
         let operation_state = data.state;
         let cancellation_reason = data.cancellation_reason;
+        let terminal_in_progress = data.terminal_in_progress;
         let Some(owner) = data.owner.as_mut() else {
             return OperationFallbackOutcome::Legacy;
         };
         if terminal_in_progress {
-            drop(data);
-            let _ = self.observe_terminal_completion();
-            return OperationFallbackOutcome::Settled;
+            let Some(claimed) = owner.claimed.as_ref() else {
+                return OperationFallbackOutcome::OwnershipLost;
+            };
+            if claimed.state == ClaimedTerminalState::Finishing {
+                // A legitimate owner already started its lock-free finish transaction. Preserve
+                // the established close contract by observing that commit rather than reporting
+                // ownership loss or inventing another result.
+                drop(data);
+                let _ = self.observe_terminal_completion();
+                return OperationFallbackOutcome::Settled;
+            }
+            // A held or abandoned deferred claim may still require domain bookkeeping outside
+            // Runtime. Close cannot manufacture that result and must remain fail-closed.
+            return OperationFallbackOutcome::OwnershipLost;
         }
         if !owner.arbiter.primary_owner_joined() {
             return OperationFallbackOutcome::OwnershipLost;
@@ -761,10 +996,7 @@ impl OperationInner {
             return OperationFallbackOutcome::OwnershipLost;
         }
         data.terminal_in_progress = true;
-        if winner == TerminalWinnerKind::Cancellation {
-            data.state = OperationState::Cancelling;
-            self.publish(&data);
-        }
+        let cancellation_winner = matches!(&primary, TerminalPrimary::Cancellation(_));
         let owner = data
             .owner
             .as_mut()
@@ -779,14 +1011,40 @@ impl OperationInner {
             .expect("handoff observer is pre-registered once");
         let propagation = self.cancellation.deactivate_deferred();
         drop(data);
+        if cancellation_winner {
+            self.publish_claimed_cancellation();
+        }
         let _ = self.finish_claimed_terminal(
             primary,
             Some((transfer_owner, winner)),
             propagation,
             cleanup,
             on_cleanup_settled,
+            Ok(()),
         );
         OperationFallbackOutcome::Settled
+    }
+
+    fn publish_claimed_cancellation(&self) {
+        let published = {
+            let mut data = self.lock_state();
+            debug_assert!(data.terminal_in_progress);
+            debug_assert!(data.cancellation_reason.is_some());
+            match data.state {
+                OperationState::Pending | OperationState::Running => {
+                    data.state = OperationState::Cancelling;
+                    true
+                }
+                OperationState::Cancelling => false,
+                OperationState::Succeeded | OperationState::Failed | OperationState::Cancelled => {
+                    false
+                }
+            }
+        };
+        if published {
+            self.publish_state(OperationState::Cancelling);
+            self.changed.notify_all();
+        }
     }
 
     fn finish_claimed_terminal<C, S>(
@@ -796,15 +1054,21 @@ impl OperationInner {
         propagation: crate::cancellation::CancellationPropagation,
         cleanup: C,
         on_cleanup_settled: S,
+        domain_cleanup: Result<(), EasyConError>,
     ) -> TransitionOutcome
     where
         C: FnOnce() -> Result<(), EasyConError>,
         S: FnOnce(Result<(), EasyConError>),
     {
         propagation.propagate();
-        let mut cleanup_outcome = match catch_isolated(cleanup) {
+        let runtime_cleanup = match catch_isolated(cleanup) {
             Ok(outcome) => outcome,
             Err(()) => Err(cleanup_panic_error()),
+        };
+        let domain_failed = domain_cleanup.is_err();
+        let mut cleanup_outcome = match domain_cleanup {
+            Err(error) => Err(error),
+            Ok(()) => runtime_cleanup,
         };
         if catch_isolated(|| on_cleanup_settled(cleanup_outcome.clone())).is_err()
             && cleanup_outcome.is_ok()
@@ -827,24 +1091,29 @@ impl OperationInner {
         data.terminal_in_progress = false;
         data.result = None;
         data.error = None;
-        match primary {
-            TerminalPrimary::Success(result) => match cleanup_outcome {
-                Ok(()) => {
-                    data.state = OperationState::Succeeded;
-                    data.result = Some(result);
-                }
-                Err(error) => {
+        if domain_failed {
+            data.state = OperationState::Failed;
+            data.error = cleanup_outcome.err();
+        } else {
+            match primary {
+                TerminalPrimary::Success(result) => match cleanup_outcome {
+                    Ok(()) => {
+                        data.state = OperationState::Succeeded;
+                        data.result = Some(result);
+                    }
+                    Err(error) => {
+                        data.state = OperationState::Failed;
+                        data.error = Some(error);
+                    }
+                },
+                TerminalPrimary::Failure(error) => {
                     data.state = OperationState::Failed;
                     data.error = Some(error);
                 }
-            },
-            TerminalPrimary::Failure(error) => {
-                data.state = OperationState::Failed;
-                data.error = Some(error);
-            }
-            TerminalPrimary::Cancellation(reason) => {
-                data.state = OperationState::Cancelled;
-                data.error = Some(cancellation_error(reason));
+                TerminalPrimary::Cancellation(reason) => {
+                    data.state = OperationState::Cancelled;
+                    data.error = Some(cancellation_error(reason));
+                }
             }
         }
         let outcome = if cleanup_failed {
@@ -950,23 +1219,27 @@ impl OperationInner {
     }
 
     fn publish(&self, data: &OperationData) {
+        self.publish_state(data.state);
+    }
+
+    fn publish_state(&self, state: OperationState) {
         let Some(runtime) = self.runtime.upgrade() else {
             return;
         };
-        let (kind, code, severity) = if data.state.is_terminal() {
-            let severity = if data.state == OperationState::Failed {
+        let (kind, code, severity) = if state.is_terminal() {
+            let severity = if state == OperationState::Failed {
                 Severity::Error
             } else {
                 Severity::Info
             };
-            (EventKind::Terminal, terminal_code(data.state), severity)
+            (EventKind::Terminal, terminal_code(state), severity)
         } else {
-            (EventKind::State, state_code(data.state), Severity::Info)
+            (EventKind::State, state_code(state), Severity::Info)
         };
         let draft = EventDraft::critical(kind, code, severity);
         let _ = catch_isolated(|| {
             assert!(
-                !(data.state.is_terminal() && runtime.take_operation_terminal_event_failpoint()),
+                !(state.is_terminal() && runtime.take_operation_terminal_event_failpoint()),
                 "failpoint:runtime.operation.terminal_event"
             );
             let _ = runtime.try_publish_event(draft.with_operation(self.id));

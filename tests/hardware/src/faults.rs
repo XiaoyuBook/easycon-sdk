@@ -1385,13 +1385,26 @@ mod tests {
 
     struct AdapterNoopTransport;
 
+    fn accept_adapter_full(request: &WriteRequest<'_>) -> Result<usize, TransportError> {
+        if !request
+            .settlement
+            .full_accepted_at(request.context.timestamp_ns)
+        {
+            return Err(TransportError::new(
+                TransportErrorKind::Io,
+                "fault adapter rejected final-byte settlement",
+            ));
+        }
+        Ok(request.bytes.len())
+    }
+
     impl ControllerTransport for AdapterNoopTransport {
         fn handshake(&mut self, _request: HandshakeRequest) -> Result<(), TransportError> {
             Ok(())
         }
 
         fn write(&mut self, request: WriteRequest<'_>) -> Result<usize, TransportError> {
-            Ok(request.bytes.len())
+            accept_adapter_full(&request)
         }
 
         fn wait_for_ack(&mut self, _request: AckRequest) -> Result<AckFrame, TransportError> {
@@ -1420,7 +1433,7 @@ mod tests {
                     "injected faults final neutral failure",
                 ))
             } else {
-                Ok(request.bytes.len())
+                accept_adapter_full(&request)
             }
         }
 

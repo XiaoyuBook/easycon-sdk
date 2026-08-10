@@ -1,16 +1,19 @@
 use std::fs;
-use std::sync::Arc;
+use std::future::Future;
+use std::pin::pin;
+use std::sync::{Arc, mpsc};
+use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
 use easycon_controller::{
-    ConnectOptions, ControllerAction, ControllerLeaseState, ControllerOptions, ControllerSession,
-    ControllerState, PreciseSequence, SequenceStep, SwitchReport, TransportError,
-    TransportErrorKind, WriteKind,
+    AutomationLease, AutomationLeaseAcquireOutcome, ConnectOptions, ControllerAction,
+    ControllerLeaseState, ControllerOptions, ControllerSession, ControllerState, PreciseSequence,
+    SequenceStep, SwitchReport, TransportError, TransportErrorKind, WriteKind,
 };
 use easycon_model::{Button, ErrorCode, Hat, StickPosition};
 use easycon_runtime::{
-    Clock, Event, Operation, OperationState, Runtime, RuntimeCounts, SubscriptionOptions,
-    SubscriptionRead, VirtualClock, WaitResult, WaitTimeout,
+    CancellationToken, Clock, Event, Operation, OperationState, Runtime, RuntimeCounts,
+    SubscriptionOptions, SubscriptionRead, VirtualClock, WaitResult, WaitTimeout,
 };
 use easycon_test_support::{AckOutcome, FakeControllerTransport, HandshakeOutcome};
 use serde_json::Value;
@@ -60,6 +63,62 @@ fn wait_terminal(operation: &Operation) {
         operation.wait(WaitTimeout::For(Duration::from_secs(2))),
         WaitResult::Completed(_)
     ));
+}
+
+struct ChannelWake(mpsc::SyncSender<()>);
+
+impl Wake for ChannelWake {
+    fn wake(self: Arc<Self>) {
+        let _ = self.0.try_send(());
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        let _ = self.0.try_send(());
+    }
+}
+
+fn block_on<F: Future>(future: F) -> F::Output {
+    let (wake_sender, wake_receiver) = mpsc::sync_channel(1);
+    let waker = Waker::from(Arc::new(ChannelWake(wake_sender)));
+    let mut context = Context::from_waker(&waker);
+    let mut future = pin!(future);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => return output,
+            Poll::Pending => wake_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("future did not wake before bounded test deadline"),
+        }
+    }
+}
+
+fn acquire_lease(controller: &ControllerSession) -> AutomationLease {
+    let cancellation = CancellationToken::root();
+    match block_on(controller.acquire_automation_lease(&cancellation, None)) {
+        AutomationLeaseAcquireOutcome::Granted(lease) => lease,
+        AutomationLeaseAcquireOutcome::Cancelled => {
+            panic!("Automation lease acquire was cancelled")
+        }
+        AutomationLeaseAcquireOutcome::Deadline => {
+            panic!("Automation lease acquire reached a deadline")
+        }
+        AutomationLeaseAcquireOutcome::Closed => {
+            panic!("Controller closed before Automation lease acquire")
+        }
+        AutomationLeaseAcquireOutcome::Failure(error) => {
+            panic!("Automation lease acquire failed: {error}")
+        }
+    }
+}
+
+fn release_lease(clock: &VirtualClock, lease: AutomationLease) {
+    let release = lease.neutralize_and_release();
+    clock.advance_to(
+        clock
+            .now_ns()
+            .saturating_add(ControllerOptions::default().minimum_report_interval_ns),
+    );
+    block_on(release).expect("settled Automation lease release");
 }
 
 fn wait_until(mut predicate: impl FnMut() -> bool) {
@@ -275,6 +334,7 @@ fn precise_sequence_matches_absolute_offset_fixture_without_drift() {
     runtime.close().expect("Runtime close");
 }
 
+// conformance: transport.sequence-intermediate-accepted-cancel-before-final
 #[test]
 fn sequence_cancel_neutralizes_and_releases_before_terminal() {
     let (clock, runtime, fake, controller) = connected();
@@ -301,7 +361,8 @@ fn sequence_cancel_neutralizes_and_releases_before_terminal() {
 
     clock.advance_to(trace.cancel_at_ns.expect("cancel timestamp"));
     operation.cancel();
-    assert_eq!(operation.snapshot().state, OperationState::Cancelling);
+    assert_eq!(operation.snapshot().state, OperationState::Running);
+    assert!(operation.snapshot().cancellation_reason.is_some());
     assert!(matches!(
         controller.snapshot().lease,
         ControllerLeaseState::Sequence(id) if id == operation.id()
@@ -414,9 +475,16 @@ fn sequence_future_state_is_not_applied_before_its_offset() {
     assert!(fake.accepted_writes().is_empty());
 
     clock.advance_to(30_000_000);
-    wait_terminal(&operation);
+    let terminal = operation.wait(WaitTimeout::For(Duration::from_secs(2)));
+    let operation_state = operation.snapshot().state;
+    let desired_report = controller.snapshot().desired_report;
+    close_after_minimum_interval(&clock, &controller);
+    runtime.close().expect("Runtime close");
+
+    assert!(matches!(terminal, WaitResult::Completed(_)));
+    assert_eq!(operation_state, OperationState::Succeeded);
     assert_eq!(
-        controller.snapshot().desired_report,
+        desired_report,
         SwitchReport::new(
             Button::A.mask(),
             Default::default(),
@@ -424,14 +492,13 @@ fn sequence_future_state_is_not_applied_before_its_offset() {
             Default::default(),
         )
     );
-    close_after_minimum_interval(&clock, &controller);
-    runtime.close().expect("Runtime close");
 }
 
-// conformance: transport.accepted-cancel-terminal
+// conformance: transport.sequence-final-acceptance-late-cancel
 #[test]
-fn cancel_after_final_sequence_acceptance_still_neutralizes() {
+fn final_sequence_acceptance_wins_over_late_cancel() {
     let (clock, runtime, fake, controller) = connected();
+    let blocked = fake.observe_next_write_blocked();
     fake.block_next_write_after_acceptance();
     let sequence = PreciseSequence::new(vec![SequenceStep::new(
         0,
@@ -441,47 +508,55 @@ fn cancel_after_final_sequence_acceptance_still_neutralizes() {
     let operation = controller
         .precise_sequence(sequence)
         .expect("sequence submit");
-    assert!(fake.wait_until_write_blocked(Duration::from_secs(2)));
+    blocked
+        .recv_timeout(Duration::from_secs(2))
+        .expect("final sequence write did not reach the post-acceptance barrier");
     assert_eq!(fake.accepted_writes().len(), 1);
 
     operation.cancel();
+    fake.release_blocked_write();
     wait_until(|| controller.snapshot().accepted_report_count == 1);
     clock.advance_to(30_000_000);
     wait_terminal(&operation);
+    wait_until(|| controller.snapshot().lease == ControllerLeaseState::Available);
 
-    assert_eq!(operation.snapshot().state, OperationState::Cancelled);
-    assert_eq!(controller.snapshot().lease, ControllerLeaseState::Available);
-    assert_eq!(fake.accepted_writes().len(), 2);
-    assert_eq!(
-        fake.accepted_writes()[1].bytes,
-        SwitchReport::NEUTRAL.encode()
-    );
+    let operation_state = operation.snapshot().state;
+    let lease_state = controller.snapshot().lease;
+    let accepted_write_count = fake.accepted_writes().len();
     close_after_minimum_interval(&clock, &controller);
     runtime.close().expect("Runtime close");
+
+    assert_eq!(operation_state, OperationState::Succeeded);
+    assert_eq!(lease_state, ControllerLeaseState::Available);
+    assert_eq!(accepted_write_count, 1);
 }
 
+// conformance: transport.direct-final-acceptance-late-cancel
 #[test]
-fn cancel_after_direct_acceptance_still_reaches_cancelled() {
+fn direct_acceptance_wins_over_late_cancel() {
     let (clock, runtime, fake, controller) = connected();
+    let blocked = fake.observe_next_write_blocked();
     fake.block_next_write_after_acceptance();
     let operation = controller
         .direct(ControllerAction::ButtonDown(Button::A))
         .expect("direct");
-    assert!(fake.wait_until_write_blocked(Duration::from_secs(2)));
+    blocked
+        .recv_timeout(Duration::from_secs(2))
+        .expect("direct write did not reach the post-acceptance barrier");
 
     operation.cancel();
+    fake.release_blocked_write();
     wait_until(|| controller.snapshot().accepted_report_count == 1);
     clock.advance_to(30_000_000);
     wait_terminal(&operation);
 
-    assert_eq!(operation.snapshot().state, OperationState::Cancelled);
-    assert_eq!(fake.accepted_writes().len(), 2);
-    assert_eq!(
-        fake.accepted_writes()[1].bytes,
-        SwitchReport::NEUTRAL.encode()
-    );
+    let operation_state = operation.snapshot().state;
+    let accepted_write_count = fake.accepted_writes().len();
     close_after_minimum_interval(&clock, &controller);
     runtime.close().expect("Runtime close");
+
+    assert_eq!(operation_state, OperationState::Succeeded);
+    assert_eq!(accepted_write_count, 1);
 }
 
 #[test]
@@ -547,7 +622,7 @@ fn failed_cancel_neutral_keeps_later_desired_report_authoritative() {
     });
     fake.fail_write_call(
         fake.write_call_count() + 1,
-        TransportError::new(
+        TransportError::reusable_stream(
             TransportErrorKind::Io,
             "neutral write failed without disconnecting",
         ),
@@ -647,6 +722,7 @@ fn close_interrupts_a_blocked_report_write_and_joins() {
     let closing = controller.clone();
     let closer = std::thread::spawn(move || closing.close());
     wait_until(|| controller.snapshot().state == ControllerState::Disconnecting);
+    wait_for_report_acceptance(&controller, 1);
     let last = controller
         .snapshot()
         .last_report_timestamp_ns
@@ -758,7 +834,7 @@ fn runtime_close_does_not_execute_direct_queued_behind_ack() {
 #[test]
 fn automation_lease_is_a_low_level_exclusive_primitive() {
     let (clock, runtime, fake, controller) = connected();
-    let lease = controller.acquire_automation_lease().expect("lease");
+    let lease = acquire_lease(&controller);
     assert_eq!(
         controller.snapshot().lease,
         ControllerLeaseState::Automation(lease.lease_id())
@@ -791,11 +867,9 @@ fn automation_lease_is_a_low_level_exclusive_primitive() {
         ErrorCode::ResourceBusy
     );
 
-    drop(lease);
-    let second = controller
-        .acquire_automation_lease()
-        .expect("released then reacquired");
-    drop(second);
+    release_lease(&clock, lease);
+    let second = acquire_lease(&controller);
+    release_lease(&clock, second);
     close_after_minimum_interval(&clock, &controller);
     runtime.close().expect("Runtime close");
 }
@@ -970,7 +1044,7 @@ fn ack_command_write_cancelled_error_commits_cancelled() {
     let (clock, runtime, fake, controller) = connected();
     fake.fail_write_call(
         1,
-        TransportError::new(
+        TransportError::reusable_stream(
             TransportErrorKind::Cancelled,
             "command write interrupted by parent cancellation",
         ),
@@ -1102,7 +1176,7 @@ fn recoverable_sequence_write_failure_accepts_neutral_before_failed() {
     let (clock, runtime, fake, controller) = connected();
     fake.fail_write_call(
         1,
-        TransportError::new(TransportErrorKind::Io, "scripted report failure"),
+        TransportError::reusable_stream(TransportErrorKind::Io, "scripted report failure"),
     );
     let sequence = PreciseSequence::new(vec![SequenceStep::new(
         0,
@@ -1128,6 +1202,37 @@ fn recoverable_sequence_write_failure_accepts_neutral_before_failed() {
         fake.accepted_writes()[0].context.kind,
         WriteKind::Neutralize
     );
+    assert_eq!(controller.snapshot().lease, ControllerLeaseState::Available);
+    close_after_minimum_interval(&clock, &controller);
+    runtime.close().expect("Runtime close");
+}
+
+// conformance: transport.sequence-final-partial-or-failure-stream-settlement
+#[test]
+fn final_sequence_partial_failure_never_succeeds_and_settles_stream() {
+    let (clock, runtime, fake, controller) = connected();
+    fake.set_maximum_write_chunk(4);
+    fake.fail_write_call(
+        2,
+        TransportError::new(TransportErrorKind::Io, "scripted final partial failure"),
+    );
+    let sequence = PreciseSequence::new(vec![SequenceStep::new(
+        0,
+        ControllerAction::ButtonDown(Button::A),
+    )])
+    .expect("sequence");
+    let operation = controller
+        .precise_sequence(sequence)
+        .expect("sequence submit");
+    wait_terminal(&operation);
+
+    assert_eq!(operation.snapshot().state, OperationState::Failed);
+    assert!(
+        fake.is_closed(),
+        "partial report failure must close the stream"
+    );
+    assert!(fake.accepted_writes().is_empty());
+    assert_eq!(controller.snapshot().state, ControllerState::Disconnected);
     assert_eq!(controller.snapshot().lease, ControllerLeaseState::Available);
     close_after_minimum_interval(&clock, &controller);
     runtime.close().expect("Runtime close");

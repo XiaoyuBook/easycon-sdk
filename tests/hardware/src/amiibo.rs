@@ -5,6 +5,8 @@ use easycon_controller::{
     AckFrame, AckRequest, ControllerTransport, HandshakeRequest, TransportError,
     TransportErrorKind, WriteContext, WriteKind, WriteRequest,
 };
+#[cfg(test)]
+use easycon_controller::WriteSettlement;
 use easycon_model::OperationId;
 use serde_json::{Value, json};
 
@@ -689,6 +691,7 @@ impl ControllerTransport for AmiiboEvidenceTransport {
         };
 
         let request_len = request.bytes.len();
+        let settlement = request.settlement.clone();
         let result = self.inner.write(request);
         match result {
             Ok(accepted) if accepted != 0 && accepted <= request_len => {
@@ -696,6 +699,13 @@ impl ControllerTransport for AmiiboEvidenceTransport {
                     .accepted
                     .checked_add(accepted)
                     .ok_or_else(|| protocol_error("Amiibo accepted-byte count overflowed"))?;
+                if accepted_total == active.context.total_len && !settlement.is_full_accepted() {
+                    let error = io_error(
+                        "Amiibo evidence transport returned a full payload without backend settlement",
+                    );
+                    self.fail_exchange(&active.exchange, &error)?;
+                    return Err(error);
+                }
                 if let Err(error) = self.record_write_progress(&active, accepted, accepted_total) {
                     self.state = match active.exchange {
                         Exchange::Chunk { .. } => EvidenceState::Recovering(
@@ -780,6 +790,11 @@ impl ControllerTransport for AmiiboEvidenceTransport {
         self.recorder.record_close(&self.state);
         self.inner.close();
     }
+
+    fn close_checked(&mut self) -> Result<(), TransportError> {
+        self.recorder.record_close(&self.state);
+        self.inner.close_checked()
+    }
 }
 
 impl ResumeState {
@@ -828,6 +843,8 @@ fn io_error(message: impl Into<Arc<str>>) -> TransportError {
 mod tests {
     use std::collections::VecDeque;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use easycon_model::{OperationId, ResourceId};
@@ -864,6 +881,35 @@ mod tests {
         acks: VecDeque<Result<(), TransportErrorKind>>,
     }
 
+    /// Returns a complete write without publishing its backend acceptance gate.
+    ///
+    /// This models a faulty decorator/adapter boundary: a full byte count alone must not become
+    /// Amiibo evidence before the shared `WriteSettlement` has accepted the physical final byte.
+    struct FullReturnWithoutSettlementTransport;
+
+    fn accept_scripted_write(
+        request: &WriteRequest<'_>,
+        accepted: usize,
+    ) -> Result<usize, TransportError> {
+        let completes_payload = request
+            .context
+            .total_len
+            .checked_sub(request.bytes.len())
+            .and_then(|offset| offset.checked_add(accepted))
+            == Some(request.context.total_len);
+        if completes_payload
+            && !request
+                .settlement
+                .full_accepted_at(request.context.timestamp_ns)
+        {
+            return Err(TransportError::new(
+                TransportErrorKind::Io,
+                "scripted Amiibo transport rejected final-byte settlement",
+            ));
+        }
+        Ok(accepted)
+    }
+
     impl ControllerTransport for ScriptedTransport {
         fn handshake(&mut self, _request: HandshakeRequest) -> Result<(), TransportError> {
             Ok(())
@@ -871,8 +917,8 @@ mod tests {
 
         fn write(&mut self, request: WriteRequest<'_>) -> Result<usize, TransportError> {
             match self.writes.pop_front().expect("scripted write") {
-                Ok(usize::MAX) => Ok(request.bytes.len()),
-                Ok(accepted) => Ok(accepted),
+                Ok(usize::MAX) => accept_scripted_write(&request, request.bytes.len()),
+                Ok(accepted) => accept_scripted_write(&request, accepted),
                 Err(kind) => Err(TransportError::new(kind, "injected write failure")),
             }
         }
@@ -890,6 +936,55 @@ mod tests {
         fn close(&mut self) {}
     }
 
+    impl ControllerTransport for FullReturnWithoutSettlementTransport {
+        fn handshake(&mut self, _request: HandshakeRequest) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn write(&mut self, request: WriteRequest<'_>) -> Result<usize, TransportError> {
+            Ok(request.bytes.len())
+        }
+
+        fn wait_for_ack(&mut self, _request: AckRequest) -> Result<AckFrame, TransportError> {
+            Err(io_error("unsettled full-return transport cannot acknowledge a command"))
+        }
+
+        fn close(&mut self) {}
+    }
+
+    struct CheckedCloseFailureTransport {
+        close_calls: Arc<AtomicUsize>,
+    }
+
+    impl ControllerTransport for CheckedCloseFailureTransport {
+        fn handshake(&mut self, _request: HandshakeRequest) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn write(&mut self, request: WriteRequest<'_>) -> Result<usize, TransportError> {
+            accept_scripted_write(&request, request.bytes.len())
+        }
+
+        fn wait_for_ack(&mut self, _request: AckRequest) -> Result<AckFrame, TransportError> {
+            Err(TransportError::new(
+                TransportErrorKind::Protocol,
+                "no ACK in checked-close delegation test",
+            ))
+        }
+
+        fn close(&mut self) {
+            self.close_calls.fetch_add(1, Ordering::AcqRel);
+        }
+
+        fn close_checked(&mut self) -> Result<(), TransportError> {
+            self.close();
+            Err(TransportError::new(
+                TransportErrorKind::Io,
+                "injected Amiibo typed checked-close failure",
+            ))
+        }
+    }
+
     struct LateAckTransport {
         frames: VecDeque<AckFrame>,
     }
@@ -900,7 +995,7 @@ mod tests {
         }
 
         fn write(&mut self, request: WriteRequest<'_>) -> Result<usize, TransportError> {
-            Ok(request.bytes.len())
+            accept_scripted_write(&request, request.bytes.len())
         }
 
         fn wait_for_ack(&mut self, _request: AckRequest) -> Result<AckFrame, TransportError> {
@@ -957,6 +1052,74 @@ mod tests {
         (transport, recorder, journal)
     }
 
+    #[test]
+    fn typed_checked_close_failure_is_delegated_once_with_close_evidence() {
+        let directory = TestDirectory::new("typed-close");
+        let journal = journal("typed-close", &directory);
+        let recorder = AmiiboEvidenceRecorder::default();
+        let close_calls = Arc::new(AtomicUsize::new(0));
+        let mut transport = AmiiboEvidenceTransport::new(
+            Box::new(CheckedCloseFailureTransport {
+                close_calls: close_calls.clone(),
+            }),
+            journal.writer(),
+            AmiiboEvidenceBinding {
+                lease_id: "lease-typed-close".to_owned(),
+                expected_stable_id: "DEVICE\\EXPECTED".to_owned(),
+                observed_stable_id: "DEVICE\\EXPECTED".to_owned(),
+                slot: 3,
+                payload_len: 3,
+                payload_sha256: "A".repeat(64),
+            },
+            recorder.clone(),
+        );
+
+        let error = transport
+            .close_checked()
+            .expect_err("typed inner checked-close failure must be preserved");
+
+        assert_eq!(error.kind(), TransportErrorKind::Io);
+        assert_eq!(error.message(), "injected Amiibo typed checked-close failure");
+        assert_eq!(close_calls.load(Ordering::Acquire), 1);
+        assert_eq!(recorder.projection()["transport_closed_in_state"], "ready");
+    }
+
+    #[test]
+    fn full_return_without_the_shared_settlement_never_records_amiibo_acceptance() {
+        let directory = TestDirectory::new("unsettled-full-return");
+        let journal = journal("unsettled-full-return", &directory);
+        let recorder = AmiiboEvidenceRecorder::default();
+        let mut transport = AmiiboEvidenceTransport::new(
+            Box::new(FullReturnWithoutSettlementTransport),
+            journal.writer(),
+            AmiiboEvidenceBinding {
+                lease_id: "lease-unsettled-full-return".to_owned(),
+                expected_stable_id: "DEVICE\\EXPECTED".to_owned(),
+                observed_stable_id: "DEVICE\\EXPECTED".to_owned(),
+                slot: 3,
+                payload_len: 3,
+                payload_sha256: "A".repeat(64),
+            },
+            recorder.clone(),
+        );
+        let bytes = header(0, 3);
+        let error = transport
+            .write(WriteRequest {
+                context: context(1, Some(OperationId::new(7)), bytes.len()),
+                bytes: &bytes,
+                deadline_ns: u64::MAX,
+                cancellation: CancellationToken::root(),
+                resource_cancellation: CancellationToken::root(),
+                settlement: WriteSettlement::untracked(),
+            })
+            .expect_err("a full return without backend acceptance must be rejected");
+
+        assert_eq!(error.kind(), TransportErrorKind::Io);
+        let projection = recorder.projection();
+        assert_eq!(projection["chunks"][0]["header_accepted_bytes"], 0);
+        assert_eq!(projection["chunks"][0]["status"], "failed");
+    }
+
     fn context(sequence: u64, operation_id: Option<OperationId>, total_len: usize) -> WriteContext {
         WriteContext {
             resource_id: ResourceId::new(1),
@@ -992,6 +1155,7 @@ mod tests {
         bytes: &[u8],
     ) -> Result<(), TransportError> {
         let write_context = context(sequence, operation_id, bytes.len());
+        let settlement = WriteSettlement::untracked();
         let mut accepted = 0;
         while accepted < bytes.len() {
             let count = transport.write(WriteRequest {
@@ -1000,6 +1164,7 @@ mod tests {
                 deadline_ns: u64::MAX,
                 cancellation: CancellationToken::root(),
                 resource_cancellation: CancellationToken::root(),
+                settlement: settlement.clone(),
             })?;
             accepted += count;
         }

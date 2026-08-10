@@ -1,10 +1,47 @@
-use std::sync::Arc;
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
+use std::time::{Duration, Instant};
 
 use easycon_runtime::{CancellationToken, CloseOutcome, Runtime, VirtualClock};
 use easycon_vision::{
     Frame, Image, ImageErrorKind, NativePool, NativePoolOptions, PixelFormat, Roi, VisionErrorKind,
     VisionLimits, native_resource_counts,
 };
+
+static NATIVE_COUNTER_GATE: RwLock<()> = RwLock::new(());
+
+fn shared_native_gate() -> RwLockReadGuard<'static, ()> {
+    let started = Instant::now();
+    loop {
+        match NATIVE_COUNTER_GATE.try_read() {
+            Ok(guard) => return guard,
+            Err(TryLockError::Poisoned(error)) => return error.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                assert!(
+                    started.elapsed() < Duration::from_secs(2),
+                    "native counter gate did not release before the bounded test deadline"
+                );
+                std::thread::yield_now();
+            }
+        }
+    }
+}
+
+fn exclusive_native_counter_gate() -> RwLockWriteGuard<'static, ()> {
+    let started = Instant::now();
+    loop {
+        match NATIVE_COUNTER_GATE.try_write() {
+            Ok(guard) => return guard,
+            Err(TryLockError::Poisoned(error)) => return error.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                assert!(
+                    started.elapsed() < Duration::from_secs(2),
+                    "native counter gate did not release before the bounded test deadline"
+                );
+                std::thread::yield_now();
+            }
+        }
+    }
+}
 
 struct TestNative {
     runtime: Runtime,
@@ -66,6 +103,7 @@ fn limits() -> VisionLimits {
 
 #[test]
 fn image_validates_layout_limits_and_immutable_rows() {
+    let _native_gate = shared_native_gate();
     let native = TestNative::new();
     let limits = limits();
     let padded: Arc<[u8]> = vec![0, 0, 255, 0, 255, 0, 9, 9, 255, 0, 0, 255, 255, 255, 8, 8].into();
@@ -117,6 +155,7 @@ fn image_validates_layout_limits_and_immutable_rows() {
 
 #[test]
 fn frame_and_crop_keep_owned_pixels_after_the_source_is_dropped() {
+    let _native_gate = shared_native_gate();
     let native = TestNative::new();
     let limits = limits();
     let image = Image::new(fixture("bgr").into(), 2, 2, 6, PixelFormat::Bgr8, &limits)
@@ -158,6 +197,7 @@ fn frame_and_crop_keep_owned_pixels_after_the_source_is_dropped() {
 
 #[test]
 fn actual_opencv_codec_and_all_format_conversions_are_lossless_where_required() {
+    let _native_gate = shared_native_gate();
     let native = TestNative::new();
     let limits = limits();
     let expected = fixture("bgr");
@@ -267,6 +307,7 @@ fn actual_opencv_codec_and_all_format_conversions_are_lossless_where_required() 
 
 #[test]
 fn invalid_truncated_and_oversized_encoded_inputs_are_bounded_and_leak_free() {
+    let _native_gate = exclusive_native_counter_gate();
     let native = TestNative::new();
     let baseline = native_resource_counts().expect("baseline");
     let limits = limits();
@@ -303,6 +344,7 @@ fn invalid_truncated_and_oversized_encoded_inputs_are_bounded_and_leak_free() {
 
 #[test]
 fn header_preflight_uses_the_encoded_color_channels() {
+    let _native_gate = shared_native_gate();
     let native = TestNative::new();
     let exact = VisionLimits::try_for_images(4096, 64, 64, 4096, 12, 6).expect("exact BGR limits");
     assert_eq!(
@@ -325,6 +367,7 @@ fn header_preflight_uses_the_encoded_color_channels() {
 
 #[test]
 fn hard_ceilings_roi_overflow_and_png_output_bound_are_explicit() {
+    let _native_gate = shared_native_gate();
     let native = TestNative::new();
     assert_eq!(
         VisionLimits::try_for_images(usize::MAX, 1, 1, 1, 1, 1)

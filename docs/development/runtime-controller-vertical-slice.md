@@ -12,6 +12,29 @@ Amiibo、故障注入、10,000-step fake 和软件热路径测量已收敛，并
 保持开放，完整 Phase 2 仍未完成。本文不声称任何具体 VID/PID、固件、baud、Amiibo 容量、UART/USB HID/
 Switch 执行时序或物理中立化已经验证，也不创建完整 Phase 2 冻结 ADR。
 
+## Stage 1 开发状态
+
+[ADR-0025](../decisions/0025-stage1-working-implementation-base.md) 将
+`main@3f1481480b3ee4206aa75a248a001213f960fcb6` 定义为本轮 Runtime/Controller/Vision 软件开发的
+working implementation base。该记录只允许在 ADR-0018/0020 的 D1 窄表面形成 builder candidate；它不倒写
+历史 ADR，不重新冻结 Runtime、Controller 或 Stage 1，也不替代后续独立 review/closeout。
+
+### Builder 初版软件能力矩阵
+
+| 区域 | 已收敛的软件能力 | 可执行证据 |
+| --- | --- | --- |
+| Runtime | operation/deadline、deferred claim -> finish transaction、资源 close 与 fail-closed owner-loss | Runtime exact、12 个 Loom 模型、`tools/run_runtime_models.py` |
+| Controller/serial | backend final-byte reservation / logical-report settlement、lease/action/release/close、partial stream、Windows completion owner | Controller exact/conformance、fake/system-serial parity、Windows Targeted `easycon-serial` |
+| Vision | capture/frame/image/label、native exception isolation、OCR/template/color 与 native-handle lifecycle | Windows Targeted `easycon-vision`、`easycon-native-sys` 与 high-parallel image contracts |
+
+Controller 的 backend final-byte gate 暴露了一个确定性跨 crate blocker：唯一 backend completion owner 必须在
+physical acceptance 处先 reservation shared winner，随后在所有 backend lock 外 claim Runtime owner，并在
+Controller bookkeeping 后 deferred finish。因此本 candidate 窄扩展了 Runtime settlement 实现；没有扩大 ABI、
+binding、hardware 或 Vision production 范围。
+
+本矩阵记录 builder 的 Stage 1 初版软件开发候选，不是 staged Workspace credential、独立 H review、Runtime/Controller/
+Stage 1 refreeze、真实 Controller/capture 硬件资格或 Linux/macOS 晋级。
+
 ## 交付范围
 
 首个开发里程碑在冻结架构下实现且只实现以下 Rust 组件：
@@ -45,6 +68,23 @@ Switch 执行时序或物理中立化已经验证，也不创建完整 Phase 2 �
   severity/log filter 影响。
 - 每个 Controller 只有一个 writer thread。所有 report（包括取消和关闭中立报告）的默认最小间隔是
   30 ms；write 必须响应 operation/resource cancellation 或绝对 I/O deadline。
+- Automation lease acquire 在方法返回前注册一个共享 completion record，并只决议 `Granted`、`Cancelled`、
+  `Deadline`、`Closed` 或 `Failure`；同一观察点优先级为 Cancelled、Deadline、Closed、Failure、Granted。
+  deadline 始终是 Controller 所属 Runtime Clock epoch 的 absolute nanoseconds，SystemClock deadline 不依赖
+  lane 继续运行。
+- 每个非零 Automation generation 在 `neutralize_and_release` 返回前 seal action admission。未 effect-linearize
+  的已接纳 action 先以 `ParentClose` 结算；完整 logical report 已被 transport 接受的 action 保留成功。随后只发出
+  一个服从 pacing 的 neutral，并以 `NeutralAccepted`、`NeutralNotDeliveredStreamSettled(cause)` 或明确 cleanup
+  failure 完成 release future。future/lease Drop 只触发同一非阻塞 cleanup，不能作为已 settlement 的 run terminal
+  证据。
+- Controller close 接管同一 release record，并在 join lane 前结算 pending acquire、action 和 release waiter；即使
+  release record 在 close admission seal 后才登记，也只会在 stream 已关闭的 settled 证据后完成。close 中断已
+  in-flight 的 release neutral 时不会重试该 logical neutral；只有完整 transport acceptance 或 stream 已关闭的 settled
+  证据可以完成该 release。
+- 合法 Controller lane owner 已消费 completion 且证明 stream settled 后，后续 cleanup Err/panic 以同一 first
+  `Err(cleanup_failure)` 恰好完成受影响 action/release waiter，并永久 seal Controller admission。只有 lane owner
+  已丢失、没有 transferable owner，且 completion/stream settlement 都不可证明时，才保留 nonterminal record/registry
+  与 waiter 并让 Runtime 返回 `CloseFailed`；这不是普通 cleanup failure。
 - Windows discovery 返回系统提供的稳定 device-instance identity 与可选属性；COM 名称只用于打开端口，
   不用于猜测 VID/PID 或支持设备。Win32 open/read/write/close 只存在于 `easycon-serial`。
 - serial partial write 使用同一个 logical `WriteContext` 连续推进；半帧错误或两次 partial call 间取消会
@@ -53,13 +93,18 @@ Switch 执行时序或物理中立化已经验证，也不创建完整 Phase 2 �
 - Win32 `HANDLE`、event、SetupAPI list 和 registry key 均由窄 RAII owner 释放；pending `OVERLAPPED` 和
   调用方 buffer 在 completion、cancel、wait failure 以及可注入 `Clock` panic 路径上都先经
   `CancelIoEx`/`GetOverlappedResult` 同步结算，再允许释放或继续 unwind。
+- Windows `CancelIoEx` 只请求 I/O interrupt，不产生 Controller operation terminal。仍由单 writer lane 消费
+  final `GetOverlappedResult` completion，并以该 completion 的 accepted/not-delivered evidence 结算 action 或
+  release waiter。
 - precise sequence 的 offset 相对 lane 获权时刻且始终为绝对目标；同 offset 按输入顺序合并
   成一个 report，不从上次 dispatch 累加目标。
 - sequence 取消或可恢复失败时，先让 transport 接受 neutral report，再释放 lease 并提交终态。
   断线导致 neutral 无法送达时发布 warning，绝不声称硬件已经中立。
-- 普通 report operation 的 `Succeeded` 只表示完整字节被 transport 接受。事件 detail 明确记录
-  `hardware_execution=false`；acceptance timestamp 在完整 write 返回后采样，close neutral report 也计入
-  report acceptance 观测。
+- 普通 report operation 的 `Succeeded` 只表示完整字节被 transport 接受。backend final-byte settlement 是
+  report acceptance 的线性化点和 timestamp boundary：backend 在消费该 completion 时先 reservation shared owner，
+  再于所有 backend/settlement lock 外采样 timestamp 并 claim Runtime owner；lane 随后记录
+  `transport_accepted`，再 finish 已 claim 的 Runtime terminal；不能在完整 write 返回后重新采样。事件 detail 明确记录 `hardware_execution=false`，close
+  neutral report 也计入 report acceptance 观测。
 - ACK command 在同一 FIFO lane 中等待前序 direct report，只有独占 sequence/Automation lease 才
   返回 `RESOURCE_BUSY`；ACK 路径发现断线时重置 desired report、记录中立化 warning 并关闭 transport。
   resource close 唤醒正在等待的 ACK 后，该 request operation 保持非终态，直到串口 stream 完成同步关闭。
@@ -116,8 +161,8 @@ Phase 2A 专项测试还包括：
   target 验证无丢失、乱序、早发和漂移，并在 close 后验证三个 registry 为零；
 - `tests/support/tests/phase2a_latency.rs`：五段时间戳单调性与不丢样本的确定性 contract。
 
-当前完整 workspace 为 157 个非文档测试通过；Runtime Loom 模型 6/6；规范校验执行 5 schemas、1 behavior、
-3 controller fixtures、9 scenarios 和 65 个 exact Rust tests。最终提交前仍以实际完整门禁输出为准。
+当前完整 workspace 的非文档测试数以最终 staged Workspace evidence 为准；Runtime Loom 模型 12/12；当前规范校验执行
+8 schemas、1 behavior spec、1 Runtime fixture、4 controller fixtures、10 conformance scenarios 和 126 个 exact Rust tests。最终提交前仍以实际完整门禁输出为准。
 
 ## 软件路径延迟结果
 

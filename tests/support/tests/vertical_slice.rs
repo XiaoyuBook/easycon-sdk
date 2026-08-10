@@ -7,8 +7,8 @@ use easycon_controller::{
 };
 use easycon_model::{Button, Hat, StickPosition};
 use easycon_runtime::{
-    Event, EventKind, Operation, OperationState, Runtime, RuntimeCounts, SubscriptionOptions,
-    SubscriptionRead, VirtualClock, WaitResult, WaitTimeout,
+    CancellationReason, Event, EventKind, Operation, OperationState, Runtime, RuntimeCounts,
+    SubscriptionOptions, SubscriptionRead, VirtualClock, WaitResult, WaitTimeout,
 };
 use easycon_test_support::{FakeControllerTransport, HandshakeOutcome};
 
@@ -85,7 +85,12 @@ fn runtime_controller_fake_vertical_slice_has_exact_trace_and_clean_shutdown() {
     sequence_operation.cancel();
     assert_eq!(
         sequence_operation.snapshot().state,
-        OperationState::Cancelling
+        OperationState::Running,
+        "an outstanding sequence report records cancellation intent until its stream settles"
+    );
+    assert_eq!(
+        sequence_operation.snapshot().cancellation_reason,
+        Some(CancellationReason::Requested)
     );
     assert!(matches!(
         controller.snapshot().lease,

@@ -19,6 +19,9 @@ remains narrower than the complete v1 product.
   traces in virtual monotonic nanoseconds.
 - `fixtures/controller/phase2a-latency-result-v1.json` records the fixed-machine 10,000-sample
   software-path distribution and its explicit non-hardware scope.
+- `fixtures/controller/lease-settlement-v1.json` fixes the Controller D1 software-only acquire,
+  action, release, close, partial-stream, and Win32 completion-owner contract without declaring a
+  Stage 1 refreeze.
 - `conformance/runtime-controller-v1.json` defines the hardware-free Runtime and Phase 2A fault
   scenarios. Every step and assertion has a stable ID. Each scenario declares the exact executable
   Rust test suite covering its assertions, and every assertion maps through a matching

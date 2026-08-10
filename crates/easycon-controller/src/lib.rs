@@ -10,13 +10,14 @@ mod transport;
 pub use protocol::SwitchReport;
 pub use sequence::{MAX_SEQUENCE_DURATION_NS, MAX_SEQUENCE_STEPS, PreciseSequence, SequenceStep};
 pub use session::{
-    AutomationLease, ConnectOptions, ControllerAction, ControllerLeaseState, ControllerOptions,
-    ControllerSession, ControllerSnapshot, ControllerState,
+    AutomationLease, AutomationLeaseAcquire, AutomationLeaseAcquireOutcome, AutomationLeaseRelease,
+    AutomationLeaseReleaseOutcome, ConnectOptions, ControllerAction, ControllerLeaseState,
+    ControllerOptions, ControllerSession, ControllerSnapshot, ControllerState,
 };
 pub use transport::{
     AUTO_BAUD_RATES, AckFrame, AckRequest, ControllerTransport, DirectWriteTiming, HANDSHAKE_REPLY,
     HANDSHAKE_REQUEST, HandshakeRequest, TransportError, TransportErrorKind, WriteContext,
-    WriteKind, WriteRequest,
+    WriteKind, WriteRequest, WriteSettlement,
 };
 
 /// Behavior schema version implemented by this crate.

@@ -572,7 +572,8 @@ mod tests {
             ))
         }
 
-        fn write(&mut self, buffer: &[u8], _request: ByteIoRequest) -> Result<usize, SerialError> {
+        fn write(&mut self, buffer: &[u8], request: ByteIoRequest) -> Result<usize, SerialError> {
+            request.publish_final_write_acceptance(buffer.len())?;
             self.trace
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
@@ -649,6 +650,7 @@ mod tests {
             deadline_ns: u64::MAX,
             cancellation: CancellationToken::root(),
             resource_cancellation: CancellationToken::root(),
+            final_write_settlement: None,
         }
     }
 
