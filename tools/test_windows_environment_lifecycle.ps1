@@ -1,8 +1,17 @@
 [CmdletBinding()]
-param()
+param(
+    [string]$ExactCase
+)
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+$script:contractProbeCleanupBlocked = $false
+$script:contractCases = [System.Collections.Generic.List[object]]::new()
+$script:contractCaseNames = [System.Collections.Generic.HashSet[string]]::new(
+    [System.StringComparer]::Ordinal
+)
+$script:exactCaseRequested = $PSBoundParameters.ContainsKey("ExactCase")
+$script:executedContractCases = 0
 
 function Assert-Contract {
     param(
@@ -54,6 +63,49 @@ function Assert-Throws {
         return
     }
     throw "contract failed: expected failure matching '$Pattern'"
+}
+
+function Invoke-ContractCase {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][scriptblock]$Action
+    )
+
+    if (-not $script:contractCaseNames.Add($Name)) {
+        throw "contract case registry contains duplicate exact name '$Name'"
+    }
+    $script:contractCases.Add([pscustomobject]@{
+        Name = $Name
+        Action = $Action
+    }) | Out-Null
+}
+
+function Invoke-SelectedContractCases {
+    if ($script:exactCaseRequested) {
+        if ([string]::IsNullOrWhiteSpace($ExactCase)) {
+            throw "-ExactCase requires one complete exact case name"
+        }
+        if (-not $script:contractCaseNames.Contains($ExactCase)) {
+            throw "unknown exact contract case '$ExactCase'"
+        }
+        $selected = @($script:contractCases | Where-Object { $_.Name -ceq $ExactCase })
+        Assert-Contract ($selected.Count -eq 1) `
+            "exact contract case selection must resolve one case"
+        $timer = [System.Diagnostics.Stopwatch]::StartNew()
+        & $selected[0].Action
+        $timer.Stop()
+        $script:executedContractCases++
+        Write-Output ("CONTRACT_PASS name={0} durationMs={1}" -f $ExactCase, $timer.ElapsedMilliseconds)
+        return
+    }
+
+    foreach ($case in $script:contractCases) {
+        $timer = [System.Diagnostics.Stopwatch]::StartNew()
+        & $case.Action
+        $timer.Stop()
+        $script:executedContractCases++
+        Write-Output ("CONTRACT_PASS name={0} durationMs={1}" -f $case.Name, $timer.ElapsedMilliseconds)
+    }
 }
 
 function Get-ContractProcessEnvironmentSnapshot {
@@ -108,31 +160,1979 @@ function Wait-ContractFileCreated {
         [Parameter(Mandatory)]
         [string]$Path,
 
-        [int]$TimeoutMilliseconds = 10000
+        [int]$TimeoutMilliseconds = 10000,
+
+        [scriptblock]$BeforeWaitRegistration
     )
 
-    if (Test-Path -LiteralPath $Path -PathType Leaf) {
-        return
-    }
-    $parent = Split-Path -Parent $Path
-    $watcher = [System.IO.FileSystemWatcher]::new($parent, (Split-Path -Leaf $Path))
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    $invokeSeam = $null -ne $BeforeWaitRegistration
     try {
-        $watcher.NotifyFilter = [System.IO.NotifyFilters]::FileName
-        $watcher.EnableRaisingEvents = $true
-        if (Test-Path -LiteralPath $Path -PathType Leaf) {
-            return
+        while ($true) {
+            if (Test-Path -LiteralPath $Path -PathType Leaf) {
+                return
+            }
+            if ($invokeSeam) {
+                $invokeSeam = $false
+                & $BeforeWaitRegistration
+                continue
+            }
+            $remaining = [long]$TimeoutMilliseconds - [long]$timer.ElapsedMilliseconds
+            Assert-Contract ($remaining -gt 0) `
+                "timed out waiting for synchronized contract file $Path"
+            [System.Threading.Thread]::Sleep([int][Math]::Min(20L, $remaining))
         }
-        $change = $watcher.WaitForChanged(
-            [System.IO.WatcherChangeTypes]::Created,
-            $TimeoutMilliseconds
-        )
-        Assert-Contract (
-            -not $change.TimedOut -and
-            (Test-Path -LiteralPath $Path -PathType Leaf)
-        ) "timed out waiting for synchronized contract file $Path"
     }
     finally {
-        $watcher.Dispose()
+        $timer.Stop()
+    }
+}
+
+function Set-ContractProbeState {
+    param(
+        [Parameter(Mandatory)][object]$Probe,
+        [Parameter(Mandatory)]
+        [ValidateSet("Started", "Ready", "ExitedEarly", "Released", "Exited", "ResultValidated")]
+        [string]$State,
+        [Parameter(Mandatory)][string]$Milestone
+    )
+
+    $allowed = switch ([string]$Probe.State) {
+        "Created" { @("Started") }
+        "Started" { @("Ready", "ExitedEarly") }
+        "Ready" { @("Released", "ExitedEarly") }
+        "Released" { @("Exited") }
+        "Exited" { @("ResultValidated") }
+        default { @() }
+    }
+    Assert-Contract ($allowed -ccontains $State) (
+        "probe $($Probe.Name) state transition $($Probe.State) -> $State is invalid"
+    )
+    $Probe.State = $State
+    $Probe.LastMilestone = $Milestone
+    $Probe.Progress = $Milestone
+}
+
+if ($null -eq ("EasyConContractProcessOperations" -as [type])) {
+    Add-Type -TypeDefinition @'
+using System.Diagnostics;
+using System.Threading.Tasks;
+
+public static class EasyConContractProcessOperations
+{
+    public static Task KillTreeAsync(Process process)
+    {
+        return Task.Run(() => process.Kill(true));
+    }
+
+    public static void ObserveTaskCompletion(Task task)
+    {
+        if (task == null)
+        {
+            return;
+        }
+
+        task.ContinueWith(completed =>
+        {
+            try
+            {
+                completed.GetAwaiter().GetResult();
+            }
+            catch
+            {
+            }
+        }, TaskScheduler.Default);
+    }
+}
+'@
+}
+
+function New-ContractProbeDeadline {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][ValidateRange(0, [int]::MaxValue)]
+        [int]$TimeoutMilliseconds
+    )
+
+    return [pscustomobject]@{
+        Name = $Name
+        TimeoutMilliseconds = [long]$TimeoutMilliseconds
+        Timer = [System.Diagnostics.Stopwatch]::new()
+        Started = $false
+    }
+}
+
+function Get-ContractProbeDeadlineRemaining {
+    param([Parameter(Mandatory)][object]$Deadline)
+
+    if (-not $Deadline.Started) {
+        $Deadline.Timer.Start()
+        $Deadline.Started = $true
+    }
+    $remaining = $Deadline.TimeoutMilliseconds - [long]$Deadline.Timer.ElapsedMilliseconds
+    if ($remaining -le 0) {
+        return 0
+    }
+    return [int][Math]::Min([long][int]::MaxValue, $remaining)
+}
+
+function Initialize-ContractProbeTeardownState {
+    param([Parameter(Mandatory)][object]$Probe)
+
+    $defaults = [ordered]@{
+        OutputCaptureFailure = ""
+        OutputCaptureIssues = [System.Collections.Generic.List[string]]::new()
+        TeardownIssues = [System.Collections.Generic.List[string]]::new()
+        OutputTaskOwned = $false
+        ErrorTaskOwned = $false
+        OutputTaskObserved = $false
+        ErrorTaskObserved = $false
+        OutputTaskSucceeded = $false
+        ErrorTaskSucceeded = $false
+        OutputDrainInitialization = "not-started"
+        ErrorDrainInitialization = "not-started"
+        KillTask = $null
+        KillLaunchAttempted = $false
+        KillTaskObserved = $true
+        PipeCancellationRequested = $false
+        LastProcessExited = $false
+        DiagnosticCached = $false
+        TeardownDiagnostic = ""
+        WasReclaimed = $false
+        ProcessId = ""
+    }
+    foreach ($entry in $defaults.GetEnumerator()) {
+        if ($Probe.PSObject.Properties.Match([string]$entry.Key).Count -eq 0) {
+            $Probe | Add-Member -NotePropertyName $entry.Key -NotePropertyValue $entry.Value
+        }
+    }
+    if ($null -ne $Probe.Process) {
+        try {
+            $observedProcessId = [string]$Probe.Process.Id
+            if (-not [string]::IsNullOrWhiteSpace($observedProcessId)) {
+                $Probe.ProcessId = $observedProcessId
+            }
+        }
+        catch {
+        }
+    }
+    if ($null -eq $Probe.OutputCaptureIssues) {
+        $Probe.OutputCaptureIssues = [System.Collections.Generic.List[string]]::new()
+    }
+    if ($null -eq $Probe.TeardownIssues) {
+        $Probe.TeardownIssues = [System.Collections.Generic.List[string]]::new()
+    }
+    foreach ($stream in @(
+        [pscustomobject]@{
+            TaskProperty = "OutputTask"
+            OwnedProperty = "OutputTaskOwned"
+            InitializationProperty = "OutputDrainInitialization"
+        },
+        [pscustomobject]@{
+            TaskProperty = "ErrorTask"
+            OwnedProperty = "ErrorTaskOwned"
+            InitializationProperty = "ErrorDrainInitialization"
+        }
+    )) {
+        if ($null -ne $Probe.($stream.TaskProperty)) {
+            $Probe.($stream.OwnedProperty) = $true
+            if ($Probe.($stream.InitializationProperty) -ceq "not-started") {
+                $Probe.($stream.InitializationProperty) = "started"
+            }
+        }
+    }
+    if ($null -ne $Probe.KillTask -and -not $Probe.KillLaunchAttempted) {
+        $Probe.KillLaunchAttempted = $true
+        $Probe.KillTaskObserved = $false
+    }
+}
+
+function Add-ContractProbeOutputCaptureIssue {
+    param(
+        [Parameter(Mandatory)][object]$Probe,
+        [Parameter(Mandatory)][string]$Issue
+    )
+
+    Initialize-ContractProbeTeardownState -Probe $Probe
+    if (-not $Probe.OutputCaptureIssues.Contains($Issue)) {
+        $Probe.OutputCaptureIssues.Add($Issue) | Out-Null
+    }
+}
+
+function Add-ContractProbeTeardownIssue {
+    param(
+        [Parameter(Mandatory)][object]$Probe,
+        [Parameter(Mandatory)][string]$Issue
+    )
+
+    Initialize-ContractProbeTeardownState -Probe $Probe
+    if (-not $Probe.TeardownIssues.Contains($Issue)) {
+        $Probe.TeardownIssues.Add($Issue) | Out-Null
+    }
+}
+
+function Get-ContractTaskState {
+    param(
+        [AllowNull()][System.Threading.Tasks.Task]$Task,
+        [Parameter(Mandatory)][bool]$Observed
+    )
+
+    if ($null -eq $Task) {
+        return "not-started"
+    }
+    if (-not $Task.IsCompleted) {
+        return "pending"
+    }
+    if ($Task.IsCanceled) {
+        return "canceled observed=$Observed"
+    }
+    if ($Task.IsFaulted) {
+        return "faulted observed=$Observed"
+    }
+    return "completed observed=$Observed"
+}
+
+function Set-ContractProbeDrainTask {
+    param(
+        [Parameter(Mandatory)][object]$Probe,
+        [Parameter(Mandatory)]
+        [ValidateSet("stdout", "stderr")]
+        [string]$Name,
+        [Parameter(Mandatory)][System.Threading.Tasks.Task]$Task
+    )
+
+    Initialize-ContractProbeTeardownState -Probe $Probe
+    $properties = if ($Name -ceq "stdout") {
+        [pscustomobject]@{
+            Task = "OutputTask"
+            Owned = "OutputTaskOwned"
+            Initialization = "OutputDrainInitialization"
+        }
+    }
+    else {
+        [pscustomobject]@{
+            Task = "ErrorTask"
+            Owned = "ErrorTaskOwned"
+            Initialization = "ErrorDrainInitialization"
+        }
+    }
+    $Probe.($properties.Task) = $Task
+    $Probe.($properties.Owned) = $true
+    $Probe.($properties.Initialization) = "started"
+    $Probe.DiagnosticCached = $false
+}
+
+function Get-ContractProbeDrainState {
+    param(
+        [Parameter(Mandatory)][object]$Probe,
+        [Parameter(Mandatory)]
+        [ValidateSet("stdout", "stderr")]
+        [string]$Name
+    )
+
+    Initialize-ContractProbeTeardownState -Probe $Probe
+    $properties = if ($Name -ceq "stdout") {
+        [pscustomobject]@{
+            Task = "OutputTask"
+            Owned = "OutputTaskOwned"
+            Observed = "OutputTaskObserved"
+            Initialization = "OutputDrainInitialization"
+        }
+    }
+    else {
+        [pscustomobject]@{
+            Task = "ErrorTask"
+            Owned = "ErrorTaskOwned"
+            Observed = "ErrorTaskObserved"
+            Initialization = "ErrorDrainInitialization"
+        }
+    }
+    if (-not $Probe.($properties.Owned)) {
+        return "not-started owned=False observed=$($Probe.($properties.Observed))"
+    }
+    if ($null -eq $Probe.($properties.Task)) {
+        return "owned-missing observed=$($Probe.($properties.Observed))"
+    }
+    $taskState = Get-ContractTaskState -Task $Probe.($properties.Task) `
+        -Observed ([bool]$Probe.($properties.Observed))
+    return "$taskState owned=True init=$($Probe.($properties.Initialization))"
+}
+
+function Complete-ContractProbeOutput {
+    param([Parameter(Mandatory)][object]$Probe)
+
+    Initialize-ContractProbeTeardownState -Probe $Probe
+    if ($null -eq $Probe.Process) {
+        return @()
+    }
+
+    $hasExited = $false
+    try {
+        $hasExited = [bool]$Probe.Process.HasExited
+    }
+    catch {
+        Add-ContractProbeOutputCaptureIssue -Probe $Probe `
+            -Issue "process exit observation failed: $($_.Exception.Message)"
+    }
+    if (-not $hasExited) {
+        return @($Probe.OutputCaptureIssues)
+    }
+
+    $issues = [System.Collections.Generic.List[string]]::new()
+    foreach ($stream in @(
+        [pscustomobject]@{
+            Name = "stdout"
+            Task = $Probe.OutputTask
+            Property = "Stdout"
+            OwnedProperty = "OutputTaskOwned"
+            ObservedProperty = "OutputTaskObserved"
+            SucceededProperty = "OutputTaskSucceeded"
+            InitializationProperty = "OutputDrainInitialization"
+        },
+        [pscustomobject]@{
+            Name = "stderr"
+            Task = $Probe.ErrorTask
+            Property = "Stderr"
+            OwnedProperty = "ErrorTaskOwned"
+            ObservedProperty = "ErrorTaskObserved"
+            SucceededProperty = "ErrorTaskSucceeded"
+            InitializationProperty = "ErrorDrainInitialization"
+        }
+    )) {
+        if (-not $Probe.($stream.OwnedProperty)) {
+            continue
+        }
+        if ($null -eq $stream.Task) {
+            Add-ContractProbeOutputCaptureIssue -Probe $Probe `
+                -Issue "$($stream.Name) drain ownership did not retain a task"
+            continue
+        }
+        if (-not $stream.Task.IsCompleted) {
+            $issues.Add("$($stream.Name) drain pending") | Out-Null
+            continue
+        }
+        if ($Probe.($stream.ObservedProperty)) {
+            continue
+        }
+        try {
+            $Probe.($stream.Property) = $stream.Task.GetAwaiter().GetResult()
+            $Probe.($stream.SucceededProperty) = $true
+            $Probe.($stream.InitializationProperty) = "observed"
+        }
+        catch {
+            $Probe.($stream.SucceededProperty) = $false
+            $Probe.($stream.InitializationProperty) = if ($stream.Task.IsCanceled) {
+                "canceled"
+            }
+            else {
+                "faulted"
+            }
+            Add-ContractProbeOutputCaptureIssue -Probe $Probe `
+                -Issue "$($stream.Name) drain failed: $($_.Exception.Message)"
+        }
+        finally {
+            $Probe.($stream.ObservedProperty) = $true
+            $Probe.DiagnosticCached = $false
+        }
+    }
+    $Probe.OutputCaptured = [bool](
+        $Probe.OutputTaskOwned -and
+        $Probe.ErrorTaskOwned -and
+        $Probe.OutputTaskObserved -and
+        $Probe.ErrorTaskObserved -and
+        $Probe.OutputTaskSucceeded -and
+        $Probe.ErrorTaskSucceeded
+    )
+    foreach ($issue in $Probe.OutputCaptureIssues) {
+        $issues.Add($issue) | Out-Null
+    }
+    $Probe.OutputCaptureFailure = @($issues) -join "; "
+    return @($issues)
+}
+
+function Complete-ContractProbeOutputFinalSnapshot {
+    param(
+        [Parameter(Mandatory)][object]$Probe,
+        [ValidateRange(1, [int]::MaxValue)][int]$TimeoutMilliseconds = 1000
+    )
+
+    Initialize-ContractProbeTeardownState -Probe $Probe
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        while ($true) {
+            $pending = @(
+                @($Probe.OutputTask, $Probe.ErrorTask) | Where-Object {
+                    $null -ne $_ -and -not $_.IsCompleted
+                }
+            )
+            if ($pending.Count -eq 0) {
+                break
+            }
+            $remaining = [long]$TimeoutMilliseconds - [long]$timer.ElapsedMilliseconds
+            if ($remaining -le 0) {
+                foreach ($stream in @(
+                    [pscustomobject]@{ Name = "stdout"; Task = $Probe.OutputTask },
+                    [pscustomobject]@{ Name = "stderr"; Task = $Probe.ErrorTask }
+                )) {
+                    if ($null -ne $stream.Task -and -not $stream.Task.IsCompleted) {
+                        Add-ContractProbeOutputCaptureIssue -Probe $Probe `
+                            -Issue "$($stream.Name) drain exceeded bounded final wait"
+                    }
+                }
+                break
+            }
+            [System.Threading.Tasks.Task]::WaitAny(
+                [System.Threading.Tasks.Task[]]$pending,
+                [int][Math]::Min(20L, $remaining)
+            ) | Out-Null
+        }
+    }
+    finally {
+        $timer.Stop()
+    }
+    return @(Complete-ContractProbeOutput -Probe $Probe)
+}
+
+function Request-ContractProbePipeCancellation {
+    param([Parameter(Mandatory)][object]$Probe)
+
+    Initialize-ContractProbeTeardownState -Probe $Probe
+    if ($Probe.PipeCancellationRequested -or $null -eq $Probe.Process) {
+        return
+    }
+    $Probe.PipeCancellationRequested = $true
+    foreach ($readerName in @("StandardOutput", "StandardError")) {
+        try {
+            $reader = $Probe.Process.$readerName
+            if ($null -ne $reader) {
+                $reader.Dispose()
+            }
+        }
+        catch {
+            Add-ContractProbeTeardownIssue -Probe $Probe `
+                -Issue "$readerName pipe close failed: $($_.Exception.Message)"
+        }
+    }
+    foreach ($task in @($Probe.OutputTask, $Probe.ErrorTask)) {
+        if ($null -ne $task -and -not $task.IsCompleted) {
+            [EasyConContractProcessOperations]::ObserveTaskCompletion($task)
+        }
+    }
+}
+
+function Get-ContractProbeTrace {
+    param([Parameter(Mandatory)][object]$Probe)
+
+    if (-not (Test-Path -LiteralPath $Probe.Trace -PathType Leaf)) {
+        return "<none>"
+    }
+    try {
+        return Get-Content -Raw -LiteralPath $Probe.Trace
+    }
+    catch {
+        return "<trace read failed: $($_.Exception.Message)>"
+    }
+}
+
+function Update-ContractProbeTraceProgress {
+    param([Parameter(Mandatory)][object]$Probe)
+
+    $trace = Get-ContractProbeTrace -Probe $Probe
+    $traceLines = @($trace -split '\r?\n' | Where-Object {
+        -not [string]::IsNullOrWhiteSpace($_)
+    })
+    if (
+        $traceLines.Count -gt 0 -and
+        $traceLines[-1] -match '^[^|]+\|(?<Milestone>.+)$'
+    ) {
+        $Probe.LastMilestone = $Matches.Milestone
+        $Probe.Progress = $Matches.Milestone
+    }
+    return $trace
+}
+
+function Get-ContractProbeDiagnostic {
+    param([Parameter(Mandatory)][object]$Probe)
+
+    Initialize-ContractProbeTeardownState -Probe $Probe
+    $pidValue = if ([string]::IsNullOrWhiteSpace([string]$Probe.ProcessId)) {
+        "<none>"
+    }
+    else {
+        [string]$Probe.ProcessId
+    }
+    $exitCode = "<not-started>"
+    if ($null -ne $Probe.Process) {
+        try {
+            $observedProcessId = [string]$Probe.Process.Id
+            if (-not [string]::IsNullOrWhiteSpace($observedProcessId)) {
+                $Probe.ProcessId = $observedProcessId
+                $pidValue = $observedProcessId
+            }
+        }
+        catch {
+            $pidValue = "<unavailable: $($_.Exception.Message)>"
+        }
+        try {
+            if ($Probe.Process.HasExited) {
+                $exitCode = [string]$Probe.Process.ExitCode
+            }
+            else {
+                $exitCode = "<running>"
+            }
+        }
+        catch {
+            $exitCode = "<unavailable: $($_.Exception.Message)>"
+        }
+    }
+    $stdout = if (-not $Probe.OutputTaskOwned) {
+        "<not-started>"
+    }
+    elseif ($Probe.OutputTaskObserved -and $Probe.OutputTaskSucceeded) {
+        $Probe.Stdout
+    }
+    else {
+        "<draining>"
+    }
+    $stderr = if (-not $Probe.ErrorTaskOwned) {
+        "<not-started>"
+    }
+    elseif ($Probe.ErrorTaskObserved -and $Probe.ErrorTaskSucceeded) {
+        $Probe.Stderr
+    }
+    else {
+        "<draining>"
+    }
+    $trace = Update-ContractProbeTraceProgress -Probe $Probe
+    $captureFailure = if ([string]::IsNullOrWhiteSpace($Probe.OutputCaptureFailure)) {
+        "<none>"
+    }
+    else {
+        $Probe.OutputCaptureFailure
+    }
+    $stdoutDrain = Get-ContractProbeDrainState -Probe $Probe -Name "stdout"
+    $stderrDrain = Get-ContractProbeDrainState -Probe $Probe -Name "stderr"
+    $killTask = Get-ContractTaskState -Task $Probe.KillTask `
+        -Observed ([bool]$Probe.KillTaskObserved)
+    return (
+        "probe=$($Probe.Name) state=$($Probe.State) progress=$($Probe.Progress) " +
+        "pid=$pidValue command=$($Probe.Command) ArgumentList=$($Probe.ArgumentListJson) " +
+        "exitCode=$exitCode lastMilestone=$($Probe.LastMilestone)`n" +
+        "stdout<<`n$stdout`n>>stdout`nstderr<<`n$stderr`n>>stderr`n" +
+        "outputCaptured=$($Probe.OutputCaptured) stdoutDrain=$stdoutDrain " +
+        "stderrDrain=$stderrDrain killTask=$killTask " +
+        "pipeCancellationRequested=$($Probe.PipeCancellationRequested) " +
+        "lastProcessExited=$($Probe.LastProcessExited) wasReclaimed=$($Probe.WasReclaimed)`n" +
+        "outputCaptureFailure=$captureFailure`n" +
+        "trace<<`n$trace`n>>trace"
+    )
+}
+
+function Cache-ContractProbeDiagnostic {
+    param([Parameter(Mandatory)][object]$Probe)
+
+    Initialize-ContractProbeTeardownState -Probe $Probe
+    if ($Probe.DiagnosticCached) {
+        return
+    }
+    try {
+        $Probe.TeardownDiagnostic = Get-ContractProbeDiagnostic -Probe $Probe
+    }
+    catch {
+        Add-ContractProbeTeardownIssue -Probe $Probe `
+            -Issue "diagnostic capture failed: $($_.Exception.Message)"
+        $Probe.TeardownDiagnostic = (
+            "probe=$($Probe.Name) state=$($Probe.State) progress=$($Probe.Progress) " +
+            "pid=<unavailable> command=$($Probe.Command) ArgumentList=$($Probe.ArgumentListJson) " +
+            "exitCode=<unavailable> lastMilestone=$($Probe.LastMilestone)`n" +
+            "stdout<<`n$($Probe.Stdout)`n>>stdout`nstderr<<`n$($Probe.Stderr)`n>>stderr`n" +
+            "diagnostic=<capture failed>"
+        )
+    }
+    finally {
+        $Probe.DiagnosticCached = $true
+    }
+}
+
+function Get-ContractProbeDiagnostics {
+    param([Parameter(Mandatory)][object[]]$Probe)
+
+    return (@($Probe | ForEach-Object {
+        if (
+            $null -ne $_.PSObject.Properties["TeardownDiagnostic"] -and
+            -not [string]::IsNullOrWhiteSpace($_.TeardownDiagnostic)
+        ) {
+            $_.TeardownDiagnostic
+        }
+        else {
+            Get-ContractProbeDiagnostic -Probe $_
+        }
+    }) -join "`n---`n")
+}
+
+function Update-ContractProbeTeardownSnapshot {
+    param([Parameter(Mandatory)][object]$Probe)
+
+    Initialize-ContractProbeTeardownState -Probe $Probe
+    if ($Probe.WasReclaimed -or $null -eq $Probe.Process) {
+        $Probe.LastProcessExited = $true
+        return
+    }
+    try {
+        $Probe.LastProcessExited = [bool]$Probe.Process.WaitForExit(0)
+    }
+    catch {
+        Add-ContractProbeTeardownIssue -Probe $Probe `
+            -Issue "process WaitForExit failed: $($_.Exception.Message)"
+        return
+    }
+    if ($null -ne $Probe.KillTask -and $Probe.KillTask.IsCompleted -and -not $Probe.KillTaskObserved) {
+        try {
+            $null = $Probe.KillTask.GetAwaiter().GetResult()
+        }
+        catch {
+            Add-ContractProbeTeardownIssue -Probe $Probe `
+                -Issue "process tree kill failed: $($_.Exception.Message)"
+        }
+        finally {
+            $Probe.KillTaskObserved = $true
+        }
+    }
+    if ($Probe.LastProcessExited) {
+        $null = Complete-ContractProbeOutput -Probe $Probe
+    }
+}
+
+function Test-ContractProbeCanBeReclaimed {
+    param([Parameter(Mandatory)][object]$Probe)
+
+    Initialize-ContractProbeTeardownState -Probe $Probe
+    if ($null -eq $Probe.Process) {
+        return $true
+    }
+    $killObserved = (
+        -not $Probe.KillLaunchAttempted -or
+        ($null -ne $Probe.KillTask -and $Probe.KillTask.IsCompleted -and $Probe.KillTaskObserved)
+    )
+    $outputDrainSettled = (
+        -not $Probe.OutputTaskOwned -or
+        (
+            $null -ne $Probe.OutputTask -and
+            $Probe.OutputTask.IsCompleted -and
+            $Probe.OutputTaskObserved
+        )
+    )
+    $errorDrainSettled = (
+        -not $Probe.ErrorTaskOwned -or
+        (
+            $null -ne $Probe.ErrorTask -and
+            $Probe.ErrorTask.IsCompleted -and
+            $Probe.ErrorTaskObserved
+        )
+    )
+    return [bool](
+        $Probe.LastProcessExited -and
+        $killObserved -and
+        $outputDrainSettled -and
+        $errorDrainSettled -and
+        $Probe.DiagnosticCached
+    )
+}
+
+function Try-ReclaimContractProbe {
+    param([Parameter(Mandatory)][object]$Probe)
+
+    if ($Probe.WasReclaimed) {
+        return
+    }
+    if ($null -eq $Probe.Process) {
+        $Probe.WasReclaimed = $true
+        return
+    }
+    if (-not (Test-ContractProbeCanBeReclaimed -Probe $Probe)) {
+        return
+    }
+    try {
+        $Probe.Process.Dispose()
+        $Probe.WasReclaimed = $true
+        # The diagnostic is part of the failure contract, so never retain a pre-reclaim snapshot.
+        $Probe.DiagnosticCached = $false
+        Cache-ContractProbeDiagnostic -Probe $Probe
+    }
+    catch {
+        Add-ContractProbeTeardownIssue -Probe $Probe `
+            -Issue "process dispose failed: $($_.Exception.Message)"
+    }
+}
+
+function Stop-ContractProbes {
+    param(
+        [Parameter(Mandatory)][object[]]$Probe,
+        [int]$TimeoutMilliseconds = 5000,
+        [object]$Deadline
+    )
+
+    if ($null -eq $Deadline) {
+        $Deadline = New-ContractProbeDeadline -Name "probe teardown" `
+            -TimeoutMilliseconds $TimeoutMilliseconds
+    }
+    $null = Get-ContractProbeDeadlineRemaining -Deadline $Deadline
+    foreach ($candidate in $Probe) {
+        Initialize-ContractProbeTeardownState -Probe $candidate
+    }
+
+    # Launch every live tree kill before any wait, drain, or diagnostic can consume the deadline.
+    foreach ($candidate in $Probe) {
+        if ($candidate.WasReclaimed -or $null -eq $candidate.Process) {
+            continue
+        }
+        $isLive = $true
+        try {
+            $candidate.LastProcessExited = [bool]$candidate.Process.HasExited
+            $isLive = -not $candidate.LastProcessExited
+        }
+        catch {
+            Add-ContractProbeTeardownIssue -Probe $candidate `
+                -Issue "process exit observation failed before kill launch: $($_.Exception.Message)"
+        }
+        if ($isLive -and -not $candidate.KillLaunchAttempted) {
+            $candidate.KillLaunchAttempted = $true
+            $candidate.KillTaskObserved = $false
+            try {
+                $candidate.KillTask = [EasyConContractProcessOperations]::KillTreeAsync(
+                    $candidate.Process
+                )
+            }
+            catch {
+                $candidate.KillTaskObserved = $true
+                Add-ContractProbeTeardownIssue -Probe $candidate `
+                    -Issue "process tree kill launch failed: $($_.Exception.Message)"
+            }
+        }
+    }
+
+    while ($true) {
+        foreach ($candidate in $Probe) {
+            Update-ContractProbeTeardownSnapshot -Probe $candidate
+            if ($candidate.LastProcessExited) {
+                Cache-ContractProbeDiagnostic -Probe $candidate
+                Try-ReclaimContractProbe -Probe $candidate
+            }
+        }
+        if (@($Probe | Where-Object { -not $_.WasReclaimed }).Count -eq 0) {
+            break
+        }
+        $remaining = Get-ContractProbeDeadlineRemaining -Deadline $Deadline
+        if ($remaining -le 0) {
+            foreach ($candidate in $Probe) {
+                Update-ContractProbeTeardownSnapshot -Probe $candidate
+                if ($candidate.LastProcessExited -and -not $candidate.OutputCaptured) {
+                    Request-ContractProbePipeCancellation -Probe $candidate
+                    Update-ContractProbeTeardownSnapshot -Probe $candidate
+                }
+                Cache-ContractProbeDiagnostic -Probe $candidate
+                Try-ReclaimContractProbe -Probe $candidate
+            }
+            break
+        }
+        [System.Threading.Thread]::Sleep([int][Math]::Min(20L, [long]$remaining))
+    }
+
+    $issues = [System.Collections.Generic.List[string]]::new()
+    $livePids = [System.Collections.Generic.List[string]]::new()
+    $unreclaimedPids = [System.Collections.Generic.List[string]]::new()
+    foreach ($candidate in $Probe) {
+        Initialize-ContractProbeTeardownState -Probe $candidate
+        if (-not $candidate.DiagnosticCached) {
+            Cache-ContractProbeDiagnostic -Probe $candidate
+        }
+        if (-not $candidate.WasReclaimed) {
+            $pidValue = "$($candidate.Name):unknown"
+            try {
+                $pidValue = [string]$candidate.Process.Id
+            }
+            catch {
+            }
+            $unreclaimedPids.Add($pidValue) | Out-Null
+            if (-not $candidate.LastProcessExited) {
+                $livePids.Add($pidValue) | Out-Null
+                $issues.Add(
+                    "probe $($candidate.Name): owned child remains alive after teardown deadline"
+                ) | Out-Null
+            }
+            if ($candidate.KillLaunchAttempted -and -not $candidate.KillTaskObserved) {
+                $issues.Add(
+                    "probe $($candidate.Name): process tree kill task remains unobserved after teardown deadline"
+                ) | Out-Null
+            }
+            if ($candidate.OutputTaskOwned -and $null -eq $candidate.OutputTask) {
+                $issues.Add(
+                    "probe $($candidate.Name): stdout drain ownership did not retain a task"
+                ) | Out-Null
+            }
+            elseif ($candidate.OutputTaskOwned -and -not $candidate.OutputTaskObserved) {
+                $issues.Add(
+                    "probe $($candidate.Name): stdout drain remains unobserved after teardown deadline"
+                ) | Out-Null
+            }
+            if ($candidate.ErrorTaskOwned -and $null -eq $candidate.ErrorTask) {
+                $issues.Add(
+                    "probe $($candidate.Name): stderr drain ownership did not retain a task"
+                ) | Out-Null
+            }
+            elseif ($candidate.ErrorTaskOwned -and -not $candidate.ErrorTaskObserved) {
+                $issues.Add(
+                    "probe $($candidate.Name): stderr drain remains unobserved after teardown deadline"
+                ) | Out-Null
+            }
+        }
+        foreach ($issue in $candidate.OutputCaptureIssues) {
+            $issues.Add("probe $($candidate.Name): $issue") | Out-Null
+        }
+        foreach ($issue in $candidate.TeardownIssues) {
+            $issues.Add("probe $($candidate.Name): $issue") | Out-Null
+        }
+    }
+    if ($unreclaimedPids.Count -gt 0) {
+        $script:contractProbeCleanupBlocked = $true
+    }
+    if ($issues.Count -gt 0) {
+        $primary = $issues[0]
+        $additional = if ($issues.Count -gt 1) {
+            @($issues | Select-Object -Skip 1) -join "; "
+        }
+        else {
+            "<none>"
+        }
+        $livePidText = if ($livePids.Count -eq 0) { "<none>" } else { $livePids -join "," }
+        $unreclaimedPidText = if ($unreclaimedPids.Count -eq 0) {
+            "<none>"
+        }
+        else {
+            $unreclaimedPids -join ","
+        }
+        throw (
+            "contract failed: probe teardown failed; primary=$primary; " +
+            "additional=$additional; liveOwnedPids=$livePidText; " +
+            "unreclaimedOwnedPids=$unreclaimedPidText`n" +
+            "probe evidence<<`n$(Get-ContractProbeDiagnostics -Probe $Probe)`n>>probe evidence"
+        )
+    }
+}
+
+function Start-ContractProbe {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][System.Diagnostics.ProcessStartInfo]$StartInfo,
+        [Parameter(Mandatory)][string[]]$Arguments,
+        [Parameter(Mandatory)][string]$Ready,
+        [Parameter(Mandatory)][string]$Release,
+        [Parameter(Mandatory)][string]$Result,
+        [Parameter(Mandatory)][string]$Trace,
+        [string]$Start,
+        [object]$Location,
+        [object]$TeardownDeadline,
+        [AllowEmptyCollection()][object[]]$OwnedProbe = @(),
+        [scriptblock]$AfterProcessStarted,
+        [scriptblock]$AfterOutputDrainStarted,
+        [scriptblock]$AfterDrainsInitialized
+    )
+
+    if ($null -eq $TeardownDeadline) {
+        $TeardownDeadline = New-ContractProbeDeadline -Name "probe teardown" `
+            -TimeoutMilliseconds 5000
+    }
+    $probe = [pscustomobject]@{
+        Name = $Name
+        State = "Created"
+        Progress = "created"
+        LastMilestone = "created"
+        Process = $null
+        ProcessId = ""
+        Command = $StartInfo.FileName
+        ArgumentListJson = ConvertTo-Json -InputObject @($Arguments) -Compress
+        OutputTask = $null
+        ErrorTask = $null
+        OutputTaskOwned = $false
+        ErrorTaskOwned = $false
+        OutputTaskObserved = $false
+        ErrorTaskObserved = $false
+        OutputTaskSucceeded = $false
+        ErrorTaskSucceeded = $false
+        OutputDrainInitialization = "not-started"
+        ErrorDrainInitialization = "not-started"
+        OutputCaptured = $false
+        OutputCaptureFailure = ""
+        Stdout = ""
+        Stderr = ""
+        Start = $Start
+        Ready = $Ready
+        Release = $Release
+        Result = $Result
+        Trace = $Trace
+        Location = $Location
+        TeardownDeadline = $TeardownDeadline
+        TeardownDiagnostic = ""
+        KillTask = $null
+        WasReclaimed = $false
+    }
+    try {
+        $probe.Process = [System.Diagnostics.Process]::Start($StartInfo)
+        if ($null -eq $probe.Process) {
+            throw "Process.Start returned null"
+        }
+        $probe.ProcessId = [string]$probe.Process.Id
+        Set-ContractProbeState -Probe $probe -State Started -Milestone "process.started"
+        if ($null -ne $AfterProcessStarted) {
+            & $AfterProcessStarted $probe
+        }
+        Set-ContractProbeDrainTask -Probe $probe -Name "stdout" `
+            -Task $probe.Process.StandardOutput.ReadToEndAsync()
+        if ($null -ne $AfterOutputDrainStarted) {
+            & $AfterOutputDrainStarted $probe
+        }
+        Set-ContractProbeDrainTask -Probe $probe -Name "stderr" `
+            -Task $probe.Process.StandardError.ReadToEndAsync()
+        if ($null -ne $AfterDrainsInitialized) {
+            & $AfterDrainsInitialized $probe
+        }
+        return $probe
+    }
+    catch {
+        $startFailure = $_
+        $cleanupFailure = $null
+        $cleanupProbes = [System.Collections.Generic.List[object]]::new()
+        foreach ($ownedProbe in $OwnedProbe) {
+            if ($null -ne $ownedProbe) {
+                $cleanupProbes.Add($ownedProbe) | Out-Null
+            }
+        }
+        $cleanupProbes.Add($probe) | Out-Null
+        [object[]]$cleanupProbeArray = @($cleanupProbes | ForEach-Object { $_ })
+        try {
+            Stop-ContractProbes -Probe $cleanupProbeArray -Deadline $TeardownDeadline
+        }
+        catch {
+            $cleanupFailure = $_
+        }
+        $message = (
+            "contract failed: probe=$Name initialization failed state=$($probe.State) " +
+            "command=$($probe.Command) " +
+            "ArgumentList=$($probe.ArgumentListJson); primary=$($startFailure.Exception.Message)`n" +
+            "probe evidence<<`n$(Get-ContractProbeDiagnostics -Probe $cleanupProbeArray)`n>>probe evidence"
+        )
+        if ($null -ne $cleanupFailure) {
+            $message += "`nteardown failure<<`n$($cleanupFailure.Exception.Message)`n>>teardown failure"
+        }
+        throw $message
+    }
+}
+
+function Update-ContractProbeReadinessSnapshot {
+    param(
+        [Parameter(Mandatory)][object[]]$Probe,
+        [Parameter(Mandatory)][scriptblock]$ProcessHasExitedAction
+    )
+
+    foreach ($candidate in $Probe) {
+        Initialize-ContractProbeTeardownState -Probe $candidate
+        $null = Update-ContractProbeTraceProgress -Probe $candidate
+        if (
+            $candidate.State -ceq "Started" -and
+            (Test-Path -LiteralPath $candidate.Ready -PathType Leaf)
+        ) {
+            Set-ContractProbeState -Probe $candidate -State Ready `
+                -Milestone "ready.observed"
+        }
+        $hasExited = $false
+        try {
+            $hasExited = [bool](& $ProcessHasExitedAction $candidate.Process)
+        }
+        catch {
+            throw (
+                "contract failed: probe process observation failed: $($_.Exception.Message); " +
+                (Get-ContractProbeDiagnostic -Probe $candidate)
+            )
+        }
+        $null = Update-ContractProbeTraceProgress -Probe $candidate
+        if (
+            @("Started", "Ready") -ccontains $candidate.State -and
+            $hasExited
+        ) {
+            $captureIssues = @(Complete-ContractProbeOutputFinalSnapshot -Probe $candidate)
+            Set-ContractProbeState -Probe $candidate -State ExitedEarly `
+                -Milestone "process.exited-before-result"
+            $captureText = if ($captureIssues.Count -eq 0) {
+                ""
+            }
+            else {
+                " outputCaptureIssues=$($captureIssues -join '; ');"
+            }
+            throw (
+                "contract failed: child exited before ready/result;$captureText " +
+                (Get-ContractProbeDiagnostic -Probe $candidate)
+            )
+        }
+    }
+}
+
+function Wait-ContractProbesReady {
+    param(
+        [Parameter(Mandatory)][object[]]$Probe,
+        [Parameter(Mandatory)][string[]]$RequiredName,
+        [Parameter(Mandatory)][System.Diagnostics.Stopwatch]$Timer,
+        [Parameter(Mandatory)][int]$TimeoutMilliseconds,
+        [scriptblock]$ProcessHasExitedAction = {
+            param([object]$Process)
+            return $Process.HasExited
+        }
+    )
+
+    $required = @($Probe | Where-Object { $RequiredName -ccontains $_.Name })
+    Assert-Contract ($required.Count -eq $RequiredName.Count) `
+        "required probe names must resolve exactly"
+    while ($true) {
+        Update-ContractProbeReadinessSnapshot -Probe $Probe `
+            -ProcessHasExitedAction $ProcessHasExitedAction
+        if (@($required | Where-Object { $_.State -cne "Ready" }).Count -eq 0) {
+            return
+        }
+        $remaining = [long]$TimeoutMilliseconds - [long]$Timer.ElapsedMilliseconds
+        if ($remaining -le 0) {
+            # The final snapshot gives an observed early exit precedence over timeout.
+            Update-ContractProbeReadinessSnapshot -Probe $Probe `
+                -ProcessHasExitedAction $ProcessHasExitedAction
+            if (@($required | Where-Object { $_.State -cne "Ready" }).Count -eq 0) {
+                return
+            }
+            throw (
+                "contract failed: timed out waiting for probe readiness; " +
+                (Get-ContractProbeDiagnostics -Probe $Probe)
+            )
+        }
+        [System.Threading.Thread]::Sleep([int][Math]::Min(20L, $remaining))
+    }
+}
+
+function Publish-ContractProbeRelease {
+    param([Parameter(Mandatory)][object[]]$Probe)
+
+    foreach ($candidate in $Probe) {
+        if ($candidate.Process.HasExited) {
+            $captureIssues = @(Complete-ContractProbeOutputFinalSnapshot -Probe $candidate)
+            Set-ContractProbeState -Probe $candidate -State ExitedEarly `
+                -Milestone "process.exited-before-release"
+            $captureText = if ($captureIssues.Count -eq 0) {
+                ""
+            }
+            else {
+                " outputCaptureIssues=$($captureIssues -join '; ');"
+            }
+            throw (
+                "contract failed: child exited before ready/result;$captureText " +
+                (Get-ContractProbeDiagnostic -Probe $candidate)
+            )
+        }
+        Assert-Contract ($candidate.State -ceq "Ready") `
+            "probe $($candidate.Name) must be Ready before release"
+    }
+    foreach ($releasePath in @($Probe.Release | Select-Object -Unique)) {
+        [System.IO.File]::WriteAllText(
+            $releasePath,
+            "release",
+            [System.Text.UTF8Encoding]::new($false)
+        )
+    }
+    foreach ($candidate in $Probe) {
+        Set-ContractProbeState -Probe $candidate -State Released `
+            -Milestone "release.published"
+    }
+}
+
+function Update-ContractProbeExitSnapshot {
+    param([Parameter(Mandatory)][object[]]$Probe)
+
+    foreach ($candidate in $Probe) {
+        Initialize-ContractProbeTeardownState -Probe $candidate
+        $null = Update-ContractProbeTraceProgress -Probe $candidate
+        if ($candidate.State -ceq "Released") {
+            $candidate.LastProcessExited = [bool]$candidate.Process.WaitForExit(0)
+        }
+        if ($candidate.State -ceq "Released" -and $candidate.LastProcessExited) {
+            $captureIssues = @(Complete-ContractProbeOutputFinalSnapshot -Probe $candidate)
+            if (-not $candidate.OutputCaptured) {
+                continue
+            }
+            Set-ContractProbeState -Probe $candidate -State Exited `
+                -Milestone "process.exited"
+            if (
+                $captureIssues.Count -gt 0 -or
+                $candidate.Process.ExitCode -ne 0 -or
+                -not (Test-Path -LiteralPath $candidate.Result -PathType Leaf)
+            ) {
+                throw (
+                    "contract failed: child exited before a valid result; " +
+                    "outputCaptureIssues=$($captureIssues -join '; '); " +
+                    (Get-ContractProbeDiagnostic -Probe $candidate)
+                )
+            }
+        }
+    }
+}
+
+function Wait-ContractProbesExited {
+    param(
+        [Parameter(Mandatory)][object[]]$Probe,
+        [Parameter(Mandatory)][int]$TimeoutMilliseconds
+    )
+
+    $deadline = New-ContractProbeDeadline -Name "release-to-exit" `
+        -TimeoutMilliseconds $TimeoutMilliseconds
+    while ($true) {
+        Update-ContractProbeExitSnapshot -Probe $Probe
+        if (@($Probe | Where-Object { $_.State -cne "Exited" }).Count -eq 0) {
+            return
+        }
+        $remaining = Get-ContractProbeDeadlineRemaining -Deadline $deadline
+        if ($remaining -le 0) {
+            Update-ContractProbeExitSnapshot -Probe $Probe
+            if (@($Probe | Where-Object { $_.State -cne "Exited" }).Count -eq 0) {
+                return
+            }
+            throw (
+                "contract failed: timed out waiting for released probes to exit; " +
+                (Get-ContractProbeDiagnostics -Probe $Probe)
+            )
+        }
+        [System.Threading.Thread]::Sleep([int][Math]::Min(20L, $remaining))
+    }
+}
+
+function Assert-ContractProbeReadinessDeadlineRegression {
+    param([Parameter(Mandatory)][string]$ProbeRoot)
+
+    New-Item -ItemType Directory -Force -Path $ProbeRoot | Out-Null
+    $trace = Join-Path $ProbeRoot "deadline-final-observation-trace.txt"
+    [System.IO.File]::WriteAllText(
+        $trace,
+        "2026-08-10T00:00:00.0000000Z|exit.before-ready`n",
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    $process = [pscustomobject]@{
+        Id = 42423
+        HasExited = $false
+        ExitCode = 23
+    }
+    $process | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {
+        param([int]$Timeout = -1)
+        return $true
+    }
+    $probe = [pscustomobject]@{
+        Name = "deadline-exit"
+        State = "Started"
+        Progress = "process.started"
+        LastMilestone = "process.started"
+        Process = $process
+        Command = "synthetic-probe.exe"
+        ArgumentListJson = '["--deadline-exit","path with spaces"]'
+        OutputTask = [System.Threading.Tasks.Task]::FromResult([string]"synthetic stdout")
+        ErrorTask = [System.Threading.Tasks.Task]::FromResult(
+            [string]"SYNTHETIC_DEADLINE_EXIT_STDERR"
+        )
+        OutputCaptured = $false
+        OutputCaptureFailure = ""
+        Stdout = ""
+        Stderr = ""
+        Ready = Join-Path $ProbeRoot "deadline-final-observation-ready.txt"
+        Release = Join-Path $ProbeRoot "deadline-final-observation-release.txt"
+        Result = Join-Path $ProbeRoot "deadline-final-observation-result.txt"
+        Trace = $trace
+        TeardownDeadline = New-ContractProbeDeadline -Name "readiness regression teardown" `
+            -TimeoutMilliseconds 1000
+        WasReclaimed = $false
+    }
+    $exitReads = [pscustomobject]@{ Count = 0 }
+    $processHasExited = {
+        param([object]$CandidateProcess)
+        $exitReads.Count++
+        if ($exitReads.Count -eq 1) {
+            $CandidateProcess.HasExited = $true
+            return $false
+        }
+        return [bool]$CandidateProcess.HasExited
+    }.GetNewClosure()
+
+    $failure = $null
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        Wait-ContractProbesReady -Probe @($probe) -RequiredName @($probe.Name) `
+            -Timer $timer -TimeoutMilliseconds 0 `
+            -ProcessHasExitedAction $processHasExited
+    }
+    catch {
+        $failure = $_
+    }
+    finally {
+        $timer.Stop()
+    }
+    $message = if ($null -eq $failure) { "<none>" } else { $failure.Exception.Message }
+    Assert-Contract (
+        $null -ne $failure -and
+        $probe.State -ceq "ExitedEarly" -and
+        $exitReads.Count -eq 2 -and
+        $message -match 'child exited before ready/result' -and
+        $message -notmatch 'timed out waiting for probe readiness' -and
+        $message -match 'exitCode=23' -and
+        $message -match 'SYNTHETIC_DEADLINE_EXIT_STDERR'
+    ) (
+        "readiness deadline must take one final marker/process/trace snapshot and prefer " +
+        "the observed early exit; exitReads=$($exitReads.Count) state=$($probe.State) " +
+        "observed=$message"
+    )
+}
+
+function Assert-ContractProbeDrainInitializationFailure {
+    param(
+        [Parameter(Mandatory)][string]$ProbeRoot,
+        [Parameter(Mandatory)]
+        [ValidateSet("zero", "partial", "both")]
+        [string]$Schedule
+    )
+
+    $capture = [pscustomobject]@{
+        Probe = $null
+        Pid = 0
+    }
+    $childArguments = @(
+        "-NoLogo",
+        "-NoProfile",
+        "-Command",
+        "Start-Sleep -Seconds 30"
+    )
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = Join-Path $PSHOME "pwsh.exe"
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    foreach ($argument in $childArguments) {
+        $startInfo.ArgumentList.Add($argument)
+    }
+    $failureToken = "synthetic-$Schedule-drain-initialization-failure"
+    $startParameters = @{
+        Name = "drain-init-$Schedule"
+        StartInfo = $startInfo
+        Arguments = $childArguments
+        Ready = Join-Path $ProbeRoot "drain-init-$Schedule-ready.txt"
+        Release = Join-Path $ProbeRoot "drain-init-$Schedule-release.txt"
+        Result = Join-Path $ProbeRoot "drain-init-$Schedule-result.txt"
+        Trace = Join-Path $ProbeRoot "drain-init-$Schedule-trace.txt"
+        TeardownDeadline = (
+            New-ContractProbeDeadline -Name "drain initialization $Schedule teardown" `
+                -TimeoutMilliseconds 1000
+        )
+        AfterProcessStarted = ({
+            param([object]$Probe)
+            $capture.Probe = $Probe
+            $capture.Pid = $Probe.Process.Id
+        }).GetNewClosure()
+    }
+    switch ($Schedule) {
+        "zero" {
+            $startParameters.AfterProcessStarted = ({
+                param([object]$Probe)
+                $capture.Probe = $Probe
+                $capture.Pid = $Probe.Process.Id
+                throw $failureToken
+            }).GetNewClosure()
+        }
+        "partial" {
+            $startParameters.AfterOutputDrainStarted = ({
+                param([object]$Probe)
+                throw $failureToken
+            }).GetNewClosure()
+        }
+        "both" {
+            $startParameters.AfterDrainsInitialized = ({
+                param([object]$Probe)
+                throw $failureToken
+            }).GetNewClosure()
+        }
+    }
+
+    $failure = $null
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        Start-ContractProbe @startParameters | Out-Null
+    }
+    catch {
+        $failure = $_
+    }
+    finally {
+        $timer.Stop()
+    }
+
+    $probe = $capture.Probe
+    $message = if ($null -eq $failure) { "<none>" } else { $failure.Exception.Message }
+    try {
+        Assert-Contract (
+            $null -ne $probe -and
+            $capture.Pid -gt 0 -and
+            $probe.State -ceq "Started" -and
+            $probe.LastProcessExited -and
+            $probe.KillLaunchAttempted -and
+            $probe.KillTaskObserved -and
+            $probe.DiagnosticCached -and
+            $probe.WasReclaimed -and
+            -not $script:contractProbeCleanupBlocked -and
+            $timer.ElapsedMilliseconds -le 2000 -and
+            $message -match [regex]::Escape($failureToken) -and
+            $message -match 'state=Started' -and
+            $message -match 'pid=\d+' -and
+            $message -match 'ArgumentList=' -and
+            $message -match 'stdoutDrain=' -and
+            $message -match 'stderrDrain=' -and
+            $message -match 'killTask='
+        ) (
+            "drain initialization $Schedule failure must preserve truthful ownership, " +
+            "diagnostics, bounded teardown, and cleanup convergence; observed=$message"
+        )
+
+        switch ($Schedule) {
+            "zero" {
+                Assert-Contract (
+                    -not $probe.OutputTaskOwned -and
+                    -not $probe.ErrorTaskOwned -and
+                    -not $probe.OutputTaskObserved -and
+                    -not $probe.ErrorTaskObserved -and
+                    $probe.OutputDrainInitialization -ceq "not-started" -and
+                    $probe.ErrorDrainInitialization -ceq "not-started" -and
+                    -not $probe.OutputCaptured
+                ) "zero-drain initialization must record both drains as not owned"
+            }
+            "partial" {
+                Assert-Contract (
+                    $probe.OutputTaskOwned -and
+                    $probe.OutputTaskObserved -and
+                    $probe.OutputTaskSucceeded -and
+                    -not $probe.ErrorTaskOwned -and
+                    -not $probe.ErrorTaskObserved -and
+                    $probe.ErrorDrainInitialization -ceq "not-started" -and
+                    -not $probe.OutputCaptured
+                ) "partial drain initialization must observe the owned stdout task only"
+            }
+            "both" {
+                Assert-Contract (
+                    $probe.OutputTaskOwned -and
+                    $probe.ErrorTaskOwned -and
+                    $probe.OutputTaskObserved -and
+                    $probe.ErrorTaskObserved -and
+                    $probe.OutputTaskSucceeded -and
+                    $probe.ErrorTaskSucceeded -and
+                    $probe.OutputCaptured
+                ) "both initialized drains must be observed and captured before reclaim"
+            }
+        }
+    }
+    finally {
+        if ($null -ne $probe -and $null -ne $probe.Process -and -not $probe.WasReclaimed) {
+            try {
+                if (-not $probe.Process.HasExited) {
+                    $probe.Process.Kill($true)
+                    $null = $probe.Process.WaitForExit(5000)
+                }
+            }
+            catch {
+            }
+            try {
+                $probe.Process.Dispose()
+            }
+            catch {
+            }
+        }
+    }
+}
+
+function Assert-ContractProbeTeardownRegression {
+    param([Parameter(Mandatory)][string]$ProbeRoot)
+
+    New-Item -ItemType Directory -Force -Path $ProbeRoot | Out-Null
+    $script:contractProbeCleanupBlocked = $false
+    foreach ($schedule in @("zero", "partial", "both")) {
+        Assert-ContractProbeDrainInitializationFailure -ProbeRoot $ProbeRoot -Schedule $schedule
+    }
+    $processes = [System.Collections.Generic.List[object]]::new()
+    $probes = [System.Collections.Generic.List[object]]::new()
+    $pendingStdout = $null
+    try {
+        $firstStart = [System.Diagnostics.ProcessStartInfo]::new()
+        $firstStart.FileName = Join-Path $PSHOME "pwsh.exe"
+        $firstStart.UseShellExecute = $false
+        $firstStart.RedirectStandardOutput = $true
+        $firstStart.RedirectStandardError = $true
+        foreach ($argument in @("-NoLogo", "-NoProfile", "-Command", "exit 0")) {
+            $firstStart.ArgumentList.Add($argument)
+        }
+        $firstProcess = [System.Diagnostics.Process]::Start($firstStart)
+        Assert-Contract ($null -ne $firstProcess -and $firstProcess.WaitForExit(5000)) `
+            "the teardown regression's first process must exit"
+        $processes.Add($firstProcess) | Out-Null
+
+        $secondStart = [System.Diagnostics.ProcessStartInfo]::new()
+        $secondStart.FileName = Join-Path $PSHOME "pwsh.exe"
+        $secondStart.UseShellExecute = $false
+        $secondStart.RedirectStandardOutput = $true
+        $secondStart.RedirectStandardError = $true
+        foreach ($argument in @("-NoLogo", "-NoProfile", "-Command", "Start-Sleep -Seconds 30")) {
+            $secondStart.ArgumentList.Add($argument)
+        }
+        $secondProcess = [System.Diagnostics.Process]::Start($secondStart)
+        Assert-Contract ($null -ne $secondProcess -and -not $secondProcess.HasExited) `
+            "the teardown regression's second process must remain running"
+        $processes.Add($secondProcess) | Out-Null
+
+        $firstProbe = [pscustomobject]@{
+            Name = "faulted-one"
+            State = "Ready"
+            Progress = "ready.observed"
+            LastMilestone = "ready.observed"
+            Process = $firstProcess
+            Command = $firstStart.FileName
+            ArgumentListJson = ConvertTo-Json -InputObject @($firstStart.ArgumentList) -Compress
+            OutputTask = [System.Threading.Tasks.Task]::FromException[string](
+                [System.InvalidOperationException]::new("synthetic-drain-failure")
+            )
+            ErrorTask = [System.Threading.Tasks.Task]::FromResult([string]"first stderr")
+            OutputCaptured = $false
+            Stdout = ""
+            Stderr = ""
+            Ready = Join-Path $ProbeRoot "faulted-one-ready.txt"
+            Release = Join-Path $ProbeRoot "faulted-one-release.txt"
+            Result = Join-Path $ProbeRoot "faulted-one-result.txt"
+            Trace = Join-Path $ProbeRoot "faulted-one-trace.txt"
+            WasReclaimed = $false
+        }
+        $secondProbe = [pscustomobject]@{
+            Name = "live-two"
+            State = "Ready"
+            Progress = "ready.observed"
+            LastMilestone = "ready.observed"
+            Process = $secondProcess
+            Command = $secondStart.FileName
+            ArgumentListJson = ConvertTo-Json -InputObject @($secondStart.ArgumentList) -Compress
+            OutputTask = $secondProcess.StandardOutput.ReadToEndAsync()
+            ErrorTask = $secondProcess.StandardError.ReadToEndAsync()
+            OutputCaptured = $false
+            Stdout = ""
+            Stderr = ""
+            Ready = Join-Path $ProbeRoot "live-two-ready.txt"
+            Release = Join-Path $ProbeRoot "live-two-release.txt"
+            Result = Join-Path $ProbeRoot "live-two-result.txt"
+            Trace = Join-Path $ProbeRoot "live-two-trace.txt"
+            WasReclaimed = $false
+        }
+        Set-Content -LiteralPath $firstProbe.Trace -Encoding utf8NoBOM -Value "one|ready.written"
+        Set-Content -LiteralPath $secondProbe.Trace -Encoding utf8NoBOM -Value "two|ready.written"
+        $probes.Add($firstProbe) | Out-Null
+        $probes.Add($secondProbe) | Out-Null
+        $failure = $null
+        $timer = [System.Diagnostics.Stopwatch]::StartNew()
+        try {
+            Stop-ContractProbes -Probe @($firstProbe, $secondProbe) -TimeoutMilliseconds 1000
+        }
+        catch {
+            $failure = $_
+        }
+        finally {
+            $timer.Stop()
+        }
+        $message = if ($null -eq $failure) { "<none>" } else { $failure.Exception.Message }
+        Assert-Contract (
+            $null -ne $failure -and
+            -not $firstProbe.OutputCaptured -and
+            $firstProbe.OutputTaskObserved -and
+            $firstProbe.ErrorTaskObserved -and
+            $firstProbe.WasReclaimed -and
+            $secondProbe.WasReclaimed -and
+            $timer.ElapsedMilliseconds -le 2000 -and
+            $message -match 'synthetic-drain-failure' -and
+            $message -match 'probe=faulted-one' -and
+            $message -match 'probe=live-two' -and
+            $message -match 'pid=\d+' -and
+            $message -match 'ArgumentList=' -and
+            $message -match 'stdout<<' -and
+            $message -match 'stderr<<' -and
+            $message -match 'lastMilestone='
+        ) (
+            "faulted drain teardown must preserve the first failure, reclaim every owned child, " +
+            "and expose complete diagnostics; elapsedMs=$($timer.ElapsedMilliseconds) observed=$message"
+        )
+
+        $startupOwnedStart = [System.Diagnostics.ProcessStartInfo]::new()
+        $startupOwnedStart.FileName = Join-Path $PSHOME "pwsh.exe"
+        $startupOwnedStart.UseShellExecute = $false
+        $startupOwnedStart.RedirectStandardOutput = $true
+        $startupOwnedStart.RedirectStandardError = $true
+        foreach ($argument in @("-NoLogo", "-NoProfile", "-Command", "Start-Sleep -Seconds 30")) {
+            $startupOwnedStart.ArgumentList.Add($argument)
+        }
+        $startupOwnedProcess = [System.Diagnostics.Process]::Start($startupOwnedStart)
+        Assert-Contract (
+            $null -ne $startupOwnedProcess -and -not $startupOwnedProcess.HasExited
+        ) "startup-failure regression's first owned process must remain running"
+        $processes.Add($startupOwnedProcess) | Out-Null
+        $startupOwnedProbe = [pscustomobject]@{
+            Name = "startup-owned-one"
+            State = "Started"
+            Progress = "process.started"
+            LastMilestone = "process.started"
+            Process = $startupOwnedProcess
+            Command = $startupOwnedStart.FileName
+            ArgumentListJson = ConvertTo-Json -InputObject @($startupOwnedStart.ArgumentList) -Compress
+            OutputTask = $startupOwnedProcess.StandardOutput.ReadToEndAsync()
+            ErrorTask = $startupOwnedProcess.StandardError.ReadToEndAsync()
+            OutputCaptured = $false
+            Stdout = ""
+            Stderr = ""
+            Ready = Join-Path $ProbeRoot "startup-owned-one-ready.txt"
+            Release = Join-Path $ProbeRoot "startup-owned-one-release.txt"
+            Result = Join-Path $ProbeRoot "startup-owned-one-result.txt"
+            Trace = Join-Path $ProbeRoot "startup-owned-one-trace.txt"
+            WasReclaimed = $false
+        }
+        Set-Content -LiteralPath $startupOwnedProbe.Trace -Encoding utf8NoBOM `
+            -Value "one|process.started"
+        $probes.Add($startupOwnedProbe) | Out-Null
+
+        $startupFaultStart = [System.Diagnostics.ProcessStartInfo]::new()
+        $startupFaultStart.FileName = Join-Path $PSHOME "pwsh.exe"
+        $startupFaultStart.UseShellExecute = $false
+        $startupFaultStart.RedirectStandardOutput = $true
+        $startupFaultStart.RedirectStandardError = $true
+        foreach ($argument in @("-NoLogo", "-NoProfile", "-Command", "Start-Sleep -Seconds 30")) {
+            $startupFaultStart.ArgumentList.Add($argument)
+        }
+        $startupFailure = $null
+        $startupTimer = [System.Diagnostics.Stopwatch]::StartNew()
+        try {
+            Start-ContractProbe -Name "startup-fault-two" -StartInfo $startupFaultStart `
+                -Arguments @($startupFaultStart.ArgumentList) `
+                -Start (Join-Path $ProbeRoot "startup-fault-two-start.txt") `
+                -Ready (Join-Path $ProbeRoot "startup-fault-two-ready.txt") `
+                -Release (Join-Path $ProbeRoot "startup-fault-two-release.txt") `
+                -Result (Join-Path $ProbeRoot "startup-fault-two-result.txt") `
+                -Trace (Join-Path $ProbeRoot "startup-fault-two-trace.txt") `
+                -TeardownDeadline (New-ContractProbeDeadline -Name "startup fault teardown" `
+                    -TimeoutMilliseconds 1000) -OwnedProbe @($startupOwnedProbe) `
+                -AfterDrainsInitialized {
+                    param([object]$Probe)
+                    throw "synthetic-startup-drain-initialization-failure"
+                } | Out-Null
+        }
+        catch {
+            $startupFailure = $_
+        }
+        finally {
+            $startupTimer.Stop()
+        }
+        $startupMessage = if ($null -eq $startupFailure) { "<none>" } else {
+            $startupFailure.Exception.Message
+        }
+        Assert-Contract (
+            $null -ne $startupFailure -and
+            $startupOwnedProbe.KillLaunchAttempted -and
+            $startupOwnedProbe.WasReclaimed -and
+            $startupTimer.ElapsedMilliseconds -le 2000 -and
+            $startupMessage -match "synthetic-startup-drain-initialization-failure" -and
+            $startupMessage -match "startup-owned-one" -and
+            $startupMessage -match "startup-fault-two"
+        ) (
+            "a startup failure must launch and reclaim every already-owned child before " +
+            "its shared teardown deadline can be consumed; elapsedMs=$($startupTimer.ElapsedMilliseconds) " +
+            "observed=$startupMessage"
+        )
+
+        $pendingStart = [System.Diagnostics.ProcessStartInfo]::new()
+        $pendingStart.FileName = Join-Path $PSHOME "pwsh.exe"
+        $pendingStart.UseShellExecute = $false
+        $pendingStart.RedirectStandardOutput = $true
+        $pendingStart.RedirectStandardError = $true
+        foreach ($argument in @("-NoLogo", "-NoProfile", "-Command", "exit 0")) {
+            $pendingStart.ArgumentList.Add($argument)
+        }
+        $pendingProcess = [System.Diagnostics.Process]::Start($pendingStart)
+        Assert-Contract ($null -ne $pendingProcess -and $pendingProcess.WaitForExit(5000)) `
+            "the pending-drain regression's first process must exit"
+        $processes.Add($pendingProcess) | Out-Null
+
+        $pendingLiveStart = [System.Diagnostics.ProcessStartInfo]::new()
+        $pendingLiveStart.FileName = Join-Path $PSHOME "pwsh.exe"
+        $pendingLiveStart.UseShellExecute = $false
+        $pendingLiveStart.RedirectStandardOutput = $true
+        $pendingLiveStart.RedirectStandardError = $true
+        foreach ($argument in @("-NoLogo", "-NoProfile", "-Command", "Start-Sleep -Seconds 30")) {
+            $pendingLiveStart.ArgumentList.Add($argument)
+        }
+        $pendingLiveProcess = [System.Diagnostics.Process]::Start($pendingLiveStart)
+        Assert-Contract ($null -ne $pendingLiveProcess -and -not $pendingLiveProcess.HasExited) `
+            "the pending-drain regression's second process must remain running"
+        $processes.Add($pendingLiveProcess) | Out-Null
+
+        $pendingStdout = [System.Threading.Tasks.TaskCompletionSource[string]]::new(
+            [System.Threading.Tasks.TaskCreationOptions]::RunContinuationsAsynchronously
+        )
+        $pendingProbe = [pscustomobject]@{
+            Name = "pending-one"
+            State = "Ready"
+            Progress = "ready.observed"
+            LastMilestone = "ready.observed"
+            Process = $pendingProcess
+            Command = $pendingStart.FileName
+            ArgumentListJson = ConvertTo-Json -InputObject @($pendingStart.ArgumentList) -Compress
+            OutputTask = $pendingStdout.Task
+            ErrorTask = [System.Threading.Tasks.Task]::FromResult([string]"pending stderr")
+            OutputCaptured = $false
+            Stdout = ""
+            Stderr = ""
+            Ready = Join-Path $ProbeRoot "pending-one-ready.txt"
+            Release = Join-Path $ProbeRoot "pending-one-release.txt"
+            Result = Join-Path $ProbeRoot "pending-one-result.txt"
+            Trace = Join-Path $ProbeRoot "pending-one-trace.txt"
+            WasReclaimed = $false
+        }
+        $liveProbe = [pscustomobject]@{
+            Name = "pending-live-two"
+            State = "Ready"
+            Progress = "ready.observed"
+            LastMilestone = "ready.observed"
+            Process = $pendingLiveProcess
+            Command = $pendingLiveStart.FileName
+            ArgumentListJson = ConvertTo-Json -InputObject @($pendingLiveStart.ArgumentList) -Compress
+            OutputTask = $pendingLiveProcess.StandardOutput.ReadToEndAsync()
+            ErrorTask = $pendingLiveProcess.StandardError.ReadToEndAsync()
+            OutputCaptured = $false
+            Stdout = ""
+            Stderr = ""
+            Ready = Join-Path $ProbeRoot "pending-live-two-ready.txt"
+            Release = Join-Path $ProbeRoot "pending-live-two-release.txt"
+            Result = Join-Path $ProbeRoot "pending-live-two-result.txt"
+            Trace = Join-Path $ProbeRoot "pending-live-two-trace.txt"
+            WasReclaimed = $false
+        }
+        Set-Content -LiteralPath $pendingProbe.Trace -Encoding utf8NoBOM -Value "one|process.exited"
+        Set-Content -LiteralPath $liveProbe.Trace -Encoding utf8NoBOM -Value "two|ready.written"
+        $probes.Add($pendingProbe) | Out-Null
+        $probes.Add($liveProbe) | Out-Null
+        $pendingFailure = $null
+        $pendingTimer = [System.Diagnostics.Stopwatch]::StartNew()
+        try {
+            Stop-ContractProbes -Probe @($pendingProbe, $liveProbe) -TimeoutMilliseconds 300
+        }
+        catch {
+            $pendingFailure = $_
+        }
+        finally {
+            $pendingTimer.Stop()
+        }
+        $pendingMessage = if ($null -eq $pendingFailure) {
+            "<none>"
+        }
+        else {
+            $pendingFailure.Exception.Message
+        }
+        Assert-Contract (
+            $null -ne $pendingFailure -and
+            -not $pendingProbe.OutputCaptured -and
+            -not $pendingProbe.OutputTaskObserved -and
+            -not $pendingProbe.WasReclaimed -and
+            $liveProbe.WasReclaimed -and
+            $liveProbe.KillLaunchAttempted -and
+            $script:contractProbeCleanupBlocked -and
+            $pendingTimer.ElapsedMilliseconds -le 1000 -and
+            $pendingMessage -match 'pending-one' -and
+            $pendingMessage -match 'pending-live-two'
+        ) (
+            "pending drain teardown must launch the second live child kill before draining, " +
+            "leave incomplete output and its handle unreclaimed, and block cleanup; " +
+            "elapsedMs=$($pendingTimer.ElapsedMilliseconds) observed=$pendingMessage"
+        )
+        Assert-Contract ($pendingStdout.TrySetResult("pending stdout released")) `
+            "the pending-drain regression must explicitly complete stdout"
+        Stop-ContractProbes -Probe @($pendingProbe) -TimeoutMilliseconds 1000
+        Assert-Contract (
+            $pendingProbe.OutputCaptured -and
+            $pendingProbe.OutputTaskObserved -and
+            $pendingProbe.ErrorTaskObserved -and
+            $pendingProbe.WasReclaimed -and
+            $pendingProbe.Stdout -ceq "pending stdout released"
+        ) "explicitly completed output must be observed before its process handle is reclaimed"
+        $script:contractProbeCleanupBlocked = $false
+    }
+    finally {
+        if ($null -ne $pendingStdout) {
+            $pendingStdout.TrySetResult("fixture cleanup") | Out-Null
+        }
+        for ($index = 0; $index -lt $processes.Count; $index++) {
+            if ($index -lt $probes.Count -and [bool]$probes[$index].WasReclaimed) {
+                continue
+            }
+            $process = $processes[$index]
+            try {
+                if (-not $process.HasExited) {
+                    $process.Kill($true)
+                    $null = $process.WaitForExit(5000)
+                }
+            }
+            finally {
+                $process.Dispose()
+            }
+        }
+    }
+}
+
+function Invoke-SharedWorkspaceProbeSynchronizationContract {
+    param(
+        [Parameter(Mandatory)][string]$ProbeRoot,
+        [Parameter(Mandatory)][object]$FirstLocation,
+        [Parameter(Mandatory)][object]$SecondLocation,
+        [Parameter(Mandatory)][string]$ModulePath,
+        [ValidateSet("Synchronization", "EarlyExit")]
+        [string]$Scenario = "Synchronization",
+        [int]$ReadinessTimeoutMilliseconds = 10000,
+        [int]$CoordinationAndTeardownMarginMilliseconds = 5000,
+        [int]$ExitTimeoutMilliseconds = 10000
+    )
+
+    $releaseTimeoutMilliseconds =
+        $ReadinessTimeoutMilliseconds + $CoordinationAndTeardownMarginMilliseconds
+    Assert-Contract (
+        $releaseTimeoutMilliseconds -eq (
+            $ReadinessTimeoutMilliseconds + $CoordinationAndTeardownMarginMilliseconds
+        )
+    ) "child release watchdog must derive from readiness plus coordination/teardown margin"
+    New-Item -ItemType Directory -Force -Path $ProbeRoot | Out-Null
+    $childPath = Join-Path $ProbeRoot "workspace-probe.ps1"
+    Set-Content -LiteralPath $childPath -Encoding utf8NoBOM -Value @'
+param(
+    [Parameter(Mandatory)][string]$ModulePath,
+    [Parameter(Mandatory)][string]$CacheRoot,
+    [Parameter(Mandatory)][string]$EnvironmentRoot,
+    [Parameter(Mandatory)][string]$StampPath,
+    [Parameter(Mandatory)][string]$LockPath,
+    [Parameter(Mandatory)][string]$WorkspaceKey,
+    [Parameter(Mandatory)][string]$WorkspaceRoot,
+    [Parameter(Mandatory)][string]$WorkspaceLockPath,
+    [Parameter(Mandatory)][string]$StartPath,
+    [Parameter(Mandatory)][string]$ReadyPath,
+    [Parameter(Mandatory)][string]$ReleasePath,
+    [Parameter(Mandatory)][string]$ResultPath,
+    [Parameter(Mandatory)][string]$TracePath,
+    [Parameter(Mandatory)][string]$Name,
+    [Parameter(Mandatory)][string]$Scenario,
+    [Parameter(Mandatory)][int]$ReleaseTimeoutMilliseconds
+)
+$ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
+function Write-ProbeTrace {
+    param([Parameter(Mandatory)][string]$Milestone)
+    [System.IO.File]::AppendAllText(
+        $TracePath,
+        ("{0:o}|{1}`n" -f [datetime]::UtcNow,$Milestone),
+        [System.Text.UTF8Encoding]::new($false)
+    )
+}
+function Wait-ProbeMarker {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Description,
+        [Parameter(Mandatory)][int]$TimeoutMilliseconds
+    )
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        while (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+            $remaining = [long]$TimeoutMilliseconds - [long]$timer.ElapsedMilliseconds
+            if ($remaining -le 0) {
+                throw "shared workspace probe timed out waiting for $Description"
+            }
+            [System.Threading.Thread]::Sleep([int][Math]::Min(20L,$remaining))
+        }
+    }
+    finally {
+        $timer.Stop()
+    }
+}
+Wait-ProbeMarker -Path $StartPath -Description "parent start" `
+    -TimeoutMilliseconds $ReleaseTimeoutMilliseconds
+Write-ProbeTrace "start.observed"
+Import-Module -Name $ModulePath -Force
+$module = Get-Module windows_workspace
+$location = [pscustomobject]@{
+    CacheRoot = $CacheRoot
+    EnvironmentRoot = $EnvironmentRoot
+    StampPath = $StampPath
+    LockPath = $LockPath
+    IdentityKey = "shared-workspace-probe"
+    WorkspaceKey = $WorkspaceKey
+    WorkspaceRoot = $WorkspaceRoot
+    WorkspaceLockPath = $WorkspaceLockPath
+    CargoTargetDirectory = Join-Path $WorkspaceRoot "target"
+}
+$verify = {
+    if (
+        -not (Test-Path -LiteralPath $StampPath -PathType Leaf) -or
+        (Get-Content -Raw -LiteralPath $StampPath).Trim() -cne "ready"
+    ) {
+        throw "shared workspace probe environment is not ready"
+    }
+    Write-ProbeTrace "verify.completed"
+    return "verified"
+}.GetNewClosure()
+$workspace = {
+    param($Summary)
+    if ($Summary -cne "verified") {
+        throw "shared workspace probe did not receive verified state"
+    }
+    if ($Scenario -ceq "EarlyExit" -and $Name -ceq "two") {
+        Write-ProbeTrace "exit.before-ready"
+        [Console]::Error.WriteLine("SYNTHETIC_SECOND_PROBE_EARLY_EXIT")
+        exit 23
+    }
+    [System.IO.File]::WriteAllText($ReadyPath,"ready",[System.Text.UTF8Encoding]::new($false))
+    Write-ProbeTrace "ready.written"
+    Wait-ProbeMarker -Path $ReleasePath -Description "parent release" `
+        -TimeoutMilliseconds $ReleaseTimeoutMilliseconds
+    Write-ProbeTrace "release.observed"
+}.GetNewClosure()
+& $module {
+    param($OwnedLocation,$VerifyAction,$WorkspaceAction)
+    Invoke-EasyConEnvironmentLifecycle -Mode Workspace -Location $OwnedLocation `
+        -SetupAction { throw "Workspace probe must not provision" } `
+        -VerifyAction $VerifyAction -WorkspaceAction $WorkspaceAction `
+        -LeaseTimeoutMilliseconds 10000
+} $location $verify $workspace | Out-Null
+[System.IO.File]::WriteAllText($ResultPath,"passed",[System.Text.UTF8Encoding]::new($false))
+Write-ProbeTrace "result.validated"
+'@
+
+    $probes = [System.Collections.Generic.List[object]]::new()
+    $teardownDeadline = New-ContractProbeDeadline -Name "shared workspace probe teardown" `
+        -TimeoutMilliseconds $CoordinationAndTeardownMarginMilliseconds
+    $primaryFailure = $null
+    try {
+        foreach ($entry in @(
+            [pscustomobject]@{ Name = "one"; Location = $FirstLocation },
+            [pscustomobject]@{ Name = "two"; Location = $SecondLocation }
+        )) {
+            $start = Join-Path $ProbeRoot "$($entry.Name)-start.txt"
+            $ready = Join-Path $ProbeRoot "$($entry.Name)-ready.txt"
+            $release = Join-Path $ProbeRoot "release.txt"
+            $result = Join-Path $ProbeRoot "$($entry.Name)-result.txt"
+            $trace = Join-Path $ProbeRoot "$($entry.Name)-trace.txt"
+            $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+            $startInfo.FileName = Join-Path $PSHOME "pwsh.exe"
+            $startInfo.UseShellExecute = $false
+            $startInfo.RedirectStandardOutput = $true
+            $startInfo.RedirectStandardError = $true
+            $arguments = @(
+                "-NoLogo", "-NoProfile", "-File", $childPath,
+                "-ModulePath", $ModulePath,
+                "-CacheRoot", $entry.Location.CacheRoot,
+                "-EnvironmentRoot", $entry.Location.EnvironmentRoot,
+                "-StampPath", $entry.Location.StampPath,
+                "-LockPath", $entry.Location.LockPath,
+                "-WorkspaceKey", $entry.Location.WorkspaceKey,
+                "-WorkspaceRoot", $entry.Location.WorkspaceRoot,
+                "-WorkspaceLockPath", $entry.Location.WorkspaceLockPath,
+                "-StartPath", $start,
+                "-ReadyPath", $ready,
+                "-ReleasePath", $release,
+                "-ResultPath", $result,
+                "-TracePath", $trace,
+                "-Name", $entry.Name,
+                "-Scenario", $Scenario,
+                "-ReleaseTimeoutMilliseconds", [string]$releaseTimeoutMilliseconds
+            )
+            foreach ($argument in $arguments) {
+                $startInfo.ArgumentList.Add([string]$argument)
+            }
+            $probes.Add((Start-ContractProbe -Name $entry.Name -StartInfo $startInfo `
+                -Arguments $arguments -Start $start -Ready $ready -Release $release -Result $result `
+                -Trace $trace -Location $entry.Location -TeardownDeadline $teardownDeadline `
+                -OwnedProbe $probes.ToArray())) | Out-Null
+        }
+        $readinessTimer = [System.Diagnostics.Stopwatch]::StartNew()
+        [System.IO.File]::WriteAllText(
+            $probes[0].Start,"start",[System.Text.UTF8Encoding]::new($false)
+        )
+        Wait-ContractProbesReady -Probe @($probes) -RequiredName @("one") `
+            -Timer $readinessTimer -TimeoutMilliseconds $ReadinessTimeoutMilliseconds
+        Assert-Contract (
+            -not (Test-Path -LiteralPath $probes[1].Ready -PathType Leaf)
+        ) "the startup-skew probe must remain parent-gated until the first probe is ready"
+        [System.IO.File]::WriteAllText(
+            $probes[1].Start,"start",[System.Text.UTF8Encoding]::new($false)
+        )
+        Wait-ContractProbesReady -Probe @($probes) -RequiredName @("one","two") `
+            -Timer $readinessTimer -TimeoutMilliseconds $ReadinessTimeoutMilliseconds
+        $readinessTimer.Stop()
+        Update-ContractProbeReadinessSnapshot -Probe @($probes) `
+            -ProcessHasExitedAction { param([object]$Process) $Process.HasExited }
+        foreach ($probe in $probes) {
+            Assert-Contract (-not $probe.Process.HasExited) `
+                "workspace probe $($probe.Name) must remain inside its synchronized gate"
+        }
+        Assert-Contract (
+            $probes[0].Location.EnvironmentRoot -ceq $probes[1].Location.EnvironmentRoot -and
+            $probes[0].Location.WorkspaceRoot -cne $probes[1].Location.WorkspaceRoot
+        ) "concurrent probes must share e/ and retain distinct w/<key> roots"
+        Assert-Throws -Pattern "busy|ownership" -Action {
+            Enter-PrivateEnvironmentLease -Location $FirstLocation -Access Exclusive `
+                -TimeoutMilliseconds 0
+        }
+        foreach ($probe in $probes) {
+            Assert-Throws -Pattern "busy|ownership" -Action {
+                Enter-PrivateWorkspaceLease -Location $probe.Location -TimeoutMilliseconds 0
+            }
+        }
+        Publish-ContractProbeRelease -Probe @($probes)
+        Wait-ContractProbesExited -Probe @($probes) -TimeoutMilliseconds $ExitTimeoutMilliseconds
+        foreach ($probe in $probes) {
+            Assert-Contract (
+                (Get-Content -Raw -LiteralPath $probe.Result).Trim() -ceq "passed"
+            ) "workspace probe $($probe.Name) must publish a passed result after release"
+            Set-ContractProbeState -Probe $probe -State ResultValidated `
+                -Milestone "result.validated"
+        }
+        return [pscustomobject]@{
+            AllReadyMilliseconds = $readinessTimer.ElapsedMilliseconds
+            ReleaseWatchdogMilliseconds = $releaseTimeoutMilliseconds
+            ExitTimeoutMilliseconds = $ExitTimeoutMilliseconds
+            Probes = @($probes)
+        }
+    }
+    catch {
+        $primaryFailure = $_
+        throw
+    }
+    finally {
+        $cleanupFailure = $null
+        try {
+            Stop-ContractProbes -Probe @($probes) -Deadline $teardownDeadline
+        }
+        catch {
+            $cleanupFailure = $_
+        }
+        if ($null -ne $cleanupFailure) {
+            if ($null -ne $primaryFailure) {
+                throw (
+                    "contract failed: primary workspace probe failure<<`n" +
+                    "$($primaryFailure.Exception.Message)`n>>primary workspace probe failure`n" +
+                    "teardown failure<<`n$($cleanupFailure.Exception.Message)`n>>teardown failure"
+                )
+            }
+            else {
+                throw $cleanupFailure
+            }
+        }
     }
 }
 
@@ -224,6 +2224,28 @@ $secondWorktreeLocation = [pscustomobject]@{
     WorkspaceLockPath = Join-Path $temporaryRoot "locks/workspace-contract-workspace-two.lock"
     CargoTargetDirectory = Join-Path $temporaryRoot "w/contract-workspace-two/target"
 }
+
+function New-ContractProbeLocation {
+    param(
+        [Parameter(Mandatory)][string]$CacheRoot,
+        [Parameter(Mandatory)][string]$IdentityKey,
+        [Parameter(Mandatory)][string]$WorkspaceKey
+    )
+
+    $environmentRoot = Join-Path $CacheRoot "e/$IdentityKey"
+    return [pscustomobject]@{
+        CacheRoot = $CacheRoot
+        EnvironmentRoot = $environmentRoot
+        StampPath = Join-Path $environmentRoot "environment-stamp.json"
+        LockPath = Join-Path $CacheRoot "locks/$IdentityKey.lock"
+        IdentityKey = $IdentityKey
+        WorkspaceKey = $WorkspaceKey
+        WorkspaceRoot = Join-Path $CacheRoot "w/$WorkspaceKey"
+        WorkspaceLockPath = Join-Path $CacheRoot "locks/workspace-$WorkspaceKey.lock"
+        CargoTargetDirectory = Join-Path $CacheRoot "w/$WorkspaceKey/target"
+    }
+}
+
 Import-Module -Name $modulePath -Force
 $workspaceModule = Get-Module windows_workspace
 
@@ -449,6 +2471,84 @@ $workspaceAction = {
 
 $contractFailure = $null
 try {
+    Invoke-ContractCase -Name "marker-wait-observes-forced-check-to-wait-interleaving" -Action {
+        $markerRoot = Join-Path $temporaryRoot "forced marker wait interleaving"
+        $markerPath = Join-Path $markerRoot "created-before-registration.txt"
+        New-Item -ItemType Directory -Force -Path $markerRoot | Out-Null
+        Wait-ContractFileCreated -Path $markerPath -TimeoutMilliseconds 250 `
+            -BeforeWaitRegistration {
+                [System.IO.File]::WriteAllText(
+                    $markerPath,
+                    "created",
+                    [System.Text.UTF8Encoding]::new($false)
+                )
+            }.GetNewClosure()
+        Assert-Contract (Test-Path -LiteralPath $markerPath -PathType Leaf) `
+            "forced check-to-wait marker must remain observable"
+    }
+    Invoke-ContractCase -Name "probe-readiness-final-observation-prefers-early-exit" -Action {
+        Assert-ContractProbeReadinessDeadlineRegression -ProbeRoot (
+            Join-Path $temporaryRoot "readiness deadline regression with spaces"
+        )
+    }
+    Invoke-ContractCase -Name "probe-teardown-is-exhaustive-bounded-and-diagnostic" -Action {
+        Assert-ContractProbeTeardownRegression -ProbeRoot (
+            Join-Path $temporaryRoot "teardown regression with spaces"
+        )
+    }
+    Invoke-ContractCase -Name "workspace-probe-early-exit-is-diagnostic" -Action {
+        $probeRoot = Join-Path $temporaryRoot "early exit diagnostic with spaces"
+        $probeLocation = New-ContractProbeLocation -CacheRoot $probeRoot `
+            -IdentityKey "early-exit" -WorkspaceKey "early-exit-one"
+        $probeSecondLocation = New-ContractProbeLocation -CacheRoot $probeRoot `
+            -IdentityKey "early-exit" -WorkspaceKey "early-exit-two"
+        New-Item -ItemType Directory -Force -Path $probeLocation.EnvironmentRoot | Out-Null
+        Set-Content -LiteralPath $probeLocation.StampPath -Value "ready" -Encoding utf8NoBOM
+        $earlyExitFailure = $null
+        try {
+            Invoke-SharedWorkspaceProbeSynchronizationContract `
+                -ProbeRoot $probeRoot -FirstLocation $probeLocation `
+                -SecondLocation $probeSecondLocation `
+                -ModulePath $modulePath -Scenario EarlyExit | Out-Null
+        }
+        catch {
+            $earlyExitFailure = $_
+        }
+        $earlyExitMessage = if ($null -eq $earlyExitFailure) {
+            "<none>"
+        }
+        else {
+            $earlyExitFailure.Exception.Message
+        }
+        Assert-Contract (
+            $null -ne $earlyExitFailure -and
+            $earlyExitMessage -match 'child exited before ready/result' -and
+            $earlyExitMessage -match 'probe=two' -and
+            $earlyExitMessage -match 'exitCode=23' -and
+            $earlyExitMessage -match 'SYNTHETIC_SECOND_PROBE_EARLY_EXIT' -and
+            $earlyExitMessage -match 'ArgumentList=' -and
+            $earlyExitMessage -match 'lastMilestone=exit.before-ready'
+        ) "early exit must fail before the readiness deadline with complete diagnostics; observed=$earlyExitMessage"
+    }
+    Invoke-ContractCase -Name "workspace-probe-startup-skew-and-release" -Action {
+        $probeRoot = Join-Path $temporaryRoot "startup skew with spaces"
+        $probeLocation = New-ContractProbeLocation -CacheRoot $probeRoot `
+            -IdentityKey "startup-skew" -WorkspaceKey "startup-skew-one"
+        $probeSecondLocation = New-ContractProbeLocation -CacheRoot $probeRoot `
+            -IdentityKey "startup-skew" -WorkspaceKey "startup-skew-two"
+        New-Item -ItemType Directory -Force -Path $probeLocation.EnvironmentRoot | Out-Null
+        Set-Content -LiteralPath $probeLocation.StampPath -Value "ready" -Encoding utf8NoBOM
+        $startupSkew = Invoke-SharedWorkspaceProbeSynchronizationContract `
+            -ProbeRoot $probeRoot -FirstLocation $probeLocation `
+            -SecondLocation $probeSecondLocation `
+            -ModulePath $modulePath
+        Assert-Contract (
+            $startupSkew.AllReadyMilliseconds -lt 10000 -and
+            @($startupSkew.Probes | Where-Object { $_.State -ceq "ResultValidated" }).Count -eq 2
+        ) "startup-skew probes must share one readiness deadline and validate both results"
+    }
+
+    Invoke-ContractCase -Name "lifecycle-core-contracts" -Action {
     Invoke-PrivateEnvironmentLifecycle -Mode Setup -Location $location `
         -SetupAction $setupAction -VerifyAction $verifyAction `
         -WorkspaceAction $workspaceAction -LeaseTimeoutMilliseconds 0 | Out-Null
@@ -977,160 +3077,18 @@ if (
         $firstWorkspaceLease.Dispose()
     }
 
-    $workspaceProbeRoot = Join-Path $temporaryRoot "shared environment workspace probes"
-    $workspaceProbeChild = Join-Path $workspaceProbeRoot "workspace-probe.ps1"
-    New-Item -ItemType Directory -Force -Path $workspaceProbeRoot | Out-Null
-    Set-Content -LiteralPath $workspaceProbeChild -Encoding utf8NoBOM -Value @'
-param(
-    [Parameter(Mandatory)][string]$ModulePath,
-    [Parameter(Mandatory)][string]$CacheRoot,
-    [Parameter(Mandatory)][string]$EnvironmentRoot,
-    [Parameter(Mandatory)][string]$StampPath,
-    [Parameter(Mandatory)][string]$LockPath,
-    [Parameter(Mandatory)][string]$WorkspaceKey,
-    [Parameter(Mandatory)][string]$WorkspaceRoot,
-    [Parameter(Mandatory)][string]$WorkspaceLockPath,
-    [Parameter(Mandatory)][string]$ReadyPath,
-    [Parameter(Mandatory)][string]$ReleasePath,
-    [Parameter(Mandatory)][string]$ResultPath
-)
-$ErrorActionPreference = "Stop"
-Set-StrictMode -Version Latest
-Import-Module -Name $ModulePath -Force
-$module = Get-Module windows_workspace
-$location = [pscustomobject]@{
-    CacheRoot = $CacheRoot
-    EnvironmentRoot = $EnvironmentRoot
-    StampPath = $StampPath
-    LockPath = $LockPath
-    IdentityKey = "shared-workspace-probe"
-    WorkspaceKey = $WorkspaceKey
-    WorkspaceRoot = $WorkspaceRoot
-    WorkspaceLockPath = $WorkspaceLockPath
-    CargoTargetDirectory = Join-Path $WorkspaceRoot "target"
-}
-$verify = {
-    if (
-        -not (Test-Path -LiteralPath $StampPath -PathType Leaf) -or
-        (Get-Content -Raw -LiteralPath $StampPath).Trim() -cne "ready"
-    ) {
-        throw "shared workspace probe environment is not ready"
-    }
-    return "verified"
-}.GetNewClosure()
-$workspace = {
-    param($Summary)
-    if ($Summary -cne "verified") {
-        throw "shared workspace probe did not receive verified state"
-    }
-    [System.IO.File]::WriteAllText($ReadyPath, "ready", [System.Text.UTF8Encoding]::new($false))
-    if (-not (Test-Path -LiteralPath $ReleasePath -PathType Leaf)) {
-        $watcher = [System.IO.FileSystemWatcher]::new(
-            (Split-Path -Parent $ReleasePath),
-            (Split-Path -Leaf $ReleasePath)
-        )
-        try {
-            $watcher.NotifyFilter = [System.IO.NotifyFilters]::FileName
-            $watcher.EnableRaisingEvents = $true
-            if (-not (Test-Path -LiteralPath $ReleasePath -PathType Leaf)) {
-                $change = $watcher.WaitForChanged(
-                    [System.IO.WatcherChangeTypes]::Created,
-                    10000
-                )
-                if ($change.TimedOut -or -not (Test-Path -LiteralPath $ReleasePath -PathType Leaf)) {
-                    throw "shared workspace probe timed out waiting for release"
-                }
-            }
-        }
-        finally {
-            $watcher.Dispose()
-        }
-    }
-}.GetNewClosure()
-& $module {
-    param($OwnedLocation, $VerifyAction, $WorkspaceAction)
-    Invoke-EasyConEnvironmentLifecycle -Mode Workspace -Location $OwnedLocation `
-        -SetupAction { throw "Workspace probe must not provision" } `
-        -VerifyAction $VerifyAction -WorkspaceAction $WorkspaceAction `
-        -LeaseTimeoutMilliseconds 10000
-} $location $verify $workspace | Out-Null
-[System.IO.File]::WriteAllText($ResultPath, "passed", [System.Text.UTF8Encoding]::new($false))
-'@
-    $workspaceProbeProcesses = [System.Collections.Generic.List[object]]::new()
-    try {
-        foreach ($entry in @(
-            [pscustomobject]@{ Name = "one"; Location = $location },
-            [pscustomobject]@{ Name = "two"; Location = $secondWorktreeLocation }
-        )) {
-            $ready = Join-Path $workspaceProbeRoot "$($entry.Name)-ready.txt"
-            $release = Join-Path $workspaceProbeRoot "$($entry.Name)-release.txt"
-            $result = Join-Path $workspaceProbeRoot "$($entry.Name)-result.txt"
-            $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
-            $startInfo.FileName = Join-Path $PSHOME "pwsh.exe"
-            $startInfo.UseShellExecute = $false
-            $startInfo.RedirectStandardOutput = $true
-            $startInfo.RedirectStandardError = $true
-            foreach ($argument in @(
-                "-NoLogo", "-NoProfile", "-File", $workspaceProbeChild,
-                "-ModulePath", $modulePath,
-                "-CacheRoot", $entry.Location.CacheRoot,
-                "-EnvironmentRoot", $entry.Location.EnvironmentRoot,
-                "-StampPath", $entry.Location.StampPath,
-                "-LockPath", $entry.Location.LockPath,
-                "-WorkspaceKey", $entry.Location.WorkspaceKey,
-                "-WorkspaceRoot", $entry.Location.WorkspaceRoot,
-                "-WorkspaceLockPath", $entry.Location.WorkspaceLockPath,
-                "-ReadyPath", $ready,
-                "-ReleasePath", $release,
-                "-ResultPath", $result
-            )) {
-                $startInfo.ArgumentList.Add([string]$argument)
-            }
-            $workspaceProbeProcesses.Add([pscustomobject]@{
-                Name = $entry.Name
-                Process = [System.Diagnostics.Process]::Start($startInfo)
-                Ready = $ready
-                Release = $release
-                Result = $result
-            }) | Out-Null
-        }
-        foreach ($probe in $workspaceProbeProcesses) {
-            Wait-ContractFileCreated -Path $probe.Ready
-            Assert-Contract (-not $probe.Process.HasExited) `
-                "workspace probe $($probe.Name) must remain inside its synchronized gate"
-        }
-        Assert-Throws -Pattern "busy|ownership" -Action {
-            Enter-PrivateEnvironmentLease -Location $location -Access Exclusive `
-                -TimeoutMilliseconds 0
-        }
-        foreach ($probe in $workspaceProbeProcesses) {
-            [System.IO.File]::WriteAllText(
-                $probe.Release,
-                "release",
-                [System.Text.UTF8Encoding]::new($false)
-            )
-        }
-        foreach ($probe in $workspaceProbeProcesses) {
-            Assert-Contract ($probe.Process.WaitForExit(10000)) `
-                "workspace probe $($probe.Name) must finish after its release marker"
-            $output = $probe.Process.StandardOutput.ReadToEnd()
-            $probeError = $probe.Process.StandardError.ReadToEnd()
-            Assert-Contract (
-                $probe.Process.ExitCode -eq 0 -and
-                (Test-Path -LiteralPath $probe.Result -PathType Leaf) -and
-                (Get-Content -Raw -LiteralPath $probe.Result).Trim() -ceq "passed"
-            ) "workspace probe $($probe.Name) failed; output=$output error=$probeError"
-        }
-    }
-    finally {
-        foreach ($probe in $workspaceProbeProcesses) {
-            if (-not $probe.Process.HasExited) {
-                $probe.Process.Kill($true)
-                $probe.Process.WaitForExit()
-            }
-            $probe.Process.Dispose()
-        }
-    }
+    $workspaceProbeSummary = Invoke-SharedWorkspaceProbeSynchronizationContract `
+        -ProbeRoot (Join-Path $temporaryRoot "shared environment workspace probes") `
+        -FirstLocation $location -SecondLocation $secondWorktreeLocation `
+        -ModulePath $modulePath
+    Assert-Contract (
+        $workspaceProbeSummary.Probes.Count -eq 2 -and
+        @($workspaceProbeSummary.Probes | Where-Object {
+            $_.State -ceq "ResultValidated"
+        }).Count -eq 2 -and
+        $workspaceProbeSummary.ReleaseWatchdogMilliseconds -eq 15000 -and
+        $workspaceProbeSummary.ExitTimeoutMilliseconds -eq 10000
+    ) "shared workspace probes must validate both results under derived watchdogs"
 
     $events.Clear()
     $workspaceWithOwnership = {
@@ -1247,6 +3205,9 @@ $workspace = {
         throw "synthetic setup not ready"
     }.GetNewClosure() -WorkspaceAction { param($Summary) } `
         -FailurePattern "synthetic setup restore failure"
+
+    }
+    Invoke-SelectedContractCases
 }
 catch {
     $contractFailure = $_
@@ -1256,7 +3217,10 @@ finally {
     $cleanupFailure = $null
     try {
         Remove-Module windows_workspace -ErrorAction Stop
-        if (Test-Path -LiteralPath $temporaryRoot) {
+        if (
+            -not $script:contractProbeCleanupBlocked -and
+            (Test-Path -LiteralPath $temporaryRoot)
+        ) {
             Remove-Item -LiteralPath $temporaryRoot -Recurse -Force -ErrorAction Stop
         }
     }
@@ -1265,8 +3229,11 @@ finally {
     }
     if ($null -ne $cleanupFailure) {
         if ($null -ne $contractFailure) {
-            $contractFailure.Exception.Data["EasyConLifecycleContractCleanupFailure"] = `
-                $cleanupFailure.Exception.ToString()
+            throw (
+                "contract failed: primary lifecycle contract failure<<`n" +
+                "$($contractFailure.Exception.Message)`n>>primary lifecycle contract failure`n" +
+                "cleanup failure<<`n$($cleanupFailure.Exception.Message)`n>>cleanup failure"
+            )
         }
         else {
             throw $cleanupFailure
@@ -1274,4 +3241,26 @@ finally {
     }
 }
 
-Write-Output "Windows environment lifecycle contracts passed: 24 cases"
+$expectedContractCases = if ($script:exactCaseRequested) {
+    1
+}
+else {
+    $script:contractCases.Count
+}
+Assert-Contract (
+    $script:contractCaseNames.Count -eq $script:contractCases.Count -and
+    $script:executedContractCases -eq $expectedContractCases
+) (
+    "contract summary must match registered, unique, and executed counts; " +
+    "registered=$($script:contractCases.Count) unique=$($script:contractCaseNames.Count) " +
+    "executed=$script:executedContractCases expected=$expectedContractCases"
+)
+$contractMode = if ($script:exactCaseRequested) { "exact" } else { "full" }
+Write-Output (
+    "Windows environment lifecycle contracts passed: {0}/{1} cases (mode={2} registered={3} unique={4})" -f
+        $script:executedContractCases,
+        $expectedContractCases,
+        $contractMode,
+        $script:contractCases.Count,
+        $script:contractCaseNames.Count
+)

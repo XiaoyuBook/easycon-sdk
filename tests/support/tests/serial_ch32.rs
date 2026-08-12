@@ -95,6 +95,17 @@ fn wait_running(operation: &Operation) {
     assert_eq!(operation.snapshot().state, OperationState::Running);
 }
 
+struct ReleaseCh32BarriersOnPanic(Ch32ByteSimulator);
+
+impl Drop for ReleaseCh32BarriersOnPanic {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.release_close();
+            self.0.disconnect();
+        }
+    }
+}
+
 fn close_controller(clock: &VirtualClock, runtime: &Runtime, controller: &ControllerSession) {
     if controller.snapshot().state == ControllerState::Connected
         && let Some(last) = controller.snapshot().last_report_timestamp_ns
@@ -400,30 +411,47 @@ fn failed_cancel_neutral_closes_the_serial_stream_before_terminal() {
         .direct(ControllerAction::ButtonDown(Button::A))
         .expect("accepted direct operation");
     wait_terminal(&accepted);
+    assert_eq!(accepted.snapshot().state, OperationState::Succeeded);
 
+    let _barrier_cleanup = ReleaseCh32BarriersOnPanic(simulator.clone());
+    simulator.block_next_write();
     let cancelled = controller
         .direct(ControllerAction::ButtonDown(Button::B))
         .expect("cancelled direct operation");
     wait_running(&cancelled);
+    clock.advance_by(Duration::from_nanos(
+        ControllerOptions::default().minimum_report_interval_ns,
+    ));
+    let write_blocked = simulator.wait_until_write_blocked(Duration::from_secs(2));
+    let reports_at_write_barrier = simulator.snapshot().reports.len();
+
     simulator.fail_next_write(SerialErrorKind::Io);
     simulator.block_next_close();
     cancelled.cancel();
-    clock.advance_by(Duration::from_millis(30));
 
     let close_blocked = simulator.wait_until_close_blocked(Duration::from_secs(2));
     let state_before_close = cancelled.wait(WaitTimeout::Poll);
     simulator.release_close();
-    assert!(
-        close_blocked,
-        "failed neutralization did not close the stream"
-    );
-    assert_eq!(state_before_close, WaitResult::Timeout);
+    if !write_blocked || !close_blocked {
+        simulator.disconnect();
+    }
     wait_terminal(&cancelled);
 
+    assert!(
+        write_blocked,
+        "cancelled B report did not enter the byte-write barrier"
+    );
+    assert_eq!(reports_at_write_barrier, 1);
+    assert!(
+        close_blocked,
+        "failed neutralization did not enter the stream-close barrier"
+    );
+    assert_eq!(state_before_close, WaitResult::Timeout);
     assert_eq!(cancelled.snapshot().state, OperationState::Cancelled);
     assert_eq!(controller.snapshot().state, ControllerState::Disconnected);
     let snapshot = simulator.snapshot();
     assert_eq!(snapshot.active_streams, 0);
+    assert_eq!(snapshot.closed_streams, 1);
     assert_eq!(snapshot.reports.len(), 1);
     controller.close();
     runtime.close().expect("Runtime close");

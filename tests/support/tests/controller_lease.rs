@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::pin::{Pin, pin};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
@@ -174,6 +174,26 @@ impl ControllerTransport for PostAcceptancePanicTransport {
 
 struct ChannelWake(mpsc::SyncSender<()>);
 
+struct ReleaseOnDrop(Option<Box<dyn FnOnce()>>);
+
+impl ReleaseOnDrop {
+    fn new(release: impl FnOnce() + 'static) -> Self {
+        Self(Some(Box::new(release)))
+    }
+
+    fn release(&mut self) {
+        if let Some(release) = self.0.take() {
+            release();
+        }
+    }
+}
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 impl Wake for ChannelWake {
     fn wake(self: Arc<Self>) {
         let _ = self.0.try_send(());
@@ -185,16 +205,18 @@ impl Wake for ChannelWake {
 }
 
 fn block_on<F: Future>(future: F) -> F::Output {
+    block_on_bounded(future).expect("future did not wake before bounded test deadline")
+}
+
+fn block_on_bounded<F: Future>(future: F) -> Result<F::Output, mpsc::RecvTimeoutError> {
     let (wake_sender, wake_receiver) = mpsc::sync_channel(1);
     let waker = Waker::from(Arc::new(ChannelWake(wake_sender)));
     let mut context = Context::from_waker(&waker);
     let mut future = pin!(future);
     loop {
         match future.as_mut().poll(&mut context) {
-            Poll::Ready(output) => return output,
-            Poll::Pending => wake_receiver
-                .recv_timeout(CHANNEL_WAIT)
-                .expect("future did not wake before bounded test deadline"),
+            Poll::Ready(output) => return Ok(output),
+            Poll::Pending => wake_receiver.recv_timeout(CHANNEL_WAIT)?,
         }
     }
 }
@@ -330,15 +352,6 @@ fn granted(
         AutomationLeaseAcquireOutcome::Closed => panic!("controller was closed"),
         AutomationLeaseAcquireOutcome::Failure(error) => panic!("acquire failed: {error}"),
     }
-}
-
-fn observe_terminal(operation: Operation) -> (mpsc::Receiver<()>, std::thread::JoinHandle<()>) {
-    let (sender, receiver) = mpsc::sync_channel(1);
-    let observer = std::thread::spawn(move || {
-        wait_terminal(&operation);
-        sender.send(()).expect("terminal observer remains alive");
-    });
-    (receiver, observer)
 }
 
 fn close_after_pacing(clock: &VirtualClock, runtime: &Runtime, controller: &ControllerSession) {
@@ -1428,57 +1441,150 @@ fn close_settles_pending_acquire_actions_and_release_before_join() {
     let (clock, runtime, fake, controller) = connected();
     let cancellation = CancellationToken::root();
     let lease = granted(&controller, &cancellation, None);
-    let blocked = fake.observe_next_write_blocked();
+    let accepted_blocked = fake.observe_next_write_blocked();
     fake.block_next_write_after_acceptance();
+    let accepted_fake = fake.clone();
+    let mut accepted_release = ReleaseOnDrop::new(move || accepted_fake.release_blocked_write());
     let accepted = controller
         .direct_with_lease(&lease, ControllerAction::ButtonDown(Button::A))
         .expect("accepted action");
-    blocked
+    accepted_blocked
         .recv_timeout(CHANNEL_WAIT)
         .expect("accepted action barrier reached");
+
+    let (classified_sender, classified_receiver) = mpsc::sync_channel(1);
+    let (resume_sender, resume_receiver) = mpsc::sync_channel(1);
+    let resume_receiver = Mutex::new(resume_receiver);
+    lease.install_lane_classified_hook_for_test(Arc::new(move || {
+        let _ = classified_sender.send(());
+        let _ = resume_receiver
+            .lock()
+            .expect("lane-classified resume lock")
+            .recv_timeout(CHANNEL_WAIT);
+    }));
+    let mut classified_release = ReleaseOnDrop::new(move || {
+        let _ = resume_sender.try_send(());
+    });
     let cancelled = controller
         .direct_with_lease(&lease, ControllerAction::ButtonDown(Button::B))
         .expect("queued action");
+
+    accepted_release.release();
+    let accepted_wait = accepted.wait(WaitTimeout::For(CHANNEL_WAIT));
+    let accepted_succeeded = matches!(&accepted_wait, WaitResult::Completed(snapshot) if snapshot.state == OperationState::Succeeded);
+    let b_classified = classified_receiver.recv_timeout(CHANNEL_WAIT).is_ok();
+    let clock_before_b_target = clock.now_ns() < INTERVAL_NS;
+
     let acquire = controller.acquire_automation_lease(&cancellation, None);
-    let (accepted_terminal, accepted_terminal_thread) = observe_terminal(accepted.clone());
     let closing = controller.clone();
     let (close_sender, close_receiver) = mpsc::sync_channel(1);
     let close_thread = std::thread::spawn(move || {
         closing.close();
-        close_sender.send(()).expect("close observer remains alive");
+        let _ = close_sender.send(());
     });
-
-    assert!(matches!(
-        block_on(acquire),
-        AutomationLeaseAcquireOutcome::Closed
-    ));
+    let close_started = {
+        let started = Instant::now();
+        loop {
+            if matches!(
+                controller.snapshot().state,
+                ControllerState::Disconnecting | ControllerState::Closed
+            ) {
+                break true;
+            }
+            if started.elapsed() >= CHANNEL_WAIT {
+                break false;
+            }
+            std::thread::yield_now();
+        }
+    };
+    let acquire_outcome = block_on_bounded(acquire);
     let release = lease.neutralize_and_release();
-    accepted_terminal
-        .recv_timeout(CHANNEL_WAIT)
-        .expect("accepted action settled");
-    accepted_terminal_thread
-        .join()
-        .expect("accepted action terminal observer");
-    wait_terminal(&cancelled);
-    assert_eq!(accepted.snapshot().state, OperationState::Succeeded);
-    assert_eq!(cancelled.snapshot().state, OperationState::Cancelled);
-    assert_eq!(
-        cancelled.snapshot().cancellation_reason,
-        Some(CancellationReason::ParentClose)
-    );
+    classified_release.release();
+    clock.advance_to(INTERVAL_NS);
 
-    clock.advance_to(clock.now_ns().saturating_add(INTERVAL_NS));
-    assert_eq!(
-        block_on(release),
-        Ok(AutomationLeaseReleaseOutcome::NeutralAccepted)
+    let cancelled_wait = cancelled.wait(WaitTimeout::For(CHANNEL_WAIT));
+    let release_outcome = block_on_bounded(release);
+    let close_joined = close_receiver.recv_timeout(CHANNEL_WAIT).is_ok();
+    let close_thread_joined = if close_joined {
+        close_thread.join().is_ok()
+    } else {
+        drop(close_thread);
+        false
+    };
+    let runtime_outcome = if close_thread_joined {
+        Some(runtime.close())
+    } else {
+        None
+    };
+
+    let cancelled_snapshot = cancelled.snapshot();
+    let accepted_snapshot = accepted.snapshot();
+    let controller_snapshot = controller.snapshot();
+    let accepted_writes = fake.accepted_writes();
+    let acquire_diagnostic = match &acquire_outcome {
+        Ok(AutomationLeaseAcquireOutcome::Granted(_)) => "Granted".to_owned(),
+        Ok(AutomationLeaseAcquireOutcome::Cancelled) => "Cancelled".to_owned(),
+        Ok(AutomationLeaseAcquireOutcome::Deadline) => "Deadline".to_owned(),
+        Ok(AutomationLeaseAcquireOutcome::Closed) => "Closed".to_owned(),
+        Ok(AutomationLeaseAcquireOutcome::Failure(error)) => format!("Failure({error:?})"),
+        Err(error) => format!("WaitError({error:?})"),
+    };
+    let diagnostics = format!(
+        "B={cancelled_snapshot:?}; B_error={:?}; A={accepted_snapshot:?}; controller={controller_snapshot:?}; accepted_writes={accepted_writes:?}; fake_closed={}; phases={{a_succeeded:{accepted_succeeded}, b_classified:{b_classified}, clock_before_b_target:{clock_before_b_target}, close_started:{close_started}, acquire:{acquire_diagnostic}, b_wait:{cancelled_wait:?}, release:{release_outcome:?}, close_joined:{close_joined}, close_thread_joined:{close_thread_joined}, runtime:{runtime_outcome:?}}}",
+        cancelled_snapshot.error,
+        fake.is_closed(),
     );
-    close_receiver
-        .recv_timeout(CHANNEL_WAIT)
-        .expect("close joined after settled release");
-    close_thread.join().expect("close thread");
-    assert_eq!(controller.snapshot().state, ControllerState::Closed);
-    assert_eq!(controller.snapshot().lease, ControllerLeaseState::Available);
-    runtime.close().expect("Runtime close");
+    assert!(
+        accepted_succeeded,
+        "A must succeed after full acceptance; {diagnostics}"
+    );
+    assert!(
+        b_classified,
+        "B did not reach the lane-classified barrier; {diagnostics}"
+    );
+    assert!(
+        clock_before_b_target,
+        "VirtualClock advanced to B's pacing target before close; {diagnostics}"
+    );
+    assert!(
+        close_started,
+        "close intent was not observed; {diagnostics}"
+    );
+    assert!(
+        matches!(&acquire_outcome, Ok(AutomationLeaseAcquireOutcome::Closed)),
+        "pending acquire did not settle Closed; {diagnostics}"
+    );
+    assert!(
+        matches!(&cancelled_wait, WaitResult::Completed(snapshot) if snapshot.state == OperationState::Cancelled)
+            && cancelled_snapshot.state == OperationState::Cancelled
+            && cancelled_snapshot.cancellation_reason == Some(CancellationReason::ParentClose),
+        "B did not settle ParentClose cancellation; {diagnostics}"
+    );
+    assert!(
+        matches!(
+            release_outcome,
+            Ok(Ok(AutomationLeaseReleaseOutcome::NeutralAccepted))
+        ),
+        "release did not settle after close; {diagnostics}"
+    );
+    assert!(
+        close_thread_joined,
+        "close did not join within the bounded deadline; {diagnostics}"
+    );
+    assert_eq!(
+        controller_snapshot.state,
+        ControllerState::Closed,
+        "{diagnostics}"
+    );
+    assert_eq!(
+        controller_snapshot.lease,
+        ControllerLeaseState::Available,
+        "{diagnostics}"
+    );
+    assert!(
+        matches!(runtime_outcome, Some(Ok(CloseOutcome::Closed))),
+        "{diagnostics}"
+    );
 }
 
 // conformance: controller.lease.close-late-release

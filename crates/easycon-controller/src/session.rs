@@ -236,6 +236,22 @@ impl AutomationLease {
         *installed = Some(hook);
     }
 
+    /// Installs a one-shot barrier after the lane classifies an action as a pending report.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn install_lane_classified_hook_for_test(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        let mut installed = self
+            .generation
+            .lane_classified_hook
+            .lock()
+            .expect("lease generation lane-classified hook lock poisoned");
+        assert!(
+            installed.is_none(),
+            "a lane-classified hook is already installed"
+        );
+        *installed = Some(hook);
+    }
+
     /// Starts the same cleanup transaction without consuming the test's borrowed lease handle.
     #[cfg(debug_assertions)]
     #[doc(hidden)]
@@ -1181,6 +1197,8 @@ struct LeaseGeneration {
     cleanup_failure: Mutex<Option<EasyConError>>,
     #[cfg(debug_assertions)]
     admission_resolution_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(debug_assertions)]
+    lane_classified_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 #[derive(Clone)]
@@ -1202,6 +1220,18 @@ enum LeaseGenerationGate {
 }
 
 impl LeaseGeneration {
+    #[cfg(debug_assertions)]
+    fn run_lane_classified_hook_for_test(&self) {
+        let hook = self
+            .lane_classified_hook
+            .lock()
+            .expect("lease generation lane-classified hook lock poisoned")
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
     fn admit(
         &self,
         submit: impl FnOnce() -> Result<LeaseGenerationAction, EasyConError>,
@@ -2881,13 +2911,17 @@ impl ControllerLane {
                 operation,
                 settlement_owner,
                 operation_settlement,
-                automation_generation,
+                automation_generation: automation_generation.clone(),
                 report: self.desired_report,
                 mutation: Some(action),
                 direct_timing: Some(direct_timing),
                 kind: WriteKind::Report,
                 completion: ReportCompletion::Direct,
             });
+            #[cfg(debug_assertions)]
+            if let Some(generation) = automation_generation {
+                generation.run_lane_classified_hook_for_test();
+            }
             return;
         }
 
@@ -3581,6 +3615,8 @@ impl ControllerLane {
             cleanup_failure: Mutex::new(None),
             #[cfg(debug_assertions)]
             admission_resolution_hook: Mutex::new(None),
+            #[cfg(debug_assertions)]
+            lane_classified_hook: Mutex::new(None),
         });
         let controller_id = self.resource_id;
         let controller_identity = self.controller_identity.clone();
@@ -6454,6 +6490,8 @@ mod tests {
             cleanup_failure: std::sync::Mutex::new(None),
             #[cfg(debug_assertions)]
             admission_resolution_hook: std::sync::Mutex::new(None),
+            #[cfg(debug_assertions)]
+            lane_classified_hook: std::sync::Mutex::new(None),
         });
         let record = generation.request_cleanup();
         let error = match generation
