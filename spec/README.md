@@ -7,9 +7,14 @@ current SDK v1 product around Runtime, Controller, and Vision, and defers ECS/Au
 ## Current v1 product specifications
 
 These behavior and conformance assets cover the current v1 Runtime/Controller product and any
-applicable Vision contracts. They are product specifications, not a claim that an incomplete
-product stage is complete. The retained Controller/Serial candidate is `Hardware Unverified` and
-remains narrower than the complete v1 product.
+applicable Vision contracts. [ADR-0026](../docs/decisions/0026-controller-d1-settlement-refreeze.md)
+proposes the Controller D1 software-settlement refreeze, and
+[ADR-0027](../docs/decisions/0027-stage-1-software-core-closeout.md) assembles the Stage 1 Windows
+software-core closeout candidate from tracked fake/synthetic/native evidence and the
+[license initial review](../docs/development/stage1-license-initial-review.md). The retained
+Controller/Serial scope remains `Hardware Unverified`; this R document candidate remains
+`Pending Stage Review`, requires user-authorized integration before it can become canonical `main`,
+and does not authorize Stage 2.
 
 - `behavior/runtime-controller-v1.json` fixes operation, timeout, event, shutdown, serial,
   Controller, Amiibo, sequence, timing, and Hardware Unverified behavior.
@@ -20,8 +25,9 @@ remains narrower than the complete v1 product.
 - `fixtures/controller/phase2a-latency-result-v1.json` records the fixed-machine 10,000-sample
   software-path distribution and its explicit non-hardware scope.
 - `fixtures/controller/lease-settlement-v1.json` fixes the Controller D1 software-only acquire,
-  action, release, close, partial-stream, and Win32 completion-owner contract without declaring a
-  Stage 1 refreeze.
+  action, release, close, partial-stream, and Win32 completion-owner contract used by the
+  ADR-0026/0027 candidate; it does not declare real hardware, ABI, binding, package, or release
+  qualification.
 - `conformance/runtime-controller-v1.json` defines the hardware-free Runtime and Phase 2A fault
   scenarios. Every step and assertion has a stable ID. Each scenario declares the exact executable
   Rust test suite covering its assertions, and every assertion maps through a matching

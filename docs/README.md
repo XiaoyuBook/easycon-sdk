@@ -49,6 +49,8 @@
     SHA、依赖版本、外部 build root、Linux 软件门禁与 macOS arm64 分阶段资格矩阵。
 21. [Phase 2B faults 协议证据修订设计](development/phase2b-fault-protocol-evidence-remediation.md)：每个 faults
     role 的 baud/handshake ledger、qualification-only reply byte correlation、legacy 分类与 candidate refreeze 门槛。
+22. [Stage 1 GPL/source/dependency license 初审](development/stage1-license-initial-review.md)：固定当前 Rust、native
+    与 OCR 测试输入的版本、来源、许可证选择和 future release gate，不替代 SBOM/notices 或法律意见。
 
 > **历史计划编号说明：** 上述 `Phase 2`、`Phase 2A`、`Phase 2B` 和 `Phase 3` 开发记录及历史 ADR 标题保留原名，
 > 只表示 ADR-0023 前的开发/证据语境；它们不表示 ADR-0023 所定义的当前四个产品阶段或其完成状态。
@@ -79,6 +81,8 @@
 - [ADR-0023：v1 宿主语言 SDK 路线与 ECS 延后（Accepted / Effective）](decisions/0023-v1-host-language-sdk-roadmap-and-ecs-deferral.md)
 - [ADR-0024：重新冻结 Runtime R0-v2 实现基线（Refrozen Runtime Implementation / Effective）](decisions/0024-runtime-r0-v2-refreeze.md)
 - [ADR-0025：Stage 1 开发 working implementation base（Not a refreeze）](decisions/0025-stage1-working-implementation-base.md)
+- [ADR-0026：Controller D1 settlement 重新冻结候选（Pending Stage Review, Hardware Unverified）](decisions/0026-controller-d1-settlement-refreeze.md)
+- [ADR-0027：Stage 1 Runtime/Controller/Vision 软件核心收口候选（Pending Stage Review）](decisions/0027-stage-1-software-core-closeout.md)
 - [ADR-0028：Windows candidate gate 分层（Accepted / Effective）](decisions/0028-windows-candidate-gate-layering.md)
 
 ## v1 固定范围
@@ -98,13 +102,18 @@ v1 路线由 [ADR-0023](decisions/0023-v1-host-language-sdk-roadmap-and-ecs-defe
 3. C++、.NET、Python、Node.js/TypeScript SDK，其中 C++ 优先形成可用候选。
 4. 打包、真实硬件、ABI、供应链与发布资格。
 
-Runtime、Controller 与 Vision 的 Stage 1 初版软件开发已经形成 builder candidate：Runtime 的 operation/close
-settlement、Controller 的 backend-final-byte settlement/lease/`ActionSequence`，以及 Vision 的 native/capture
-software lifecycle 都由 fake 或 synthetic 路径验证。该候选不关闭或重新冻结 Stage 1，也不声明真实硬件资格；C++ SDK
-尚未进入实施，C++ 可用候选也不等于四语言 GA。
+Controller D1 production implementation 固定为 `f99333f1e4d359af4588a659e2890bcfd58483de`；其后的 approved H
+validation/build-infrastructure input `df13db4cb78c14602e05a31636a3e3a8f277f873`、tree
+`a3819e469c9dc629876b84835fccbabcc73ccc8e` 已获独立 Task reviewer `APPROVE`，P0/P1/P2/P3 均为 0。
+H SHA/tree 不替代 production implementation object。
 
-Controller D1 以 [ADR-0025](decisions/0025-stage1-working-implementation-base.md) 记录的 working implementation
-base 完成 builder 开发候选；该记录和候选都不是 Runtime、Controller 或 Stage 1 的重新冻结或 closeout 声明。
+本 R 文档候选由 [ADR-0026](decisions/0026-controller-d1-settlement-refreeze.md) 提议重新冻结 Controller D1
+software settlement，并由 [ADR-0027](decisions/0027-stage-1-software-core-closeout.md) 汇总 Runtime R0-v2、
+Controller D1、Vision 既有 software evidence 和
+[Stage 1 license 初审](development/stage1-license-initial-review.md)，形成 Windows Runtime/Controller/Vision
+software-core closeout candidate。fake/synthetic/native software 路径覆盖八类退出条件；真实硬件、O-01 至 O-06、
+public C ABI、bindings、packages、SBOM/signing/release 仍开放。该 R candidate 仍为 `Pending Stage Review`，未经用户授权
+尚未集成 canonical `main`，不授权开始或集成 Stage 2；C++ SDK 尚未进入实施，C++ 可用候选也不等于四语言 GA。
 
 现有 ECS spec、fixture、conformance、validator、guards 和 `easycon-ecs` crate 继续是 dormant workspace maintenance
 资产：现有健康门禁继续维护它们，但它们不属于 v1 public ABI、语言 SDK 的共同验收、硬件/soak 或发布资格。ADR-0017、

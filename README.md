@@ -8,11 +8,18 @@ EasyCon SDK 是基于 EasyCon 源码进行二次开发的多语言 SDK 项目，
 Runtime、Controller、Vision 核心收口；公共 C ABI 与 canonical native bundle；各语言 SDK；以及打包、真实硬件、ABI、
 供应链与发布资格。
 
-Runtime、Controller 与 Vision 的 Stage 1 初版软件开发已经形成 builder candidate：Runtime 的 operation/close
-settlement、Controller 的 backend-final-byte settlement/lease/`ActionSequence`，以及 Vision 的 native/capture
-software lifecycle 都由 fake 或 synthetic 路径验证。该候选不关闭或重新冻结 Stage 1，也不声明真实 Controller/capture
-硬件资格；尚无稳定 public C ABI 或任一语言 SDK 候选。C++ 会在第一、第二阶段完成后优先进入第三阶段；其可用候选也不等于
-四语言 v1 GA。
+Controller D1 production implementation 已固定；其上的 validation/build-infrastructure hardening H input
+`df13db4cb78c14602e05a31636a3e3a8f277f873`、tree
+`a3819e469c9dc629876b84835fccbabcc73ccc8e` 已获独立 Task reviewer `APPROVE`。本 R 文档候选通过
+[ADR-0026](docs/decisions/0026-controller-d1-settlement-refreeze.md) 提议重新冻结 Controller D1 software settlement，
+并由 [ADR-0027](docs/decisions/0027-stage-1-software-core-closeout.md) 提议关闭 Runtime、Controller 与 Vision 的
+Stage 1 Windows software core；[许可证初审](docs/development/stage1-license-initial-review.md) 覆盖当前 GPL/source、
+41 个 Rust registry package、17 个 native runtime dependency 和 1 个 OCR 测试模型及其许可证文本。该候选仍为
+`Pending Stage Review`，未经用户授权尚未集成 canonical `main`，不授权开始或集成 Stage 2。
+
+上述候选只依据 fake/synthetic/native software evidence，状态保持 `Hardware Unverified`；尚无稳定 public C ABI、
+canonical native bundle、任一语言 SDK、package、SBOM 或 release candidate。C++ 会在第一、第二阶段完成后优先进入
+第三阶段；其可用候选也不等于四语言 v1 GA。
 
 现有 `easycon-ecs`、ECS spec、fixture、conformance、validator 和 guards 保留为 dormant workspace maintenance 资产。
 它们继续参加仓库健康门禁，但不是 v1 public ABI、四语言共同验收、真实硬件、soak 或发布的前置。ADR-0017、ADR-0019

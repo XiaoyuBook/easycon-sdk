@@ -74,12 +74,17 @@ easycon sdk/
 退出门槛：核心行为、所有权与关闭顺序由实现测试覆盖；ActionSequence 的精确时间线经过核心校验；Controller 与 Vision
 不依赖语言 binding 才能运行。软件收口不把真实设备资格、四语言 package 或正式 ABI 冻结提前声明为完成。
 
-当前状态：Runtime R0-v2 已完成 fixed-SHA review、集成和
-[独立重新冻结](../decisions/0024-runtime-r0-v2-refreeze.md)，满足 ADR-0020 要求的 separate Phase 1 refreeze。基于
-[ADR-0025](../decisions/0025-stage1-working-implementation-base.md) 的 builder candidate 已完成 D1 所需的
-Controller/serial settlement，并为 backend final-byte claim 窄扩展 Runtime deferred finish transaction；Vision 以既有
-native/capture 软件路径完成同一候选的集成验证。该状态只表示 Stage 1 初版软件开发候选已经完成，不构成 D2 independent
-review/refreeze、Stage 1 closeout 或真实 capture hardware 资格；这些后续决议仍未发生。
+当前状态：Runtime R0-v2 已由 [ADR-0024](../decisions/0024-runtime-r0-v2-refreeze.md) 独立重新冻结。Controller D1
+production implementation 固定在 `f99333f1e4d359af4588a659e2890bcfd58483de`；其后的 approved H validation/
+build-infrastructure input `df13db4cb78c14602e05a31636a3e3a8f277f873`、tree
+`a3819e469c9dc629876b84835fccbabcc73ccc8e` 已获独立 Task reviewer `APPROVE`，但不改变 production
+implementation identity。本 R 文档候选由
+[ADR-0026](../decisions/0026-controller-d1-settlement-refreeze.md) 提议重新冻结 Controller D1 software settlement，
+并由 [ADR-0027](../decisions/0027-stage-1-software-core-closeout.md) 结合 Vision 既有 refreeze records、
+fake/synthetic/native software evidence 和
+[Stage 1 license 初审](../development/stage1-license-initial-review.md)，形成 Windows Runtime/Controller/Vision
+software-core closeout candidate。该候选仍为 `Pending Stage Review`，未集成 canonical `main`，不授权 Stage 2；
+它也不构成真实 Controller/capture hardware、O-01 至 O-06、public C ABI、bindings/packages、SBOM/signing/release 资格。
 
 ### 公共 C ABI 与 canonical native bundle
 
@@ -168,6 +173,11 @@ canonical bundle 或在本地复制核心业务逻辑。
    独立工作流 `wait()`/delay/sleep 承诺为 v1 API。
 8. GPL 来源、版权和 dependency license 已完成初审。
 
+上述 8 项的逐项 tracked evidence 与保守 owner-loss `CloseFailed` 例外记录在
+[ADR-0027](../decisions/0027-stage-1-software-core-closeout.md)；依赖闭包和许可证选择记录在
+[Stage 1 license 初审](../development/stage1-license-initial-review.md)。这些记录形成待独立 Stage review 的第一阶段
+software-core closeout candidate，不关闭任何硬件、跨平台、ABI、binding、package 或 release 资格。
+
 ### 第二阶段工作
 
 - 从 ABI manifest 形成 reference C API、生成 `easycon.h`、语言低层声明和 symbol allowlist；
@@ -199,6 +209,9 @@ smoke、symbol/layout golden 与兼容矩阵，且四语言的低层 ABI 表达�
 
 - [ADR-0023：v1 宿主语言 SDK 路线与 ECS 延后](../decisions/0023-v1-host-language-sdk-roadmap-and-ecs-deferral.md)
 - [ADR-0024：重新冻结 Runtime R0-v2 实现基线](../decisions/0024-runtime-r0-v2-refreeze.md)
+- [ADR-0026：Controller D1 settlement 重新冻结候选](../decisions/0026-controller-d1-settlement-refreeze.md)
+- [ADR-0027：Stage 1 Runtime/Controller/Vision 软件核心收口候选](../decisions/0027-stage-1-software-core-closeout.md)
+- [Stage 1 GPL/source/dependency license 初审](../development/stage1-license-initial-review.md)
 - [架构总览](architecture-overview.md)
 - [C ABI v1](c-abi-v1.md)
 - [语言绑定](language-bindings.md)

@@ -12,14 +12,28 @@ Amiibo、故障注入、10,000-step fake 和软件热路径测量已收敛，并
 保持开放，完整 Phase 2 仍未完成。本文不声称任何具体 VID/PID、固件、baud、Amiibo 容量、UART/USB HID/
 Switch 执行时序或物理中立化已经验证，也不创建完整 Phase 2 冻结 ADR。
 
-## Stage 1 开发状态
+## Stage 1 software-core 状态
 
-[ADR-0025](../decisions/0025-stage1-working-implementation-base.md) 将
-`main@3f1481480b3ee4206aa75a248a001213f960fcb6` 定义为本轮 Runtime/Controller/Vision 软件开发的
-working implementation base。该记录只允许在 ADR-0018/0020 的 D1 窄表面形成 builder candidate；它不倒写
-历史 ADR，不重新冻结 Runtime、Controller 或 Stage 1，也不替代后续独立 review/closeout。
+[ADR-0025](../decisions/0025-stage1-working-implementation-base.md) 继续只作为历史 working-base 记录。Controller D1
+production implementation object 固定为 `f99333f1e4d359af4588a659e2890bcfd58483de`，唯一 parent 是
+`be4c2cdfe9ffcdfe9de35cdda032502d2a63e89c`，tree 是
+`cc9a6040d000be9c070f586b04bb20d2be75a685`，主题是 `fix:线性化控制器动作派发结算`。
 
-### Builder 初版软件能力矩阵
+其 validation lineage 精确为 `f99333f1 <- 8edc700a <- df13db4c`：`8edc700a91dc02fbe58833126954881a2ab0de22`
+增加 debug-only deterministic rendezvous 和相关测试；`df13db4cb78c14602e05a31636a3e3a8f277f873` 以
+`8edc700a91dc02fbe58833126954881a2ab0de22` 为唯一 parent，tree 为
+`a3819e469c9dc629876b84835fccbabcc73ccc8e`，增加 [ADR-0028](../decisions/0028-windows-candidate-gate-layering.md)
+的 A/B/C/D gate layering、classifier、runner 与 CI hardening。独立 Task reviewer 已对 `df13db4` 给出 `APPROVE`，
+P0/P1/P2/P3=`0/0/0/0`。两个 H object 都只属于 validation/build-infrastructure lineage，不替代 production
+implementation object。
+
+[ADR-0026](../decisions/0026-controller-d1-settlement-refreeze.md) 和
+[ADR-0027](../decisions/0027-stage-1-software-core-closeout.md) 在 approved H input `df13db4` 上形成 Controller D1
+refreeze 与 Stage 1 software-core closeout 的 R 文档候选；[许可证初审](stage1-license-initial-review.md) 绑定同一
+H tree 的固定依赖输入。该 R candidate 仍为 `Pending Stage Review`，未经用户授权尚未集成 canonical `main`，
+不授权 Stage 2。
+
+### Stage 1 软件能力矩阵
 
 | 区域 | 已收敛的软件能力 | 可执行证据 |
 | --- | --- | --- |
@@ -27,13 +41,17 @@ working implementation base。该记录只允许在 ADR-0018/0020 的 D1 窄表�
 | Controller/serial | backend final-byte reservation / logical-report settlement、lease/action/release/close、partial stream、Windows completion owner | Controller exact/conformance、fake/system-serial parity、Windows Targeted `easycon-serial` |
 | Vision | capture/frame/image/label、native exception isolation、OCR/template/color 与 native-handle lifecycle | Windows Targeted `easycon-vision`、`easycon-native-sys` 与 high-parallel image contracts |
 
-Controller 的 backend final-byte gate 暴露了一个确定性跨 crate blocker：唯一 backend completion owner 必须在
-physical acceptance 处先 reservation shared winner，随后在所有 backend lock 外 claim Runtime owner，并在
-Controller bookkeeping 后 deferred finish。因此本 candidate 窄扩展了 Runtime settlement 实现；没有扩大 ABI、
-binding、hardware 或 Vision production 范围。
+Controller 的 backend final-byte gate 暴露了三个相连的确定性跨 crate 边界：唯一 backend completion owner 必须在
+physical acceptance 处先 reservation shared winner，随后在所有 backend lock 外 claim Runtime owner，并在 Controller
+bookkeeping 后 deferred finish；generation seal 对 `NotDispatched` 可以立即取消结算，但对 `Outstanding` 只能登记 intent、
+请求 interrupt 并等待 backend completion；并发 admission 回填与 backend dispatch 通过同一 Controller settlement record
+线性化，不能让 seal 的 rejection 抢走已派发 action 的 owner。Windows `ERROR_NOT_FOUND` 后仍消费完整 completion，full
+accepted winner 不被 late cancellation 改写。因此 production object 窄扩展了 Runtime settlement 并修复 Controller/
+serial ownership；H lineage 只使这些竞争可确定性复验并加固候选验证，没有扩大 ABI、binding、hardware 或 Vision
+production 范围。
 
-本矩阵记录 builder 的 Stage 1 初版软件开发候选，不是 staged Workspace credential、独立 H review、Runtime/Controller/
-Stage 1 refreeze、真实 Controller/capture 硬件资格或 Linux/macOS 晋级。
+本矩阵记录待 Stage review 的 Stage 1 Windows software-core closeout candidate；它不是真实 Controller/capture 硬件资格、
+public C ABI、binding/package、O-01 至 O-06、Linux/macOS 晋级、SBOM/signing 或 release 证据。
 
 ## 交付范围
 
@@ -72,8 +90,9 @@ Stage 1 refreeze、真实 Controller/capture 硬件资格或 Linux/macOS 晋级�
   `Deadline`、`Closed` 或 `Failure`；同一观察点优先级为 Cancelled、Deadline、Closed、Failure、Granted。
   deadline 始终是 Controller 所属 Runtime Clock epoch 的 absolute nanoseconds，SystemClock deadline 不依赖
   lane 继续运行。
-- 每个非零 Automation generation 在 `neutralize_and_release` 返回前 seal action admission。未 effect-linearize
-  的已接纳 action 先以 `ParentClose` 结算；完整 logical report 已被 transport 接受的 action 保留成功。随后只发出
+- 每个非零 Automation generation 在 `neutralize_and_release` 返回前 seal action admission。仍为 `NotDispatched` 的 action
+  可以 `ParentClose` + `NotDelivered` 结算；已进入 backend `Outstanding` 的 action 只登记 `ParentClose` intent 并等待真实
+  completion，完整 logical report 已被 transport 接受的 action 保留成功。随后只发出
   一个服从 pacing 的 neutral，并以 `NeutralAccepted`、`NeutralNotDeliveredStreamSettled(cause)` 或明确 cleanup
   failure 完成 release future。future/lease Drop 只触发同一非阻塞 cleanup，不能作为已 settlement 的 run terminal
   证据。
@@ -161,8 +180,17 @@ Phase 2A 专项测试还包括：
   target 验证无丢失、乱序、早发和漂移，并在 close 后验证三个 registry 为零；
 - `tests/support/tests/phase2a_latency.rs`：五段时间戳单调性与不丢样本的确定性 contract。
 
-当前完整 workspace 的非文档测试数以最终 staged Workspace evidence 为准；Runtime Loom 模型 12/12；当前规范校验执行
-8 schemas、1 behavior spec、1 Runtime fixture、4 controller fixtures、10 conformance scenarios 和 126 个 exact Rust tests。最终提交前仍以实际完整门禁输出为准。
+2026-08-12 的直接产品与 validator 结果实际来自 `8edc700a91dc02fbe58833126954881a2ab0de22`：Runtime Loom
+模型 12/12；冻结 validator 为 8 schemas、1 behavior spec、1 Runtime fixture、4 controller fixtures、15 Vision binary
+fixtures、1 capture manifest、24 label corpus entries、11 dormant ECS provenance records（33 个 SDK-local artifacts）、
+10 conformance scenarios 和 129 个 exact Rust tests；Controller settlement 资产包含 40 个 D1 obligations，
+`controller-settlement` 场景包含 9 个 assertions，均由 validator 的 exact test/marker 闭包验证。
+
+从 `8edc700a` 到 `df13db4c` 没有修改 product source/tests、`spec/**`、`tools/validate_specs.py`、
+`tools/run_runtime_models.py`、`tools/check_markdown_links.py`、Cargo/native/license fixed inputs，因此上述 2026-08-12
+产品与 validator provenance 继续适用于 approved H input；本文不声称在 `df13db4c` 上重新运行了这些直接检查。
+`df13db4c` 对 repository guards、policy、runner 和 CI 的迁移由独立 H `APPROVE` 覆盖，并由本 R candidate 的唯一
+staged A 实际覆盖；完整 workspace 的非文档测试和最终 candidate tree 以该新 A evidence 为准。
 
 ## 软件路径延迟结果
 
