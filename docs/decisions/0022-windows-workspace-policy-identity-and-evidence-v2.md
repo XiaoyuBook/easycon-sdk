@@ -74,6 +74,7 @@ Verify/gate window 中变化的 fail-closed 行为，还要覆盖 v2 evidence �
 
 ## 关联
 
+- [ADR-0028：Windows candidate gate 分层](0028-windows-candidate-gate-layering.md) 演进 gate 编排，保留本 ADR 的 schema-v2 evidence 与 fail-closed binding。
 - [构建、发布与合规](../architecture/build-release.md)
 - [测试策略](../architecture/testing-strategy.md)
 - [Windows CI 合同](../../.github/CI.md)

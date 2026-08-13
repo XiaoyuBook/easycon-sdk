@@ -61,7 +61,8 @@ exact path/kind/order、规范相对 path 和 Windows 大小写不敏感 identit
 identity。v5 将 `crates/easycon-file-identity/Cargo.toml` 纳入 exact fingerprint inputs；runner 本身不再作为 prepared
 identity 输入，因为它不物化 prepared tree。旧 schema stamp 不迁移、不降级为 cache 命中，Verify 必须 fail closed 并要求
 Setup 发布新树。runner、gate policy JSON 与 private policy parser 另组成 Workspace policy identity，见
-[ADR-0022](../decisions/0022-windows-workspace-policy-identity-and-evidence-v2.md)。
+[ADR-0022](../decisions/0022-windows-workspace-policy-identity-and-evidence-v2.md)；candidate 验证的 A/B/C/D
+分层见 [ADR-0028](../decisions/0028-windows-candidate-gate-layering.md)。
 
 ### Windows 开发环境生命周期
 
@@ -90,6 +91,35 @@ root/downloads 和测试临时目录等可写/source-bound 输出。local root �
 `vcpkg.exe` 与 `scripts/buildsystems/vcpkg.cmake` wrapper；wrapper 在 include immutable prepared toolchain 前绑定该 root，
 使 CMake 的 z-applocal 后处理只执行当前 worktree 拥有的工具副本。tool、marker、manifest 与 wrapper 都经同目录临时文件
 完整校验后原子替换 final，不沿预置 hardlink 覆写 shared environment 或 source。`Workspace` 在 Verify 后运行完整仓库门禁。
+
+#### Windows candidate 验证分层
+
+Windows candidate 验证按 A/B/C/D 分层。A 是唯一正式 credential，继续由
+`tools/run_windows_workspace.ps1 -Mode Workspace` 执行 Verify 后的固定 policy。JSON 中的 9 个固定 gate 是：
+
+- `cargo fmt --all --check`；
+- default-feature、all-target workspace `cargo check`；
+- all-feature、all-target workspace Clippy，warnings denied；
+- all-feature workspace tests；
+- Runtime models、冻结 spec validator、Markdown links、repository guards；
+- `git diff --check`。
+
+staged candidate 追加 cached diff check；提供 `BaseSha` 时追加 base-to-HEAD diff check。gate 的名称、顺序、tool 与参数只由
+`tools/windows_gate_policy.json` 提供。PowerShell parser 与 Python guard 分别验证通用 schema、安全不变量和必要 A 属性，
+不保存第二、第三份完整命令表。evidence 仍使用 ADR-0022 的 schema v2，精确绑定 base、HEAD、tree、environment
+fingerprint、policy hash、status 与逐 gate timing；policy 改变可以改变 gate count，不改变 binding 或 no-replace publication。
+
+B 通过 `tools/test_windows_workspace.ps1 -Mode Fast` 运行 bootstrap 和 12 个确定性合并组，只阻断 runner、policy、
+environment、bootstrap、configuration、相关 manifest/workflow 等 infrastructure candidate。Required CI 的显式 path classifier
+在 base 不可用时保守运行 B，普通产品 `.rs` path 不运行 B。Fast 的 registered/unique/executed 计数、mode 与 exact name
+都 fail closed，warm 目标不超过 90 秒，不靠 sleep 或放宽断言达成。
+
+C 通过同一脚本的 `-Mode Qualification` 承载真实 child process、Git worktree、cache/lease/lock、download、junction/
+reparse、cleanup 与 timing 观察。它只在现有 Native Quality schedule/workflow dispatch 中独立报告，不是普通 candidate
+required status。并发 Verify child 在持有 lifecycle leases 时先完成 checkout/layout 验证并记录
+`verification.completed`，随后发布 `ready.written`，父进程在 release 前证明 leases 仍被占用，最后才允许
+`release.observed`。D 删除旧 lifecycle runner、重复 harness 自测注册和同义变体；一份 runner/helper/harness 同时服务
+B 与 C。
 
 #### Targeted Cargo 与候选证据
 

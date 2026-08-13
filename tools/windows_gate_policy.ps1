@@ -121,22 +121,6 @@ $script:EasyConGatePolicyRunnerSnapshot = New-EasyConGatePolicyStrictUtf8TextSna
     -Path $gatePolicyRunnerScript -RelativePath "tools/run_windows_workspace.ps1" `
     -TrustedRoot $gatePolicyRepositoryRoot -Description "Windows gate runner script"
 
-function Get-EasyConExpectedWindowsGatePolicy {
-    return @(
-        [pscustomobject]@{ Name = "cargo fmt --all --check"; Tool = "cargo"; Arguments = @("fmt", "--all", "--check") },
-        [pscustomobject]@{ Name = "cargo check --locked --jobs 4 --workspace --all-targets"; Tool = "cargo"; Arguments = @("check", "--locked", "--workspace", "--all-targets") },
-        [pscustomobject]@{ Name = "cargo clippy --locked --jobs 4 --workspace --all-targets --all-features -- -D warnings"; Tool = "cargo"; Arguments = @("clippy", "--locked", "--workspace", "--all-targets", "--all-features", "--", "-D", "warnings") },
-        [pscustomobject]@{ Name = "cargo test --locked --jobs 4 --workspace --all-features"; Tool = "cargo"; Arguments = @("test", "--locked", "--workspace", "--all-features") },
-        [pscustomobject]@{ Name = "python tools/run_runtime_models.py"; Tool = "python"; Arguments = @("tools/run_runtime_models.py") },
-        [pscustomobject]@{ Name = "python tools/validate_specs.py"; Tool = "python"; Arguments = @("tools/validate_specs.py") },
-        [pscustomobject]@{ Name = "python tools/check_markdown_links.py"; Tool = "python"; Arguments = @("tools/check_markdown_links.py") },
-        [pscustomobject]@{ Name = "python tools/check_repository_guards.py"; Tool = "python"; Arguments = @("tools/check_repository_guards.py") },
-        [pscustomobject]@{ Name = "python tools/test_windows_bootstrap_contracts.py"; Tool = "python"; Arguments = @("tools/test_windows_bootstrap_contracts.py") },
-        [pscustomobject]@{ Name = "pwsh tools/test_windows_workspace.ps1"; Tool = "pwsh"; Arguments = @("-NoLogo", "-NoProfile", "-File", "tools/test_windows_workspace.ps1") },
-        [pscustomobject]@{ Name = "pwsh tools/test_windows_environment_lifecycle.ps1"; Tool = "pwsh"; Arguments = @("-NoLogo", "-NoProfile", "-File", "tools/test_windows_environment_lifecycle.ps1") },
-        [pscustomobject]@{ Name = "git diff --check"; Tool = "git"; Arguments = @("diff", "--check") }
-    )
-}
 function Get-EasyConGatePolicyStrictObject {
     param(
         [Parameter(Mandatory)]
@@ -358,14 +342,26 @@ function Get-EasyConWindowsGatePolicy {
             throw "Windows gate policy gates must be a JSON array"
         }
 
-        $expectedGates = @(Get-EasyConExpectedWindowsGatePolicy)
         $actualGates = @($root.gates.EnumerateArray())
-        if ($actualGates.Count -ne $expectedGates.Count) {
-            throw "Windows gate policy gate set or order changed"
+        if ($actualGates.Count -eq 0 -or $actualGates.Count -gt 32) {
+            throw "Windows gate policy must contain between 1 and 32 gates"
         }
         $gateNames = [System.Collections.Generic.HashSet[string]]::new(
             [System.StringComparer]::OrdinalIgnoreCase
         )
+        $cargoCommands = [System.Collections.Generic.HashSet[string]]::new(
+            [System.StringComparer]::Ordinal
+        )
+        $pythonEntries = [System.Collections.Generic.HashSet[string]]::new(
+            [System.StringComparer]::Ordinal
+        )
+        $requiredPythonEntries = @(
+            "tools/run_runtime_models.py",
+            "tools/validate_specs.py",
+            "tools/check_markdown_links.py",
+            "tools/check_repository_guards.py"
+        )
+        $gitDiffCheck = 0
         $parsed = [System.Collections.Generic.List[object]]::new()
         for ($index = 0; $index -lt $actualGates.Count; $index++) {
             $gate = Get-EasyConGatePolicyStrictObject -Element $actualGates[$index] `
@@ -386,19 +382,164 @@ function Get-EasyConWindowsGatePolicy {
                 $arguments.Add((Get-EasyConGatePolicyStrictString -Element $argument `
                     -Description "Windows gate policy argument"))
             }
-            $expected = $expectedGates[$index]
             if (
-                $name -cne $expected.Name -or
-                $tool -cne $expected.Tool -or
-                (($arguments.ToArray() -join "`0") -cne ($expected.Arguments -join "`0"))
+                [string]::IsNullOrWhiteSpace($name) -or
+                $name.Length -gt 240 -or
+                $name -match '[\r\n\0]'
             ) {
-                throw "Windows gate policy gate set, path, case, or order changed"
+                throw "Windows gate policy gate name is empty, unsafe, or too long"
+            }
+            if ($tool -cnotin @("cargo", "python", "git")) {
+                throw "Windows gate policy selected an unsupported tool '$tool'"
+            }
+            if ($arguments.Count -eq 0 -or $arguments.Count -gt 64) {
+                throw "Windows gate policy gate arguments must contain between 1 and 64 tokens"
+            }
+            foreach ($argument in $arguments) {
+                if (
+                    [string]::IsNullOrWhiteSpace($argument) -or
+                    $argument.Length -gt 1024 -or
+                    $argument -match '[\r\n\0]'
+                ) {
+                    throw "Windows gate policy argument is empty, unsafe, or too long"
+                }
+            }
+            if ($tool -ceq "cargo") {
+                $command = [string]$arguments[0]
+                if ($command -cnotin @("fmt", "check", "clippy", "test")) {
+                    throw "Windows gate policy Cargo command is not permitted"
+                }
+                if (-not $cargoCommands.Add($command)) {
+                    throw "Windows gate policy repeats Cargo command '$command'"
+                }
+                if (
+                    $command -cne "fmt" -and
+                    $arguments -cnotcontains "--locked"
+                ) {
+                    throw "Windows gate policy Cargo gates other than fmt must use --locked"
+                }
+                if (@($arguments | Where-Object {
+                    $_ -ceq "--jobs" -or $_ -ceq "-j" -or
+                    $_.StartsWith("--jobs=") -or
+                    ($_.StartsWith("-j") -and $_.Length -gt 2)
+                }).Count -ne 0) {
+                    throw "Windows gate policy Cargo arguments must not override injected jobs"
+                }
+                if (@($arguments | Where-Object {
+                    $_ -cin @(
+                        "--manifest-path", "-m", "--package", "-p", "--exclude",
+                        "--target", "--target-dir", "--config", "--features", "-F",
+                        "--no-default-features", "--lib", "--bins", "--bin", "--examples",
+                        "--example", "--tests", "--test", "--benches", "--bench",
+                        "--no-run", "--no-fail-fast", "--doc", "--keep-going", "--release",
+                        "--profile"
+                    ) -or
+                    $_ -cmatch '^-(?:m|p|F).+' -or
+                    $_ -cmatch '^--(?:manifest-path|package|exclude|target|target-dir|config|features|bin|example|test|bench|profile)='
+                }).Count -ne 0) {
+                    throw "Windows gate policy Cargo arguments contain a scope or execution override"
+                }
+                $requiredFlags = switch -CaseSensitive ($command) {
+                    "fmt" { @("--all", "--check") }
+                    "check" { @("--workspace", "--all-targets") }
+                    "clippy" {
+                        @("--workspace", "--all-targets", "--all-features", "--", "-D", "warnings")
+                    }
+                    "test" { @("--workspace", "--all-features") }
+                }
+                foreach ($requiredFlag in $requiredFlags) {
+                    if ($arguments -cnotcontains $requiredFlag) {
+                        throw "Windows gate policy Cargo '$command' misses required properties"
+                    }
+                }
+                if ($command -ceq "check" -and $arguments -ccontains "--all-features") {
+                    throw "Windows gate policy default-feature check must not use --all-features"
+                }
+                if ($command -cne "clippy" -and $arguments -ccontains "--") {
+                    throw "Windows gate policy Cargo gate must not select test-binary arguments"
+                }
+                if (
+                    $command -ceq "clippy" -and
+                    (
+                        $arguments.Count -lt 3 -or
+                        @($arguments | Where-Object { $_ -ceq "--" }).Count -ne 1 -or
+                        (($arguments | Select-Object -Last 3) -join "`0") -cne "--`0-D`0warnings"
+                    )
+                ) {
+                    throw "Windows gate policy Clippy must end with -- -D warnings"
+                }
+            }
+            elseif ($tool -ceq "python") {
+                $scriptPath = [string]$arguments[0]
+                if (
+                    $scriptPath -cnotmatch `
+                        '^tools/(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*\.py$'
+                ) {
+                    throw "Windows gate policy Python entry must be a normalized tools path"
+                }
+                if (
+                    $requiredPythonEntries -ccontains $scriptPath -and
+                    $arguments.Count -ne 1
+                ) {
+                    throw "Windows gate policy required Python gates must not accept extra arguments"
+                }
+                [void]$pythonEntries.Add($scriptPath)
+            }
+            elseif (
+                $tool -ceq "git" -and
+                (
+                    $arguments.Count -ne 2 -or
+                    $arguments[0] -cne "diff" -or
+                    $arguments[1] -cne "--check"
+                )
+            ) {
+                throw "Windows gate policy Git gate must be git diff --check"
+            }
+            elseif ($tool -ceq "git") {
+                $gitDiffCheck++
+            }
+            if (@(
+                $name,
+                $tool,
+                ($arguments -join " ")
+            ) -match 'test_windows_bootstrap_contracts|test_windows_workspace|test_windows_environment_lifecycle') {
+                throw "Windows candidate policy must not include B or retired PowerShell infra contracts"
+            }
+            $renderedArguments = if ($tool -ceq "cargo" -and $arguments[0] -cne "fmt") {
+                @($arguments | Select-Object -First 2) + @(
+                    "--jobs", [string]$cargoJobs
+                ) + @(
+                    $arguments | Select-Object -Skip 2
+                )
+            }
+            else {
+                @($arguments)
+            }
+            $renderedName = (@($tool) + $renderedArguments) -join " "
+            if ($name -cne $renderedName) {
+                throw "Windows gate policy name must match its structured command: $renderedName"
             }
             $parsed.Add([pscustomobject]@{
                 Name = $name
                 Tool = $tool
                 Arguments = $arguments.ToArray()
             }) | Out-Null
+        }
+        if (
+            $cargoCommands.Count -ne 4 -or
+            @(@("fmt", "check", "clippy", "test") | Where-Object {
+                -not $cargoCommands.Contains($_)
+            }).Count -ne 0
+        ) {
+            throw "Windows gate policy must retain all four Cargo gate properties"
+        }
+        foreach ($requiredPythonEntry in $requiredPythonEntries) {
+            if (-not $pythonEntries.Contains($requiredPythonEntry)) {
+                throw "Windows gate policy misses a required Python gate property"
+            }
+        }
+        if ($gitDiffCheck -ne 1) {
+            throw "Windows gate policy must contain one git diff --check gate"
         }
         return [pscustomobject]@{
             Version = $version
@@ -1413,7 +1554,6 @@ function Invoke-EasyConWindowsWorkspaceGates {
     }
     $cargo = Get-EasyConCommandPath -Name "cargo.exe"
     $python = Get-EasyConCommandPath -Name "python.exe"
-    $pwsh = Get-EasyConCommandPath -Name "pwsh.exe"
     $git = Get-EasyConCommandPath -Name "git.exe"
     $baseCommit = Resolve-EasyConWorkspaceBaseCommit -Git $git -RepositoryRoot $repository `
         -BaseSha $BaseSha
@@ -1427,7 +1567,6 @@ function Invoke-EasyConWindowsWorkspaceGates {
     $programs = @{
         cargo = $cargo
         python = $python
-        pwsh = $pwsh
         git = $git
     }
     $records = [System.Collections.Generic.List[object]]::new()
@@ -1438,8 +1577,10 @@ function Invoke-EasyConWindowsWorkspaceGates {
         }
         $arguments = @($gate.Arguments)
         if ($tool -ceq "cargo" -and $arguments[0] -cne "fmt") {
-            $arguments = @($arguments[0], "--jobs", [string]$cargoJobs) + @(
-                $arguments | Select-Object -Skip 1
+            $arguments = @($arguments | Select-Object -First 2) + @(
+                "--jobs", [string]$cargoJobs
+            ) + @(
+                $arguments | Select-Object -Skip 2
             )
         }
         $records.Add((Invoke-EasyConTimedPolicyGate -Name ([string]$gate.Name) `

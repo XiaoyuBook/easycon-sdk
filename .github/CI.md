@@ -7,19 +7,27 @@
 | Workflow | 触发 | 稳定 check 名 | Ruleset 边界 |
 | --- | --- | --- | --- |
 | `Required CI` | pull request、merge queue、`main` push | `Required / Policy`、`Required / Windows Workspace` | 两项都在 GitHub-hosted runner 首次实际通过后，才可作为 `main` required checks |
-| `Native Quality (Non-Required)` | 每周 schedule、手动 dispatch | `Windows Native / <preset>`、`Linux Phase 3 Candidate (Non-Required)` | 重型证据任务，不设为 required |
+| `Native Quality (Non-Required)` | 每周 schedule、手动 dispatch | `Windows Infrastructure Qualification (Non-Required)`、`Windows Native / <preset>`、`Linux Phase 3 Candidate (Non-Required)` | qualification 与重型证据任务，不设为 required |
 
 `Required / Policy` 在 Windows Server 2022 的 MSVC x64 developer environment 中校验规范、Rust exact
-conformance、Markdown 链接、repository guards、变更行和 clean tree。选择 Windows runner 是为了让
+conformance、Markdown 链接、repository guards、变更行和 clean tree。它先用 `base...HEAD`、`--no-renames` 与明确
+path 分类识别 Windows infrastructure candidate；命中 runner/policy/environment/bootstrap/config/相关 workflow、Cargo
+manifest 或 Windows build 配置时，运行 bootstrap 加 `tools/test_windows_workspace.ps1 -Mode Fast` 的 12 个确定性组并
+阻断；Workspace job 依赖 Policy job，命中的 Fast 失败时不会继续 A。普通产品源码 path 不运行 Fast。base 缺失或
+全零时保守运行 Fast。选择 Windows runner 是为了让
 `easycon-serial` 的 `#[cfg(windows)]` tests 与其余测试在同一 Policy job 中真实编译并执行；Ubuntu runner 既不能
 链接仓库默认的 MSVC target，改用 Linux target 又会排除这些测试。
 
-`Required / Windows Workspace` 仍在独立的 MSVC x64 job 中执行冻结 Rust workspace、Loom runtime models、规范、
-链接、repository guards 和 diff 全门禁，并保留完整 vcpkg、OCR、cache 与权限边界。Policy 使用 Windows runner
+`Required / Windows Workspace` 仍在独立的 MSVC x64 job 中执行 A：Verify、四个固定 Cargo gate、Runtime models、规范、
+链接、repository guards 和 diff，共 9 个 JSON policy gate，并保留完整 vcpkg、OCR、cache 与权限边界。它是唯一
+candidate credential；staged/base diff 只按 candidate 参数追加。Policy 使用 Windows runner
 只证明该次 repository policy 与 exact conformance gate；它不产生新的 Windows 平台、serial 硬件、Phase 3 native
 或发布支持结论，也不能替代 Windows Workspace 或 non-required native-quality 证据。
 
-重型 Windows native matrix 与 Phase 3 文档保持一致：MSVC Debug/Release、clang-cl ASan、clang-cl UBSan trap、
+`Windows Infrastructure Qualification (Non-Required)` 运行
+`tools/test_windows_workspace.ps1 -Mode Qualification`，观察真实 child process、fixed-SHA worktree、cache/lock/download、
+junction/reparse 与 bounded cleanup。它只使用 Native Quality 已有 schedule 和 manual dispatch，不进入普通 candidate
+required status。重型 Windows native matrix 与 Phase 3 文档保持一致：MSVC Debug/Release、clang-cl ASan、clang-cl UBSan trap、
 MSVC analyze、clang-tidy warnings-as-errors 和 libFuzzer tracked corpus。它们只能由 schedule 或手动触发，普通
 PR 上的 workspace 结果不能替代这些 native-quality 证据。
 
@@ -54,7 +62,8 @@ path/kind/顺序、无 `.`/`..` component 的规范相对路径和 Windows 大�
 不能等到后置 repository gate 才发现。Python guard 独立执行同一严格合同，防止清单与 Setup parser 漂移。
 当前环境清单为 v5，并精确包含 `crates/easycon-file-identity/Cargo.toml`；runner 文本不进入 prepared identity。
 `windows_gate_policy.json`、`windows_gate_policy.ps1` 与 runner 则组成独立 Workspace policy hash，见
-[ADR-0022](../docs/decisions/0022-windows-workspace-policy-identity-and-evidence-v2.md)。
+[ADR-0022](../docs/decisions/0022-windows-workspace-policy-identity-and-evidence-v2.md)。A/B/C/D 分层、schema-v2 不迁移和
+Ready barrier 见 [ADR-0028](../docs/decisions/0028-windows-candidate-gate-layering.md)。
 
 ## Windows Setup、Verify 与 Workspace
 
@@ -188,9 +197,10 @@ namespace，再回退到 trusted-main；每个 run 使用新 primary key，并�
 namespace。所有 restore 都是不可信的提速输入：Setup 每次按上述 hash/git/rustup 安全模型复验，cache miss 不改变正确性。
 Cargo downloads 与 vcpkg binary cache 保持独立 key，且同样不因 workflow/module 文本编辑全量失效。
 
-`Native Quality (Non-Required)` 没有改用 workspace runner：其 clang-cl、clang-tidy、analyze、sanitizer、fuzz preset
-矩阵不是 Required Windows Workspace 合同。它保留独立初始化，同时由 guard 防止 vcpkg pins 漂移。
+`Native Quality (Non-Required)` 中的 native matrix 没有改用 workspace runner：其 clang-cl、clang-tidy、analyze、
+sanitizer、fuzz preset 不是 Required Windows Workspace 合同，保留独立初始化并由 guard 防止 vcpkg pins 漂移。
+同一 workflow 中的 infrastructure Qualification 使用 contract runner，但结果保持独立且 non-required。
 
 首次启用 Ruleset 时，应从成功的 `Required CI` 运行中选择精确 check 名 `Required / Policy` 与
 `Required / Windows Workspace`。
-不要选择 native matrix 或 Linux candidate；本仓库不由 workflow 自动创建或修改 Ruleset。
+不要选择 infrastructure Qualification、native matrix 或 Linux candidate；本仓库不由 workflow 自动创建或修改 Ruleset。

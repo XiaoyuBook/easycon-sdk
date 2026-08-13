@@ -43,21 +43,6 @@
       "arguments": ["tools/check_repository_guards.py"]
     },
     {
-      "name": "python tools/test_windows_bootstrap_contracts.py",
-      "tool": "python",
-      "arguments": ["tools/test_windows_bootstrap_contracts.py"]
-    },
-    {
-      "name": "pwsh tools/test_windows_workspace.ps1",
-      "tool": "pwsh",
-      "arguments": ["-NoLogo", "-NoProfile", "-File", "tools/test_windows_workspace.ps1"]
-    },
-    {
-      "name": "pwsh tools/test_windows_environment_lifecycle.ps1",
-      "tool": "pwsh",
-      "arguments": ["-NoLogo", "-NoProfile", "-File", "tools/test_windows_environment_lifecycle.ps1"]
-    },
-    {
       "name": "git diff --check",
       "tool": "git",
       "arguments": ["diff", "--check"]

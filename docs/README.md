@@ -79,6 +79,7 @@
 - [ADR-0023：v1 宿主语言 SDK 路线与 ECS 延后（Accepted / Effective）](decisions/0023-v1-host-language-sdk-roadmap-and-ecs-deferral.md)
 - [ADR-0024：重新冻结 Runtime R0-v2 实现基线（Refrozen Runtime Implementation / Effective）](decisions/0024-runtime-r0-v2-refreeze.md)
 - [ADR-0025：Stage 1 开发 working implementation base（Not a refreeze）](decisions/0025-stage1-working-implementation-base.md)
+- [ADR-0028：Windows candidate gate 分层（Accepted / Effective）](decisions/0028-windows-candidate-gate-layering.md)
 
 ## v1 固定范围
 

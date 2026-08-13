@@ -102,7 +102,6 @@ CONFORMANCE_MARKER = re.compile(
 )
 WINDOWS_BUILD_FILES = {
     "tools/run_windows_workspace.ps1",
-    "tools/test_windows_environment_lifecycle.ps1",
     "tools/test_windows_workspace.ps1",
     "tools/test_windows_bootstrap_contracts.py",
     "tools/windows_build_environment.json",
@@ -149,9 +148,16 @@ POLICY_RUN_SHA256 = {
     "Isolate generated outputs": "774f504e5fdcdfb96cfb68e74e803d2e228f4df65a7846b305fbb76359bb3292",
     "Load the MSVC x64 developer environment": "738056873e87faf3bc1ee900547897413b0e462c67fa48b2b4b2dc14cda414fc",
     "Install and verify the frozen Rust toolchain": "dddf2ec394db5fdd537cda92ecd397fe32c2c029e4a74b760b5c6f4900ede4e1",
+    "Classify Windows infrastructure paths": "f69b4d237ea5c14a152f7da9e9fc397020839e1cc3208f78f35a18d90ea89ee2",
+    "Run Windows infrastructure Fast contracts": "5855c21dc990b1bbe765c3d45b516d1f01d5450d4c649671f03c542877eeed44",
     "Run repository policy gates": "2103a97e81bdc4366d3b4d1f89cd9391b24d4ebe614938deafe42b286d6abe4b",
     "Check changed lines and repository cleanliness": "cf7ca03b111e12bb1e3e951bb3957e487b87249609a73f1f6b34aac24bc95286",
 }
+WINDOWS_INFRASTRUCTURE_REQUIRED_EXACT_PATHS = (
+    ".cargo/config.toml",
+    "clippy.toml",
+    "rustfmt.toml",
+)
 WINDOWS_CONFIGURATION_KEYS = {
     "version",
     "target",
@@ -202,23 +208,6 @@ def expected_windows_environment_fingerprint_paths():
         "CMakePresets.json",
         "spec/fixtures/vision/ocr-model.json",
         "tools/provision_vision_test_model.py",
-    ]
-
-
-def expected_windows_gate_policy_gates():
-    return [
-        ("cargo fmt --all --check", "cargo", ["fmt", "--all", "--check"]),
-        ("cargo check --locked --jobs 4 --workspace --all-targets", "cargo", ["check", "--locked", "--workspace", "--all-targets"]),
-        ("cargo clippy --locked --jobs 4 --workspace --all-targets --all-features -- -D warnings", "cargo", ["clippy", "--locked", "--workspace", "--all-targets", "--all-features", "--", "-D", "warnings"]),
-        ("cargo test --locked --jobs 4 --workspace --all-features", "cargo", ["test", "--locked", "--workspace", "--all-features"]),
-        ("python tools/run_runtime_models.py", "python", ["tools/run_runtime_models.py"]),
-        ("python tools/validate_specs.py", "python", ["tools/validate_specs.py"]),
-        ("python tools/check_markdown_links.py", "python", ["tools/check_markdown_links.py"]),
-        ("python tools/check_repository_guards.py", "python", ["tools/check_repository_guards.py"]),
-        ("python tools/test_windows_bootstrap_contracts.py", "python", ["tools/test_windows_bootstrap_contracts.py"]),
-        ("pwsh tools/test_windows_workspace.ps1", "pwsh", ["-NoLogo", "-NoProfile", "-File", "tools/test_windows_workspace.ps1"]),
-        ("pwsh tools/test_windows_environment_lifecycle.ps1", "pwsh", ["-NoLogo", "-NoProfile", "-File", "tools/test_windows_environment_lifecycle.ps1"]),
-        ("git diff --check", "git", ["diff", "--check"]),
     ]
 
 
@@ -1960,6 +1949,8 @@ def required_ci_failures(workflow):
         "Isolate generated outputs",
         "Load the MSVC x64 developer environment",
         "Install and verify the frozen Rust toolchain",
+        "Classify Windows infrastructure paths",
+        "Run Windows infrastructure Fast contracts",
         "Run repository policy gates",
         "Check changed lines and repository cleanliness",
     ]
@@ -1973,9 +1964,45 @@ def required_ci_failures(workflow):
         allowed = {"name", "shell", "run"}
         if name == "Check changed lines and repository cleanliness":
             allowed.add("env")
+        elif name == "Classify Windows infrastructure paths":
+            allowed.update({"id", "env"})
+        elif name == "Run Windows infrastructure Fast contracts":
+            allowed.add("if")
         if _exact_keys(step, allowed, "Required / Policy step {!r}".format(name), failures):
             if step.get("shell") != "pwsh":
                 failures.append("Required / Policy step {!r} shell changed".format(name))
+
+    classifier_step = policy_steps.get("Classify Windows infrastructure paths", {})
+    if classifier_step.get("id") != "infra_paths":
+        failures.append("Windows infrastructure path classifier id changed")
+    if classifier_step.get("env") != {
+        "BASE_SHA": "${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}"
+    }:
+        failures.append("Windows infrastructure path classifier base SHA contract changed")
+    classifier_script = classifier_step.get("run")
+    classifier_exact_paths = set()
+    if isinstance(classifier_script, str):
+        assignment_offset = classifier_script.find(
+            "$exactPaths = [System.Collections.Generic.HashSet[string]]::new("
+        )
+        block_start = classifier_script.find("\n  @(\n", assignment_offset)
+        block_end = classifier_script.find(
+            "\n  ) | ForEach-Object { [void]$exactPaths.Add($_) }", block_start
+        )
+        if assignment_offset >= 0 and block_start >= 0 and block_end >= 0:
+            for line in classifier_script[block_start + len("\n  @(\n") : block_end].splitlines():
+                match = re.fullmatch(r'\s*"([^"]+)"(?:,)?\s*', line)
+                if match:
+                    classifier_exact_paths.add(match.group(1))
+    for path in WINDOWS_INFRASTRUCTURE_REQUIRED_EXACT_PATHS:
+        if path not in classifier_exact_paths:
+            failures.append(
+                "Windows infrastructure path classifier misses required exact path: "
+                + path
+            )
+    fast_step = policy_steps.get("Run Windows infrastructure Fast contracts", {})
+    if fast_step.get("if") != "steps.infra_paths.outputs.run_fast == 'true'":
+        failures.append("Windows infrastructure Fast condition changed")
 
     for name, expected_digest in POLICY_RUN_SHA256.items():
         script = policy_steps.get(name, {}).get("run")
@@ -1996,12 +2023,14 @@ def required_ci_failures(workflow):
 
     if _exact_keys(
         windows_workspace,
-        {"name", "runs-on", "timeout-minutes", "steps"},
+        {"name", "needs", "runs-on", "timeout-minutes", "steps"},
         "Required / Windows Workspace job",
         failures,
     ):
         if windows_workspace["name"] != "Required / Windows Workspace":
             failures.append("Required / Windows Workspace check name changed")
+        if windows_workspace["needs"] != "policy":
+            failures.append("Required / Windows Workspace must stop when Policy or Fast fails")
         if windows_workspace["runs-on"] != "windows-2022":
             failures.append("Required / Windows Workspace must run on windows-2022")
         if windows_workspace["timeout-minutes"] != 180:
@@ -2423,10 +2452,12 @@ def parse_windows_gate_policy(text):
     if type(gates) is not list:
         raise ValueError("Windows gate policy gates must be a JSON array")
 
-    expected = expected_windows_gate_policy_gates()
-    if len(gates) != len(expected):
-        raise ValueError("Windows gate policy gate set or order changed")
+    if not 1 <= len(gates) <= 32:
+        raise ValueError("Windows gate policy must contain between 1 and 32 gates")
     identities = []
+    cargo_commands = set()
+    python_entries = set()
+    git_diff_check = 0
     for index, gate in enumerate(gates):
         _require_json_keys(
             gate, WINDOWS_GATE_POLICY_GATE_KEYS, "Windows gate policy gate {}".format(index)
@@ -2436,16 +2467,146 @@ def parse_windows_gate_policy(text):
         arguments = gate["arguments"]
         if type(arguments) is not list or any(type(value) is not str for value in arguments):
             raise ValueError("Windows gate policy gate arguments must be a JSON string array")
-        identities.append(name.casefold())
-        expected_name, expected_tool, expected_arguments = expected[index]
-        if (
-            name != expected_name
-            or tool != expected_tool
-            or arguments != expected_arguments
+        if not name or len(name) > 240 or any(value in name for value in ("\r", "\n", "\0")):
+            raise ValueError("Windows gate policy gate name is empty, unsafe, or too long")
+        if tool not in {"cargo", "python", "git"}:
+            raise ValueError("Windows gate policy selected an unsupported tool {!r}".format(tool))
+        if not 1 <= len(arguments) <= 64:
+            raise ValueError(
+                "Windows gate policy gate arguments must contain between 1 and 64 tokens"
+            )
+        if any(
+            not argument
+            or len(argument) > 1024
+            or any(value in argument for value in ("\r", "\n", "\0"))
+            for argument in arguments
         ):
-            raise ValueError("Windows gate policy gate set, path, case, or order changed")
+            raise ValueError("Windows gate policy argument is empty, unsafe, or too long")
+
+        if tool == "cargo":
+            command = arguments[0]
+            if command not in {"fmt", "check", "clippy", "test"}:
+                raise ValueError("Windows gate policy Cargo command is not permitted")
+            if command in cargo_commands:
+                raise ValueError("Windows gate policy repeats Cargo command {!r}".format(command))
+            cargo_commands.add(command)
+            if command != "fmt" and "--locked" not in arguments:
+                raise ValueError("Windows gate policy Cargo gates other than fmt must use --locked")
+            if any(
+                argument in {"--jobs", "-j"}
+                or argument.startswith("--jobs=")
+                or (argument.startswith("-j") and len(argument) > 2)
+                for argument in arguments
+            ):
+                raise ValueError("Windows gate policy Cargo arguments must not override injected jobs")
+            forbidden_options = {
+                "--manifest-path", "-m", "--package", "-p", "--exclude",
+                "--target", "--target-dir", "--config", "--features", "-F",
+                "--no-default-features", "--lib", "--bins", "--bin", "--examples",
+                "--example", "--tests", "--test", "--benches", "--bench", "--no-run",
+                "--no-fail-fast", "--doc", "--keep-going", "--release", "--profile",
+            }
+            forbidden_long_prefixes = (
+                "--manifest-path=", "--package=", "--exclude=", "--target=",
+                "--target-dir=", "--config=", "--features=", "--bin=", "--example=",
+                "--test=", "--bench=", "--profile=",
+            )
+            if any(
+                argument in forbidden_options
+                or re.fullmatch(r"-(?:m|p|F).+", argument) is not None
+                or argument.startswith(forbidden_long_prefixes)
+                for argument in arguments
+            ):
+                raise ValueError(
+                    "Windows gate policy Cargo arguments contain a scope or execution override"
+                )
+            required_flags = {
+                "fmt": {"--all", "--check"},
+                "check": {"--workspace", "--all-targets"},
+                "clippy": {"--workspace", "--all-targets", "--all-features", "--", "-D", "warnings"},
+                "test": {"--workspace", "--all-features"},
+            }[command]
+            if not required_flags.issubset(arguments):
+                raise ValueError(
+                    "Windows gate policy Cargo {!r} misses required properties".format(command)
+                )
+            if command == "check" and "--all-features" in arguments:
+                raise ValueError("Windows gate policy default-feature check must not use --all-features")
+            if command != "clippy" and "--" in arguments:
+                raise ValueError(
+                    "Windows gate policy Cargo gate must not select test-binary arguments"
+                )
+            if command == "clippy" and (
+                arguments.count("--") != 1 or arguments[-3:] != ["--", "-D", "warnings"]
+            ):
+                raise ValueError(
+                    "Windows gate policy Clippy must end with -- -D warnings"
+                )
+        elif tool == "python":
+            script_path = arguments[0]
+            if (
+                re.fullmatch(
+                    r"tools/(?:[A-Za-z0-9_-]+/)*"
+                    r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*\.py",
+                    script_path,
+                )
+                is None
+            ):
+                raise ValueError(
+                    "Windows gate policy Python entry must be a normalized tools path"
+                )
+            required_python_entries = {
+                "tools/run_runtime_models.py",
+                "tools/validate_specs.py",
+                "tools/check_markdown_links.py",
+                "tools/check_repository_guards.py",
+            }
+            if script_path in required_python_entries and len(arguments) != 1:
+                raise ValueError(
+                    "Windows gate policy required Python gates must not accept extra arguments"
+                )
+            python_entries.add(script_path)
+        else:
+            if arguments != ["diff", "--check"]:
+                raise ValueError("Windows gate policy Git gate must be git diff --check")
+            git_diff_check += 1
+
+        rendered_arguments = list(arguments)
+        if tool == "cargo" and arguments[0] != "fmt":
+            rendered_arguments[2:2] = ["--jobs", str(policy["cargoJobs"])]
+        rendered_name = " ".join([tool] + rendered_arguments)
+        if name != rendered_name:
+            raise ValueError(
+                "Windows gate policy name must match its structured command: {}".format(
+                    rendered_name
+                )
+            )
+        if any(
+            forbidden in " ".join([name, tool] + arguments)
+            for forbidden in (
+                "test_windows_bootstrap_contracts",
+                "test_windows_workspace",
+                "test_windows_environment_lifecycle",
+            )
+        ):
+            raise ValueError(
+                "Windows candidate policy must not include B or retired PowerShell infra contracts"
+            )
+        identities.append(name.casefold())
     if len(identities) != len(set(identities)):
         raise ValueError("Windows gate policy contains duplicate Windows gate identity")
+    if cargo_commands != {"fmt", "check", "clippy", "test"}:
+        raise ValueError("Windows gate policy must retain all four Cargo gate properties")
+    required_python_entries = {
+        "tools/run_runtime_models.py",
+        "tools/validate_specs.py",
+        "tools/check_markdown_links.py",
+        "tools/check_repository_guards.py",
+    }
+    if not required_python_entries.issubset(python_entries):
+        raise ValueError("Windows gate policy misses a required Python gate property")
+    if git_diff_check != 1:
+        raise ValueError("Windows gate policy must contain one git diff --check gate")
     return policy
 
 
@@ -2483,6 +2644,156 @@ def windows_build_environment_failures(configuration, native_quality):
                     name
                 )
             )
+    return failures
+
+
+def windows_infrastructure_qualification_failures(native_quality):
+    failures = []
+    try:
+        document = parse_required_ci(native_quality)
+    except ValueError as error:
+        return ["Native Quality YAML is invalid: {}".format(error)]
+
+    triggers = document.get("on") if isinstance(document, dict) else None
+    if not isinstance(triggers, dict):
+        failures.append("Native Quality triggers must be a mapping")
+    else:
+        if "workflow_dispatch" not in triggers or "schedule" not in triggers:
+            failures.append(
+                "Windows infrastructure Qualification must use existing dispatch and schedule triggers"
+            )
+        if set(triggers) != {"workflow_dispatch", "schedule"}:
+            failures.append("Native Quality must not add a Qualification-specific trigger")
+    jobs = document.get("jobs") if isinstance(document, dict) else None
+    job = jobs.get("windows-infrastructure-qualification") if isinstance(jobs, dict) else None
+    if not _exact_keys(
+        job,
+        {"name", "runs-on", "timeout-minutes", "steps"},
+        "Windows infrastructure Qualification job",
+        failures,
+    ):
+        return failures
+    if job.get("name") != "Windows Infrastructure Qualification (Non-Required)":
+        failures.append("Windows infrastructure Qualification check name changed")
+    if job.get("runs-on") != "windows-2022" or job.get("timeout-minutes") != 30:
+        failures.append("Windows infrastructure Qualification runner or timeout changed")
+    expected_steps = [
+        "Check out the scheduled candidate",
+        "Run Windows infrastructure Qualification contracts",
+    ]
+    steps = _step_map(job, expected_steps, "Windows infrastructure Qualification", failures)
+    checkout = steps.get("Check out the scheduled candidate")
+    if checkout is not None:
+        _validate_checkout(checkout, "Windows infrastructure Qualification checkout", failures)
+    runner = steps.get("Run Windows infrastructure Qualification contracts", {})
+    if _exact_keys(
+        runner,
+        {"name", "shell", "run"},
+        "Windows infrastructure Qualification runner",
+        failures,
+    ):
+        if runner.get("shell") != "pwsh":
+            failures.append("Windows infrastructure Qualification shell changed")
+        expected = (
+            '$ErrorActionPreference = "Stop"\n'
+            "$PSNativeCommandUseErrorActionPreference = $true\n"
+            "pwsh -NoProfile -File tools/test_windows_workspace.ps1 -Mode Qualification"
+        )
+        if runner.get("run", "").strip() != expected:
+            failures.append(
+                "Windows infrastructure Qualification invocation changed or is not active"
+            )
+    return failures
+
+
+def windows_contract_runner_failures(runner):
+    failures = []
+    registrations = re.findall(
+        r'(?m)^Add-ContractCase -Name "([a-z0-9]+(?:-[a-z0-9]+)*)" '
+        r'-CaseMode "(Fast|Qualification)" -Action \{',
+        runner,
+    )
+    expected_fast = [
+        "configuration-fingerprint",
+        "tool-version-pin-parsers",
+        "module-wrapper-contracts",
+        "plan-targeted-arguments",
+        "candidate-binding",
+        "evidence-output",
+        "policy-snapshot-revalidation",
+        "stamp-tool-damage",
+        "atomic-publication",
+        "transport-policy",
+        "msvc-environment-seam",
+        "lifecycle-state-restore",
+    ]
+    expected_qualification = [
+        "real-worktree-concurrency",
+        "process-lifecycle",
+        "cache-lock-download",
+        "junction-cleanup",
+    ]
+    actual_fast = [name for name, mode in registrations if mode == "Fast"]
+    actual_qualification = [
+        name for name, mode in registrations if mode == "Qualification"
+    ]
+    if actual_fast != expected_fast:
+        failures.append("Windows Fast contract registry changed")
+    if actual_qualification != expected_qualification:
+        failures.append("Windows Qualification contract registry changed")
+    names = [name for name, _ in registrations]
+    if len(names) != 16 or len(set(names)) != 16:
+        failures.append("Windows contract registry must contain 16 unique exact names")
+
+    functions = re.findall(r"(?m)^function\s+([A-Za-z0-9-]+)\s*\{", runner)
+    duplicates = sorted(name for name in set(functions) if functions.count(name) > 1)
+    if duplicates:
+        failures.append(
+            "Windows contract runner contains duplicate helper definitions: {}".format(
+                ", ".join(duplicates)
+            )
+        )
+    if len(runner.splitlines()) >= 6000:
+        failures.append("Windows contract runner must remain below 6000 physical lines")
+    for forbidden in (
+        "Start-Sleep",
+        "Invoke-Expression",
+        "tools/test_windows_environment_lifecycle.ps1",
+    ):
+        if forbidden in runner:
+            failures.append(
+                "Windows contract runner contains forbidden legacy or timing behavior: {}".format(
+                    forbidden
+                )
+            )
+    for required in (
+        '[ValidateSet("Fast", "Qualification", IgnoreCase = $false)]',
+        '$Mode -cnotin @("Fast", "Qualification")',
+        '$script:contractCaseNames.Add($Name)',
+        '$expectedRegistered = if ($Mode -ceq "Fast") { 12 } else { 4 }',
+        '$script:contractCases.Count -eq 16',
+        '$script:contractCaseNames.Count -eq 16',
+        'throw "unknown exact contract group \'$ExactCase\'"',
+        '$registered.Count -eq 1',
+        '$expectedExecuted = if ($script:exactCaseRequested) { 1 } else { $expectedRegistered }',
+        '$executed -eq $expectedExecuted',
+        '"CONTRACT_SUMMARY mode={0} selection={1} registered={2} unique={3} "',
+        '$Mode -ceq "Fast" -and -not $script:exactCaseRequested',
+        "Invoke-BootstrapContracts",
+        'Write-Trace "verification.completed"',
+        'Write-Trace "ready.written"',
+        'Write-Trace "release.observed"',
+        "Stop-ContractProcesses",
+    ):
+        if required not in runner:
+            failures.append("Windows contract runner is missing: {}".format(required))
+    verification = runner.find('Write-Trace "verification.completed"')
+    ready = runner.find('Write-Trace "ready.written"')
+    release = runner.find('Write-Trace "release.observed"')
+    if not (0 <= verification < ready < release):
+        failures.append(
+            "Windows real-worktree qualification must verify before Ready and release"
+        )
     return failures
 
 
@@ -3013,11 +3324,24 @@ def windows_gate_policy_failures(environment_module, policy_module, runner):
         "Get-EasyConGatePolicyStrictString",
         "TryGetInt32",
         "cargoJobs must be the JSON integer 4",
-        "gate set, path, case, or order changed",
+        "must contain between 1 and 32 gates",
+        "selected an unsupported tool",
+        "normalized tools path",
+        "Git gate must be git diff --check",
+        "scope or execution override",
+        "must not select test-binary arguments",
+        "Clippy must end with -- -D warnings",
+        "required Python gates must not accept extra arguments",
+        "must retain all four Cargo gate properties",
+        "misses a required Python gate property",
+        "name must match its structured command",
+        "must not include B or retired PowerShell infra contracts",
         "OrdinalIgnoreCase",
     ):
         if required not in policy_parser:
             failures.append("strict gate policy parser is missing: {}".format(required))
+    if "Get-EasyConExpectedWindowsGatePolicy" in policy_module:
+        failures.append("PowerShell policy must not mirror the JSON gate command table")
     if "--jobs" not in targeted or "CargoJobs" not in targeted:
         failures.append("Targeted Cargo must inject the fixed Cargo jobs budget")
     for rejected in (
@@ -3214,6 +3538,7 @@ def main():
     native_quality = (ROOT / ".github/workflows/native-quality.yml").read_text(
         encoding="utf-8"
     )
+    failures.extend(windows_infrastructure_qualification_failures(native_quality))
     if windows_build_configuration is not None:
         failures.extend(
             windows_build_environment_failures(
@@ -3230,7 +3555,11 @@ def main():
     windows_runner = (ROOT / "tools/run_windows_workspace.ps1").read_text(
         encoding="utf-8"
     )
+    windows_contract_runner = (ROOT / "tools/test_windows_workspace.ps1").read_text(
+        encoding="utf-8"
+    )
     failures.extend(windows_workspace_module_failures(windows_module))
+    failures.extend(windows_contract_runner_failures(windows_contract_runner))
     failures.extend(
         windows_gate_policy_failures(
             windows_module, windows_gate_policy_module, windows_runner

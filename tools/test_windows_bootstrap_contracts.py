@@ -2,6 +2,7 @@
 """Regression contracts for Windows Setup, Workspace, and pinned inputs."""
 
 import copy
+import hashlib
 import importlib.util
 import json
 import unittest
@@ -29,6 +30,51 @@ class RequiredCiContracts(unittest.TestCase):
 
     def test_current_workflow_is_valid(self):
         self.assertEqual(GUARD.required_ci_failures(self.workflow), [])
+
+    def test_infrastructure_classifier_covers_tracked_rust_configuration(self):
+        classifier_name = "Classify Windows infrastructure paths"
+        required_paths = (
+            ".cargo/config.toml",
+            "clippy.toml",
+            "rustfmt.toml",
+        )
+        current_failures = GUARD.required_ci_failures(self.workflow)
+
+        for path in required_paths:
+            with self.subTest(path=path):
+                marker = '              "{}",\n'.format(path)
+                expected_failure = (
+                    "Windows infrastructure path classifier misses required exact path: "
+                    + path
+                )
+                if marker not in self.workflow:
+                    self.assertIn(expected_failure, current_failures)
+                    continue
+
+                self.assertEqual(current_failures, [])
+                mutated = self.workflow.replace(marker, "", 1)
+                document = GUARD.parse_required_ci(mutated)
+                classifier_script = next(
+                    step["run"]
+                    for step in document["jobs"]["policy"]["steps"]
+                    if step.get("name") == classifier_name
+                )
+                original_digest = GUARD.POLICY_RUN_SHA256[classifier_name]
+                try:
+                    GUARD.POLICY_RUN_SHA256[classifier_name] = hashlib.sha256(
+                        classifier_script.encode("utf-8")
+                    ).hexdigest()
+                    failures = GUARD.required_ci_failures(mutated)
+                finally:
+                    GUARD.POLICY_RUN_SHA256[classifier_name] = original_digest
+
+                self.assertIn(expected_failure, failures)
+                self.assertNotIn(
+                    "Required / Policy step {!r} exact run block changed".format(
+                        classifier_name
+                    ),
+                    failures,
+                )
 
     def test_setup_and_workspace_are_separate_active_steps(self):
         mutations = {
@@ -202,6 +248,11 @@ class RequiredCiContracts(unittest.TestCase):
             1,
         )
         self.assert_rejected(unpinned, "unpinned action")
+        independent_workspace = self.workflow.replace("    needs: policy\n", "", 1)
+        self.assertNotEqual(independent_workspace, self.workflow)
+        self.assert_rejected(
+            independent_workspace, "Workspace continuing after Policy or Fast failure"
+        )
 
     def test_policy_commands_remain_exact_active_invocations(self):
         for label, original, replacement in (
@@ -220,6 +271,104 @@ class RequiredCiContracts(unittest.TestCase):
                 self.assert_rejected(
                     self.workflow.replace(original, replacement, 1), label
                 )
+
+
+class NativeQualityContracts(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.workflow = (ROOT / ".github/workflows/native-quality.yml").read_text(
+            encoding="utf-8"
+        )
+
+    def assert_rejected(self, workflow, label):
+        self.assertTrue(
+            GUARD.windows_infrastructure_qualification_failures(workflow),
+            "{} must be rejected".format(label),
+        )
+
+    def test_current_qualification_entry_is_valid(self):
+        self.assertEqual(
+            GUARD.windows_infrastructure_qualification_failures(self.workflow), []
+        )
+
+    def test_qualification_remains_non_required_and_on_existing_triggers(self):
+        mutations = {
+            "disabled Qualification": (
+                "      - name: Run Windows infrastructure Qualification contracts\n",
+                "      - name: Run Windows infrastructure Qualification contracts\n"
+                "        if: false\n",
+            ),
+            "legacy lifecycle runner": (
+                "tools/test_windows_workspace.ps1 -Mode Qualification",
+                "tools/test_windows_environment_lifecycle.ps1",
+            ),
+            "Fast in qualification workflow": (
+                "-Mode Qualification",
+                "-Mode Fast",
+            ),
+            "missing schedule": (
+                "  schedule:\n    - cron: \"23 3 * * 1\"\n",
+                "",
+            ),
+        }
+        for label, (original, replacement) in mutations.items():
+            with self.subTest(label=label):
+                mutated = self.workflow.replace(original, replacement, 1)
+                self.assertNotEqual(mutated, self.workflow)
+                self.assert_rejected(mutated, label)
+
+
+class WindowsContractRunnerContracts(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.runner = (ROOT / "tools/test_windows_workspace.ps1").read_text(
+            encoding="utf-8"
+        )
+
+    def assert_rejected(self, runner, label):
+        self.assertTrue(
+            GUARD.windows_contract_runner_failures(runner),
+            "{} must be rejected".format(label),
+        )
+
+    def test_current_single_runner_is_valid(self):
+        self.assertEqual(GUARD.windows_contract_runner_failures(self.runner), [])
+
+    def test_registry_timing_and_ready_order_are_guarded(self):
+        mutations = {
+            "Fast registry drift": self.runner.replace(
+                'Add-ContractCase -Name "configuration-fingerprint" -CaseMode "Fast"',
+                'Add-ContractCase -Name "configuration-other" -CaseMode "Fast"',
+                1,
+            ),
+            "Qualification registry drift": self.runner.replace(
+                'Add-ContractCase -Name "junction-cleanup" -CaseMode "Qualification"',
+                'Add-ContractCase -Name "junction-other" -CaseMode "Qualification"',
+                1,
+            ),
+            "sleep reintroduced": self.runner.replace(
+                "$ErrorActionPreference = \"Stop\"",
+                '$ErrorActionPreference = "Stop"\nStart-Sleep -Milliseconds 1',
+                1,
+            ),
+            "Ready before verification": self.runner.replace(
+                'Write-Trace "verification.completed"',
+                'Write-Trace "__swap__"',
+                1,
+            ).replace(
+                'Write-Trace "ready.written"',
+                'Write-Trace "verification.completed"',
+                1,
+            ).replace(
+                'Write-Trace "__swap__"',
+                'Write-Trace "ready.written"',
+                1,
+            ),
+        }
+        for label, mutation in mutations.items():
+            with self.subTest(label=label):
+                self.assertNotEqual(mutation, self.runner)
+                self.assert_rejected(mutation, label)
 
 
 class WindowsBuildEnvironmentContracts(unittest.TestCase):
@@ -554,7 +703,68 @@ class WindowsGatePolicyContracts(unittest.TestCase):
             GUARD.expected_windows_environment_fingerprint_paths(),
         )
 
-    def test_policy_schema_order_case_and_jobs_are_strict(self):
+    def test_policy_schema_safety_and_required_properties_are_strict(self):
+        unknown_tool = copy.deepcopy(self.policy)
+        unknown_tool["gates"][0]["tool"] = "pwsh"
+        missing_runtime_models = copy.deepcopy(self.policy)
+        missing_runtime_models["gates"] = [
+            gate
+            for gate in missing_runtime_models["gates"]
+            if gate["arguments"] != ["tools/run_runtime_models.py"]
+        ]
+        missing_all_targets = copy.deepcopy(self.policy)
+        missing_all_targets["gates"][1]["name"] = (
+            "cargo check --locked --jobs 4 --workspace"
+        )
+        missing_all_targets["gates"][1]["arguments"] = [
+            "check",
+            "--locked",
+            "--workspace",
+        ]
+        all_features_check = copy.deepcopy(self.policy)
+        all_features_check["gates"][1]["name"] += " --all-features"
+        all_features_check["gates"][1]["arguments"].append("--all-features")
+        package_scope = copy.deepcopy(self.policy)
+        package_scope["gates"][3]["name"] += " -p easycon-runtime"
+        package_scope["gates"][3]["arguments"].extend(["-p", "easycon-runtime"])
+        filtered_test = copy.deepcopy(self.policy)
+        filtered_test["gates"][3]["name"] += " -- exact_filter"
+        filtered_test["gates"][3]["arguments"].extend(["--", "exact_filter"])
+        weakened_clippy = copy.deepcopy(self.policy)
+        weakened_clippy["gates"][2]["name"] = weakened_clippy["gates"][2][
+            "name"
+        ].replace("-- -D warnings", "-- --cap-lints allow -D warnings")
+        weakened_clippy["gates"][2]["arguments"] = weakened_clippy["gates"][2][
+            "arguments"
+        ][:-3] + ["--", "--cap-lints", "allow", "-D", "warnings"]
+        python_extra = copy.deepcopy(self.policy)
+        python_extra["gates"][4]["name"] += " --quiet"
+        python_extra["gates"][4]["arguments"].append("--quiet")
+        mismatched_name = copy.deepcopy(self.policy)
+        mismatched_name["gates"][0]["name"] = "cargo fmt"
+        dotted_path = self.policy_text.replace(
+            "tools/validate_specs.py", "tools/./validate_specs.py"
+        )
+        empty_path_segment = self.policy_text.replace(
+            "tools/check_markdown_links.py", "tools//check_markdown_links.py"
+        )
+        trailing_dot_segment = self.policy_text.replace(
+            "tools/check_repository_guards.py", "tools/contracts./check_repository_guards.py"
+        )
+        expanded_git = copy.deepcopy(self.policy)
+        expanded_git["gates"][-1] = {
+            "name": "git diff --check --stat",
+            "tool": "git",
+            "arguments": ["diff", "--check", "--stat"],
+        }
+        infra_contract = copy.deepcopy(self.policy)
+        infra_contract["gates"].append(
+            {
+                "name": "python tools/test_windows_bootstrap_contracts.py",
+                "tool": "python",
+                "arguments": ["tools/test_windows_bootstrap_contracts.py"],
+            }
+        )
         mutations = {
             "duplicate root key": self.policy_text.replace(
                 '"version": 1', '"version": 1, "version": 1', 1
@@ -562,14 +772,33 @@ class WindowsGatePolicyContracts(unittest.TestCase):
             "unknown root key": dict(self.policy, unknown=True),
             "noninteger jobs": dict(self.policy, cargoJobs=True),
             "wrong jobs": dict(self.policy, cargoJobs=3),
-            "reordered gates": dict(self.policy, gates=list(reversed(self.policy["gates"]))),
             "path case alias": self.policy_text.replace(
                 "tools/validate_specs.py", "TOOLS/VALIDATE_SPECS.PY", 1
             ),
+            "unknown tool": unknown_tool,
+            "missing runtime models": missing_runtime_models,
+            "missing check all-targets": missing_all_targets,
+            "all-features default check": all_features_check,
+            "package-scoped workspace test": package_scope,
+            "filtered workspace test": filtered_test,
+            "weakened Clippy cap": weakened_clippy,
+            "required Python extra argument": python_extra,
+            "mismatched gate name": mismatched_name,
+            "dot path segment": dotted_path,
+            "empty path segment": empty_path_segment,
+            "trailing dot path segment": trailing_dot_segment,
+            "expanded Git command": expanded_git,
+            "infra contract in candidate policy": infra_contract,
         }
         for label, mutation in mutations.items():
             with self.subTest(label=label):
                 self.assert_policy_rejected(mutation, label)
+
+    def test_json_order_is_policy_data_not_a_python_mirror(self):
+        reordered = copy.deepcopy(self.policy)
+        reordered["gates"] = list(reversed(reordered["gates"]))
+        self.assertEqual(GUARD.parse_windows_gate_policy(json.dumps(reordered)), reordered)
+        self.assertNotIn("Get-EasyConExpectedWindowsGatePolicy", self.policy_module)
 
     def test_gate_policy_bypass_jobs_and_evidence_mutations_are_rejected(self):
         mutations = {
@@ -583,7 +812,9 @@ class WindowsGatePolicyContracts(unittest.TestCase):
             ),
             "Targeted jobs override": (
                 self.policy_module.replace(
-                    'StartsWith("--jobs=")', 'StartsWith("--worker-jobs=")', 1
+                    '$argument.StartsWith("--jobs=")',
+                    '$argument.StartsWith("--worker-jobs=")',
+                    1,
                 ),
                 self.runner,
             ),

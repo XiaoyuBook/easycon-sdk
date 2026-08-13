@@ -26,6 +26,24 @@ env:
   VCPKG_FEATURE_FLAGS: manifests,registries,versions
 
 jobs:
+  windows-infrastructure-qualification:
+    name: Windows Infrastructure Qualification (Non-Required)
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - name: Check out the scheduled candidate
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Run Windows infrastructure Qualification contracts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          pwsh -NoProfile -File tools/test_windows_workspace.ps1 -Mode Qualification
+
   windows-native:
     name: Windows Native / ${{ matrix.label }}
     runs-on: windows-2022

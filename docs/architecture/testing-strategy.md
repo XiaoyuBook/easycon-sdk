@@ -430,8 +430,8 @@ SLO 在专用、固定电源策略的测试机测量；O-04 依据首轮数据�
 
 仓库已经包含 Runtime、Controller 和 test support 功能项目，不再处于只验证架构文档的阶段。验证范围
 以当前仓库协作规则为准：Rust 源码、Cargo、behavior、schema、fixture 或 conformance
-变更必须执行完整 workspace、Loom 模型、规范、链接、repository guard 和 diff 门禁；当前完整命令清单见
-[Runtime + Controller fake vertical slice](../development/runtime-controller-vertical-slice.md#本地验证)。
+变更必须执行适用 profile 要求的完整 Workspace；A 的当前 ordered gate 数据只见
+[`tools/windows_gate_policy.json`](../../tools/windows_gate_policy.json)，不得从历史开发记录复制命令清单。
 
 仅修改说明性文档且确认不影响可执行行为时，至少执行：
 
@@ -439,90 +439,40 @@ SLO 在专用、固定电源策略的测试机测量；O-04 依据首轮数据�
 - repository guard；
 - `git diff --check`。
 
-Windows 环境生命周期另有无网络轻量合同：两个不同物理 worktree 在同一固定 SHA/fingerprint、环境 schema、host/target 下
-必须解析同一个 prepared `EnvironmentRoot` 和 environment lease，首个 Setup 后第二个 Setup 必须 `already-ready` 且零 provision/
-download；Cargo target、CMake cache、Cargo home/config、vcpkg wrapper/downloads 和测试临时目录必须不同。prepared tree、stamp、
-Cargo vendor/config、vcpkg installed tree 和工具记录必须审计 worktree absolute path 与潜在写入边界，泄漏 fixture 必须 fail closed。
-prepared Cargo/native tree 的性能回归还必须用确定性合同证明每棵 tree 只受控枚举一次、`FilesScanned` 等于内容读取和 SHA
-计算次数，并以 `zh-CN` 的标点/Unicode fixture 及 case-sensitive 目录中的 40 个 comparer-equal casing variants 比较旧
-`Sort-Object FullName` 单次当前文化排序产生的 stamp v2 digest；content traversal 不得在该最终排序前预排 entry，wall-clock
-仅可输出诊断，不能作为安全或正确性唯一断言。
-同一合同继续注入 reparse、锁定读失败、损坏 BOM text/strict JSON、raw/escaped source 或任意 writable path 及
-files/hash mismatch，并要求 Verify/Workspace 在任一环境缺陷下零 gate 启动。
-两个 fixture 都必须是同一 fixed SHA 的独立 clean checkout，使用当前严格 v5 配置计算 fingerprint，禁止复制 fingerprint
-inputs；合同必须真实走首次 Setup 与第二次 already-ready Setup，证明单一 `e/`、不同 `w/` 及 provision/download 计数不增加。prepared JSON 的 escaped source/任意
-`CacheRoot/w` path、source/writable tool record、stamp 每层 duplicate/unknown/type/integer mutation 都要独立 fail closed。
-合同还覆盖首次 Setup、
-损坏重建、Setup 中断后恢复、跨 worktree 的 Setup-vs-Verify/Workspace ownership、Verify 失败时 gate 零启动，以及两个不同
-worktree 的 Workspace 并发时从 Verify 到全部 gates 持共享 environment lease、各自持 writable-output lease。ready 环境与另一
-identity 的 shared-cache writer 竞争必须分别覆盖 timeout 与等待后成功：timeout 原样返回 busy、
-Verify/Setup 调用均为零且 stamp/marker 保留；等待测试用真实子进程与同步 marker 释放 writer，不用随机 sleep。
-环境测试必须启动真实子进程证明 ambient compiler/wrapper、target compiler/linker、MSVC include/lib、
-CMake/package-root/vcpkg/proxy 未被继承；vcpkg publish 测试通过注入访问冲突证明有限重试、partial destination
-可清理时的回滚，以及文件被独占句柄锁定时保留 publish 首错、附加 cleanup 状态并在句柄释放后恢复，不使用随机
-sleep。生命周期合同还必须证明普通 Import 后完整 exported function set exact 等于 Setup/Verify/Workspace，所有 helper
-只能通过模块作用域测试，并逐项覆盖三个 wrapper 参数转发以及 Setup/Verify/Workspace 成功与失败后完整恢复调用进程
-环境；Workspace gate 内仍只能看到受控环境。配置合同分别向 PowerShell parser 注入倒序 inputs、遗漏
-`crates/easycon-file-identity/Cargo.toml`、Windows 大小写 alias duplicate 与 `.` component，并要求在 provision 前拒绝；Python guard 对同一 schema/path/kind/order/identity 规则
-给出独立回归。文件 cleanup 合同用真实 `FileShare.None` 覆盖通用 pinned download、vcpkg asset 和 stamp temporary，证明
-首错、cleanup/residual 诊断、最终 destination 不可见和句柄释放后的恢复。
-cwd cleanup 合同由真实子 `pwsh` 删除 caller 原目录后分别 exit 42/43，证明 native 输出/描述和 gate 名称/退出码保持主错误，
-location restore failure 仅为附加 Data；exit 0 对照则证明没有更早主错误时 restore failure 仍直接失败。
-Setup/Verify 宿主版本合同通过各自的 native capture 路径注入 Python `--version` 输出，覆盖 `3.12.10`、`3.10.x`、
-`3.8.0`、`3.7.99`、空输出、多行、同一行尾随与非法格式，证明 minimum 比较使用 `System.Version` 数值语义、
-parser 只接受恰好一行完整输出，且测试不依赖机器当前 Python 版本。
-prepared vcpkg checkout 的真实 Git fixture 必须在改变 tracked file stat 后记录 `.git/index` hash/mtime，Verify 后保持二者
-不变且不产生 `index.lock`。Python 合同核对 `TEMP`/`TMP`/`TMPDIR`、pycache/bytecode 全部落到当前 `w/`，并让
-`RequireCleanTree` 对 gate 新增的 ignored pyc 仍然失败。
-Windows targeted Cargo 合同还必须用 child runner 证明非 `Targeted` mode 携带 targeted 参数及 lowercase mode 都在 Verify 前失败；私有 gate
-contract 必须逐 token 核对自动插入的 `--locked` 与 `--jobs 4`、显式 package、仅允许的 command，以及 `--workspace`/`--all`、所有
-source/output/config/target bypass 参数和 `--name=value` 形式的零启动拒绝。它还必须在 Cargo `--` 前分别覆盖 `-m <path>`、
-紧凑 `-m<path>` 与 `clippy --fix`/equals 形式的零启动拒绝，同时保留 `--` 后 test-binary 参数不按 Cargo option 解析。
-公开 Targeted wrapper 必须继续走 Workspace lifecycle，证明 Verify 失败时零 targeted gate、lease/环境恢复仍由既有 lifecycle
-负责、public export set 不扩张。
-candidate contract 使用真实 Git fixture 覆盖 staged success、unstaged/untracked 拒绝及 gate 内 index tree 改变；成功 binding
-必须同时固定 HEAD 与 `git write-tree`，clean-tree 继续覆盖 ignored pyc。任何 `BaseSha` branch/ref/`HEAD`/abbrev 都必须在 gate
-前由一次受控 Git 解析为 40 位 immutable commit，非法 ref 零 gate 拒绝，diff/evidence 均使用同一解析值。policy 的 JSON、private
-script 和 runner 必须作为 strict UTF-8、无 BOM、无换行归一化的同批 source-byte snapshot 解析和 hash；三个 capture-time
-deterministic mutation fixture 分别证明零 Verify/零 gate，LF/CRLF 与 BOM fixture 证明 byte identity 不会隐式归一化或放宽。
-policy hash 还必须在 Verify 后和最后一个 gate 后复核；两个 deterministic mutation fixture 分别证明前者零 gate，后者零 passed
-record/evidence。evidence contract 必须覆盖普通 Workspace 只输出
-`credential=none` summary、staged/clean credential 成功后才在当前 `w/<workspace-key>` 原子 no-replace 发布
-`evidence/v2/workspace-<candidate-mode>-<tree>-<run-id>.json`、final `EASYCON_WORKSPACE` 与 JSON 的
-tree/environment fingerprint/policy hash/identity/timing 一致、没有残留 temporary，以及 gate 失败时零 passed record 和零 evidence。所有这些 fixture 以同步 marker、真实 Git 状态或真实原子 writer 判断，不用随机 sleep。
-vcpkg checkout 还必须在 audit 后、首次 Git 前确定性尝试把 checkout root、`.git`、非 root required entry 与 ordinary tracked
-entry 分别替换为 junction/reparse；全树以 file `FILE_READ_DATA`、directory `FILE_LIST_DIRECTORY` 的 `FileShare.Read`
-binding 必须拒绝每种替换、持续到全部 Git commit/tracked-file/cleanliness 查询结束。行为 fixture 还必须证明 zero access
-与 `FILE_READ_ATTRIBUTES` 允许 replacement，而最小 read-data/list lock 拒绝它。bulk fixture 的确定性 call counters 必须
-结合 guard 证明 ordinary entry 不先调用 `File.GetAttributes`，而是只由 bound handle 的一次真实 basic query 完成
-reparse/type 分类；FileId/final-path 仅用于 critical path 和其重开，且让 Direct、Verify 与 Workspace
-均在零 gate 前 fail closed。该 fixture
-还必须覆盖本地盘超过 `MAX_PATH` 的 audited
-directory/file、critical-path reopen，以及 ordinary/already-extended local 和 UNC path 的 private Win32 conversion；extended
-prefix 不得泄漏到 audit/stamp/digest diagnostics 或公开环境变量。单 root handle 不能作为该合同的替代，测试使用同步 native
-capture 而非随机 sleep。
-Visual Studio discovery 合同通过 native capture 注入 `vswhere` 的空输出、仅空白、多条、畸形、有效单路径与非零失败；
-空/空白成功输出必须给出 x64 C++ toolchain 未找到诊断，不能泄漏数组索引异常，其他既有边界保持不变。
+Windows candidate 验证遵循 [ADR-0028](../decisions/0028-windows-candidate-gate-layering.md) 的 A/B/C/D
+矩阵：
 
-共享资产合同必须覆盖：cache miss 只下载一次；完整命中时阻断 download seam 且零下载；损坏 blob 隔离后恢复；错误
-hash fail closed；不同 hash 的发布锁可并行且同一 hash 跨 identity 互斥；fingerprint 变化、worktree 切换及失败重建仍复用
-已验证 blob。vcpkg scripts 命中每次复核且不执行 install/fetch seam，损坏 checkout 隔离重建。7-Zip 合同在宿主 PATH
-同时放入兼容和不兼容 `7z.exe` 时仍只接受空 PATH fetch 返回的清单派生路径，并核对最终 executable hash/精确 x64
-版本。Rust 合同明确保留每次 rustup install/check 及 release/host/target/components 复核，证明 transient install 可在第三次
-有界尝试恢复且持续失败恰在三次后关闭，不能把未 hash 固定的 PR cache 降级为仅信任自报版本。Cargo provenance 合同
-在 PATH 前置可伪报正确版本的无关 `cargo.exe`，要求 rustup `which` 的固定 toolchain 路径、release、host、target/components
-全部在 vendor 前通过，并覆盖缺失 toolchain、路径逃逸与错误版本；ambient fake 的执行计数必须为零。Required CI workflow
-合同对 PR/main cache namespace、restore 顺序、save 条件、缓存路径和 key
-实施 mutation tests，保证 PR 缓存不能写入或被 trusted main 读取，且 environment/stamp 不进入 Actions cache。
-受控 CMake/Ninja 合同还必须在阻断网络时证明 archive 预填到 commit-scoped vcpkg downloads，跨 environment 命中不下载，
-且损坏的目标副本可从重新核验的 blob 修复。vcpkg install 合同精确核对 commit-scoped downloads 参数，证明第三次尝试
-可恢复且持续失败恰在三次后关闭。hosted port source 可包含合法 reparse/symlink，因此合同要在失败 install 的
-buildtrees/packages 中创建指向 trusted root 外部 marker 的真实 junction，证明失败 cleanup、后续 Setup recovery 与成功
-cleanup 都只删除 transient link/tree、不跟随目标或误删 installed tree；真实独占句柄还要证明 install 首错与
-cleanup/residual 诊断并存。恢复合同必须锁住 junction 本身制造两个 known transient root 的失败残留，释放句柄后走
-公开 Setup lifecycle 并证明 SetupAction 恰好执行一次；句柄仍占用时保留 Verify 首错与 cleanup/residual Data，且不启动
-SetupAction。固定布局外的 unknown reparse 必须继续 fail closed，installed tree 和外部目标都不得被专用清理误删；
-这些并发边界使用真实 handle 与同步终态，不依赖随机 sleep。
+| 层 | 入口 | 覆盖与阻断范围 |
+| --- | --- | --- |
+| A | `tools/run_windows_workspace.ps1 -Mode Workspace` | 唯一 candidate credential；Verify 后运行 JSON policy 的 9 个固定 gate，staged/base diff 按参数追加 |
+| B | `tools/test_windows_workspace.ps1 -Mode Fast` | bootstrap 加 12 个确定性组；只阻断 Windows infrastructure candidate，warm 目标不超过 90 秒 |
+| C | `tools/test_windows_workspace.ps1 -Mode Qualification` | 4 个真实 OS 资格组；由 Native Quality schedule/dispatch 独立观察，不是普通 required status |
+| D | 无入口 | 删除独立 lifecycle runner、重复 harness 自测注册与同义变体 |
+
+A 的固定 policy 包含 fmt、default-feature/all-target check、all-feature/all-target Clippy、all-feature tests、Runtime
+models、冻结 spec validator、Markdown links、repository guards 与 diff check。JSON 是 gate 名称、顺序、tool 和参数的
+唯一数据源；PowerShell parser 与 Python guard 只独立检查通用 schema、安全不变量和必要属性，不维护完整镜像。
+candidate 成功仍只发布 ADR-0022 的 schema-v2 no-replace evidence，精确绑定 base、HEAD、index/HEAD tree、environment
+fingerprint、policy hash、status 与 ordered gate timings。gate count 可随 policy 变化，但 binding 不迁移、不放宽。
+
+B 固定注册以下 12 个唯一组：`configuration-fingerprint`、`tool-version-pin-parsers`、
+`module-wrapper-contracts`、`plan-targeted-arguments`、`candidate-binding`、`evidence-output`、
+`policy-snapshot-revalidation`、`stamp-tool-damage`、`atomic-publication`、`transport-policy`、
+`msvc-environment-seam`、`lifecycle-state-restore`。同义 mutation 在组内表驱动合并。mode、exact name、
+registered/unique/executed 数量和 bootstrap 执行都 fail closed；unknown、duplicate、cross-mode 或大小写变体不能运行。
+Required CI 只在 runner/policy/environment/bootstrap/config、相关 manifest 或 CI workflow path 变化时运行 B，base
+不可用时保守运行；普通产品源码 path 不运行 B。
+
+C 固定注册 `real-worktree-concurrency`、`process-lifecycle`、`cache-lock-download` 与 `junction-cleanup`。它覆盖
+真实 child process、fixed-SHA Git worktree、cache/lease/lock、download、junction/reparse、cleanup、wall clock、startup
+skew 与 early exit。并发 Verify child 必须在持有 environment/workspace/shared-cache leases 时完成 checkout/layout
+验证并记录 `verification.completed`，随后才发布 `ready.written`；父进程在 release 前证明三类 lease 仍被占用，最后才允许
+`release.observed`。teardown 必须 bounded、all-live-first，保留 primary failure 与 residual diagnostics；这些真实 OS
+边界不进入 A，也不能替代 A。
+
+开发期只选择少量 exact group。最终 infrastructure source 的 B 只运行一次，失败即停止；同一 source 的 C 只观察一次，
+qualification/fixture failure 如实记录，只有证明 production defect 才阻断 candidate。最终 staged tree 的 A 由任务 profile
+规定的正式入口运行，B/C 不得作为其替代证据。
 
 无论变更类型，都必须确认 `EasyCon/` 仍被根 `.gitignore` 忽略、第三方参考源码没有改动，且外层 tracked
 文件没有引入 `EasyCon/` 内容或项目依赖。

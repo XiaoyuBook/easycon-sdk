@@ -124,6 +124,78 @@ jobs:
           cargo --version --verbose
           python --version
 
+      - name: Classify Windows infrastructure paths
+        id: infra_paths
+        shell: pwsh
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          $runFast = [string]::IsNullOrWhiteSpace($env:BASE_SHA) -or $env:BASE_SHA -match '^0+$'
+          if (-not $runFast) {
+            try {
+              git cat-file -e "${env:BASE_SHA}^{commit}" 2>$null
+            }
+            catch {
+              $runFast = $true
+            }
+          }
+          if (-not $runFast) {
+            $changedPaths = @(
+              git diff --name-only --no-renames --diff-filter=ACDMRTUXB "${env:BASE_SHA}...HEAD"
+            )
+            $exactPaths = [System.Collections.Generic.HashSet[string]]::new(
+              [System.StringComparer]::Ordinal
+            )
+            @(
+              ".cargo/config.toml",
+              ".github/workflows/required-ci.yml",
+              ".github/workflows/native-quality.yml",
+              "Cargo.lock",
+              "Cargo.toml",
+              "CMakePresets.json",
+              "clippy.toml",
+              "rust-toolchain.toml",
+              "rustfmt.toml",
+              "scripts/vcpkg-tools.json",
+              "spec/fixtures/vision/ocr-model.json",
+              "tests/support/Cargo.toml",
+              "tools/check_repository_guards.py",
+              "tools/provision_vision_test_model.py",
+              "tools/run_windows_workspace.ps1",
+              "tools/test_windows_bootstrap_contracts.py",
+              "tools/test_windows_workspace.ps1",
+              "tools/windows_build_environment.json",
+              "tools/windows_gate_policy.json",
+              "tools/windows_gate_policy.ps1",
+              "tools/windows_workspace.psm1",
+              "vcpkg-configuration.json",
+              "vcpkg.json"
+            ) | ForEach-Object { [void]$exactPaths.Add($_) }
+            foreach ($path in $changedPaths) {
+              if (
+                $exactPaths.Contains($path) -or
+                $path.StartsWith("cmake/triplets/", [StringComparison]::Ordinal) -or
+                ($path.StartsWith("crates/", [StringComparison]::Ordinal) -and
+                  $path.EndsWith("/Cargo.toml", [StringComparison]::Ordinal))
+              ) {
+                $runFast = $true
+                break
+              }
+            }
+          }
+          "run_fast=$($runFast.ToString().ToLowerInvariant())" |
+            Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Run Windows infrastructure Fast contracts
+        if: steps.infra_paths.outputs.run_fast == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          pwsh -NoProfile -File tools/test_windows_workspace.ps1 -Mode Fast
+
       - name: Run repository policy gates
         shell: pwsh
         run: |
@@ -153,6 +225,7 @@ jobs:
 
   windows-workspace:
     name: Required / Windows Workspace
+    needs: policy
     runs-on: windows-2022
     timeout-minutes: 180
     steps:
